@@ -66,31 +66,49 @@
     "summary": "Drops the pointer/descriptor left by the structured field helpers once a store completes, keeping the table writer balanced."
   },
   "00:3C": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "inline_ascii_chunk_00",
     "stack_delta": 0,
     "summary": "Encodes two ASCII bytes in the opcode and two in the operand, forming inline resource strings rather than executable VM behaviour."
   },
+  "00:3E": {
+    "control_flow": "fallthrough",
+    "name": "structured_pointer_literal",
+    "stack_delta": 1,
+    "summary": "Pushes the pointer literal consumed by 00:30 and 30:69 to prime indirect store sequences with fresh cursor metadata."
+  },
   "00:3D": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_field_fetch",
     "stack_delta": 1,
     "summary": "Promotes the structure slot prepared by 00:64/00:65 onto the stack so downstream loads and stores can address the resolved field."
   },
   "00:41": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "inline_ascii_chunk_41",
     "stack_delta": 0,
     "summary": "Another inline ASCII word emitter: opcode+mode carry the leading characters and the operand supplies the trailing pair."
   },
+  "00:53": {
+    "control_flow": "fallthrough",
+    "name": "inline_ascii_chunk_53",
+    "stack_delta": 0,
+    "summary": "Opcode/mode spell the leading 'S' character while the operand contributes the trailing pair, yielding inline resource text without affecting the stack."
+  },
   "00:5E": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_anchor_literal",
     "stack_delta": 1,
     "summary": "Pushes the structured table anchor (operands like 0x2910/0x3D30) that seeds the commit/dispatch sequence."
   },
+  "00:63": {
+    "control_flow": "fallthrough",
+    "name": "inline_ascii_chunk_63",
+    "stack_delta": 0,
+    "summary": "Embeds an inline 'c' prefix with operand-supplied tail bytes for resource strings, leaving execution stack depth unchanged."
+  },
   "00:64": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_pair_collapse",
     "stack_delta": -1,
     "summary": "Consumes a literal base/offset pair and leaves a pointer descriptor that 00:65/00:3D consume when wiring structured fields."
@@ -216,16 +234,34 @@
     "summary": "Seen inside resource blobs where the opcode/mode bytes encode leading characters; treated as non-executable string data by the VM."
   },
   "07:00": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_literal_marker",
     "stack_delta": -1,
     "summary": "Drops the temporary literal used while walking structured tables, frequently appearing between successive field descriptors."
   },
+  "09:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_quintet_loader",
+    "stack_delta": 5,
+    "summary": "Expands register-fed metadata into a five-slot bundle that seeds the following indirect fetches and literal stores in table constructors."
+  },
+  "0A:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_variadic_loader",
+    "stack_delta": 4.75,
+    "summary": "Bulk loader that replenishes roughly five stack entries (mix of four and five) after heavy teardowns, feeding the pointer/closure scaffolding used by structured initialisers."
+  },
   "0D:00": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "literal_quad_load",
     "stack_delta": 4,
     "summary": "Injects four literal words (often pointer/value combos) before the structured store helpers consume them."
+  },
+  "0E:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_heavy_loader",
+    "stack_delta": 3.6666666666666665,
+    "summary": "Fans out multi-field metadata in large bursts (alternating three and four pushes on average) before pointer patches and dispatch helpers consume the temporary payload."
   },
   "10:00": {
     "control_flow": "call",
@@ -348,8 +384,14 @@
     "stack_delta": 1,
     "summary": "Advances the generic for-loop iterator (TFORLOOP) and branches back when additional elements remain."
   },
+  "23:30": {
+    "control_flow": "fallthrough",
+    "name": "structured_teardown_pair",
+    "stack_delta": -2,
+    "summary": "Consumes the pointer/value pair left after structured stores, clearing the lane before the next literal bundle is prepared."
+  },
   "23:4F": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_entry_expand",
     "stack_delta": 3,
     "summary": "Expands a structured table entry into a triple (index, pointer, payload) that downstream helpers consume."
@@ -366,8 +408,20 @@
     "stack_delta": 0,
     "summary": "Neutral marker that syncs structured pointer metadata between helper bursts without disturbing the stack depth."
   },
+  "26:2C": {
+    "control_flow": "fallthrough",
+    "name": "structured_selector_prime",
+    "stack_delta": 1,
+    "summary": "Pushes the selector descriptor that immediately drives dispatcher families (14:30/70:30/9C:30) during complex structured writes."
+  },
+  "28:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_bundle_expand",
+    "stack_delta": 5,
+    "summary": "Fans out the cursor prepared by 3D:30 into a five-value bundle (index plus payload quartet) before indirect stores commit the data."
+  },
   "28:10": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_loop_step",
     "stack_delta": -1,
     "summary": "Consumes one stack item while advancing through multi-field initialiser loops, preceding 6C:01/29:10 store patterns."
@@ -457,10 +511,16 @@
     "summary": "Collapses one entry when normalising structured control data."
   },
   "30:41": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "resource_pointer_hint",
     "stack_delta": 0,
     "summary": "Loads pointer-like metadata (operands often spell out resource tags) without adjusting stack depth."
+  },
+  "30:65": {
+    "control_flow": "fallthrough",
+    "name": "structured_dispatch_bridge",
+    "stack_delta": 0,
+    "summary": "Neutral bridge between register fetch bursts and downstream call/dispatch helpers, tagging the active structured cursor without touching stack height."
   },
   "30:69": {
     "control_flow": "fallthrough",
@@ -504,11 +564,23 @@
     "stack_delta": -4,
     "summary": "Consumes the four-literal bundle built by the vector literal loader (3A:00) and commits it to the operand-directed table slot, draining the constructor stack."
   },
+  "3D:30": {
+    "control_flow": "fallthrough",
+    "name": "structured_cursor_commit",
+    "stack_delta": -2,
+    "summary": "Collapses the anchor literal and pointer descriptor into an active cursor that downstream bundle loaders (28:00/40:00) immediately expand."
+  },
   "3E:00": {
     "control_flow": "call",
     "name": "invoke_call_dispatch",
     "stack_delta": -4,
     "summary": "Transfers control to the routine prepared by the pack_call helpers, finalising the indirect call sequence."
+  },
+  "40:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_quad_expand",
+    "stack_delta": 4,
+    "summary": "Expands the committed cursor into four stack values that immediately feed indirect stores and pointer patches."
   },
   "42:00": {
     "control_flow": "fallthrough",
@@ -667,16 +739,28 @@
     "summary": "Pushes the field index (0x4Fxx operands) used by 31:30/72:30 when committing structured writes."
   },
   "72:30": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "structured_field_finish",
     "stack_delta": -2,
     "summary": "Consumes the index/value pair prepared by 72:23 and accompanying literals, finalising the structured field mutation."
   },
+  "72:65": {
+    "control_flow": "fallthrough",
+    "name": "inline_ascii_chunk_7265",
+    "stack_delta": 0,
+    "summary": "Opcode/mode contribute the leading 're' characters while the operand fills in the tail, forming inline resource text with no stack effect."
+  },
   "73:00": {
-	"control_flow": "fallthrough",
+        "control_flow": "fallthrough",
     "name": "inline_ascii_chunk_73",
     "stack_delta": 0,
     "summary": "Carries inline character data (leading 's\u0000') inside resource blobs; exhibits no executable semantics."
+  },
+  "73:65": {
+    "control_flow": "fallthrough",
+    "name": "inline_ascii_chunk_7365",
+    "stack_delta": 0,
+    "summary": "Embeds the 'se' byte pair at the start of four-character ASCII words, leaving the stack untouched."
   },
   "74:00": {
     "control_flow": "fallthrough",
@@ -731,6 +815,12 @@
     "name": "structured_dispatch_marker",
     "stack_delta": 0,
     "summary": "Dispatch marker threaded through structured control scaffolding, leaving stack height untouched."
+  },
+  "7C:7C": {
+    "control_flow": "fallthrough",
+    "name": "inline_ascii_chunk_7C7C",
+    "stack_delta": -1,
+    "summary": "Streams repeating '||' ASCII words straight from the data blob; modelling shows a single-slot drain when these separators appear in code paths."
   },
   "7D:00": {
     "control_flow": "fallthrough",
@@ -1109,6 +1199,12 @@
     "name": "resource_refresh_marker",
     "stack_delta": 0,
     "summary": "Refresh token embedded in textual status blocks (\"WinGroupList...\"); inert for stack tracking."
+  },
+  "E0:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_bulk_entry",
+    "stack_delta": 0,
+    "summary": "Bridges dense register-pair bursts into the metadata pulses that precede 10:60/closure scaffolding, acting as a stack-neutral hand-off marker."
   },
   "E2:00": {
     "control_flow": "fallthrough",
