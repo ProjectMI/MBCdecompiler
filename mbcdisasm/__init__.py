@@ -19,6 +19,7 @@ from .ir import IRBuilder, IRProgram, write_ir_programs
 from .emulator import Emulator, EmulationReport, write_emulation_reports
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .ast import LuaReconstructor
+from .highlevel import HighLevelFunction, HighLevelReconstructor
 from .segment_classifier import SegmentClassifier
 
 __all__ = [
@@ -47,5 +48,7 @@ __all__ = [
     "StackDeltaEstimate",
     "StackDeltaModeler",
     "LuaReconstructor",
+    "HighLevelFunction",
+    "HighLevelReconstructor",
     "SegmentClassifier",
 ]

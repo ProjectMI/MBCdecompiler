@@ -9,6 +9,7 @@ class LuaReconstructorTest(unittest.TestCase):
         instructions = [
             IRInstruction(
                 offset=0x10,
+                key="00:00",
                 mnemonic="push_literal_small",
                 operand=5,
                 stack_delta=1,
@@ -16,6 +17,7 @@ class LuaReconstructorTest(unittest.TestCase):
             ),
             IRInstruction(
                 offset=0x14,
+                key="00:01",
                 mnemonic="fold_stack_pair",
                 operand=0,
                 stack_delta=-2,
