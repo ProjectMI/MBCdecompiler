@@ -8,6 +8,8 @@ from typing import List, Optional, Sequence
 from .instruction import InstructionWord, read_instructions
 from .knowledge import KnowledgeBase
 from .mbc import MbcContainer, Segment
+from .stack_model import StackDeltaEstimate, StackDeltaModeler
+from .stack_seed import seed_stack_modeler_from_knowledge
 
 
 class Disassembler:
@@ -40,6 +42,9 @@ class Disassembler:
 
     def _render_segment(self, segment: Segment, max_instructions: Optional[int]) -> List[str]:
         instructions, remainder = read_instructions(segment.data, segment.start)
+        modeler = StackDeltaModeler()
+        seed_stack_modeler_from_knowledge(modeler, self.knowledge, instructions)
+        estimates = modeler.model_segment(instructions)
 
         header = (
             f"; segment {segment.index} offset=0x{segment.start:06X} length={segment.length}"
@@ -49,22 +54,41 @@ class Disassembler:
             if max_instructions is not None and idx >= max_instructions:
                 lines.append("; ... truncated ...")
                 break
-            lines.append(self._format_instruction(instruction))
+            estimate = (
+                estimates[idx]
+                if idx < len(estimates)
+                else StackDeltaEstimate(
+                    key=instruction.label(), delta=None, confidence=0.0, source="unknown"
+                )
+            )
+            lines.append(self._format_instruction(instruction, estimate))
         if remainder:
             lines.append(f"; trailing {remainder} byte(s) ignored")
         lines.append("")
         return lines
 
-    def _format_instruction(self, instruction: InstructionWord) -> str:
+    def _format_instruction(
+        self, instruction: InstructionWord, estimate: StackDeltaEstimate
+    ) -> str:
         key = instruction.label()
         metadata = self.knowledge.instruction_metadata(key)
 
+        stack_value = metadata.stack_delta
+        stack_confidence = metadata.stack_confidence
+        if stack_value is None and estimate.delta is not None:
+            stack_value = estimate.delta
+        if stack_confidence is None and estimate.delta is not None:
+            stack_confidence = estimate.confidence
+        stack_origin = metadata.stack_source or self._stack_source_from_estimate(estimate.source)
+
         stack_detail = "stackΔ="
-        if metadata.stack_delta is not None:
-            stack_detail += f"{metadata.stack_delta:+.1f}"
+        if stack_value is not None:
+            stack_detail += self._format_stack_delta(stack_value)
             extras = []
-            if metadata.stack_confidence is not None:
-                extras.append(f"{metadata.stack_confidence * 100:.0f}%")
+            if stack_origin:
+                extras.append(stack_origin)
+            if stack_confidence is not None:
+                extras.append(f"{stack_confidence * 100:.0f}%")
             if metadata.stack_samples:
                 extras.append(f"n={metadata.stack_samples}")
             if extras:
@@ -96,6 +120,21 @@ class Disassembler:
             f"{metadata.mnemonic:<24} ; mode={instruction.mode:02X} "
             f"operand=0x{instruction.operand:04X} | {comment}"
         )
+
+    @staticmethod
+    def _stack_source_from_estimate(source: str) -> Optional[str]:
+        if not source or source == "unknown":
+            return None
+        if source == "derived":
+            return "derived"
+        return "heuristic"
+
+    @staticmethod
+    def _format_stack_delta(delta: float) -> str:
+        value = float(delta)
+        if value.is_integer():
+            return f"{value:+.0f}"
+        return f"{value:+.1f}"
 
     def write_listing(
         self,

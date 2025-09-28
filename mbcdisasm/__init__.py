@@ -11,6 +11,7 @@ from .knowledge import (
     MergeReport,
     ProfileAssessment,
     ReviewTask,
+    SemanticNamingReport,
     StackObservation,
 )
 from .cfg import ControlFlowGraphBuilder, ControlFlowGraph
@@ -33,6 +34,7 @@ __all__ = [
     "ProfileAssessment",
     "MergeReport",
     "ReviewTask",
+    "SemanticNamingReport",
     "StackObservation",
     "ControlFlowGraphBuilder",
     "ControlFlowGraph",

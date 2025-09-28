@@ -41,6 +41,7 @@ def main() -> None:
         container = MbcContainer.load(mbc_path, adb_path, classifier=classifier)
         result = analyzer.analyze(container)
         merge_report = knowledge.merge_profiles(result.iter_profiles())
+        semantic_report = knowledge.apply_semantic_annotations()
         print(f"processed {mbc_path.name}: {result.total_instructions} instructions")
         if merge_report.updates:
             sample = ", ".join(
@@ -50,6 +51,14 @@ def main() -> None:
             if len(merge_report.updates) > 3:
                 sample += f", +{len(merge_report.updates) - 3} more"
             print(f"  learned stack patterns: {sample}")
+        if semantic_report.matches:
+            preview = ", ".join(
+                f"{match.key}->{match.prototype} ({match.score:.2f})"
+                for match in semantic_report.matches[:3]
+            )
+            if len(semantic_report.matches) > 3:
+                preview += f", +{len(semantic_report.matches) - 3} more"
+            print(f"  semantic assignments: {preview}")
         conflicts = merge_report.conflicts()
         if conflicts:
             names = ", ".join(c.key for c in conflicts[:5])

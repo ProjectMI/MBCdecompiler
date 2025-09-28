@@ -77,6 +77,10 @@ def generate_review_package(
             min_samples=min_samples,
             confidence_threshold=confidence_threshold,
         )
+        knowledge.apply_semantic_annotations(
+            min_samples=min_samples,
+            score_threshold=confidence_threshold,
+        )
 
         status_counts = Counter()
         for assessment in merge_report.assessments:
