@@ -393,6 +393,7 @@ class KnowledgeBase:
         for key, payload in data.get("opcode_modes", {}).items():
             self._profiles[key] = OpcodeProfile.from_json(key, payload)
         self._annotations = data.setdefault("annotations", {})
+        self._manual_reference: Dict[str, Mapping[str, object]] = {}
         self._merge_manual_annotations()
         self._review_tasks: Dict[Tuple[str, str], ReviewTask] = {}
         for entry in data.get("review_tasks", []):
@@ -668,6 +669,13 @@ class KnowledgeBase:
             if operand_update:
                 updates.append(operand_update)
 
+            manual_inferences = self._infer_manual_annotations(
+                target,
+                observation,
+            )
+            if manual_inferences:
+                updates.extend(manual_inferences)
+
             for task in self._derive_review_tasks(
                 target,
                 assessment,
@@ -814,8 +822,16 @@ class KnowledgeBase:
         return "\n".join(lines)
 
     def record_annotation(self, key: str, **updates: object) -> None:
-        ann = self._annotations.setdefault(key, {})
-        ann.update(updates)
+        key_str = str(key)
+        normalized = {str(field): value for field, value in updates.items()}
+        ann = self._annotations.setdefault(key_str, {})
+        ann.update(normalized)
+
+        manual_entry = self._manual_reference.get(key_str)
+        if manual_entry is None:
+            manual_entry = {}
+            self._manual_reference[key_str] = manual_entry
+        manual_entry.update(normalized)
 
     def pending_review_tasks(self) -> List[ReviewTask]:
         return sorted(
@@ -1051,8 +1067,8 @@ class KnowledgeBase:
             missing_fields.append("stack_delta")
         if "control_flow" not in ann and (profile.preceding or profile.following):
             missing_fields.append("control_flow")
-        if "operand_hint" not in ann and operand_hint is not None:
-            missing_fields.append("operand_hint")
+        # Manual annotations may intentionally omit operand hints; do not
+        # treat this as an actionable error.
 
         reason: Optional[str] = None
         notes = ""
@@ -1106,6 +1122,8 @@ class KnowledgeBase:
         self.path.write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
 
     def _merge_manual_annotations(self) -> None:
+        self._manual_reference = {}
+
         manual_path = self.path.with_name("manual_annotations.json")
         if not manual_path.exists():
             return
@@ -1124,9 +1142,170 @@ class KnowledgeBase:
         for key, payload in manual_data.items():
             if not isinstance(payload, Mapping):
                 continue
-            ann = self._annotations.setdefault(str(key), {})
-            for field, value in payload.items():
-                ann[str(field)] = value
+            key_str = str(key)
+            normalized = {str(field): value for field, value in payload.items()}
+            self._manual_reference[key_str] = normalized
+            ann = self._annotations.setdefault(key_str, {})
+            ann.update(normalized)
+
+    def _infer_manual_annotations(
+        self,
+        profile: OpcodeProfile,
+        observation: StackObservation,
+    ) -> List[AnnotationUpdate]:
+        if profile.key in self._manual_reference:
+            return []
+
+        ann = self._annotations.setdefault(profile.key, {})
+        # Skip if the opcode is already fully annotated.
+        if "name" in ann and "control_flow" in ann and "summary" in ann:
+            return []
+
+        match = self._select_manual_match(profile, observation)
+        if match is None:
+            return []
+
+        manual_key, manual_payload, _score = match
+        updates: List[AnnotationUpdate] = []
+
+        def _record(field: str, value: object) -> None:
+            if field in ann:
+                return
+            ann[field] = value
+            updates.append(
+                AnnotationUpdate(
+                    key=profile.key,
+                    field=field,
+                    old_value=None,
+                    new_value=value,
+                    confidence=float(observation.confidence or 1.0),
+                    samples=int(profile.count),
+                    reason=f"manual_match:{manual_key}",
+                )
+            )
+
+        for field in (
+            "name",
+            "summary",
+            "description",
+            "comment",
+            "notes",
+            "control_flow",
+            "flow_target",
+            "stack_delta",
+            "operand_hint",
+        ):
+            value = manual_payload.get(field)
+            if value is not None:
+                _record(field, value)
+
+        previous_source = ann.get("manual_source")
+        if previous_source != manual_key:
+            ann["manual_source"] = manual_key
+            updates.append(
+                AnnotationUpdate(
+                    key=profile.key,
+                    field="manual_source",
+                    old_value=previous_source,
+                    new_value=manual_key,
+                    confidence=float(observation.confidence or 1.0),
+                    samples=int(profile.count),
+                    reason=f"manual_match:{manual_key}",
+                )
+            )
+
+        return updates
+
+    def _select_manual_match(
+        self,
+        profile: OpcodeProfile,
+        observation: StackObservation,
+    ) -> Optional[Tuple[str, Mapping[str, object], float]]:
+        operand_hint, operand_confidence = self._dominant_operand_type(profile)
+        candidates: List[Tuple[float, str, Mapping[str, object]]] = []
+
+        for manual_key, payload in self._manual_reference.items():
+            if manual_key == profile.key:
+                continue
+            score = self._score_manual_candidate(
+                profile,
+                observation,
+                operand_hint,
+                operand_confidence,
+                manual_key,
+                payload,
+            )
+            if score is None:
+                continue
+            candidates.append((score, manual_key, payload))
+
+        if not candidates:
+            return None
+
+        candidates.sort(reverse=True, key=lambda item: item[0])
+        top_score, top_key, top_payload = candidates[0]
+        if len(candidates) > 1 and top_score - candidates[1][0] < 0.5:
+            return None
+        return top_key, top_payload, top_score
+
+    def _score_manual_candidate(
+        self,
+        profile: OpcodeProfile,
+        observation: StackObservation,
+        operand_hint: Optional[str],
+        operand_confidence: Optional[float],
+        manual_key: str,
+        payload: Mapping[str, object],
+    ) -> Optional[float]:
+        score = 0.0
+
+        manual_delta = payload.get("stack_delta")
+        if manual_delta is not None:
+            observed_delta = observation.dominant
+            if observed_delta is None:
+                return None
+            try:
+                manual_delta_numeric = float(manual_delta)
+            except (TypeError, ValueError):
+                return None
+            if not self._stack_delta_close(manual_delta_numeric, observed_delta):
+                return None
+            score += 3.0
+            if observation.confidence is not None:
+                score += observation.confidence
+        elif observation.dominant is not None:
+            score += 0.5
+
+        manual_operand = payload.get("operand_hint")
+        if manual_operand is not None:
+            if operand_hint is None or operand_hint != manual_operand:
+                return None
+            score += 1.5
+            if operand_confidence is not None:
+                score += operand_confidence
+        else:
+            score += 0.1
+
+        reference = self._profiles.get(manual_key)
+        if reference is not None:
+            score += self._relationship_similarity(profile.preceding, reference.preceding)
+            score += self._relationship_similarity(profile.following, reference.following)
+
+        return score if score >= 1.0 else None
+
+    @staticmethod
+    def _relationship_similarity(counter_a: Counter, counter_b: Counter) -> float:
+        if not counter_a or not counter_b:
+            return 0.0
+        keys_a = {key for key, value in counter_a.items() if value > 0}
+        keys_b = {key for key, value in counter_b.items() if value > 0}
+        if not keys_a or not keys_b:
+            return 0.0
+        intersection = len(keys_a & keys_b)
+        union = len(keys_a | keys_b)
+        if union == 0:
+            return 0.0
+        return intersection / union
 
     @classmethod
     def _upgrade_schema(
