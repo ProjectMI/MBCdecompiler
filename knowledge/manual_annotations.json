@@ -1,0 +1,1089 @@
+{
+  "00:00": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_small",
+    "stack_delta": 1,
+    "summary": "Pushes a zero-extended literal constant to seed the evaluation stack."
+  },
+  "00:01": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_large_primary",
+    "stack_delta": 1,
+    "summary": "Pushes a wide literal constant using the hot-path encoding that feeds structure initialisers."
+  },
+  "00:02": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_compact",
+    "stack_delta": 1,
+    "summary": "Adds a literal sourced from the mixed-width stream, padding table constructor inputs."
+  },
+  "00:03": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_pair_compact",
+    "stack_delta": 2,
+    "summary": "Pushes a compact literal pair in one instruction, boosting the stack by two slots."
+  },
+  "00:04": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_followup",
+    "stack_delta": 1,
+    "summary": "Continuing literal form that keeps the constructor stream flowing without altering context."
+  },
+  "00:29": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_wide",
+    "stack_delta": 1,
+    "summary": "Pushes a wide immediate constant, mirroring the stack-priming role of mode 00."
+  },
+  "00:2C": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_medium",
+    "stack_delta": 1,
+    "summary": "Pushes a medium-width literal value for later consumers."
+  },
+  "00:30": {
+    "control_flow": "fallthrough",
+    "name": "fold_stack_pair",
+    "stack_delta": -2,
+    "summary": "Consumes two recently pushed literals, likely combining them into an address or descriptor."
+  },
+  "00:69": {
+    "control_flow": "fallthrough",
+    "name": "literal_compare",
+    "stack_delta": 0,
+    "summary": "Touches literal operands without changing stack depth, hinting at compare/move semantics."
+  },
+  "01:00": {
+    "control_flow": "fallthrough",
+    "name": "stack_teardown_5",
+    "stack_delta": -5,
+    "summary": "Aggressively clears five entries, matching destructor or return cleanup behaviour."
+  },
+  "01:66": {
+    "control_flow": "fallthrough",
+    "name": "stack_teardown_hold",
+    "stack_delta": 0,
+    "summary": "Neutral variant that likely writes results without additional pops."
+  },
+  "01:EC": {
+    "control_flow": "fallthrough",
+    "name": "stack_teardown_1",
+    "stack_delta": -1,
+    "summary": "Single-slot cleanup companion to the deeper teardown forms."
+  },
+  "01:F0": {
+    "control_flow": "fallthrough",
+    "name": "stack_teardown_4",
+    "stack_delta": -4,
+    "summary": "Four-entry consumer that fits the destructor-style opcode behaviour."
+  },
+  "01:F1": {
+    "control_flow": "fallthrough",
+    "name": "stack_teardown_3",
+    "stack_delta": -3,
+    "summary": "Consumes three entries as part of the cleanup sequence."
+  },
+  "04:00": {
+    "control_flow": "fallthrough",
+    "name": "reduce_pair",
+    "stack_delta": -2,
+    "summary": "Primary binary reducer that consumes two operands (likely arithmetic)."
+  },
+  "04:29": {
+    "control_flow": "fallthrough",
+    "name": "reduce_push_helper_a",
+    "stack_delta": 1,
+    "summary": "Stashes a helper result, yielding a net +1 delta."
+  },
+  "04:2C": {
+    "control_flow": "fallthrough",
+    "name": "reduce_push_helper_b",
+    "stack_delta": 1,
+    "summary": "Medium-width helper that restores a value after reduction."
+  },
+  "04:66": {
+    "control_flow": "fallthrough",
+    "name": "reduce_passthrough",
+    "stack_delta": 0,
+    "summary": "Write-back oriented form that keeps the stack balanced."
+  },
+  "04:F0": {
+    "control_flow": "fallthrough",
+    "name": "reduce_quad",
+    "stack_delta": -4,
+    "summary": "Extended reducer operating on four stacked operands."
+  },
+  "10:00": {
+    "control_flow": "call",
+    "name": "pack_call_triple",
+    "stack_delta": -3,
+    "summary": "Consumes three operands to prepare a call frame or tuple payload."
+  },
+  "10:01": {
+    "control_flow": "call",
+    "name": "call_helper_result_a",
+    "stack_delta": 1,
+    "summary": "Returns a single value after the triple-pack helper completes."
+  },
+  "10:02": {
+    "control_flow": "call",
+    "name": "call_helper_result_b",
+    "stack_delta": 1,
+    "summary": "Variant that restores a single result after argument packaging."
+  },
+  "10:04": {
+    "control_flow": "call",
+    "name": "call_helper_result_c",
+    "stack_delta": 1,
+    "summary": "Another +1 stack variant associated with call preparation helpers."
+  },
+  "10:AC": {
+    "control_flow": "call",
+    "name": "call_helper_metadata",
+    "stack_delta": 0,
+    "summary": "Metadata-bearing form that leaves the stack untouched during call setup."
+  },
+  "12:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_fetch_pair",
+    "stack_delta": 2,
+    "summary": "Loads the key/value pair prepared by the structured pointer helpers onto the evaluation stack."
+  },
+  "15:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_teardown_six",
+    "stack_delta": -6,
+    "summary": "Flushes six entries from the constructor frame as part of structured slot finalisation."
+  },
+  "16:00": {
+    "control_flow": "jump",
+    "flow_target": "relative",
+    "name": "jump_relative",
+    "stack_delta": 0,
+    "summary": "Unconditionally redirects execution to a PC-relative target, matching Lua's JMP instruction semantics."
+  },
+  "17:00": {
+    "control_flow": "branch",
+    "flow_target": "relative",
+    "name": "branch_eq",
+    "stack_delta": -2.5,
+    "summary": "Performs an equality test on the compared operands and branches relative to the next instruction when the condition is met."
+  },
+  "18:00": {
+    "control_flow": "branch",
+    "flow_target": "relative",
+    "name": "branch_lt",
+    "stack_delta": 4,
+    "summary": "Evaluates a strict less-than comparison and jumps to the relative target when the predicate succeeds."
+  },
+  "19:00": {
+    "control_flow": "branch",
+    "flow_target": "relative",
+    "name": "branch_le",
+    "stack_delta": -5.333333333333332,
+    "summary": "Implements the less-than-or-equal comparison branch used by Lua's ordered predicates."
+  },
+  "1A:00": {
+    "control_flow": "branch",
+    "flow_target": "relative",
+    "name": "test_branch",
+    "stack_delta": 2,
+    "summary": "Tests a value for truthiness and conditionally branches without modifying the operand in place."
+  },
+  "1B:00": {
+    "control_flow": "branch",
+    "flow_target": "relative",
+    "name": "testset_branch",
+    "stack_delta": 2,
+    "summary": "Lua-style TESTSET that copies the value when the predicate matches and otherwise jumps to the relative fallback."
+  },
+  "1C:00": {
+    "control_flow": "call",
+    "name": "call_dispatch",
+    "stack_delta": 6,
+    "summary": "Invokes a function using the CALL opcode, consuming the prepared argument tuple and leaving results on the stack."
+  },
+  "1D:00": {
+    "control_flow": "call",
+    "name": "tailcall_dispatch",
+    "stack_delta": -3,
+    "summary": "Performs the TAILCALL opcode, transferring control to the callee and discarding the current activation record."
+  },
+  "1E:00": {
+    "control_flow": "return",
+    "name": "return_values",
+    "stack_delta": -2,
+    "summary": "Implements the RETURN opcode, unwinding the stack and handing control back to the caller with the requested results."
+  },
+  "21:00": {
+    "control_flow": "branch",
+    "flow_target": "relative",
+    "name": "tforloop_iter",
+    "stack_delta": 1,
+    "summary": "Advances the generic for-loop iterator (TFORLOOP) and branches back when additional elements remain."
+  },
+  "24:00": {
+    "control_flow": "fallthrough",
+    "name": "closure_create",
+    "stack_delta": -4.5,
+    "summary": "Lua CLOSURE opcode that instantiates a function prototype, capturing referenced upvalues for later use."
+  },
+  "26:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_anchor_marker",
+    "stack_delta": 0,
+    "summary": "Neutral marker that syncs structured pointer metadata between helper bursts without disturbing the stack depth."
+  },
+  "29:00": {
+    "control_flow": "fallthrough",
+    "name": "prime_stack_triple",
+    "stack_delta": 3,
+    "summary": "Initialises the stack with three fresh entries at routine start."
+  },
+  "29:01": {
+    "control_flow": "fallthrough",
+    "name": "trim_stack_push_tiny",
+    "stack_delta": 1,
+    "summary": "Tiny-immediate variant that replenishes one slot during trims."
+  },
+  "29:10": {
+    "control_flow": "fallthrough",
+    "name": "trim_stack_slot",
+    "stack_delta": -1,
+    "summary": "Canonical single-slot pop used after value producers."
+  },
+  "29:20": {
+    "control_flow": "fallthrough",
+    "name": "trim_stack_slot_zero",
+    "stack_delta": -1,
+    "summary": "Zero-immediate pop specialised for table initialisation."
+  },
+  "29:29": {
+    "control_flow": "fallthrough",
+    "name": "trim_stack_push",
+    "stack_delta": 1,
+    "summary": "Minor variant that backfills a single entry while performing stack trims."
+  },
+  "2B:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_word_literal",
+    "stack_delta": 0,
+    "summary": "Inline 32-bit resource table word preserved from the container payload; treated as data with no stack interaction."
+  },
+  "2C:00": {
+    "control_flow": "fallthrough",
+    "name": "commit_register_value",
+    "stack_delta": -1,
+    "summary": "Moves a stack value out, acting as the sink for register-style transfers."
+  },
+  "2C:01": {
+    "control_flow": "fallthrough",
+    "name": "fetch_register_value_a",
+    "stack_delta": 1,
+    "summary": "Pushes a register or literal value onto the evaluation stack."
+  },
+  "2C:02": {
+    "control_flow": "fallthrough",
+    "name": "fetch_register_value_b",
+    "stack_delta": 1,
+    "summary": "Alternate register fetch that still produces a single stack entry."
+  },
+  "2C:03": {
+    "control_flow": "fallthrough",
+    "name": "fetch_register_pair",
+    "stack_delta": 2,
+    "summary": "Loads two related values from register-like sources."
+  },
+  "2C:04": {
+    "control_flow": "fallthrough",
+    "name": "fetch_register_value_c",
+    "stack_delta": 1,
+    "summary": "Another +1 variant of the register-style move helper."
+  },
+  "30:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_collapse_bulk",
+    "stack_delta": -5,
+    "summary": "Bulk variant that consumes five entries to rebuild structured control blocks."
+  },
+  "30:29": {
+    "control_flow": "fallthrough",
+    "name": "structured_extend",
+    "stack_delta": 1,
+    "summary": "Extends the structured control helper by pushing one additional entry."
+  },
+  "30:32": {
+    "control_flow": "fallthrough",
+    "name": "structured_collapse_single",
+    "stack_delta": -1,
+    "summary": "Collapses one entry when normalising structured control data."
+  },
+  "30:69": {
+    "control_flow": "fallthrough",
+    "name": "structured_pointer_patch",
+    "stack_delta": 0,
+    "summary": "Maintains stack depth while adjusting large structured pointers."
+  },
+  "30:6C": {
+    "control_flow": "fallthrough",
+    "name": "structured_passthrough",
+    "stack_delta": 0,
+    "summary": "Neutral helper variant that forwards structured operands unchanged."
+  },
+  "32:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_lane_marker",
+    "stack_delta": 0,
+    "summary": "Way-point emitted while structured control lanes realign; it carries metadata but leaves the evaluation stack unchanged."
+  },
+  "35:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_digit_marker",
+    "stack_delta": 0,
+    "summary": "ASCII digit word preserved in textual resources and scoreboard data; no effect on the execution stack."
+  },
+  "3B:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_literal_flush",
+    "stack_delta": -4,
+    "summary": "Consumes the four-literal bundle built by the vector literal loader (3A:00) and commits it to the operand-directed table slot, draining the constructor stack."
+  },
+  "3E:00": {
+    "control_flow": "call",
+    "name": "invoke_call_dispatch",
+    "stack_delta": -4,
+    "summary": "Transfers control to the routine prepared by the pack_call helpers, finalising the indirect call sequence."
+  },
+  "42:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_zero_pad",
+    "stack_delta": 0,
+    "summary": "Zero padding word used to align resource blobs; the disassembler should treat it as inert data."
+  },
+  "43:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_commit_marker",
+    "stack_delta": 0,
+    "summary": "Commit marker used by structured writers to note a completed slot without altering stack depth."
+  },
+  "44:00": {
+    "control_flow": "fallthrough",
+    "name": "dispatch_cursor_push",
+    "stack_delta": 1,
+    "summary": "Pushes the dispatch cursor pointer used by the table dispatch helpers."
+  },
+  "45:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_string_marker",
+    "stack_delta": 0,
+    "summary": "ASCII 'E' word repeated in resource prompts (\"FreeIt\" etc.); inert filler for listings."
+  },
+  "47:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_ascii_header",
+    "stack_delta": 0,
+    "summary": "ASCII header marker embedded in text/resource segments that has no runtime execution effect."
+  },
+  "65:00": {
+    "control_flow": "fallthrough",
+    "name": "reduce_stack_five",
+    "stack_delta": -5,
+    "summary": "Heavy variant that drains five entries when collapsing aggregates."
+  },
+  "65:30": {
+    "control_flow": "fallthrough",
+    "name": "reduce_stack_pair_a",
+    "stack_delta": -2,
+    "summary": "Consumes two operands as part of a bulk reduction helper."
+  },
+  "65:72": {
+    "control_flow": "fallthrough",
+    "name": "reduce_stack_pair_c",
+    "stack_delta": -2,
+    "summary": "Further -2 form within the reduction family."
+  },
+  "65:74": {
+    "control_flow": "fallthrough",
+    "name": "reduce_stack_pair_b",
+    "stack_delta": -2,
+    "summary": "Second -2 variant for reducing multi-value aggregates."
+  },
+  "65:78": {
+    "control_flow": "fallthrough",
+    "name": "reduce_stack_pair_d",
+    "stack_delta": -2,
+    "summary": "-2 stack consumer linked to bulk reducers."
+  },
+  "66:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_ascii_filler",
+    "stack_delta": 0,
+    "summary": "ASCII 'f' word encountered in script strings (e.g. \"SetText\", \"createInfo\"); stored as inert data."
+  },
+  "66:14": {
+    "control_flow": "fallthrough",
+    "name": "fanout_passthrough",
+    "stack_delta": 0,
+    "summary": "Neutral helper that leaves stack width unchanged within the fan-out family."
+  },
+  "66:15": {
+    "control_flow": "fallthrough",
+    "name": "fanout_single_a",
+    "stack_delta": 1,
+    "summary": "Produces a single additional copy for downstream consumers."
+  },
+  "66:27": {
+    "control_flow": "fallthrough",
+    "name": "fanout_pair",
+    "stack_delta": 2,
+    "summary": "Duplicates inputs to fan them out as two stack entries."
+  },
+  "66:43": {
+    "control_flow": "fallthrough",
+    "name": "fanout_single_b",
+    "stack_delta": 1,
+    "summary": "Secondary +1 variant used in fan-out sequences."
+  },
+  "66:6F": {
+    "control_flow": "fallthrough",
+    "name": "fanout_pair_alt",
+    "stack_delta": 2,
+    "summary": "Alternate +2 variant supporting broader fan-out patterns."
+  },
+  "69:01": {
+    "control_flow": "fallthrough",
+    "name": "indirect_fetch_slot",
+    "stack_delta": 1,
+    "summary": "Pushes a value fetched through an indirect accessor."
+  },
+  "69:10": {
+    "control_flow": "fallthrough",
+    "name": "indirect_store_slot",
+    "stack_delta": -1,
+    "summary": "Pops one stack entry to feed an indirect table or memory store."
+  },
+  "69:11": {
+    "control_flow": "fallthrough",
+    "name": "indirect_probe",
+    "stack_delta": 0,
+    "summary": "Peeks through an indirection without modifying stack height."
+  },
+  "69:20": {
+    "control_flow": "fallthrough",
+    "name": "indirect_store_slot_alt",
+    "stack_delta": -1,
+    "summary": "Secondary store form that also consumes one entry for an indirect destination."
+  },
+  "69:6E": {
+    "control_flow": "fallthrough",
+    "name": "indirect_fetch_slot_alt",
+    "stack_delta": 1,
+    "summary": "Alternate indirect fetch that still returns a single value."
+  },
+  "71:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_store_cursor",
+    "stack_delta": 0,
+    "summary": "Coordinates structured store sequences by tagging the active cursor while keeping the stack balanced."
+  },
+  "72:00": {
+    "control_flow": "fallthrough",
+    "name": "string_table_tag",
+    "stack_delta": 0,
+    "summary": "Tag word that gates string-table metadata blocks, acting purely as a marker without stack impact."
+  },
+  "74:00": {
+    "control_flow": "fallthrough",
+    "name": "dispatch_teardown",
+    "stack_delta": -14,
+    "summary": "Bulk dispatch helper that tears down fourteen entries when unwinding tables."
+  },
+  "74:4F": {
+    "control_flow": "fallthrough",
+    "name": "dispatch_enqueue",
+    "stack_delta": 3,
+    "summary": "Pushes three entries, likely enqueuing table-driven work items."
+  },
+  "74:50": {
+    "control_flow": "fallthrough",
+    "name": "dispatch_consume_pair",
+    "stack_delta": -2,
+    "summary": "Consumes two entries while orchestrating table dispatch."
+  },
+  "74:53": {
+    "control_flow": "fallthrough",
+    "name": "dispatch_passthrough_b",
+    "stack_delta": 0,
+    "summary": "Second neutral variant in the table dispatch scaffolding family."
+  },
+  "74:65": {
+    "control_flow": "fallthrough",
+    "name": "dispatch_passthrough_a",
+    "stack_delta": 0,
+    "summary": "Neutral dispatch mode that forwards operands unchanged."
+  },
+  "75:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_flag_marker",
+    "stack_delta": 0,
+    "summary": "Neutral flag flip within the structured table machinery that carries no direct stack effect."
+  },
+  "79:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_ascii_footer",
+    "stack_delta": 0,
+    "summary": "Trailing ASCII marker terminating resource name tables; included for completeness with no stack change."
+  },
+  "7A:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_ascii_marker",
+    "stack_delta": 0,
+    "summary": "ASCII sentinel captured from resource payloads; maintained as a passive marker with no stack effect."
+  },
+  "7B:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_dispatch_marker",
+    "stack_delta": 0,
+    "summary": "Dispatch marker threaded through structured control scaffolding, leaving stack height untouched."
+  },
+  "7D:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_reset_marker",
+    "stack_delta": 0,
+    "summary": "Resets structured builders to a baseline state, implemented as a stack-neutral tag."
+  },
+  "7F:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_chunk_marker",
+    "stack_delta": 0,
+    "summary": "Chunk header observed chaining long metadata runs between neighbouring call helpers; retained as inert resource data."
+  },
+  "81:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_index_marker",
+    "stack_delta": 0,
+    "summary": "Index tag linking string table bytes (73:00) with later lookup helpers (94:00) while leaving the execution stack untouched."
+  },
+  "82:00": {
+    "control_flow": "fallthrough",
+    "name": "callsite_metadata_marker",
+    "stack_delta": 0,
+    "summary": "Bridges structured dispatchers and call helpers by tagging metadata in-place without stack movement."
+  },
+  "86:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_section_marker",
+    "stack_delta": 0,
+    "summary": "Section delimiter that recurs alongside descriptor loaders (30:69/20:DB) to group structured blobs without affecting stack depth."
+  },
+  "89:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_preamble",
+    "stack_delta": 0,
+    "summary": "Preamble marker linking pack_call_triple (10:00) to call dispatch (1C:00) sequences; informational only."
+  },
+  "8A:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_midpoint",
+    "stack_delta": 0,
+    "summary": "Mid-call bridge between pointer stores (ED:4B) and follow-up pointer patches (69:10); stack neutral."
+  },
+  "8B:00": {
+    "control_flow": "fallthrough",
+    "name": "callsite_block_marker",
+    "stack_delta": 0,
+    "summary": "Neutral metadata marker that brackets call helper scaffolding without pushing or popping values."
+  },
+  "96:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_guard_marker",
+    "stack_delta": 0,
+    "summary": "Guard tag ensuring structured reducers stay aligned; it carries no standalone stack delta."
+  },
+  "97:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_selector_marker",
+    "stack_delta": 0,
+    "summary": "Selector tag driving structured dispatch choices while preserving the current stack height."
+  },
+  "99:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_row_marker",
+    "stack_delta": 0,
+    "summary": "Row marker that repeats between header bytes (91:00) and trailing literal runs, acting purely as metadata glue."
+  },
+  "9A:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_entry_marker",
+    "stack_delta": 0,
+    "summary": "Resource entry tag encountered in both data blobs and structured scaffolding with no inherent stack cost."
+  },
+  "9E:00": {
+    "control_flow": "fallthrough",
+    "name": "blob_word_marker",
+    "stack_delta": 0,
+    "summary": "Neutral placeholder word recorded in blob segments, serving as data-only padding."
+  },
+  "9F:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_banner_marker",
+    "stack_delta": 0,
+    "summary": "Banner literal captured from resource blobs; left as a descriptive marker for data listings."
+  },
+  "A0:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_bootstrap",
+    "stack_delta": 0,
+    "summary": "Bootstrap tag inserted between call prep (10:00/ED:4B) and follow-up helpers (10:80); metadata only."
+  },
+  "A1:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_callsite_marker",
+    "stack_delta": 0,
+    "summary": "Callsite metadata word wedged between pack helpers (10:00) and follow-up reducers, purely annotative for stack modelling."
+  },
+  "A2:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_cursor_marker",
+    "stack_delta": 0,
+    "summary": "Cursor positioning tag for structured pointer chains, implemented as a no-op for stack accounting."
+  },
+  "A3:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_callsite_payload",
+    "stack_delta": 0,
+    "summary": "Payload descriptor that repeats alongside literal loaders (30:69/02:63) when assembling call scaffolding; has no direct stack impact."
+  },
+  "A5:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_window_marker",
+    "stack_delta": 0,
+    "summary": "Windowing marker exchanged between structured pointer helpers while leaving the stack untouched."
+  },
+  "A6:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_hint_marker",
+    "stack_delta": 0,
+    "summary": "Hint marker exchanged among structured pointer helpers without consuming stack slots."
+  },
+  "A8:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_overlay_marker",
+    "stack_delta": 0,
+    "summary": "Overlay marker threaded through structured constructor phases to annotate state changes without stack motion."
+  },
+  "A9:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_callsite_footer",
+    "stack_delta": 0,
+    "summary": "Footer word closing out structured call tables before the FF:00 terminator; inert data only."
+  },
+  "AB:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_operand",
+    "stack_delta": 0,
+    "summary": "Operand descriptor bridging pointer patch bursts (30:69) to register writes (61:10); leaves the stack unchanged."
+  },
+  "AD:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_dispatch_flag",
+    "stack_delta": 0,
+    "summary": "Flag word that recurs between descriptor loads (30:69) and dispatcher invocations (10:00), serving purely as metadata."
+  },
+  "AE:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_dispatch_entry",
+    "stack_delta": 0,
+    "summary": "Entry marker that links structured dispatch tables to follow-up helpers while keeping the stack steady."
+  },
+  "AF:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_branchpoint",
+    "stack_delta": 0,
+    "summary": "Branch point tag pairing pointer adjustments (10:64) with reduction helpers (2C:03/66:0B); metadata bridging only."
+  },
+  "B0:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_descriptor",
+    "stack_delta": 0,
+    "summary": "Descriptor word slotted between literal loaders (00:00/30:69) and call helpers (10:xx, B6:00); purely metadata with no stack impact."
+  },
+  "B1:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_target",
+    "stack_delta": 0,
+    "summary": "Target selector that follows the main call packer (10:00) before heavy reducers (0E:00); stack-neutral bookkeeping."
+  },
+  "B2:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_record_marker",
+    "stack_delta": 0,
+    "summary": "Record delimiter emitted inside structured review tasks that carries metadata only."
+  },
+  "B3:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_payload",
+    "stack_delta": 0,
+    "summary": "Payload pointer that pairs with literal streams (30:69) before dispatch helpers (10:00/10:01); contributes no stack delta."
+  },
+  "B7:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_text_marker",
+    "stack_delta": 0,
+    "summary": "Textual metadata word recurring amid resource glyph pairs (76:65 -> B9:00), preserved as an inert marker."
+  },
+  "B9:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_exit",
+    "stack_delta": 0,
+    "summary": "Exit wrapper marker between reduction helpers (2C:03/66) and branch follow-ups (69:28); leaves the stack unchanged."
+  },
+  "BA:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_argument",
+    "stack_delta": 0,
+    "summary": "Argument descriptor bridging structured lists (63:6C) to follow-up markers (CB:00); observed with no stack interaction."
+  },
+  "BB:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_blob_marker",
+    "stack_delta": 0,
+    "summary": "Blob metadata word echoed inside resource tables ahead of CC:00 blocks, entirely stack neutral."
+  },
+  "BC:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_slot_marker",
+    "stack_delta": 0,
+    "summary": "Slot bookkeeping tag emitted during structured field updates, purely annotative for the stack."
+  },
+  "BE:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_result",
+    "stack_delta": 0,
+    "summary": "Result descriptor that sits between dispatcher outputs (10:1E/66:0B) with no direct effect on the stack."
+  },
+  "BF:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_metadata",
+    "stack_delta": 0,
+    "summary": "Metadata padding that links descriptor loads (30:69/E8:03) to call helpers (10:00); stack accounting remains unchanged."
+  },
+  "C1:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_anchor",
+    "stack_delta": 0,
+    "summary": "Anchor marker appearing after teardown helpers (10:00/ED:4B) before register fetch combos; purely descriptive for call scaffolding."
+  },
+  "C2:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_field_marker",
+    "stack_delta": 0,
+    "summary": "Field descriptor woven between descriptor loads (30:69) and follow-up calls (10:00/FF:00); has no stack footprint."
+  },
+  "C3:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_patch_marker",
+    "stack_delta": 0,
+    "summary": "Pointer patch bookkeeping entry that threads metadata through structured reducers neutrally."
+  },
+  "C6:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_slot",
+    "stack_delta": 0,
+    "summary": "Records the target slot for upcoming pack_call_triple invocations; sits between structured pointer patches (30:69) and pack_call_triple (10:00) without altering the stack."
+  },
+  "C7:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_cursor",
+    "stack_delta": 0,
+    "summary": "Cursor handoff between structured call results (10:01/BE:00) and subsequent pointer adjustments (10:6C); stack neutral."
+  },
+  "C9:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_label_marker",
+    "stack_delta": 0,
+    "summary": "Label word captured verbatim from resource tables; helpful for listings but inert at runtime."
+  },
+  "CB:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_footer",
+    "stack_delta": 0,
+    "summary": "Footer marker following BA:00 argument descriptors before stack tidiers (01:00/DF:00); purely descriptive."
+  },
+  "CD:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_label_word",
+    "stack_delta": 0,
+    "summary": "Resource label component that precedes cleanup helpers (D5:00/FF:01) and carries no runtime stack effect."
+  },
+  "CE:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_entry",
+    "stack_delta": 0,
+    "summary": "Entry tag bridging pointer patch loads (30:69) and call helpers (4B:05/10:8C) while keeping stack depth unchanged."
+  },
+  "CF:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_stage_marker",
+    "stack_delta": 0,
+    "summary": "Table marker captured from resource metadata blocks; shows up between alphabetical runes and remains stack neutral."
+  },
+  "D0:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_stub",
+    "stack_delta": 0,
+    "summary": "Stub word seen between descriptor loaders (30:69) and follow-up invocations (10:00); acts as stack-neutral glue."
+  },
+  "D1:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_gatekeeper",
+    "stack_delta": 0,
+    "summary": "Gatekeeper marker inserted after pointer patches (3D:30/69:10) before literal loads; coordinates structured call setup without moving the stack."
+  },
+  "D2:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_index_marker",
+    "stack_delta": 0,
+    "summary": "Index word recurring in string tables and constructor blobs, acting as inert metadata when literal bytes are streamed."
+  },
+  "D3:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_type_marker",
+    "stack_delta": 0,
+    "summary": "Type label preserved inside resource text conversions (\"ItemType...\"); retained for listings only."
+  },
+  "D4:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_init_marker",
+    "stack_delta": 0,
+    "summary": "Structured segment header aligning fetches (66:0A) ahead of pointer patches; serves as metadata glue without stack impact."
+  },
+  "D5:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_cleanup_marker",
+    "stack_delta": 0,
+    "summary": "Cleanup marker preceding frame resets (01:00/D7:00) after resource label words; has no independent stack effect."
+  },
+  "D6:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_join_marker",
+    "stack_delta": 0,
+    "summary": "Join marker coordinating structured aggregation branches without affecting stack depth."
+  },
+  "D7:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_padding_marker",
+    "stack_delta": 0,
+    "summary": "Padding sentinel embedded in container data; the interpreter should ignore it stack-wise."
+  },
+  "D9:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_dialog_marker",
+    "stack_delta": 0,
+    "summary": "Dialogue marker extracted from script text (\"ShowChat...\"); purely descriptive metadata."
+  },
+  "DA:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_branch",
+    "stack_delta": 0,
+    "summary": "Branch descriptor paired with heavy call helpers (10:0E/10:80); recorded metadata only."
+  },
+  "DB:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_padding_word",
+    "stack_delta": 0,
+    "summary": "Padding word recurring inside resource tables ahead of EA:00/F5:00 gates; stack height remains unchanged."
+  },
+  "DC:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_state_marker",
+    "stack_delta": 0,
+    "summary": "State marker that alternates with constructor helpers (E4:00/29:10) without altering the evaluation stack."
+  },
+  "DF:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_dispatch",
+    "stack_delta": 0,
+    "summary": "Dispatch metadata word threaded between result packers (10:0A) and pointer cleanup helpers (01:94/00:CF); purely descriptive for stack tracking."
+  },
+  "E1:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_refresh_marker",
+    "stack_delta": 0,
+    "summary": "Refresh token embedded in textual status blocks (\"WinGroupList...\"); inert for stack tracking."
+  },
+  "E2:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_span_marker",
+    "stack_delta": 0,
+    "summary": "Marks the start of a structured span inside aggregate builders, conveying metadata only."
+  },
+  "E3:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_menu_marker",
+    "stack_delta": 0,
+    "summary": "Menu marker extracted from resource strings (\"Mgr...\"); inert data retained for clarity."
+  },
+  "E4:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_ctor_marker",
+    "stack_delta": 0,
+    "summary": "Constructor marker appearing between state words (DC:00) and setup helpers (07:00/01:00); neutral for the stack."
+  },
+  "E5:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_cursor_reset",
+    "stack_delta": 0,
+    "summary": "Cursor reset tag observed between pointer adjustments (30:69) and numeric fixups (10:98/00:4B); leaves the evaluation stack untouched."
+  },
+  "E7:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_stage_padding",
+    "stack_delta": 0,
+    "summary": "Stage padding word seen in sequential counters; kept for documentation without stack impact."
+  },
+  "E9:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_event_marker",
+    "stack_delta": 0,
+    "summary": "Event tag enumerated alongside other resource constants; carries no runtime stack effect."
+  },
+  "EA:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_literal_bridge",
+    "stack_delta": 0,
+    "summary": "Bridge word linking padding (00:00/DB:00) to literal burst sequences (69:10/F5:00), carrying metadata only."
+  },
+  "EC:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_batch_marker",
+    "stack_delta": 0,
+    "summary": "Batch anchor linking join markers (15:00) to follow-up pointer tweakers (66:10); keeps stack depth unchanged."
+  },
+  "ED:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_preface",
+    "stack_delta": 0,
+    "summary": "Preface marker inserted after pointer conversions (61:30) before call scaffolding (4B:2C); stack neutral."
+  },
+  "EE:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_footer_a",
+    "stack_delta": 0,
+    "summary": "Footer tag closing out structured call preparations (10:13E4B) before literal resets; no stack delta observed."
+  },
+  "EF:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_prefix",
+    "stack_delta": 0,
+    "summary": "Prefix marker preceding separator words (F5:00/FA:00) inside structured call scaffolding; leaves stack height untouched."
+  },
+  "F1:00": {
+    "control_flow": "fallthrough",
+    "name": "blob_filler_marker",
+    "stack_delta": 0,
+    "summary": "Repeated filler word observed in dense data arrays; kept for reference with no stack interaction."
+  },
+  "F2:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_vector_marker",
+    "stack_delta": 0,
+    "summary": "Vector descriptor that accompanies reduction opcodes (3D:30/9C:15) and remains stack neutral."
+  },
+  "F3:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_script_marker",
+    "stack_delta": 0,
+    "summary": "Script metadata word emitted after comment headers (0A:2A) before structured patches (A4:15); inert for stack tracking."
+  },
+  "F4:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_pointer_word",
+    "stack_delta": 0,
+    "summary": "Literal pointer/offset word appearing in resource initialisation blocks, preserved as inert data."
+  },
+  "F5:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_separator",
+    "stack_delta": 0,
+    "summary": "Separator word between prefix markers (EF:00) and call gates (FA:00); exists solely as metadata glue."
+  },
+  "F6:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_table_padding",
+    "stack_delta": 0,
+    "summary": "Padding word in resource sequences enumerating offsets; leaves the stack untouched."
+  },
+  "F7:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_segment",
+    "stack_delta": 0,
+    "summary": "Segment tag linking pack_call helpers (4B:05) to pointer loads (10:F0) during structured call setup; stack neutral."
+  },
+  "F8:00": {
+    "control_flow": "fallthrough",
+    "name": "literal_block_marker",
+    "stack_delta": 0,
+    "summary": "Header preceding bursts of literal pushes (00:29) inside resource blobs; it does not manipulate the stack."
+  },
+  "F9:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_tail_marker",
+    "stack_delta": 0,
+    "summary": "Tail sentinel written at the end of resource blocks to aid parsing; no stack effect."
+  },
+  "FA:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_gate",
+    "stack_delta": 0,
+    "summary": "Bridges structured metadata into subsequent call helpers while keeping the stack height unchanged."
+  },
+  "FC:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_text_padding",
+    "stack_delta": 0,
+    "summary": "Padding word that precedes readable resource strings (e.g. \"Set...\"), repeated in data blobs with no operational stack effect."
+  },
+  "FD:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_footer_b",
+    "stack_delta": 0,
+    "summary": "Late-stage call footer bridging pointer adjustments (10:13D4A) to final literal stores; purely metadata."
+  },
+  "FE:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_bridge",
+    "stack_delta": 0,
+    "summary": "Bridge between helper packers (4B:05) and store slots (10:80/29:10); threads structured call metadata without altering stack height."
+  },
+  "FF:00": {
+    "control_flow": "stop",
+    "name": "terminator_teardown",
+    "stack_delta": -33,
+    "summary": "Bulk teardown helper that unwinds frame data and terminates execution for the enclosing block."
+  },
+  "FF:30": {
+    "control_flow": "stop",
+    "name": "terminator_consume_pair",
+    "stack_delta": -2,
+    "summary": "Consumes two stack entries while finalising the terminator and then halts further execution."
+  },
+  "FF:3D": {
+    "control_flow": "stop",
+    "name": "terminator_push_marker",
+    "stack_delta": 1,
+    "summary": "Produces a sentinel value just before the terminator sequence stops execution."
+  },
+  "FF:69": {
+    "control_flow": "stop",
+    "name": "terminator_passthrough",
+    "stack_delta": 0,
+    "summary": "Passthrough sentinel that still marks a hard stop in the terminator scaffold."
+  },
+  "FF:FF": {
+    "control_flow": "stop",
+    "name": "terminator_marker",
+    "stack_delta": 0,
+    "summary": "Marker opcode that delimits tables/blocks and acts as an execution terminator sentinel."
+  }
+}

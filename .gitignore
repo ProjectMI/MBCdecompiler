@@ -1,0 +1,8 @@
+# Cache
+mbcdisasm/__pycache__/*
+mbcdisasm/analyzer/__pycache__/*
+
+# Decompile
+*.txt
+*.pyc
+*.lua
