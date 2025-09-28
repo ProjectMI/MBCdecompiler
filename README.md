@@ -98,5 +98,7 @@ opcode/mode histogram individually.
 Run the tests as
 
 ```bash
-python -m tests.test_reports
+pytest -s tests/test_reports.py
+pytest -s tests/test_stack_gap_inventory.py
+pytest -s tests/test_opcode_profiles.py 
 ```
