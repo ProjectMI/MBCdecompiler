@@ -4,16 +4,29 @@ from pathlib import Path
 from mbcdisasm.highlevel import HighLevelReconstructor
 from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
 from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.manual_semantics import ManualSemanticAnalyzer
+from mbcdisasm.vm_analysis import estimate_stack_io
 
 
-def _make_instruction(offset: int, key: str, mnemonic: str, operand: int, stack_delta: float, control_flow):
+def _make_instruction(
+    analyzer: ManualSemanticAnalyzer,
+    offset: int,
+    key: str,
+    operand: int,
+    control_flow,
+):
+    semantics = analyzer.describe_key(key)
+    inputs, outputs = estimate_stack_io(semantics)
     return IRInstruction(
         offset=offset,
         key=key,
-        mnemonic=mnemonic,
+        mnemonic=semantics.mnemonic,
         operand=operand,
-        stack_delta=stack_delta,
-        control_flow=control_flow,
+        stack_delta=semantics.stack_delta,
+        control_flow=control_flow or semantics.control_flow,
+        semantics=semantics,
+        stack_inputs=inputs,
+        stack_outputs=outputs,
     )
 
 
@@ -55,29 +68,30 @@ def test_highlevel_reconstruction_generates_control_flow(tmp_path: Path) -> None
     )
 
     knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
 
     block0 = IRBlock(
         start=0x0000,
         instructions=[
-            _make_instruction(0x0000, "01:00", "push_literal_small", 1, 1, None),
-            _make_instruction(0x0004, "01:00", "push_literal_small", 0, 1, None),
-            _make_instruction(0x0008, "02:00", "compare_equal", 0, -1, None),
-            _make_instruction(0x000C, "03:00", "branch_if_true", 0, -1, "branch"),
+            _make_instruction(analyzer, 0x0000, "01:00", 1, None),
+            _make_instruction(analyzer, 0x0004, "01:00", 0, None),
+            _make_instruction(analyzer, 0x0008, "02:00", 0, None),
+            _make_instruction(analyzer, 0x000C, "03:00", 0, "branch"),
         ],
         successors=[0x0010, 0x0020],
     )
     block1 = IRBlock(
         start=0x0010,
         instructions=[
-            _make_instruction(0x0010, "04:00", "return_value", 0, -1, "return"),
+            _make_instruction(analyzer, 0x0010, "04:00", 0, "return"),
         ],
         successors=[],
     )
     block2 = IRBlock(
         start=0x0020,
         instructions=[
-            _make_instruction(0x0020, "01:00", "push_literal_small", 0, 1, None),
-            _make_instruction(0x0024, "04:00", "return_value", 0, -1, "return"),
+            _make_instruction(analyzer, 0x0020, "01:00", 0, None),
+            _make_instruction(analyzer, 0x0024, "04:00", 0, "return"),
         ],
         successors=[],
     )

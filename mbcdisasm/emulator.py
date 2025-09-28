@@ -8,6 +8,7 @@ from typing import Iterable, List, Optional, Sequence
 
 from .instruction import InstructionWord, read_instructions
 from .knowledge import KnowledgeBase
+from .manual_semantics import AnnotatedInstruction, ManualSemanticAnalyzer
 from .mbc import Segment
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .stack_seed import seed_stack_modeler_from_knowledge
@@ -15,15 +16,17 @@ from .stack_seed import seed_stack_modeler_from_knowledge
 
 @dataclass
 class InstructionTrace:
-    instruction: InstructionWord
+    instruction: AnnotatedInstruction
     stack_before: float
     stack_after: float
     warnings: List[str] = field(default_factory=list)
 
     def to_text(self) -> str:
         warn = f" ({', '.join(self.warnings)})" if self.warnings else ""
+        word = self.instruction.word
+        semantics = self.instruction.semantics
         return (
-            f"{self.instruction.offset:08X}: {self.instruction.raw:08X}"
+            f"{word.offset:08X}: {word.raw:08X} {semantics.manual_name}"
             f" stack {self.stack_before:6.1f} -> {self.stack_after:6.1f}" + warn
         )
 
@@ -87,6 +90,7 @@ class Emulator:
         unknown_ratio_threshold: float = 0.25,
         stack_modeler: Optional[StackDeltaModeler] = None,
         model_confidence_threshold: Optional[float] = None,
+        semantic_analyzer: Optional[ManualSemanticAnalyzer] = None,
     ) -> None:
         self.knowledge = knowledge
         self.initial_stack = initial_stack
@@ -96,6 +100,7 @@ class Emulator:
             model_confidence_threshold = self.stack_modeler.confidence_threshold
         self.model_confidence_threshold = model_confidence_threshold
         self._seeded_keys: set[str] = set()
+        self._semantic_analyzer = semantic_analyzer or ManualSemanticAnalyzer(knowledge)
 
     def simulate_segment(
         self,
@@ -103,9 +108,14 @@ class Emulator:
         *,
         max_instructions: Optional[int] = None,
     ) -> EmulationReport:
-        instructions, remainder = read_instructions(segment.data, segment.start)
+        raw_instructions, remainder = read_instructions(segment.data, segment.start)
         if max_instructions is not None:
-            instructions = instructions[:max_instructions]
+            raw_instructions = raw_instructions[:max_instructions]
+
+        annotated = [
+            self._semantic_analyzer.describe_word(instr) for instr in raw_instructions
+        ]
+        instructions = [item.word for item in annotated]
 
         seed_stack_modeler_from_knowledge(
             self.stack_modeler,
@@ -124,16 +134,23 @@ class Emulator:
         self._seed_stack_modeler(instructions)
         estimates = self.stack_modeler.model_segment(instructions)
 
-        for index, instr in enumerate(instructions):
+        for index, annotated_instr in enumerate(annotated):
+            instr = annotated_instr.word
+            semantics = annotated_instr.semantics
             estimate = estimates[index] if index < len(estimates) else StackDeltaEstimate(
                 key=instr.label(), delta=None, confidence=0.0
             )
             warnings: List[str] = []
             total_instructions += 1
             if estimate.delta is None:
-                delta_value = 0.0
-                warnings.append("unknown-delta")
-                unknown_delta_instructions += 1
+                manual_delta = semantics.stack_effect.delta
+                if manual_delta is not None:
+                    delta_value = float(manual_delta)
+                    warnings.append("manual-delta")
+                else:
+                    delta_value = 0.0
+                    warnings.append("unknown-delta")
+                    unknown_delta_instructions += 1
             else:
                 delta_value = float(estimate.delta)
                 if estimate.confidence < self.model_confidence_threshold:
@@ -144,7 +161,7 @@ class Emulator:
                 warnings.append("underflow")
             traces.append(
                 InstructionTrace(
-                    instruction=instr,
+                    instruction=annotated_instr,
                     stack_before=stack,
                     stack_after=stack_after,
                     warnings=warnings,

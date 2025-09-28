@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 from .cfg import ControlFlowGraph
-from .instruction import InstructionWord
 from .knowledge import KnowledgeBase
+from .manual_semantics import AnnotatedInstruction, InstructionSemantics
+from .vm_analysis import estimate_stack_io
 
 
 @dataclass
@@ -19,12 +20,17 @@ class IRInstruction:
     operand: int
     stack_delta: Optional[float]
     control_flow: Optional[str]
+    semantics: InstructionSemantics
+    stack_inputs: int
+    stack_outputs: int
 
     def to_text(self) -> str:
         stack = "" if self.stack_delta is None else f" stackΔ={self.stack_delta:+.1f}"
         cf = f" [{self.control_flow}]" if self.control_flow else ""
+        io = f" inputs={self.stack_inputs} outputs={self.stack_outputs}"
         return (
-            f"{self.offset:08X}: {self.mnemonic} operand=0x{self.operand:04X}" + stack + cf
+            f"{self.offset:08X}: {self.mnemonic} operand=0x{self.operand:04X}"
+            f" ({self.semantics.manual_name})" + stack + io + cf
         )
 
 
@@ -70,16 +76,21 @@ class IRBuilder:
             )
         return IRProgram(segment.index, blocks)
 
-    def _lower_instruction(self, instr: InstructionWord) -> IRInstruction:
-        key = instr.label()
-        metadata = self.knowledge.instruction_metadata(key)
+    def _lower_instruction(self, instr: AnnotatedInstruction) -> IRInstruction:
+        word = instr.word
+        key = word.label()
+        semantics = instr.semantics
+        inputs, outputs = estimate_stack_io(semantics)
         return IRInstruction(
-            offset=instr.offset,
+            offset=word.offset,
             key=key,
-            mnemonic=metadata.mnemonic,
-            operand=instr.operand,
-            stack_delta=metadata.stack_delta,
-            control_flow=metadata.control_flow,
+            mnemonic=semantics.mnemonic,
+            operand=word.operand,
+            stack_delta=semantics.stack_delta,
+            control_flow=semantics.control_flow,
+            semantics=semantics,
+            stack_inputs=inputs,
+            stack_outputs=outputs,
         )
 
 

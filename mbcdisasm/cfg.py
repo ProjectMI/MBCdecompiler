@@ -7,6 +7,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from .instruction import InstructionWord, WORD_SIZE, read_instructions
 from .knowledge import KnowledgeBase
+from .manual_semantics import AnnotatedInstruction, ManualSemanticAnalyzer
+from .vm_analysis import estimate_stack_io
 from .mbc import Segment
 
 
@@ -15,7 +17,7 @@ class BasicBlock:
     """A linear sequence of instructions without internal jumps."""
 
     start: int
-    instructions: List[InstructionWord]
+    instructions: List[AnnotatedInstruction]
     successors: Set[int] = field(default_factory=set)
     predecessors: Set[int] = field(default_factory=set)
 
@@ -23,7 +25,7 @@ class BasicBlock:
     def end(self) -> int:
         if not self.instructions:
             return self.start
-        return self.instructions[-1].offset + WORD_SIZE
+        return self.instructions[-1].word.offset + WORD_SIZE
 
 
 @dataclass
@@ -46,8 +48,14 @@ class ControlFlowGraph:
                 f"  block 0x{block.start:06X} size={len(block.instructions)} succ={[hex(s) for s in sorted(block.successors)]}"
             )
             for instr in block.instructions:
+                sem = instr.semantics
+                inputs, outputs = estimate_stack_io(sem)
                 lines.append(
-                    f"    {instr.offset:08X}: {instr.raw:08X} op={instr.opcode:02X} mode={instr.mode:02X} operand=0x{instr.operand:04X}"
+                    f"    {instr.word.offset:08X}: {instr.word.raw:08X} "
+                    f"op={instr.word.opcode:02X} mode={instr.word.mode:02X} "
+                    f"operand=0x{instr.word.operand:04X}"
+                    f" {sem.manual_name}"
+                    f" inputs={inputs} outputs={outputs}"
                 )
         if self.remainder:
             lines.append(f"  trailing bytes ignored: {self.remainder}")
@@ -57,8 +65,14 @@ class ControlFlowGraph:
 class ControlFlowGraphBuilder:
     """Create CFGs using heuristics supplied by the knowledge base."""
 
-    def __init__(self, knowledge: KnowledgeBase) -> None:
+    def __init__(
+        self,
+        knowledge: KnowledgeBase,
+        *,
+        semantic_analyzer: Optional[ManualSemanticAnalyzer] = None,
+    ) -> None:
         self.knowledge = knowledge
+        self._semantic_analyzer = semantic_analyzer or ManualSemanticAnalyzer(knowledge)
 
     def build(
         self,
@@ -66,36 +80,40 @@ class ControlFlowGraphBuilder:
         *,
         max_instructions: Optional[int] = None,
     ) -> ControlFlowGraph:
-        instructions, remainder = read_instructions(segment.data, segment.start)
+        raw_instructions, remainder = read_instructions(segment.data, segment.start)
         if max_instructions is not None:
-            instructions = instructions[:max_instructions]
+            raw_instructions = raw_instructions[:max_instructions]
 
-        if not instructions:
+        if not raw_instructions:
             return ControlFlowGraph(segment, {}, remainder)
 
-        block_starts = self._discover_block_starts(segment, instructions)
-        blocks = self._materialise_blocks(instructions, block_starts)
+        annotated = [
+            self._semantic_analyzer.describe_word(instr) for instr in raw_instructions
+        ]
+
+        block_starts = self._discover_block_starts(segment, annotated)
+        blocks = self._materialise_blocks(annotated, block_starts)
         self._link_edges(segment, blocks)
         return ControlFlowGraph(segment, blocks, remainder)
 
     def _discover_block_starts(
         self,
         segment: Segment,
-        instructions: Sequence[InstructionWord],
+        instructions: Sequence[AnnotatedInstruction],
     ) -> Set[int]:
-        starts: Set[int] = {instructions[0].offset}
-        offsets = {instr.offset: idx for idx, instr in enumerate(instructions)}
+        starts: Set[int] = {instructions[0].word.offset}
+        offsets = {instr.word.offset: idx for idx, instr in enumerate(instructions)}
         available_offsets = set(offsets)
         for idx, instr in enumerate(instructions):
             key = instr.label()
             hint = self.knowledge.control_flow_hint(key)
-            next_offset = instr.offset + WORD_SIZE
+            next_offset = instr.word.offset + WORD_SIZE
             if hint == "return" or hint == "stop":
                 if idx + 1 < len(instructions):
                     starts.add(next_offset)
                 continue
             if hint in {"jump", "branch", "call"}:
-                target = self._resolve_target(segment, instr, available_offsets)
+                target = self._resolve_target(segment, instr.word, available_offsets)
                 if target is not None:
                     starts.add(target)
             # Even for unconditional jumps we keep the following block as a
@@ -109,11 +127,11 @@ class ControlFlowGraphBuilder:
 
     def _materialise_blocks(
         self,
-        instructions: Sequence[InstructionWord],
+        instructions: Sequence[AnnotatedInstruction],
         starts: Set[int],
     ) -> Dict[int, BasicBlock]:
         ordered_starts = sorted(starts)
-        index_by_offset = {instr.offset: idx for idx, instr in enumerate(instructions)}
+        index_by_offset = {instr.word.offset: idx for idx, instr in enumerate(instructions)}
         blocks: Dict[int, BasicBlock] = {}
         for pos, start in enumerate(ordered_starts):
             idx = index_by_offset[start]
@@ -129,7 +147,7 @@ class ControlFlowGraphBuilder:
     def _link_edges(self, segment: Segment, blocks: Dict[int, BasicBlock]) -> None:
         offsets = sorted(blocks)
         available_offsets = {
-            instr.offset
+            instr.word.offset
             for block in blocks.values()
             for instr in block.instructions
         }
@@ -141,11 +159,11 @@ class ControlFlowGraphBuilder:
             last = block.instructions[-1]
             key = last.label()
             hint = self.knowledge.control_flow_hint(key)
-            next_offset = last.offset + WORD_SIZE
+            next_offset = last.word.offset + WORD_SIZE
             if hint == "return" or hint == "stop":
                 continue
             if hint in {"jump", "branch"}:
-                target = self._resolve_target(segment, last, available_offsets)
+                target = self._resolve_target(segment, last.word, available_offsets)
                 if target is not None and target in block_by_offset:
                     block.successors.add(target)
                     block_by_offset[target].predecessors.add(block.start)
@@ -154,7 +172,7 @@ class ControlFlowGraphBuilder:
                     block.successors.add(next_offset)
                     block_by_offset[next_offset].predecessors.add(block.start)
             elif hint == "call":
-                target = self._resolve_target(segment, last, available_offsets)
+                target = self._resolve_target(segment, last.word, available_offsets)
                 if target is not None and target in block_by_offset:
                     block.successors.add(target)
                     block_by_offset[target].predecessors.add(block.start)

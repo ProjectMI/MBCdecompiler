@@ -11,6 +11,7 @@ from mbcdisasm import (
     ControlFlowGraphBuilder,
     IRBuilder,
     KnowledgeBase,
+    ManualSemanticAnalyzer,
     MbcContainer,
     Segment,
     SegmentClassifier,
@@ -69,7 +70,8 @@ def main() -> None:
     classifier = SegmentClassifier(knowledge)
     container = MbcContainer.load(args.mbc, args.adb, classifier=classifier)
 
-    cfg_builder = ControlFlowGraphBuilder(knowledge)
+    semantics = ManualSemanticAnalyzer(knowledge)
+    cfg_builder = ControlFlowGraphBuilder(knowledge, semantic_analyzer=semantics)
     ir_builder = IRBuilder(knowledge)
     reconstructor = HighLevelReconstructor(knowledge)
 

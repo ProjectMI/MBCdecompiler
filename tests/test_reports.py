@@ -227,10 +227,10 @@ class AnalysisPipelineTest(unittest.TestCase):
         empty_knowledge = KnowledgeBase.load(empty_path)
         empty_emulator = Emulator(empty_knowledge)
         empty_report = empty_emulator.simulate_segment(segment)
-        self.assertEqual(
-            empty_report.unknown_delta_instructions,
-            empty_report.total_instructions,
-            msg="expected all instructions to be unknown without annotations",
+        self.assertEqual(empty_report.unknown_delta_instructions, 0)
+        self.assertTrue(
+            any("manual-delta" in trace.warnings for trace in empty_report.traces),
+            msg="manual semantics should provide delta fallbacks",
         )
 
         seeded_path = Path(self.tempdir.name) / "emu_seeded.json"
@@ -240,14 +240,10 @@ class AnalysisPipelineTest(unittest.TestCase):
         seeded_report = seeded_emulator.simulate_segment(segment)
 
         self.assertEqual(seeded_report.total_instructions, empty_report.total_instructions)
-        self.assertLess(
-            seeded_report.unknown_delta_instructions,
-            empty_report.unknown_delta_instructions,
-            msg="seeding from knowledge should reduce unknown delta counts",
-        )
+        self.assertEqual(seeded_report.unknown_delta_instructions, 0)
         self.assertAlmostEqual(seeded_report.unknown_delta_ratio, 0.0)
         for trace in seeded_report.traces:
-            self.assertNotIn("unknown-delta", trace.warnings)
+            self.assertNotIn("manual-delta", trace.warnings)
 
     def test_emulator_seeds_model_with_knowledge(self) -> None:
         kb_path = Path(self.tempdir.name) / "emulator.json"

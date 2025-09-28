@@ -9,7 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
-from mbcdisasm import Analyzer, Disassembler, KnowledgeBase, MbcContainer
+from mbcdisasm import (
+    Analyzer,
+    Disassembler,
+    KnowledgeBase,
+    ManualSemanticAnalyzer,
+    MbcContainer,
+)
 from mbcdisasm.ast import LuaReconstructor
 from mbcdisasm.cfg import ControlFlowGraphBuilder, render_cfgs
 from mbcdisasm.emulator import Emulator, render_reports, write_emulation_reports
@@ -156,6 +162,8 @@ def main() -> None:
     analyzer = Analyzer(knowledge)
     analysis = analyzer.analyze(container)
 
+    semantic_analyzer = ManualSemanticAnalyzer(knowledge)
+
     merge_report = None
     semantic_report = None
     preview_count = 0
@@ -216,7 +224,7 @@ def main() -> None:
     selected_segments = list(_selected_segments(container, plan.segment_indices))
 
     if plan.cfg_path or plan.ir_path or plan.ast_path:
-        cfg_builder = ControlFlowGraphBuilder(knowledge)
+        cfg_builder = ControlFlowGraphBuilder(knowledge, semantic_analyzer=semantic_analyzer)
         cfgs = [
             cfg_builder.build(segment, max_instructions=args.max_instr)
             for segment in selected_segments
@@ -227,7 +235,7 @@ def main() -> None:
 
     if plan.ir_path or plan.ast_path:
         if "cfgs" not in locals():
-            cfg_builder = ControlFlowGraphBuilder(knowledge)
+            cfg_builder = ControlFlowGraphBuilder(knowledge, semantic_analyzer=semantic_analyzer)
             cfgs = [
                 cfg_builder.build(segment, max_instructions=args.max_instr)
                 for segment in selected_segments
@@ -250,7 +258,11 @@ def main() -> None:
             print(f"ast written to {plan.ast_path}")
 
     if plan.emulation_path:
-        emulator = Emulator(knowledge, stack_modeler=analyzer.clone_stack_modeler())
+        emulator = Emulator(
+            knowledge,
+            stack_modeler=analyzer.clone_stack_modeler(),
+            semantic_analyzer=semantic_analyzer,
+        )
         reports = emulator.simulate_container(
             selected_segments,
             max_instructions=plan.max_instructions,
