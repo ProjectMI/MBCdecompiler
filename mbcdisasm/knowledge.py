@@ -1261,18 +1261,26 @@ class KnowledgeBase:
 
         manual_delta = payload.get("stack_delta")
         if manual_delta is not None:
-            observed_delta = observation.dominant
-            if observed_delta is None:
-                return None
             try:
                 manual_delta_numeric = float(manual_delta)
             except (TypeError, ValueError):
                 return None
-            if not self._stack_delta_close(manual_delta_numeric, observed_delta):
-                return None
-            score += 3.0
-            if observation.confidence is not None:
-                score += observation.confidence
+            observed_delta = observation.dominant
+            if observed_delta is None:
+                # When the emulator could not determine a dominant stack delta we
+                # still treat the manual hint as weak evidence so operand and
+                # relationship similarities can drive the match.
+                confidence = observation.confidence or 0.0
+                # Encourage additional signals by scaling the boost with the
+                # proportion of known samples (zero when everything is unknown).
+                score += 0.25 + 0.5 * (1.0 - float(observation.unknown_ratio or 1.0))
+                score += confidence * 0.25
+            else:
+                if not self._stack_delta_close(manual_delta_numeric, observed_delta):
+                    return None
+                score += 3.0
+                if observation.confidence is not None:
+                    score += observation.confidence
         elif observation.dominant is not None:
             score += 0.5
 

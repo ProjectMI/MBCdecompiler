@@ -152,6 +152,43 @@ def test_merge_profiles_infers_manual_annotations(tmp_path):
     assert "manual_source" in update_fields
 
 
+def test_manual_inference_handles_unknown_stack(tmp_path):
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "AA:00": {
+                    "name": "manual_literal",
+                    "summary": "Push literal value",
+                    "stack_delta": 1,
+                    "operand_hint": "small",
+                    "control_flow": "fallthrough",
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+
+    profile = OpcodeProfile("BB:00")
+    profile.count = 8
+    profile.stack_deltas = Counter({"unknown": 8})
+    profile.operand_types = Counter({"small": 8})
+
+    report = knowledge.merge_profiles([profile], min_samples=3, confidence_threshold=0.5)
+
+    metadata = knowledge.instruction_metadata("BB:00")
+    assert metadata.mnemonic == "manual_literal"
+    assert metadata.summary == "Push literal value"
+    assert metadata.stack_delta == 1
+    assert metadata.operand_hint == "small"
+
+    update_fields = {update.field for update in report.updates if update.key == "BB:00"}
+    assert "manual_source" in update_fields
+
+
 def test_missing_operand_hint_not_queued_for_review(tmp_path):
     kb_path = tmp_path / "kb.json"
     manual_path = tmp_path / "manual_annotations.json"
