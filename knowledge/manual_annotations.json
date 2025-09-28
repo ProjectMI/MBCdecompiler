@@ -29,6 +29,18 @@
     "stack_delta": 1,
     "summary": "Continuing literal form that keeps the constructor stream flowing without altering context."
   },
+  "00:26": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_char_ampersand",
+    "stack_delta": 1,
+    "summary": "Pushes the '&' character for inline textual expressions encountered in resource blobs."
+  },
+  "00:28": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_char_left_paren",
+    "stack_delta": 0,
+    "summary": "Inline '(' literal used by text constructors; stack neutral."
+  },
   "00:29": {
     "control_flow": "fallthrough",
     "name": "push_literal_wide",
@@ -47,11 +59,83 @@
     "stack_delta": -2,
     "summary": "Consumes two recently pushed literals, likely combining them into an address or descriptor."
   },
+  "00:31": {
+    "control_flow": "fallthrough",
+    "name": "resource_slot_trim",
+    "stack_delta": -1,
+    "summary": "Pops one entry to tidy structured bundle stacks after emission stages."
+  },
+  "00:3C": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_char_less_than",
+    "stack_delta": 0,
+    "summary": "Encodes the '<' character in resource text without touching the evaluation stack."
+  },
+  "00:3D": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_char_equals",
+    "stack_delta": 1,
+    "summary": "Pushes the '=' character as part of inline literal generation used in text-heavy resources."
+  },
+  "00:41": {
+    "control_flow": "fallthrough",
+    "name": "resource_literal_A",
+    "stack_delta": 0,
+    "summary": "UTF-16 'A' literal encountered in menu/text resources without stack side effects."
+  },
+  "00:5E": {
+    "control_flow": "fallthrough",
+    "name": "push_literal_char_caret",
+    "stack_delta": 1,
+    "summary": "Pushes the '^' character literal for inline resource text expressions."
+  },
+  "00:64": {
+    "control_flow": "fallthrough",
+    "name": "resource_store_scalar",
+    "stack_delta": -1,
+    "summary": "Consumes one prepared literal when writing scalar fields into resource construction tables."
+  },
+  "00:65": {
+    "control_flow": "fallthrough",
+    "name": "resource_literal_e",
+    "stack_delta": 0,
+    "summary": "Lower-case 'e' literal appearing in resource text payloads without altering stack height."
+  },
+  "00:66": {
+    "control_flow": "fallthrough",
+    "name": "resource_literal_passthrough",
+    "stack_delta": 0,
+    "summary": "Bridges literal staging and register commits during resource initialisation without disturbing stack height."
+  },
   "00:69": {
     "control_flow": "fallthrough",
     "name": "literal_compare",
     "stack_delta": 0,
     "summary": "Touches literal operands without changing stack depth, hinting at compare/move semantics."
+  },
+  "00:72": {
+    "control_flow": "fallthrough",
+    "name": "resource_store_pair",
+    "stack_delta": -2,
+    "summary": "Flushes a literal pair into the active resource structure, consuming two stack entries in the process."
+  },
+  "00:ED": {
+    "control_flow": "fallthrough",
+    "name": "resource_magic_word_DEED",
+    "stack_delta": 0,
+    "summary": "DEED sentinel word decorating resource tables; preserved without manipulating the stack."
+  },
+  "00:F0": {
+    "control_flow": "fallthrough",
+    "name": "resource_block_drain",
+    "stack_delta": -4,
+    "summary": "Drains four entries during large resource teardown phases, resetting the staging stack."
+  },
+  "00:FF": {
+    "control_flow": "fallthrough",
+    "name": "resource_magic_word_FFFF",
+    "stack_delta": 0,
+    "summary": "FFFF sentinel delimiting resource sections while keeping the stack untouched."
   },
   "01:00": {
     "control_flow": "fallthrough",
@@ -83,6 +167,12 @@
     "stack_delta": -3,
     "summary": "Consumes three entries as part of the cleanup sequence."
   },
+  "02:66": {
+    "control_flow": "fallthrough",
+    "name": "resource_passthrough_latch",
+    "stack_delta": 0,
+    "summary": "Stack-neutral latch observed between literal bursts and pointer stores inside resource setup code."
+  },
   "04:00": {
     "control_flow": "fallthrough",
     "name": "reduce_pair",
@@ -112,6 +202,30 @@
     "name": "reduce_quad",
     "stack_delta": -4,
     "summary": "Extended reducer operating on four stacked operands."
+  },
+  "05:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_text_command_05",
+    "stack_delta": 4,
+    "summary": "Four-slot text helper that seeds glyph or token sequences ahead of formatter logic."
+  },
+  "06:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_text_command_06",
+    "stack_delta": 1.4285714285714286,
+    "summary": "Bulk text command that expands the stack by roughly ten slots every seven executions, priming follow-up glyph writes."
+  },
+  "07:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_section_handoff",
+    "stack_delta": -1,
+    "summary": "Drops a bookkeeping slot while advancing between adjacent resource-construction sections."
+  },
+  "0D:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_dispatch_payload",
+    "stack_delta": 4,
+    "summary": "Injects a four-entry payload prior to dispatch/branch handling in resource-driven control paths."
   },
   "10:00": {
     "control_flow": "call",
@@ -148,6 +262,12 @@
     "name": "structured_fetch_pair",
     "stack_delta": 2,
     "summary": "Loads the key/value pair prepared by the structured pointer helpers onto the evaluation stack."
+  },
+  "14:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_bundle_flush",
+    "stack_delta": -1.5,
+    "summary": "Collapses partially-filled bundle state, shedding roughly three entries every two invocations."
   },
   "15:00": {
     "control_flow": "fallthrough",
@@ -215,12 +335,24 @@
     "stack_delta": -2,
     "summary": "Implements the RETURN opcode, unwinding the stack and handing control back to the caller with the requested results."
   },
+  "1F:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_format_marker",
+    "stack_delta": 0,
+    "summary": "Formatting marker found inside resource text runs; bridges literal bursts without affecting stack depth."
+  },
   "21:00": {
     "control_flow": "branch",
     "flow_target": "relative",
     "name": "tforloop_iter",
     "stack_delta": 1,
     "summary": "Advances the generic for-loop iterator (TFORLOOP) and branches back when additional elements remain."
+  },
+  "23:4F": {
+    "control_flow": "fallthrough",
+    "name": "structured_bundle_prime_triple",
+    "stack_delta": 3,
+    "summary": "Primes the structured bundle machinery with three freshly-pushed entries before further expansion."
   },
   "24:00": {
     "control_flow": "fallthrough",
@@ -233,6 +365,12 @@
     "name": "structured_anchor_marker",
     "stack_delta": 0,
     "summary": "Neutral marker that syncs structured pointer metadata between helper bursts without disturbing the stack depth."
+  },
+  "28:10": {
+    "control_flow": "fallthrough",
+    "name": "resource_index_store",
+    "stack_delta": -1,
+    "summary": "Consumes one value when committing index/offset words within resource constructor streams."
   },
   "29:00": {
     "control_flow": "fallthrough",
@@ -318,6 +456,12 @@
     "stack_delta": -1,
     "summary": "Collapses one entry when normalising structured control data."
   },
+  "30:41": {
+    "control_flow": "fallthrough",
+    "name": "structured_anchor_passthrough",
+    "stack_delta": 0,
+    "summary": "Anchor between register fetches and store commits in structured routines; stack neutral."
+  },
   "30:69": {
     "control_flow": "fallthrough",
     "name": "structured_pointer_patch",
@@ -330,11 +474,23 @@
     "stack_delta": 0,
     "summary": "Neutral helper variant that forwards structured operands unchanged."
   },
+  "31:30": {
+    "control_flow": "fallthrough",
+    "name": "structured_bundle_collapse",
+    "stack_delta": -2,
+    "summary": "Drops two entries as structured bundle pipelines hand results to subsequent call helpers."
+  },
   "32:00": {
     "control_flow": "fallthrough",
     "name": "structured_lane_marker",
     "stack_delta": 0,
     "summary": "Way-point emitted while structured control lanes realign; it carries metadata but leaves the evaluation stack unchanged."
+  },
+  "32:29": {
+    "control_flow": "fallthrough",
+    "name": "structured_bundle_seed",
+    "stack_delta": 1,
+    "summary": "Seeds the structured bundle pipeline ahead of the 72:23/72:30 emit-and-flush phases."
   },
   "35:00": {
     "control_flow": "fallthrough",
@@ -383,6 +539,18 @@
     "name": "resource_ascii_header",
     "stack_delta": 0,
     "summary": "ASCII header marker embedded in text/resource segments that has no runtime execution effect."
+  },
+  "47:65": {
+    "control_flow": "fallthrough",
+    "name": "resource_literal_GE",
+    "stack_delta": 0,
+    "summary": "Inline ASCII word 'Ge' stored verbatim inside resource text blocks; stack neutral."
+  },
+  "64:10": {
+    "control_flow": "fallthrough",
+    "name": "resource_offset_store",
+    "stack_delta": -1,
+    "summary": "Consumes a single operand while committing offset words within resource constructor loops."
   },
   "65:00": {
     "control_flow": "fallthrough",
@@ -491,6 +659,24 @@
     "name": "string_table_tag",
     "stack_delta": 0,
     "summary": "Tag word that gates string-table metadata blocks, acting purely as a marker without stack impact."
+  },
+  "72:23": {
+    "control_flow": "fallthrough",
+    "name": "structured_bundle_emit",
+    "stack_delta": 1,
+    "summary": "Adds a bundle entry that downstream helpers expand during structured call preparation."
+  },
+  "72:30": {
+    "control_flow": "fallthrough",
+    "name": "structured_bundle_finalize",
+    "stack_delta": -2,
+    "summary": "Consumes two entries when finalising structured bundle stages ahead of call execution."
+  },
+  "73:00": {
+    "control_flow": "fallthrough",
+    "name": "resource_text_chunk_marker",
+    "stack_delta": 0,
+    "summary": "Delimits logical chunks within resource text payloads while leaving the evaluation stack untouched."
   },
   "74:00": {
     "control_flow": "fallthrough",
@@ -786,6 +972,12 @@
     "stack_delta": 0,
     "summary": "Pointer patch bookkeeping entry that threads metadata through structured reducers neutrally."
   },
+  "C5:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_prologue",
+    "stack_delta": 0,
+    "summary": "Prologue marker for structured call scaffolding that links literal preparation with pointer patching."
+  },
   "C6:00": {
     "control_flow": "fallthrough",
     "name": "structured_call_slot",
@@ -803,6 +995,12 @@
     "name": "resource_label_marker",
     "stack_delta": 0,
     "summary": "Label word captured verbatim from resource tables; helpful for listings but inert at runtime."
+  },
+  "CA:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_label",
+    "stack_delta": 0,
+    "summary": "Tag that precedes call-packing helpers inside structured sequences, effectively acting as a stack-neutral label."
   },
   "CB:00": {
     "control_flow": "fallthrough",
@@ -954,6 +1152,12 @@
     "stack_delta": 0,
     "summary": "Bridge word linking padding (00:00/DB:00) to literal burst sequences (69:10/F5:00), carrying metadata only."
   },
+  "EB:00": {
+    "control_flow": "fallthrough",
+    "name": "structured_call_connector",
+    "stack_delta": 0,
+    "summary": "Connector bridging pointer fetches and subsequent call helpers when emitting structured call sequences."
+  },
   "EC:00": {
     "control_flow": "fallthrough",
     "name": "structured_batch_marker",
@@ -965,6 +1169,12 @@
     "name": "structured_call_preface",
     "stack_delta": 0,
     "summary": "Preface marker inserted after pointer conversions (61:30) before call scaffolding (4B:2C); stack neutral."
+  },
+  "ED:DE": {
+    "control_flow": "fallthrough",
+    "name": "resource_magic_DEED",
+    "stack_delta": 0,
+    "summary": "Reversed DEED signature mirrored inside resource tables; serves purely as metadata padding."
   },
   "EE:00": {
     "control_flow": "fallthrough",
