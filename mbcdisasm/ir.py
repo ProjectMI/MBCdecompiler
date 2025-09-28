@@ -14,6 +14,7 @@ from .knowledge import KnowledgeBase
 @dataclass
 class IRInstruction:
     offset: int
+    key: str
     mnemonic: str
     operand: int
     stack_delta: Optional[float]
@@ -74,6 +75,7 @@ class IRBuilder:
         metadata = self.knowledge.instruction_metadata(key)
         return IRInstruction(
             offset=instr.offset,
+            key=key,
             mnemonic=metadata.mnemonic,
             operand=instr.operand,
             stack_delta=metadata.stack_delta,

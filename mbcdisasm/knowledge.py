@@ -628,6 +628,17 @@ class KnowledgeBase:
             summary=summary,
         )
 
+    def manual_annotation(self, key: str) -> Mapping[str, object]:
+        """Return the raw manual annotation payload for ``key`` if available."""
+
+        manual = self._manual_reference.get(key)
+        if manual is not None:
+            return dict(manual)
+        ann = self._annotations.get(key)
+        if isinstance(ann, Mapping):
+            return {str(field): value for field, value in ann.items()}
+        return {}
+
     def control_flow_hint(self, key: str) -> Optional[str]:
         """Return the declared control-flow semantics for ``key``.
 

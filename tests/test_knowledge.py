@@ -56,6 +56,9 @@ def test_manual_annotations_are_loaded(tmp_path):
     assert metadata.mnemonic == "custom"
     assert metadata.summary == "manual override"
 
+    manual = knowledge.manual_annotation("01:02")
+    assert manual["name"] == "custom"
+
 
 def _profile_with_stack_delta(key: str, delta: float, samples: int) -> OpcodeProfile:
     profile = OpcodeProfile(key)
