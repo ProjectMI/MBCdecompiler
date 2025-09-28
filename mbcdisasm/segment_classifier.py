@@ -68,6 +68,7 @@ class SegmentClassifier:
         self.bias = -0.6
         self._cfg_builder: Optional["ControlFlowGraphBuilder"] = None
         self._emulator: Optional["Emulator"] = None
+        self._semantic_analyzer: Optional["ManualSemanticAnalyzer"] = None
         self._uncertainty_level = 0.0
         self._cooling_decay = 0.9
         self._max_uncertainty = 6.0
@@ -390,14 +391,22 @@ class SegmentClassifier:
     def _ensure_tooling(self) -> Tuple[Optional["ControlFlowGraphBuilder"], Optional["Emulator"]]:
         if self.knowledge is None:
             return None, None
+        if self._semantic_analyzer is None:
+            from .manual_semantics import ManualSemanticAnalyzer
+
+            self._semantic_analyzer = ManualSemanticAnalyzer(self.knowledge)
         if self._cfg_builder is None:
             from .cfg import ControlFlowGraphBuilder
 
-            self._cfg_builder = ControlFlowGraphBuilder(self.knowledge)
+            self._cfg_builder = ControlFlowGraphBuilder(
+                self.knowledge, semantic_analyzer=self._semantic_analyzer
+            )
         if self._emulator is None:
             from .emulator import Emulator
 
-            self._emulator = Emulator(self.knowledge)
+            self._emulator = Emulator(
+                self.knowledge, semantic_analyzer=self._semantic_analyzer
+            )
         return self._cfg_builder, self._emulator
 
     def _build_segment(self, descriptor: SegmentDescriptor, data: bytes) -> "Segment":

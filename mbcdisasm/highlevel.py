@@ -2,140 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
-from .ast import LuaLiteralFormatter
 from .ir import IRBlock, IRInstruction, IRProgram
 from .knowledge import KnowledgeBase
-
-
-@dataclass
-class InstructionSemantics:
-    """Normalised manual context describing an instruction."""
-
-    key: str
-    mnemonic: str
-    summary: Optional[str]
-    control_flow: Optional[str]
-    stack_delta: Optional[float]
-    tags: set[str] = field(default_factory=set)
-    enum_values: Dict[int, str] = field(default_factory=dict)
-    enum_namespace: Optional[str] = None
-    struct_context: Optional[str] = None
-    comparison_operator: Optional[str] = None
-    stack_inputs: Optional[int] = None
-    stack_outputs: Optional[int] = None
-    uses_operand: bool = True
-
-
-class ManualSemanticsDatabase:
-    """Adapter that exposes rich manual annotations for reconstruction."""
-
-    def __init__(self, knowledge: KnowledgeBase) -> None:
-        self.knowledge = knowledge
-        self._cache: Dict[str, InstructionSemantics] = {}
-        self.enum_registry: Dict[str, Dict[int, str]] = {}
-
-    def semantics_for(self, instruction: IRInstruction) -> InstructionSemantics:
-        cached = self._cache.get(instruction.key)
-        if cached is not None:
-            return cached
-
-        metadata = self.knowledge.instruction_metadata(instruction.key)
-        manual = self.knowledge.manual_annotation(instruction.key)
-
-        semantics = InstructionSemantics(
-            key=instruction.key,
-            mnemonic=metadata.mnemonic,
-            summary=metadata.summary,
-            control_flow=metadata.control_flow,
-            stack_delta=metadata.stack_delta,
-        )
-
-        raw_tags = manual.get("tags") if manual else None
-        if isinstance(raw_tags, Sequence) and not isinstance(raw_tags, (str, bytes)):
-            semantics.tags.update(str(tag).lower() for tag in raw_tags)
-        category = manual.get("category") if manual else None
-        if category:
-            semantics.tags.add(str(category).lower())
-
-        name_lower = semantics.mnemonic.lower()
-        summary_lower = metadata.summary.lower() if metadata.summary else ""
-
-        if name_lower.startswith("push_literal"):
-            semantics.tags.add("literal")
-        if "compare" in name_lower or "cmp" in name_lower or "compare" in summary_lower:
-            semantics.tags.add("comparison")
-        if semantics.control_flow == "branch" or "branch" in name_lower:
-            semantics.tags.add("branch")
-        if semantics.control_flow == "return":
-            semantics.tags.add("return")
-        if semantics.control_flow == "call":
-            semantics.tags.add("call")
-        if "structured" in name_lower or manual.get("structure") or manual.get("struct"):
-            semantics.tags.add("structure")
-        if "loop" in name_lower:
-            semantics.tags.add("loop")
-
-        semantics.struct_context = _string_field(manual, "struct") or _string_field(
-            manual, "structure"
-        )
-        semantics.enum_namespace = _string_field(manual, "enum_namespace") or _string_field(
-            manual, "enum_type"
-        )
-        semantics.stack_inputs = _int_field(manual, "stack_inputs")
-        semantics.stack_outputs = _int_field(manual, "stack_outputs")
-
-        operator_hint = _string_field(manual, "comparison_operator")
-        if operator_hint:
-            semantics.comparison_operator = operator_hint
-        else:
-            semantics.comparison_operator = self._deduce_operator(name_lower)
-
-        enum_payload = _mapping_field(manual, "enum_values") or _mapping_field(
-            manual, "enums"
-        )
-        if enum_payload:
-            parsed = {
-                _parse_int(key): str(value)
-                for key, value in enum_payload.items()
-                if _parse_int(key) is not None
-            }
-            semantics.enum_values = parsed
-            namespace = semantics.enum_namespace or _sanitize_namespace(semantics.mnemonic)
-            registry = self.enum_registry.setdefault(namespace, {})
-            registry.update(parsed)
-            semantics.enum_namespace = namespace
-
-        operand_usage = manual.get("uses_operand") if manual else None
-        if operand_usage is not None:
-            semantics.uses_operand = bool(operand_usage)
-
-        self._cache[instruction.key] = semantics
-        return semantics
-
-    @staticmethod
-    def _deduce_operator(name_lower: str) -> Optional[str]:
-        candidates = [
-            ("not_equal", "~="),
-            ("not_eq", "~="),
-            ("ne", "~="),
-            ("less_equal", "<="),
-            ("le", "<="),
-            ("greater_equal", ">="),
-            ("ge", ">="),
-            ("greater", ">"),
-            ("gt", ">"),
-            ("less", "<"),
-            ("lt", "<"),
-            ("equal", "=="),
-            ("eq", "=="),
-        ]
-        for needle, operator in candidates:
-            if needle in name_lower:
-                return operator
-        return None
+from .manual_semantics import InstructionSemantics
+from .vm_analysis import LuaLiteralFormatter, estimate_stack_io
 
 
 class HighLevelStack:
@@ -209,8 +82,8 @@ class HighLevelReconstructor:
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
-        self._semantics = ManualSemanticsDatabase(knowledge)
         self._literal_formatter = LuaLiteralFormatter()
+        self._enum_registry: Dict[str, Dict[int, str]] = {}
 
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
         stack = HighLevelStack()
@@ -230,7 +103,7 @@ class HighLevelReconstructor:
 
     def render(self, functions: Sequence[HighLevelFunction]) -> str:
         lines: List[str] = []
-        for namespace, values in sorted(self._semantics.enum_registry.items()):
+        for namespace, values in sorted(self._enum_registry.items()):
             lines.append(f"local {namespace} = {{")
             for value, label in sorted(values.items()):
                 lines.append(f"  [{value}] = \"{label}\",")
@@ -249,7 +122,8 @@ class HighLevelReconstructor:
     ) -> List[str]:
         lines: List[str] = [f"::block_{block.start:06X}::"]
         for idx, instruction in enumerate(block.instructions):
-            semantics = self._semantics.semantics_for(instruction)
+            semantics = instruction.semantics
+            self._register_enums(semantics)
             is_last = idx == len(block.instructions) - 1
             successors = block.successors if is_last else []
             fallthrough = next_offset if is_last else None
@@ -265,6 +139,11 @@ class HighLevelReconstructor:
             )
         return lines
 
+    def _register_enums(self, semantics: InstructionSemantics) -> None:
+        if semantics.enum_namespace and semantics.enum_values:
+            registry = self._enum_registry.setdefault(semantics.enum_namespace, {})
+            registry.update(semantics.enum_values)
+
     def _emit_instruction(
         self,
         block_start: int,
@@ -275,17 +154,17 @@ class HighLevelReconstructor:
         successors: Sequence[int],
         fallthrough: Optional[int],
     ) -> List[str]:
-        if "literal" in semantics.tags:
+        if semantics.has_tag("literal"):
             return [self._emit_literal(instruction, semantics, stack)]
-        if "comparison" in semantics.tags:
+        if semantics.has_tag("comparison"):
             return [self._emit_comparison(instruction, semantics, stack)]
         if semantics.control_flow == "branch":
             return self._emit_branch(block_start, instruction, semantics, stack, successors, fallthrough)
         if semantics.control_flow == "return":
             return [self._emit_return(instruction, semantics, stack)]
-        if "structure" in semantics.tags:
+        if semantics.has_tag("structure"):
             return [self._emit_structure(instruction, semantics, stack)]
-        if "call" in semantics.tags:
+        if semantics.has_tag("call"):
             return self._emit_call(instruction, semantics, stack)
         return [self._emit_generic(instruction, semantics, stack)]
 
@@ -364,7 +243,7 @@ class HighLevelReconstructor:
     def _emit_structure(
         self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
     ) -> str:
-        inputs, outputs = self._estimate_stack_io(semantics)
+        inputs, outputs = estimate_stack_io(semantics)
         args = stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._format_operand(semantics, instruction.operand))
@@ -383,7 +262,7 @@ class HighLevelReconstructor:
     def _emit_call(
         self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
     ) -> List[str]:
-        inputs, outputs = self._estimate_stack_io(semantics)
+        inputs, outputs = estimate_stack_io(semantics)
         args = stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._format_operand(semantics, instruction.operand))
@@ -414,7 +293,7 @@ class HighLevelReconstructor:
     def _emit_generic(
         self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
     ) -> str:
-        inputs, outputs = self._estimate_stack_io(semantics)
+        inputs, outputs = estimate_stack_io(semantics)
         args = stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._format_operand(semantics, instruction.operand))
@@ -427,26 +306,6 @@ class HighLevelReconstructor:
         if comment:
             line += f"  -- {comment}"
         return line
-
-    def _estimate_stack_io(self, semantics: InstructionSemantics) -> Tuple[int, int]:
-        inputs = semantics.stack_inputs if semantics.stack_inputs is not None else 0
-        outputs = semantics.stack_outputs if semantics.stack_outputs is not None else 0
-        delta = semantics.stack_delta
-        if "comparison" in semantics.tags:
-            inputs = max(inputs, 2)
-            outputs = max(outputs, 1)
-        elif semantics.control_flow == "branch":
-            inputs = max(inputs, 1)
-        elif semantics.control_flow == "return":
-            inputs = max(inputs, 1)
-        else:
-            if delta is not None:
-                rounded = int(round(delta))
-                if rounded < 0:
-                    inputs = max(inputs, abs(rounded))
-                elif rounded > 0:
-                    outputs = max(outputs, rounded)
-        return inputs, outputs
 
     def _select_branch_targets(
         self,
@@ -481,58 +340,6 @@ class HighLevelReconstructor:
     @staticmethod
     def _format_comment(semantics: InstructionSemantics) -> str:
         return semantics.summary or ""
-
-
-def _parse_int(value: object) -> Optional[int]:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value, 0)
-        except ValueError:
-            return None
-    return None
-
-
-def _string_field(data: Optional[Mapping[str, object]], key: str) -> Optional[str]:
-    if not data:
-        return None
-    value = data.get(key)
-    if value is None:
-        return None
-    return str(value)
-
-
-def _int_field(data: Optional[Mapping[str, object]], key: str) -> Optional[int]:
-    if not data:
-        return None
-    value = data.get(key)
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        try:
-            return int(str(value), 0)
-        except ValueError:
-            return None
-
-
-def _mapping_field(data: Optional[Mapping[str, object]], key: str) -> Optional[Mapping[str, object]]:
-    if not data:
-        return None
-    value = data.get(key)
-    if isinstance(value, Mapping):
-        return value
-    return None
-
-
-def _sanitize_namespace(name: str) -> str:
-    cleaned = "".join(ch if ch.isalnum() else "_" for ch in name)
-    if cleaned and cleaned[0].isdigit():
-        cleaned = "N_" + cleaned
-    return cleaned or "Enum"
-
 
 def _snake_to_camel(name: str) -> str:
     parts = name.split("_")
