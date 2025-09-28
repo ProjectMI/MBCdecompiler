@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .ir import IRBlock, IRInstruction, IRProgram
 from .knowledge import KnowledgeBase
 from .manual_semantics import InstructionSemantics
 from .vm_analysis import LuaLiteralFormatter, estimate_stack_io
+from .lua_formatter import (
+    CommentFormatter,
+    EnumRegistry,
+    HelperRegistry,
+    HelperSignature,
+    LuaRenderOptions,
+    LuaWriter,
+    MethodSignature,
+    join_sections,
+)
 
 
 class HighLevelStack:
@@ -37,6 +47,14 @@ class HighLevelStack:
     def push_existing(self, name: str) -> None:
         self._values.append(name)
 
+    def allocate_results(self, count: int, prefix: str = "result") -> List[str]:
+        names = []
+        for _ in range(count):
+            name = self.new_symbol(prefix)
+            self._values.append(name)
+            names.append(name)
+        return names
+
     def pop_single(self) -> str:
         if self._values:
             return self._values.pop()
@@ -60,64 +78,138 @@ class HighLevelStack:
 
 
 @dataclass
+class FunctionMetadata:
+    """Descriptive statistics collected while reconstructing a function."""
+
+    block_count: int
+    instruction_count: int
+    warnings: List[str] = field(default_factory=list)
+    helper_calls: int = 0
+    branch_count: int = 0
+    literal_count: int = 0
+
+    def summary_lines(self) -> List[str]:
+        lines = ["function summary:"]
+        lines.append(f"- blocks: {self.block_count}")
+        lines.append(f"- instructions: {self.instruction_count}")
+        lines.append(f"- literal instructions: {self.literal_count}")
+        lines.append(f"- helper invocations: {self.helper_calls}")
+        lines.append(f"- branches: {self.branch_count}")
+        return lines
+
+    def warning_lines(self) -> List[str]:
+        return [f"- {warning}" for warning in self.warnings]
+
+
+@dataclass
 class HighLevelFunction:
     """Container describing a reconstructed Lua function."""
 
     name: str
     statements: List[str]
+    metadata: FunctionMetadata
 
     def render(self) -> str:
-        lines = [f"function {self.name}()"]
-        for stmt in self.statements:
-            if stmt:
-                lines.append("  " + stmt)
-            else:
-                lines.append("")
-        lines.append("end")
-        return "\n".join(lines) + "\n"
+        writer = LuaWriter()
+        summary = self.metadata.summary_lines()
+        if summary:
+            writer.write_comment_block(summary)
+            writer.write_line("")
+        if self.metadata.warnings:
+            writer.write_comment_block(
+                ["stack reconstruction warnings:"] + self.metadata.warning_lines()
+            )
+            writer.write_line("")
+        writer.write_line(f"function {self.name}()")
+        with writer.indented():
+            for stmt in self.statements:
+                if not stmt:
+                    writer.write_line("")
+                    continue
+                if stmt.startswith("::") and stmt.endswith("::"):
+                    writer.write_label(stmt[2:-2])
+                else:
+                    writer.write_line(stmt)
+        writer.write_line("end")
+        return writer.render()
 
 
 class HighLevelReconstructor:
     """Best-effort reconstruction of high-level Lua from IR programs."""
 
-    def __init__(self, knowledge: KnowledgeBase) -> None:
+    def __init__(
+        self,
+        knowledge: KnowledgeBase,
+        *,
+        options: Optional[LuaRenderOptions] = None,
+    ) -> None:
         self.knowledge = knowledge
         self._literal_formatter = LuaLiteralFormatter()
-        self._enum_registry: Dict[str, Dict[int, str]] = {}
+        self._enum_registry = EnumRegistry()
+        self._comment_formatter = CommentFormatter()
+        self._helper_registry = HelperRegistry()
+        self.options = options or LuaRenderOptions()
+        self._last_summary: Optional[str] = None
 
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
         stack = HighLevelStack()
+        self._last_summary = None
         statements: List[str] = []
         block_order = sorted(program.blocks)
+        instruction_total = 0
+        stats: Dict[str, int] = {"literals": 0, "helpers": 0, "branches": 0}
         for index, start in enumerate(block_order):
             block = program.blocks[start]
-            statements.append(f"-- begin block 0x{start:06X}")
+            instruction_total += len(block.instructions)
             next_offset = program.blocks[block_order[index + 1]].start if index + 1 < len(block_order) else None
+            if statements and statements[-1] != "":
+                statements.append("")
             statements.extend(
-                self._emit_block(block, stack, next_offset=next_offset)
+                self._emit_block(block, stack, stats=stats, next_offset=next_offset)
             )
-            statements.append(f"-- end block 0x{start:06X}")
-            statements.append("")
         function_name = f"segment_{program.segment_index:03d}"
-        return HighLevelFunction(name=function_name, statements=statements[:-1])
+        metadata = FunctionMetadata(
+            block_count=len(block_order),
+            instruction_count=instruction_total,
+            warnings=list(stack.warnings),
+            helper_calls=stats["helpers"],
+            branch_count=stats["branches"],
+            literal_count=stats["literals"],
+        )
+        return HighLevelFunction(
+            name=function_name,
+            statements=statements,
+            metadata=metadata,
+        )
 
     def render(self, functions: Sequence[HighLevelFunction]) -> str:
-        lines: List[str] = []
-        for namespace, values in sorted(self._enum_registry.items()):
-            lines.append(f"local {namespace} = {{")
-            for value, label in sorted(values.items()):
-                lines.append(f"  [{value}] = \"{label}\",")
-            lines.append("}\n")
+        sections: List[str] = []
+        if self.options.emit_module_summary:
+            summary_writer = LuaWriter()
+            summary_writer.write_comment_block(self._module_summary_lines(functions))
+            sections.append(summary_writer.render())
+        if not self._enum_registry.is_empty():
+            writer = LuaWriter()
+            self._enum_registry.render(writer, options=self.options)
+            sections.append(writer.render())
+        if not self._helper_registry.is_empty():
+            writer = LuaWriter()
+            self._helper_registry.render(
+                writer,
+                self._comment_formatter,
+                options=self.options,
+            )
+            sections.append(writer.render())
         for function in functions:
-            lines.append(function.render().rstrip())
-            lines.append("")
-        return "\n".join(lines).rstrip() + "\n"
+            sections.append(function.render().rstrip())
+        return join_sections(sections)
 
     def _emit_block(
         self,
         block: IRBlock,
         stack: HighLevelStack,
         *,
+        stats: Dict[str, int],
         next_offset: Optional[int],
     ) -> List[str]:
         lines: List[str] = [f"::block_{block.start:06X}::"]
@@ -133,6 +225,7 @@ class HighLevelReconstructor:
                     instruction,
                     semantics,
                     stack,
+                    stats,
                     successors=successors,
                     fallthrough=fallthrough,
                 )
@@ -141,8 +234,8 @@ class HighLevelReconstructor:
 
     def _register_enums(self, semantics: InstructionSemantics) -> None:
         if semantics.enum_namespace and semantics.enum_values:
-            registry = self._enum_registry.setdefault(semantics.enum_namespace, {})
-            registry.update(semantics.enum_values)
+            for value, label in semantics.enum_values.items():
+                self._enum_registry.register(semantics.enum_namespace, value, label)
 
     def _emit_instruction(
         self,
@@ -150,45 +243,45 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         stack: HighLevelStack,
+        stats: Dict[str, int],
         *,
         successors: Sequence[int],
         fallthrough: Optional[int],
     ) -> List[str]:
         if semantics.has_tag("literal"):
-            return [self._emit_literal(instruction, semantics, stack)]
+            return self._emit_literal(instruction, semantics, stack, stats)
         if semantics.has_tag("comparison"):
-            return [self._emit_comparison(instruction, semantics, stack)]
+            return self._emit_comparison(instruction, semantics, stack)
         if semantics.control_flow == "branch":
-            return self._emit_branch(block_start, instruction, semantics, stack, successors, fallthrough)
+            return self._emit_branch(block_start, instruction, semantics, stack, stats, successors, fallthrough)
         if semantics.control_flow == "return":
-            return [self._emit_return(instruction, semantics, stack)]
+            return self._emit_return(instruction, semantics, stack)
         if semantics.has_tag("structure"):
-            return [self._emit_structure(instruction, semantics, stack)]
+            return self._emit_structure(instruction, semantics, stack, stats)
         if semantics.has_tag("call"):
-            return self._emit_call(instruction, semantics, stack)
-        return [self._emit_generic(instruction, semantics, stack)]
+            return self._emit_call(instruction, semantics, stack, stats)
+        return self._emit_generic(instruction, semantics, stack, stats)
 
     def _emit_literal(
-        self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
-    ) -> str:
+        self,
+        instruction: IRInstruction,
+        semantics: InstructionSemantics,
+        stack: HighLevelStack,
+        stats: Dict[str, int],
+    ) -> List[str]:
         operand = self._format_operand(semantics, instruction.operand)
         line, _ = stack.push_literal(operand)
-        comment = self._format_comment(semantics)
-        if comment:
-            line += f"  -- {comment}"
-        return line
+        stats["literals"] += 1
+        return self._decorate_with_comment(line, semantics)
 
     def _emit_comparison(
         self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
-    ) -> str:
+    ) -> List[str]:
         lhs, rhs = stack.pop_pair()
         operator = semantics.comparison_operator or "=="
         expression = f"({lhs} {operator} {rhs})"
         line, name = stack.push_result(expression, prefix="cmp")
-        comment = self._format_comment(semantics)
-        if comment:
-            line += f"  -- {comment}"
-        return line
+        return self._decorate_with_comment(line, semantics)
 
     def _emit_branch(
         self,
@@ -196,27 +289,33 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         stack: HighLevelStack,
+        stats: Dict[str, int],
         successors: Sequence[int],
         fallthrough: Optional[int],
     ) -> List[str]:
         condition = stack.pop_single()
         true_target, false_target = self._select_branch_targets(block_start, successors, fallthrough)
-        comment = self._format_comment(semantics)
+        comment_lines = self._comment_lines(semantics)
+        stats["branches"] += 1
         if true_target is not None and true_target <= block_start:
-            lines = [f"while {condition} do"]
+            lines = list(comment_lines)
+            lines.append(f"while {condition} do")
             body = f"  goto {self._format_block_label(true_target)}"
-            if comment:
-                body += f"  -- {comment}"
             lines.append(body)
             lines.append("end")
             if false_target is not None and false_target != true_target:
                 lines.append(f"-- fallthrough to {self._format_block_label(false_target)}")
             return lines
 
+        lines = list(comment_lines)
         header = f"if {condition} then"
-        if comment:
-            header += f"  -- {comment}"
-        lines = [header]
+        if comment_lines:
+            lines.append(header)
+        else:
+            inline = self._comment_formatter.format_inline(semantics.summary or "")
+            if inline and inline == (semantics.summary or "") and len(header) + len(inline) + 4 <= 100:
+                header += f"  -- {inline}"
+            lines.append(header)
         if true_target is not None:
             lines.append(f"  goto {self._format_block_label(true_target)}")
         else:
@@ -229,20 +328,21 @@ class HighLevelReconstructor:
 
     def _emit_return(
         self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
-    ) -> str:
+    ) -> List[str]:
         values = stack.flush()
-        comment = self._format_comment(semantics)
         if values:
             line = "return " + ", ".join(values)
         else:
             line = "return"
-        if comment:
-            line += f"  -- {comment}"
-        return line
+        return self._decorate_with_comment(line, semantics)
 
     def _emit_structure(
-        self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
-    ) -> str:
+        self,
+        instruction: IRInstruction,
+        semantics: InstructionSemantics,
+        stack: HighLevelStack,
+        stats: Dict[str, int],
+    ) -> List[str]:
         inputs, outputs = estimate_stack_io(semantics)
         args = stack.pop_many(inputs)
         if semantics.uses_operand:
@@ -250,62 +350,79 @@ class HighLevelReconstructor:
         method = _snake_to_camel(semantics.mnemonic)
         target = semantics.struct_context or "struct"
         call = f"{target}:{method}({', '.join(args)})" if args else f"{target}:{method}()"
+        signature = MethodSignature(
+            name=semantics.mnemonic,
+            summary=semantics.summary or "",
+            inputs=inputs,
+            outputs=outputs,
+            uses_operand=semantics.uses_operand,
+            struct=target,
+            method=method,
+        )
+        self._helper_registry.register_method(signature)
+        stats["helpers"] += 1
         if outputs > 0:
             line, _ = stack.push_result(call, prefix="struct")
         else:
             line = call
-        comment = self._format_comment(semantics)
-        if comment:
-            line += f"  -- {comment}"
-        return line
+        return self._decorate_with_comment(line, semantics)
 
     def _emit_call(
-        self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
+        self,
+        instruction: IRInstruction,
+        semantics: InstructionSemantics,
+        stack: HighLevelStack,
+        stats: Dict[str, int],
     ) -> List[str]:
         inputs, outputs = estimate_stack_io(semantics)
         args = stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._format_operand(semantics, instruction.operand))
         call = f"{semantics.mnemonic}({', '.join(args)})" if args else f"{semantics.mnemonic}()"
-        comment = self._format_comment(semantics)
+        signature = HelperSignature(
+            name=semantics.mnemonic,
+            summary=semantics.summary or "",
+            inputs=inputs,
+            outputs=outputs,
+            uses_operand=semantics.uses_operand,
+        )
+        self._helper_registry.register_function(signature)
+        stats["helpers"] += 1
         if outputs <= 0:
-            line = call
-            if comment:
-                line += f"  -- {comment}"
-            return [line]
+            return self._decorate_with_comment(call, semantics)
         if outputs == 1:
             line, name = stack.push_result(call, prefix="result")
-            if comment:
-                line += f"  -- {comment}"
-            return [line]
-        names = []
-        assignments = []
-        for index in range(outputs):
-            line, name = stack.push_result("", prefix=f"result{index}")
-            assignments.append(name)
-            names.append(name)
-        stack.push_existing(names[-1])
+            return self._decorate_with_comment(line, semantics)
+        names = stack.allocate_results(outputs, prefix="result")
         assignment = f"local {', '.join(names)} = {call}"
-        if comment:
-            assignment += f"  -- {comment}"
-        return [assignment]
+        return self._decorate_with_comment(assignment, semantics)
 
     def _emit_generic(
-        self, instruction: IRInstruction, semantics: InstructionSemantics, stack: HighLevelStack
-    ) -> str:
+        self,
+        instruction: IRInstruction,
+        semantics: InstructionSemantics,
+        stack: HighLevelStack,
+        stats: Dict[str, int],
+    ) -> List[str]:
         inputs, outputs = estimate_stack_io(semantics)
         args = stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._format_operand(semantics, instruction.operand))
         invocation = f"{semantics.mnemonic}({', '.join(args)})" if args else f"{semantics.mnemonic}()"
+        signature = HelperSignature(
+            name=semantics.mnemonic,
+            summary=semantics.summary or "",
+            inputs=inputs,
+            outputs=outputs,
+            uses_operand=semantics.uses_operand,
+        )
+        self._helper_registry.register_function(signature)
+        stats["helpers"] += 1
         if outputs > 0:
             line, _ = stack.push_result(invocation)
         else:
             line = invocation
-        comment = self._format_comment(semantics)
-        if comment:
-            line += f"  -- {comment}"
-        return line
+        return self._decorate_with_comment(line, semantics)
 
     def _select_branch_targets(
         self,
@@ -337,9 +454,60 @@ class HighLevelReconstructor:
     def _format_block_label(offset: int) -> str:
         return f"block_{offset:06X}"
 
-    @staticmethod
-    def _format_comment(semantics: InstructionSemantics) -> str:
-        return semantics.summary or ""
+    def _comment_lines(self, semantics: InstructionSemantics) -> List[str]:
+        summary = semantics.summary or ""
+        if not self._should_emit_comment(summary):
+            return []
+        return [f"-- {line}" for line in self._comment_formatter.wrap(summary)]
+
+    def _decorate_with_comment(
+        self, line: str, semantics: InstructionSemantics
+    ) -> List[str]:
+        summary = semantics.summary or ""
+        if not self._should_emit_comment(summary):
+            return [line]
+        inline = self._comment_formatter.format_inline(summary)
+        if (
+            inline
+            and inline == summary
+            and len(line) + len(inline) + 4 <= self.options.max_inline_comment
+        ):
+            return [f"{line}  -- {inline}"]
+        lines = [f"-- {wrapped}" for wrapped in self._comment_formatter.wrap(summary)]
+        lines.append(line)
+        return lines
+
+    def _should_emit_comment(self, summary: str) -> bool:
+        if not summary:
+            self._last_summary = None
+            return False
+        if self.options.deduplicate_comments and summary == self._last_summary:
+            return False
+        self._last_summary = summary
+        return True
+
+    def _module_summary_lines(
+        self, functions: Sequence[HighLevelFunction]
+    ) -> List[str]:
+        lines = ["module summary:"]
+        lines.append(f"- functions: {len(functions)}")
+        helper_functions = self._helper_registry.function_count()
+        helper_methods = self._helper_registry.method_count()
+        lines.append(f"- helper functions: {helper_functions}")
+        lines.append(f"- struct helpers: {helper_methods}")
+        literal_total = sum(func.metadata.literal_count for func in functions)
+        lines.append(f"- literal instructions: {literal_total}")
+        branch_total = sum(func.metadata.branch_count for func in functions)
+        lines.append(f"- branch instructions: {branch_total}")
+        if not self._enum_registry.is_empty():
+            lines.append(
+                "- enum namespaces: "
+                f"{self._enum_registry.namespace_count()} "
+                f"({self._enum_registry.total_values()} values)"
+            )
+        warnings = sum(len(func.metadata.warnings) for func in functions)
+        lines.append(f"- stack warnings: {warnings}")
+        return lines
 
 def _snake_to_camel(name: str) -> str:
     parts = name.split("_")

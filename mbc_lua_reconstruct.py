@@ -17,6 +17,7 @@ from mbcdisasm import (
     SegmentClassifier,
 )
 from mbcdisasm.highlevel import HighLevelReconstructor, HighLevelFunction
+from mbcdisasm.lua_formatter import LuaRenderOptions
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,6 +49,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write the reconstructed Lua module to the provided path",
     )
+    parser.add_argument(
+        "--keep-duplicate-comments",
+        action="store_true",
+        help="Preserve repeated semantic comments instead of collapsing them",
+    )
+    parser.add_argument(
+        "--inline-comment-width",
+        type=int,
+        default=None,
+        help="Maximum width for inline comments before they become standalone",
+    )
+    parser.add_argument(
+        "--no-stub-metadata",
+        action="store_true",
+        help="Skip emitting helper stub metadata (inputs/outputs annotations)",
+    )
+    parser.add_argument(
+        "--no-enum-metadata",
+        action="store_true",
+        help="Do not emit enumeration metadata comments above namespace tables",
+    )
+    parser.add_argument(
+        "--no-module-summary",
+        action="store_true",
+        help="Suppress the module-level summary comment block",
+    )
     return parser.parse_args()
 
 
@@ -73,7 +100,19 @@ def main() -> None:
     semantics = ManualSemanticAnalyzer(knowledge)
     cfg_builder = ControlFlowGraphBuilder(knowledge, semantic_analyzer=semantics)
     ir_builder = IRBuilder(knowledge)
-    reconstructor = HighLevelReconstructor(knowledge)
+    options = LuaRenderOptions()
+    if args.inline_comment_width is not None and args.inline_comment_width > 0:
+        options.max_inline_comment = args.inline_comment_width
+    if args.keep_duplicate_comments:
+        options.deduplicate_comments = False
+    if args.no_stub_metadata:
+        options.emit_stub_metadata = False
+    if args.no_enum_metadata:
+        options.emit_enum_metadata = False
+    if args.no_module_summary:
+        options.emit_module_summary = False
+
+    reconstructor = HighLevelReconstructor(knowledge, options=options)
 
     functions: list[HighLevelFunction] = []
     for segment in iter_segments(container, args.segments):

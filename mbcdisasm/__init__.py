@@ -19,7 +19,8 @@ from .ir import IRBuilder, IRProgram, write_ir_programs
 from .emulator import Emulator, EmulationReport, write_emulation_reports
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .ast import LuaReconstructor
-from .highlevel import HighLevelFunction, HighLevelReconstructor
+from .highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from .lua_formatter import LuaRenderOptions
 from .segment_classifier import SegmentClassifier
 from .manual_semantics import (
     AnnotatedInstruction,
@@ -81,6 +82,8 @@ __all__ = [
     "LuaReconstructor",
     "HighLevelFunction",
     "HighLevelReconstructor",
+    "FunctionMetadata",
+    "LuaRenderOptions",
     "SegmentClassifier",
     "ManualSemanticAnalyzer",
     "InstructionSemantics",
