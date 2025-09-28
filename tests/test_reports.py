@@ -283,6 +283,7 @@ class AnalysisPipelineTest(unittest.TestCase):
         lua_function = reconstructor.from_ir(segment.index, ir_program)
         lua_text = reconstructor.render(lua_function)
         self.assertIn("function", lua_text)
+        self.assertIn("local stack = {}", lua_text)
 
         emulator = Emulator(self.knowledge)
         report = emulator.simulate_segment(segment, max_instructions=4)
