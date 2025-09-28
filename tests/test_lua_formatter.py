@@ -1,0 +1,375 @@
+"""Unit tests covering Lua rendering utilities."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from mbcdisasm.highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
+from mbcdisasm.lua_formatter import (
+    CommentFormatter,
+    EnumRegistry,
+    HelperRegistry,
+    HelperSignature,
+    LuaRenderOptions,
+    LuaWriter,
+    MethodSignature,
+)
+from mbcdisasm.manual_semantics import InstructionSemantics, StackEffect
+from mbcdisasm.knowledge import KnowledgeBase
+
+
+def _make_semantics(
+    mnemonic: str,
+    *,
+    summary: str = "",
+    tags: tuple[str, ...] = (),
+    control_flow: str | None = None,
+    inputs: int = 0,
+    outputs: int = 0,
+    delta: int = 0,
+) -> InstructionSemantics:
+    """Helper used by tests to craft :class:`InstructionSemantics` objects."""
+
+    return InstructionSemantics(
+        key="00:00",
+        mnemonic=mnemonic,
+        manual_name=mnemonic,
+        summary=summary,
+        control_flow=control_flow,
+        stack_delta=0,
+        stack_effect=StackEffect(inputs=inputs, outputs=outputs, delta=delta, source="test"),
+        tags=tuple(tag.lower() for tag in tags),
+        comparison_operator=None,
+        enum_values={},
+        enum_namespace=None,
+        struct_context=None,
+        stack_inputs=0,
+        stack_outputs=0,
+        uses_operand=False,
+        operand_hint=None,
+        vm_method="",
+        vm_call_style="",
+    )
+
+
+def test_lua_writer_label_spacing() -> None:
+    writer = LuaWriter()
+    writer.write_line("function demo()")
+    with writer.indented():
+        writer.write_line("local value = 1")
+        writer.write_label("block_000001")
+        writer.write_line("return value")
+    writer.write_line("end")
+
+    rendered = writer.render().splitlines()
+    assert rendered[0] == "function demo()"
+    assert rendered[1] == "  local value = 1"
+    # A blank line should separate the label from previous statements.
+    assert rendered[2] == ""
+    assert rendered[3] == "::block_000001::"
+    assert rendered[4] == "  return value"
+
+
+def test_helper_registry_metadata_toggle() -> None:
+    registry = HelperRegistry()
+    registry.register_function(
+        HelperSignature(
+            name="reduce_pair",
+            summary="Test helper",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+        )
+    )
+    registry.register_method(
+        MethodSignature(
+            name="structured_field_store",
+            summary="Store value",
+            inputs=2,
+            outputs=0,
+            uses_operand=True,
+            struct="struct",
+            method="structuredFieldStore",
+        )
+    )
+
+    writer = LuaWriter()
+    registry.render(writer, CommentFormatter())
+    text = writer.render()
+    assert "inputs=2; outputs=0" in text
+
+    writer = LuaWriter()
+    registry.render(
+        writer,
+        CommentFormatter(),
+        options=LuaRenderOptions(emit_stub_metadata=False),
+    )
+    text_no_meta = writer.render()
+    assert "inputs=2; outputs=0" not in text_no_meta
+
+
+def test_helper_and_enum_counts() -> None:
+    registry = HelperRegistry()
+    registry.register_function(
+        HelperSignature(
+            name="reduce_pair",
+            summary="",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+        )
+    )
+    registry.register_method(
+        MethodSignature(
+            name="structured_field_store",
+            summary="",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+            struct="struct",
+            method="structuredFieldStore",
+        )
+    )
+    assert registry.function_count() == 1
+    assert registry.method_count() == 1
+    assert registry.struct_count() == 1
+
+    enums = EnumRegistry()
+    enums.register("demo", 1, "ONE")
+    enums.register("demo", 2, "TWO")
+    enums.register("other", 3, "THREE")
+    assert enums.namespace_count() == 2
+    assert enums.total_values() == 3
+
+
+def test_enum_registry_metadata_toggle() -> None:
+    registry = EnumRegistry()
+    registry.register("test_enum", 1, "ONE")
+    registry.register("test_enum", 2, "TWO")
+
+    writer = LuaWriter()
+    registry.render(writer)
+    text = writer.render()
+    assert "enum test_enum: 2 entries" in text
+
+    writer = LuaWriter()
+    registry.render(writer, options=LuaRenderOptions(emit_enum_metadata=False))
+    text_no_meta = writer.render()
+    assert "enum test_enum" not in text_no_meta
+
+
+def test_highlevel_function_summary_and_warnings() -> None:
+    metadata = FunctionMetadata(block_count=3, instruction_count=9, warnings=["stack underflow"])
+    function = HighLevelFunction(
+        name="segment_001",
+        statements=["::block_000000::", "return"],
+        metadata=metadata,
+    )
+    rendered = function.render().splitlines()
+    assert rendered[0] == "-- function summary:"
+    assert "-- - blocks: 3" in rendered
+    assert "-- - instructions: 9" in rendered
+    assert "-- - literal instructions: 0" in rendered
+    assert "-- - helper invocations: 0" in rendered
+    assert "-- - branches: 0" in rendered
+    assert "-- stack reconstruction warnings:" in rendered
+    assert "-- - stack underflow" in rendered
+    assert "function segment_001()" in rendered
+
+
+def test_module_summary_toggle(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase.load(tmp_path / "kb_summary.json")
+    options = LuaRenderOptions()
+    reconstructor = HighLevelReconstructor(knowledge, options=options)
+    metadata = FunctionMetadata(block_count=1, instruction_count=2)
+    function = HighLevelFunction(
+        name="segment_010",
+        statements=["::block_000000::", "return"],
+        metadata=metadata,
+    )
+    reconstructor._helper_registry.register_function(
+        HelperSignature(
+            name="reduce_pair",
+            summary="Test helper",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+        )
+    )
+    reconstructor._enum_registry.register("demo_enum", 1, "ONE")
+    output = reconstructor.render([function])
+    assert "module summary:" in output
+    assert "- functions: 1" in output
+    assert "- helper functions: 1" in output
+    assert "- struct helpers: 0" in output
+    assert "- literal instructions: 0" in output
+    assert "- branch instructions: 0" in output
+    assert "- enum namespaces: 1 (1 values)" in output
+    assert "- stack warnings: 0" in output
+
+    no_summary = HighLevelReconstructor(
+        knowledge,
+        options=LuaRenderOptions(emit_module_summary=False),
+    )
+    no_summary._helper_registry.register_function(
+        HelperSignature(
+            name="reduce_pair",
+            summary="Test helper",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+        )
+    )
+    result = no_summary.render([function])
+    assert "module summary" not in result
+
+
+def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase.load(tmp_path / "kb_multi.json")
+    reconstructor = HighLevelReconstructor(knowledge)
+
+    metadata_a = FunctionMetadata(block_count=1, instruction_count=2, literal_count=1, helper_calls=0, branch_count=1)
+    metadata_b = FunctionMetadata(
+        block_count=2,
+        instruction_count=3,
+        literal_count=2,
+        helper_calls=1,
+        branch_count=0,
+        warnings=["placeholder"],
+    )
+    fn_a = HighLevelFunction(name="segment_a", statements=["::block_000000::", "return"], metadata=metadata_a)
+    fn_b = HighLevelFunction(name="segment_b", statements=["::block_000010::", "return"], metadata=metadata_b)
+
+    reconstructor._helper_registry.register_function(
+        HelperSignature(
+            name="reduce_pair",
+            summary="",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+        )
+    )
+    reconstructor._helper_registry.register_method(
+        MethodSignature(
+            name="structured_field_store",
+            summary="",
+            inputs=2,
+            outputs=0,
+            uses_operand=False,
+            struct="struct",
+            method="structuredFieldStore",
+        )
+    )
+    reconstructor._enum_registry.register("demo", 1, "ONE")
+
+    rendered = reconstructor.render([fn_a, fn_b])
+    assert "module summary:" in rendered
+    assert "- functions: 2" in rendered
+    assert "- helper functions: 1" in rendered
+    assert "- struct helpers: 1" in rendered
+    assert "- literal instructions: 3" in rendered
+    assert "- branch instructions: 1" in rendered
+    assert "- stack warnings: 1" in rendered
+
+
+def test_comment_deduplication(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase.load(tmp_path / "kb.json")
+    reconstructor = HighLevelReconstructor(knowledge)
+
+    literal_semantics = _make_semantics(
+        "literal_push",
+        summary="Pushes a zero-extended literal constant to seed the evaluation stack.",
+        tags=("literal",),
+    )
+
+    first = reconstructor._decorate_with_comment("local literal_0 = 0", literal_semantics)
+    second = reconstructor._decorate_with_comment("local literal_1 = 1", literal_semantics)
+
+    assert any("--" in line for line in first), "first literal should carry a comment"
+    assert all("--" not in line for line in second), "duplicate comment should be suppressed"
+
+    # Introducing a different comment resets the deduplication window.
+    other_semantics = _make_semantics(
+        "reduce_pair",
+        summary="Primary reducer",
+        tags=("generic",),
+    )
+    reconstructor._decorate_with_comment("reduce_pair(x, y)", other_semantics)
+    again = reconstructor._decorate_with_comment("local literal_2 = 2", literal_semantics)
+    assert any("--" in line for line in again)
+
+
+def test_function_metadata_counts(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase.load(tmp_path / "kb_counts.json")
+    reconstructor = HighLevelReconstructor(knowledge)
+
+    literal_semantics = _make_semantics(
+        "literal_push",
+        summary="literal",
+        tags=("literal",),
+        outputs=1,
+        delta=1,
+    )
+    helper_semantics = _make_semantics(
+        "helper_call",
+        summary="helper",
+        tags=("call",),
+        inputs=1,
+        delta=-1,
+    )
+    branch_semantics = _make_semantics(
+        "branch",
+        summary="branch",
+        control_flow="branch",
+        inputs=1,
+        delta=-1,
+    )
+
+    literal_instr = IRInstruction(
+        offset=0,
+        key="00:00",
+        mnemonic="literal_push",
+        operand=0,
+        stack_delta=1,
+        control_flow=None,
+        semantics=literal_semantics,
+        stack_inputs=0,
+        stack_outputs=1,
+    )
+    helper_instr = IRInstruction(
+        offset=4,
+        key="00:01",
+        mnemonic="helper_call",
+        operand=0,
+        stack_delta=-1,
+        control_flow=None,
+        semantics=helper_semantics,
+        stack_inputs=1,
+        stack_outputs=0,
+    )
+    branch_instr = IRInstruction(
+        offset=8,
+        key="00:02",
+        mnemonic="branch",
+        operand=0,
+        stack_delta=-1,
+        control_flow="branch",
+        semantics=branch_semantics,
+        stack_inputs=1,
+        stack_outputs=0,
+    )
+
+    block = IRBlock(start=0, instructions=[literal_instr, helper_instr, branch_instr], successors=[0x10])
+    program = IRProgram(segment_index=0, blocks={0: block})
+
+    function = reconstructor.from_ir(program)
+    metadata = function.metadata
+    assert metadata.literal_count == 1
+    assert metadata.helper_calls == 1
+    assert metadata.branch_count == 1
+
+    rendered = function.render()
+    assert "- literal instructions: 1" in rendered
+    assert "- helper invocations: 1" in rendered
+    assert "- branches: 1" in rendered
