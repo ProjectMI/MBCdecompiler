@@ -373,6 +373,7 @@ class InstructionMetadata:
     stack_delta: Optional[float]
     stack_confidence: Optional[float]
     stack_samples: Optional[int]
+    stack_source: Optional[str]
     operand_hint: Optional[str]
     operand_confidence: Optional[float]
     control_flow: Optional[str]
@@ -380,15 +381,51 @@ class InstructionMetadata:
     summary: Optional[str]
 
 
+@dataclass(frozen=True)
+class SemanticSignature:
+    """Compact representation of behavioural evidence for an opcode key."""
+
+    key: str
+    stack_delta: Optional[float]
+    stack_confidence: Optional[float]
+    operand_hint: Optional[str]
+    operand_confidence: Optional[float]
+    preceding: Dict[str, float]
+    following: Dict[str, float]
+    flow_target: Optional[str]
+
+
+@dataclass(frozen=True)
+class SemanticMatch:
+    """Description of a semantic naming match applied to a profile."""
+
+    key: str
+    prototype: str
+    score: float
+    channels: Dict[str, str]
+    applied_fields: Tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SemanticNamingReport:
+    """Outcome of a semantic post-analysis pass."""
+
+    updates: List[AnnotationUpdate]
+    matches: List[SemanticMatch]
+
+
 class KnowledgeBase:
     """On-disk knowledge base with light conflict tracking."""
 
     SCHEMA_VERSION = 1
-    MANUAL_MIN_KNOWN_STACK_SAMPLES = 4
-    MANUAL_MAX_UNKNOWN_RATIO = 0.4
-    MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD = 1.0 / 3.0
-    MANUAL_STRICT_FIELD_SCORE = 5.0
-    MANUAL_UNKNOWN_OVERRIDE_SCORE = 2.5
+    SEMANTIC_MIN_PROFILE_SAMPLES = 4
+    SEMANTIC_MIN_SCORE = 0.75
+    SEMANTIC_SCORE_MARGIN = 0.08
+    SEMANTIC_NEIGHBOUR_THRESHOLD = 0.35
+    SEMANTIC_STACK_WEIGHT = 0.4
+    SEMANTIC_OPERAND_WEIGHT = 0.3
+    SEMANTIC_CONTEXT_WEIGHT = 0.2
+    SEMANTIC_FLOW_WEIGHT = 0.1
     _MigrationFunc = Callable[[MutableMapping[str, object]], MutableMapping[str, object]]
     _MIGRATIONS: Dict[int, _MigrationFunc] = {}
 
@@ -531,6 +568,7 @@ class KnowledgeBase:
         stack_delta = self.estimate_stack_delta(key)
         stack_confidence: Optional[float] = None
         stack_samples: Optional[int] = None
+        stack_source: Optional[str] = None
 
         profile = self._profiles.get(key)
         if profile is not None:
@@ -549,6 +587,13 @@ class KnowledgeBase:
             samples = ann.get("stack_samples")
             if samples is not None:
                 stack_samples = int(samples)
+        source_hint = ann.get("stack_source")
+        if source_hint:
+            stack_source = str(source_hint)
+        elif key in self._manual_reference and "stack_delta" in self._manual_reference[key]:
+            stack_source = "manual"
+        elif stack_delta is not None and stack_samples:
+            stack_source = "derived"
 
         operand_hint, operand_confidence = self._dominant_operand_type(profile)
         hint_override = ann.get("operand_hint")
@@ -575,6 +620,7 @@ class KnowledgeBase:
             stack_delta=stack_delta,
             stack_confidence=stack_confidence,
             stack_samples=stack_samples,
+            stack_source=stack_source,
             operand_hint=operand_hint,
             operand_confidence=operand_confidence,
             control_flow=control_flow,
@@ -674,13 +720,6 @@ class KnowledgeBase:
             )
             if operand_update:
                 updates.append(operand_update)
-
-            manual_inferences = self._infer_manual_annotations(
-                target,
-                observation,
-            )
-            if manual_inferences:
-                updates.extend(manual_inferences)
 
             for task in self._derive_review_tasks(
                 target,
@@ -985,6 +1024,7 @@ class KnowledgeBase:
                 "stack_delta": stored_dominant,
                 "stack_confidence": float(ratio),
                 "stack_samples": int(total_samples),
+                "stack_source": "derived",
             }
         )
         if not ann_is_mutable:
@@ -1192,260 +1232,498 @@ class KnowledgeBase:
                 else:
                     ann = {}
                 ann.update(normalized)
+                if "stack_delta" in normalized:
+                    ann.setdefault("stack_source", "manual")
                 if not ann_is_mutable:
                     self._annotations[key_str] = ann
 
-    def _infer_manual_annotations(
+    def apply_semantic_annotations(
         self,
-        profile: OpcodeProfile,
-        observation: StackObservation,
-    ) -> List[AnnotationUpdate]:
-        if profile.key in self._manual_reference:
-            return []
+        *,
+        min_samples: int = 6,
+        neighbour_threshold: Optional[float] = None,
+        score_threshold: Optional[float] = None,
+    ) -> SemanticNamingReport:
+        if neighbour_threshold is None:
+            neighbour_threshold = self.SEMANTIC_NEIGHBOUR_THRESHOLD
+        if score_threshold is None:
+            score_threshold = self.SEMANTIC_MIN_SCORE
 
-        existing_ann = self._annotations.get(profile.key)
-        ann_is_mutable = isinstance(existing_ann, MutableMapping)
-        ann: MutableMapping[str, object]
-        if ann_is_mutable:
-            ann = cast(MutableMapping[str, object], existing_ann)
-        else:
-            ann = {}
-        # Skip if the opcode is already fully annotated.
-        if "name" in ann and "control_flow" in ann and "summary" in ann:
-            return []
+        prototypes = self._semantic_prototypes(
+            min_samples=max(1, min_samples // 2),
+            neighbour_threshold=neighbour_threshold,
+        )
+        if not prototypes:
+            return SemanticNamingReport(updates=[], matches=[])
 
-        match = self._select_manual_match(profile, observation)
-        if match is None:
-            return []
-
-        (
-            manual_key,
-            manual_payload,
-            score,
-            structural_score,
-            has_structural_context,
-            allow_unknown_override,
-        ) = match
         updates: List[AnnotationUpdate] = []
-        modified = False
+        matches: List[SemanticMatch] = []
+        required_samples = max(min_samples, self.SEMANTIC_MIN_PROFILE_SAMPLES)
 
-        strong_fields_allowed = (
-            (
-                score >= self.MANUAL_STRICT_FIELD_SCORE
-                and (
-                    (
-                        has_structural_context
-                        and structural_score
-                        >= self.MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD
+        for profile in sorted(self._profiles.values(), key=lambda item: item.key):
+            if profile.count < required_samples:
+                continue
+            if profile.key in self._manual_reference:
+                continue
+
+            existing_ann = self._annotations.get(profile.key)
+            ann_is_mutable = isinstance(existing_ann, MutableMapping)
+            ann: MutableMapping[str, object]
+            if ann_is_mutable:
+                ann = cast(MutableMapping[str, object], existing_ann)
+            else:
+                ann = {}
+
+            if "name" in ann:
+                continue
+
+            signature = self._semantic_signature(
+                profile,
+                neighbour_threshold=neighbour_threshold,
+                annotation=ann,
+            )
+
+            match = self._select_semantic_match(
+                signature,
+                prototypes,
+                score_threshold=score_threshold,
+            )
+            if match is None:
+                continue
+
+            prototype_key, payload, score, channel_details = match
+            applied_fields: List[str] = []
+            semantic_reason = f"semantic_match:{prototype_key}"
+
+            if "stack_delta" not in ann and payload.get("stack_delta") is not None:
+                ann["stack_delta"] = payload["stack_delta"]
+                ann["stack_source"] = "manual"
+                applied_fields.append("stack_delta")
+                updates.append(
+                    AnnotationUpdate(
+                        key=profile.key,
+                        field="stack_delta",
+                        old_value=None,
+                        new_value=payload.get("stack_delta"),
+                        confidence=float(score),
+                        samples=int(profile.count),
+                        reason=semantic_reason,
                     )
-                    or not has_structural_context
                 )
-            )
-            or (
-                allow_unknown_override
-                and score >= self.MANUAL_UNKNOWN_OVERRIDE_SCORE
-            )
-        )
-        always_fields = ("stack_delta", "operand_hint")
-        strong_fields = (
-            "name",
-            "summary",
-            "description",
-            "comment",
-            "notes",
-            "control_flow",
-            "flow_target",
-        )
-
-        def _record(field: str, value: object) -> None:
-            if field in ann:
-                return
-            ann[field] = value
-            nonlocal modified
-            modified = True
-            updates.append(
-                AnnotationUpdate(
-                    key=profile.key,
-                    field=field,
-                    old_value=None,
-                    new_value=value,
-                    confidence=float(observation.confidence or 1.0),
-                    samples=int(profile.count),
-                    reason=f"manual_match:{manual_key}",
+            if "operand_hint" not in ann and payload.get("operand_hint") is not None:
+                ann["operand_hint"] = payload["operand_hint"]
+                applied_fields.append("operand_hint")
+                updates.append(
+                    AnnotationUpdate(
+                        key=profile.key,
+                        field="operand_hint",
+                        old_value=None,
+                        new_value=payload.get("operand_hint"),
+                        confidence=float(score),
+                        samples=int(profile.count),
+                        reason=semantic_reason,
+                    )
                 )
-            )
 
-        for field in always_fields:
-            value = manual_payload.get(field)
-            if value is not None:
-                _record(field, value)
-
-        if strong_fields_allowed:
-            for field in strong_fields:
-                value = manual_payload.get(field)
-                if value is not None:
-                    _record(field, value)
-
-        previous_source = ann.get("manual_source")
-        if previous_source != manual_key:
-            ann["manual_source"] = manual_key
-            modified = True
-            updates.append(
-                AnnotationUpdate(
-                    key=profile.key,
-                    field="manual_source",
-                    old_value=previous_source,
-                    new_value=manual_key,
-                    confidence=float(observation.confidence or 1.0),
-                    samples=int(profile.count),
-                    reason=f"manual_match:{manual_key}",
+            for field in (
+                "name",
+                "summary",
+                "description",
+                "comment",
+                "notes",
+                "control_flow",
+                "flow_target",
+            ):
+                value = payload.get(field)
+                if value is None or field in ann:
+                    continue
+                ann[field] = value
+                applied_fields.append(field)
+                updates.append(
+                    AnnotationUpdate(
+                        key=profile.key,
+                        field=field,
+                        old_value=None,
+                        new_value=value,
+                        confidence=float(score),
+                        samples=int(profile.count),
+                        reason=semantic_reason,
+                    )
                 )
-            )
 
-        if modified and not ann_is_mutable:
-            self._annotations[profile.key] = ann
+            previous_manual_source = ann.get("manual_source")
+            if previous_manual_source != prototype_key:
+                ann["manual_source"] = prototype_key
+                applied_fields.append("manual_source")
+                updates.append(
+                    AnnotationUpdate(
+                        key=profile.key,
+                        field="manual_source",
+                        old_value=previous_manual_source,
+                        new_value=prototype_key,
+                        confidence=float(score),
+                        samples=int(profile.count),
+                        reason=semantic_reason,
+                    )
+                )
 
-        return updates
+            prev_basis_raw = ann.get("semantic_basis")
+            if isinstance(prev_basis_raw, Mapping):
+                previous_basis: object = dict(prev_basis_raw)
+            else:
+                previous_basis = prev_basis_raw
+            basis = {
+                "prototype": prototype_key,
+                "score": round(float(score), 3),
+                "channels": dict(channel_details),
+            }
+            if previous_basis != basis:
+                ann["semantic_basis"] = basis
+                applied_fields.append("semantic_basis")
+                updates.append(
+                    AnnotationUpdate(
+                        key=profile.key,
+                        field="semantic_basis",
+                        old_value=previous_basis,
+                        new_value=basis,
+                        confidence=float(score),
+                        samples=int(profile.count),
+                        reason=semantic_reason,
+                    )
+                )
 
-    def _select_manual_match(
+            if applied_fields and not ann_is_mutable:
+                self._annotations[profile.key] = ann
+
+            if applied_fields:
+                matches.append(
+                    SemanticMatch(
+                        key=profile.key,
+                        prototype=prototype_key,
+                        score=float(score),
+                        channels=dict(channel_details),
+                        applied_fields=tuple(sorted(set(applied_fields))),
+                    )
+                )
+
+        return SemanticNamingReport(updates=updates, matches=matches)
+
+    def _semantic_signature(
         self,
         profile: OpcodeProfile,
-        observation: StackObservation,
-    ) -> Optional[Tuple[str, Mapping[str, object], float]]:
-        operand_hint, operand_confidence = self._dominant_operand_type(profile)
-        candidates: List[
-            Tuple[float, float, bool, bool, str, Mapping[str, object]]
-        ] = []
+        *,
+        neighbour_threshold: float,
+        override: Optional[Mapping[str, object]] = None,
+        annotation: Optional[Mapping[str, object]] = None,
+    ) -> SemanticSignature:
+        dominant_delta, dominant_ratio = self._dominant(profile.stack_deltas)
+        stack_confidence = dominant_ratio if dominant_ratio else None
 
-        for manual_key, payload in self._manual_reference.items():
-            if manual_key == profile.key:
+        if override:
+            override_delta = _coerce_stack_delta_numeric(override.get("stack_delta"))
+            if override_delta is not None:
+                dominant_delta = float(override_delta)
+                stack_confidence = 1.0
+
+        if dominant_delta is None and annotation is not None:
+            override_delta = _coerce_stack_delta_numeric(annotation.get("stack_delta"))
+            if override_delta is not None:
+                dominant_delta = float(override_delta)
+                try:
+                    raw_conf = annotation.get("stack_confidence")
+                    stack_confidence = float(raw_conf) if raw_conf is not None else 1.0
+                except (TypeError, ValueError):
+                    stack_confidence = 1.0
+
+        operand_hint, operand_ratio = self._dominant_operand_type(profile)
+        operand_confidence = operand_ratio if operand_ratio else None
+
+        if override and override.get("operand_hint") is not None:
+            operand_hint = str(override.get("operand_hint"))
+            operand_confidence = 1.0
+
+        if operand_hint is None and annotation is not None:
+            operand_override = annotation.get("operand_hint")
+            if operand_override is not None:
+                operand_hint = str(operand_override)
+                try:
+                    raw_conf = annotation.get("operand_confidence")
+                    operand_confidence = (
+                        float(raw_conf) if raw_conf is not None else operand_confidence or 1.0
+                    )
+                except (TypeError, ValueError):
+                    operand_confidence = operand_confidence or 1.0
+
+        flow_target: Optional[str] = None
+        if override and override.get("flow_target") is not None:
+            flow_target = str(override.get("flow_target"))
+        elif annotation is not None and annotation.get("flow_target") is not None:
+            flow_target = str(annotation.get("flow_target"))
+
+        preceding = self._stable_neighbour_ratios(
+            profile.preceding, threshold=neighbour_threshold
+        )
+        following = self._stable_neighbour_ratios(
+            profile.following, threshold=neighbour_threshold
+        )
+
+        return SemanticSignature(
+            key=profile.key,
+            stack_delta=dominant_delta,
+            stack_confidence=stack_confidence,
+            operand_hint=operand_hint,
+            operand_confidence=operand_confidence,
+            preceding=preceding,
+            following=following,
+            flow_target=flow_target,
+        )
+
+    @staticmethod
+    def _stable_neighbour_ratios(
+        counter: Counter, *, threshold: float
+    ) -> Dict[str, float]:
+        total = sum(counter.values())
+        if total <= 0:
+            return {}
+        stable: Dict[str, float] = {}
+        for key, count in counter.items():
+            if count <= 0:
                 continue
-            score_result = self._score_manual_candidate(
+            ratio = count / total
+            if ratio >= threshold:
+                stable[str(key)] = ratio
+        return stable
+
+    def _semantic_prototypes(
+        self,
+        *,
+        min_samples: int,
+        neighbour_threshold: float,
+    ) -> Dict[str, Tuple[SemanticSignature, Mapping[str, object]]]:
+        prototypes: Dict[str, Tuple[SemanticSignature, Mapping[str, object]]] = {}
+        for key, payload in self._manual_reference.items():
+            profile = self._profiles.get(key)
+            if profile is None:
+                profile = OpcodeProfile(key)
+            if profile.count < min_samples and not payload:
+                continue
+            annotation_raw = self._annotations.get(key)
+            annotation = annotation_raw if isinstance(annotation_raw, Mapping) else None
+            signature = self._semantic_signature(
                 profile,
-                observation,
-                operand_hint,
-                operand_confidence,
-                manual_key,
-                payload,
+                neighbour_threshold=neighbour_threshold,
+                override=payload,
+                annotation=annotation,
             )
-            if score_result is None:
+            prototypes[key] = (signature, payload)
+        return prototypes
+
+    def _select_semantic_match(
+        self,
+        signature: SemanticSignature,
+        prototypes: Mapping[str, Tuple[SemanticSignature, Mapping[str, object]]],
+        *,
+        score_threshold: float,
+    ) -> Optional[Tuple[str, Mapping[str, object], float, Dict[str, str]]]:
+        candidates: List[Tuple[float, Dict[str, str], str, Mapping[str, object]]] = []
+        for proto_key, (proto_signature, payload) in prototypes.items():
+            similarity = self._semantic_similarity(signature, proto_signature)
+            if similarity is None:
                 continue
-            score, structural, has_structural, allow_override = score_result
-            candidates.append(
-                (score, structural, has_structural, allow_override, manual_key, payload)
-            )
+            score, channels = similarity
+            if score < score_threshold:
+                continue
+            candidates.append((score, channels, proto_key, payload))
 
         if not candidates:
             return None
 
-        candidates.sort(reverse=True, key=lambda item: item[0])
-        top_score, top_structural, top_has_structural, top_allow_override, top_key, top_payload = candidates[0]
-        if len(candidates) > 1 and top_score - candidates[1][0] < 0.5:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        if len(candidates) > 1 and (
+            candidates[0][0] - candidates[1][0] < self.SEMANTIC_SCORE_MARGIN
+        ):
             return None
-        return (
-            top_key,
-            top_payload,
-            top_score,
-            top_structural,
-            top_has_structural,
-            top_allow_override,
-        )
 
-    def _score_manual_candidate(
+        top_score, top_channels, top_key, top_payload = candidates[0]
+        return top_key, top_payload, top_score, dict(top_channels)
+
+    def _semantic_similarity(
         self,
-        profile: OpcodeProfile,
-        observation: StackObservation,
-        operand_hint: Optional[str],
-        operand_confidence: Optional[float],
-        manual_key: str,
-        payload: Mapping[str, object],
-    ) -> Optional[Tuple[float, float, bool, bool]]:
-        unknown_ratio = observation.unknown_ratio
-        allow_unknown_override = (
-            observation.known_samples == 0
-            and (unknown_ratio is None or unknown_ratio >= 1.0)
+        candidate: SemanticSignature,
+        prototype: SemanticSignature,
+    ) -> Optional[Tuple[float, Dict[str, str]]]:
+        total_weight = 0.0
+        weighted_score = 0.0
+        details: Dict[str, str] = {}
+
+        stack_result = self._stack_similarity(
+            candidate.stack_delta,
+            candidate.stack_confidence,
+            prototype.stack_delta,
+            prototype.stack_confidence,
         )
+        if stack_result is not None:
+            score, detail, consider_weight = stack_result
+            if consider_weight:
+                total_weight += self.SEMANTIC_STACK_WEIGHT
+                weighted_score += score * self.SEMANTIC_STACK_WEIGHT
+            details["stack"] = detail
 
-        if (
-            observation.known_samples < self.MANUAL_MIN_KNOWN_STACK_SAMPLES
-            and not allow_unknown_override
-        ):
+        operand_result = self._operand_similarity(
+            candidate.operand_hint,
+            candidate.operand_confidence,
+            prototype.operand_hint,
+            prototype.operand_confidence,
+        )
+        if operand_result is not None:
+            score, detail = operand_result
+            total_weight += self.SEMANTIC_OPERAND_WEIGHT
+            weighted_score += score * self.SEMANTIC_OPERAND_WEIGHT
+            details["operand"] = detail
+
+        context_result = self._context_similarity(
+            candidate.preceding,
+            candidate.following,
+            prototype.preceding,
+            prototype.following,
+        )
+        if context_result is not None:
+            score, detail = context_result
+            total_weight += self.SEMANTIC_CONTEXT_WEIGHT
+            weighted_score += score * self.SEMANTIC_CONTEXT_WEIGHT
+            details["context"] = detail
+
+        flow_result = self._flow_similarity(
+            candidate.flow_target,
+            prototype.flow_target,
+        )
+        if flow_result is not None:
+            score, detail = flow_result
+            total_weight += self.SEMANTIC_FLOW_WEIGHT
+            weighted_score += score * self.SEMANTIC_FLOW_WEIGHT
+            details["flow"] = detail
+
+        if total_weight == 0.0:
             return None
 
-        if (
-            unknown_ratio is not None
-            and unknown_ratio > self.MANUAL_MAX_UNKNOWN_RATIO
-            and not allow_unknown_override
-        ):
+        return weighted_score / total_weight, details
+
+    def _stack_similarity(
+        self,
+        candidate_delta: Optional[float],
+        candidate_confidence: Optional[float],
+        prototype_delta: Optional[float],
+        prototype_confidence: Optional[float],
+    ) -> Optional[Tuple[float, str, bool]]:
+        if candidate_delta is None and prototype_delta is None:
+            return None
+        if candidate_delta is None or prototype_delta is None:
+            fmt = lambda value: self._format_stack_delta(value) if value is not None else "—"
+            detail = f"Δ={fmt(candidate_delta)} vs {fmt(prototype_delta)}"
+            return 0.0, detail, False
+
+        diff = abs(candidate_delta - prototype_delta)
+        closeness = max(0.0, 1.0 - min(diff, 1.0))
+        if not self._stack_delta_close(candidate_delta, prototype_delta):
+            closeness *= 0.25
+
+        min_conf = min(
+            float(candidate_confidence or 0.0),
+            float(prototype_confidence or 0.0),
+        )
+        score = closeness * (0.5 + 0.5 * min(1.0, min_conf))
+        detail = (
+            f"Δ={self._format_stack_delta(candidate_delta)} vs "
+            f"{self._format_stack_delta(prototype_delta)} (Δ={diff:.2f}, conf≈{min_conf:.2f})"
+        )
+        return score, detail, True
+
+    def _operand_similarity(
+        self,
+        candidate_operand: Optional[str],
+        candidate_confidence: Optional[float],
+        prototype_operand: Optional[str],
+        prototype_confidence: Optional[float],
+    ) -> Optional[Tuple[float, str]]:
+        if candidate_operand is None and prototype_operand is None:
+            return None
+        if candidate_operand is None or prototype_operand is None:
+            detail = f"operand {candidate_operand or '—'} vs {prototype_operand or '—'}"
+            return 0.0, detail
+        if candidate_operand != prototype_operand:
+            detail = f"operand {candidate_operand} vs {prototype_operand}"
+            return 0.0, detail
+
+        min_conf = min(
+            float(candidate_confidence or 0.0),
+            float(prototype_confidence or 0.0),
+        )
+        score = 0.5 + 0.5 * min_conf
+        detail = f"operand={candidate_operand} (conf≈{min_conf:.2f})"
+        return score, detail
+
+    def _context_similarity(
+        self,
+        candidate_pre: Dict[str, float],
+        candidate_post: Dict[str, float],
+        prototype_pre: Dict[str, float],
+        prototype_post: Dict[str, float],
+    ) -> Optional[Tuple[float, str]]:
+        components: List[str] = []
+        scores: List[float] = []
+
+        if candidate_pre and prototype_pre:
+            score, detail = self._neighbour_similarity(candidate_pre, prototype_pre)
+            components.append(f"L{detail}")
+            scores.append(score)
+
+        if candidate_post and prototype_post:
+            score, detail = self._neighbour_similarity(candidate_post, prototype_post)
+            components.append(f"R{detail}")
+            scores.append(score)
+
+        if not scores:
             return None
 
-        score = 0.0
-        structural_score = 0.0
-        has_structural_context = False
+        combined_score = sum(scores) / len(scores)
+        return combined_score, "; ".join(components)
 
-        manual_delta = payload.get("stack_delta")
-        if manual_delta is not None:
-            try:
-                manual_delta_numeric = float(manual_delta)
-            except (TypeError, ValueError):
-                return None
-            observed_delta = observation.dominant
-            if observed_delta is None:
-                # When the emulator could not determine a dominant stack delta we
-                # still treat the manual hint as weak evidence so operand and
-                # relationship similarities can drive the match.
-                confidence = observation.confidence or 0.0
-                # Encourage additional signals by scaling the boost with the
-                # proportion of known samples (zero when everything is unknown).
-                score += 0.25 + 0.5 * (1.0 - float(observation.unknown_ratio or 1.0))
-                score += confidence * 0.25
-            else:
-                if not self._stack_delta_close(manual_delta_numeric, observed_delta):
-                    return None
-                score += 3.0
-                if observation.confidence is not None:
-                    score += observation.confidence
-        elif observation.dominant is not None:
-            score += 0.5
+    def _neighbour_similarity(
+        self, candidate: Dict[str, float], prototype: Dict[str, float]
+    ) -> Tuple[float, str]:
+        if not candidate or not prototype:
+            return 0.0, "0/0"
 
-        manual_operand = payload.get("operand_hint")
-        if manual_operand is not None:
-            if operand_hint is None or operand_hint != manual_operand:
-                return None
-            score += 1.5
-            if operand_confidence is not None:
-                score += operand_confidence
-        else:
-            score += 0.1
+        candidate_keys = set(candidate)
+        prototype_keys = set(prototype)
+        intersection = candidate_keys & prototype_keys
+        union = candidate_keys | prototype_keys
+        if not union:
+            return 0.0, "0/0"
+        if not intersection:
+            return 0.0, f"0/{len(union)}"
 
-        reference = self._profiles.get(manual_key)
-        if reference is not None:
-            preceding_similarity = self._relationship_similarity(
-                profile.preceding, reference.preceding
-            )
-            if profile.preceding and reference.preceding:
-                if preceding_similarity < self.MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD:
-                    return None
-                structural_score += preceding_similarity
-                has_structural_context = True
+        base = len(intersection) / len(union)
+        ratio_alignment = sum(
+            1.0 - min(abs(candidate[key] - prototype[key]), 1.0)
+            for key in intersection
+        ) / len(intersection)
+        score = base * (0.5 + 0.5 * ratio_alignment)
+        detail = f"{len(intersection)}/{len(union)} {','.join(sorted(intersection))}"
+        return score, detail
 
-            following_similarity = self._relationship_similarity(
-                profile.following, reference.following
-            )
-            if profile.following and reference.following:
-                if following_similarity < self.MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD:
-                    return None
-                structural_score += following_similarity
-                has_structural_context = True
-
-        score += structural_score
-
-        return (
-            score,
-            structural_score,
-            has_structural_context,
-            allow_unknown_override,
-        ) if score >= 1.0 else None
+    def _flow_similarity(
+        self,
+        candidate_flow: Optional[str],
+        prototype_flow: Optional[str],
+    ) -> Optional[Tuple[float, str]]:
+        if candidate_flow is None and prototype_flow is None:
+            return None
+        if candidate_flow is None or prototype_flow is None:
+            return 0.0, f"flow {candidate_flow or '—'} vs {prototype_flow or '—'}"
+        if candidate_flow == prototype_flow:
+            return 1.0, f"flow={candidate_flow}"
+        return 0.0, f"flow {candidate_flow}->{prototype_flow}"
 
     @staticmethod
     def _relationship_similarity(counter_a: Counter, counter_b: Counter) -> float:

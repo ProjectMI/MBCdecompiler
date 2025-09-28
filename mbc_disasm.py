@@ -157,6 +157,7 @@ def main() -> None:
     analysis = analyzer.analyze(container)
 
     merge_report = None
+    semantic_report = None
     preview_count = 0
     if args.update_knowledge:
         merge_report = knowledge.merge_profiles(analysis.iter_profiles())
@@ -183,6 +184,18 @@ def main() -> None:
             if len(merge_report.review_tasks) > 5:
                 preview += f", +{len(merge_report.review_tasks) - 5} more"
             print(f"queued review tasks: {preview}")
+        semantic_report = knowledge.apply_semantic_annotations()
+        if semantic_report.matches:
+            semantic_preview = semantic_report.matches[:3]
+            summary = ", ".join(
+                f"{match.key}->{match.prototype} ({match.score:.2f})"
+                for match in semantic_preview
+            )
+            if len(semantic_report.matches) > len(semantic_preview):
+                summary += (
+                    f", +{len(semantic_report.matches) - len(semantic_preview)} more"
+                )
+            print(f"semantic matches applied: {summary}")
 
     render_cli_summary(container, analysis, opcode_limit=args.opcode_limit, plan=plan)
 
@@ -248,6 +261,8 @@ def main() -> None:
     detailed_updates: Sequence = ()
     if merge_report:
         detailed_updates = merge_report.updates[preview_count:]
+    if semantic_report:
+        detailed_updates = tuple(list(detailed_updates) + list(semantic_report.updates))
 
     if plan.update_knowledge:
         knowledge.save()

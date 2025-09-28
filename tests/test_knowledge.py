@@ -140,6 +140,7 @@ def test_merge_profiles_infers_manual_annotations(tmp_path):
     profile.following = Counter({"00:01": 4})
 
     report = knowledge.merge_profiles([profile], min_samples=3, confidence_threshold=0.5)
+    semantic_report = knowledge.apply_semantic_annotations(min_samples=3)
 
     metadata = knowledge.instruction_metadata("BB:00")
     assert metadata.mnemonic == "manual_literal"
@@ -147,7 +148,9 @@ def test_merge_profiles_infers_manual_annotations(tmp_path):
     assert metadata.stack_delta == 1
     assert metadata.operand_hint == "small"
 
-    update_fields = {update.field for update in report.updates if update.key == "BB:00"}
+    update_fields = {
+        update.field for update in semantic_report.updates if update.key == "BB:00"
+    }
     assert "name" in update_fields
     assert "manual_source" in update_fields
 
@@ -178,6 +181,7 @@ def test_manual_inference_handles_unknown_stack(tmp_path):
     profile.operand_types = Counter({"small": 8})
 
     report = knowledge.merge_profiles([profile], min_samples=3, confidence_threshold=0.5)
+    semantic_report = knowledge.apply_semantic_annotations(min_samples=3)
 
     metadata = knowledge.instruction_metadata("BB:00")
     assert metadata.mnemonic == "manual_literal"
@@ -185,7 +189,9 @@ def test_manual_inference_handles_unknown_stack(tmp_path):
     assert metadata.stack_delta == 1
     assert metadata.operand_hint == "small"
 
-    update_fields = {update.field for update in report.updates if update.key == "BB:00"}
+    update_fields = {
+        update.field for update in semantic_report.updates if update.key == "BB:00"
+    }
     assert "manual_source" in update_fields
 
 
