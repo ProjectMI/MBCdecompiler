@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    cast,
 )
 
 
@@ -383,6 +384,11 @@ class KnowledgeBase:
     """On-disk knowledge base with light conflict tracking."""
 
     SCHEMA_VERSION = 1
+    MANUAL_MIN_KNOWN_STACK_SAMPLES = 4
+    MANUAL_MAX_UNKNOWN_RATIO = 0.4
+    MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD = 1.0 / 3.0
+    MANUAL_STRICT_FIELD_SCORE = 5.0
+    MANUAL_UNKNOWN_OVERRIDE_SCORE = 2.5
     _MigrationFunc = Callable[[MutableMapping[str, object]], MutableMapping[str, object]]
     _MIGRATIONS: Dict[int, _MigrationFunc] = {}
 
@@ -947,7 +953,13 @@ class KnowledgeBase:
         if dominant is None or ratio < confidence_threshold:
             return None
 
-        ann = self._annotations.setdefault(profile.key, {})
+        existing_ann = self._annotations.get(profile.key)
+        ann_is_mutable = isinstance(existing_ann, MutableMapping)
+        ann: MutableMapping[str, object]
+        if ann_is_mutable:
+            ann = cast(MutableMapping[str, object], existing_ann)
+        else:
+            ann = {}
         previous = ann.get("stack_delta")
         previous_numeric = _coerce_stack_delta_numeric(previous)
         previous_confidence = float(ann.get("stack_confidence", 0.0))
@@ -975,6 +987,8 @@ class KnowledgeBase:
                 "stack_samples": int(total_samples),
             }
         )
+        if not ann_is_mutable:
+            self._annotations[profile.key] = ann
 
         reason = "initial" if previous is None else "revised"
         return AnnotationUpdate(
@@ -1005,7 +1019,13 @@ class KnowledgeBase:
         if ratio < confidence_threshold:
             return None
 
-        ann = self._annotations.setdefault(profile.key, {})
+        existing_ann = self._annotations.get(profile.key)
+        ann_is_mutable = isinstance(existing_ann, MutableMapping)
+        ann: MutableMapping[str, object]
+        if ann_is_mutable:
+            ann = cast(MutableMapping[str, object], existing_ann)
+        else:
+            ann = {}
         previous = ann.get("operand_hint")
         previous_confidence = float(ann.get("operand_confidence", 0.0))
         previous_samples = int(ann.get("operand_samples", 0))
@@ -1024,6 +1044,8 @@ class KnowledgeBase:
                 "operand_samples": int(total_samples),
             }
         )
+        if not ann_is_mutable:
+            self._annotations[profile.key] = ann
 
         reason = "initial" if previous is None else "revised"
         return AnnotationUpdate(
@@ -1110,8 +1132,24 @@ class KnowledgeBase:
 
     def save(self) -> None:
         payload = dict(self._data)
-        payload["opcode_modes"] = {key: profile.to_json() for key, profile in self._profiles.items()}
-        payload["annotations"] = self._annotations
+        payload["opcode_modes"] = {
+            key: profile.to_json() for key, profile in self._profiles.items()
+        }
+
+        cleaned_annotations: Dict[str, object] = {}
+        stale_keys: List[str] = []
+        for key, value in self._annotations.items():
+            if isinstance(value, Mapping):
+                if value:
+                    cleaned_annotations[key] = dict(value)
+                else:
+                    stale_keys.append(key)
+            else:
+                cleaned_annotations[key] = value
+        if stale_keys:
+            for key in stale_keys:
+                self._annotations.pop(key, None)
+        payload["annotations"] = cleaned_annotations
         payload["review_tasks"] = [
             task.to_json()
             for task in sorted(
@@ -1145,8 +1183,17 @@ class KnowledgeBase:
             key_str = str(key)
             normalized = {str(field): value for field, value in payload.items()}
             self._manual_reference[key_str] = normalized
-            ann = self._annotations.setdefault(key_str, {})
-            ann.update(normalized)
+            if normalized:
+                existing_ann = self._annotations.get(key_str)
+                ann_is_mutable = isinstance(existing_ann, MutableMapping)
+                ann: MutableMapping[str, object]
+                if ann_is_mutable:
+                    ann = cast(MutableMapping[str, object], existing_ann)
+                else:
+                    ann = {}
+                ann.update(normalized)
+                if not ann_is_mutable:
+                    self._annotations[key_str] = ann
 
     def _infer_manual_annotations(
         self,
@@ -1156,7 +1203,13 @@ class KnowledgeBase:
         if profile.key in self._manual_reference:
             return []
 
-        ann = self._annotations.setdefault(profile.key, {})
+        existing_ann = self._annotations.get(profile.key)
+        ann_is_mutable = isinstance(existing_ann, MutableMapping)
+        ann: MutableMapping[str, object]
+        if ann_is_mutable:
+            ann = cast(MutableMapping[str, object], existing_ann)
+        else:
+            ann = {}
         # Skip if the opcode is already fully annotated.
         if "name" in ann and "control_flow" in ann and "summary" in ann:
             return []
@@ -1165,13 +1218,51 @@ class KnowledgeBase:
         if match is None:
             return []
 
-        manual_key, manual_payload, _score = match
+        (
+            manual_key,
+            manual_payload,
+            score,
+            structural_score,
+            has_structural_context,
+            allow_unknown_override,
+        ) = match
         updates: List[AnnotationUpdate] = []
+        modified = False
+
+        strong_fields_allowed = (
+            (
+                score >= self.MANUAL_STRICT_FIELD_SCORE
+                and (
+                    (
+                        has_structural_context
+                        and structural_score
+                        >= self.MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD
+                    )
+                    or not has_structural_context
+                )
+            )
+            or (
+                allow_unknown_override
+                and score >= self.MANUAL_UNKNOWN_OVERRIDE_SCORE
+            )
+        )
+        always_fields = ("stack_delta", "operand_hint")
+        strong_fields = (
+            "name",
+            "summary",
+            "description",
+            "comment",
+            "notes",
+            "control_flow",
+            "flow_target",
+        )
 
         def _record(field: str, value: object) -> None:
             if field in ann:
                 return
             ann[field] = value
+            nonlocal modified
+            modified = True
             updates.append(
                 AnnotationUpdate(
                     key=profile.key,
@@ -1184,24 +1275,21 @@ class KnowledgeBase:
                 )
             )
 
-        for field in (
-            "name",
-            "summary",
-            "description",
-            "comment",
-            "notes",
-            "control_flow",
-            "flow_target",
-            "stack_delta",
-            "operand_hint",
-        ):
+        for field in always_fields:
             value = manual_payload.get(field)
             if value is not None:
                 _record(field, value)
 
+        if strong_fields_allowed:
+            for field in strong_fields:
+                value = manual_payload.get(field)
+                if value is not None:
+                    _record(field, value)
+
         previous_source = ann.get("manual_source")
         if previous_source != manual_key:
             ann["manual_source"] = manual_key
+            modified = True
             updates.append(
                 AnnotationUpdate(
                     key=profile.key,
@@ -1214,6 +1302,9 @@ class KnowledgeBase:
                 )
             )
 
+        if modified and not ann_is_mutable:
+            self._annotations[profile.key] = ann
+
         return updates
 
     def _select_manual_match(
@@ -1222,12 +1313,14 @@ class KnowledgeBase:
         observation: StackObservation,
     ) -> Optional[Tuple[str, Mapping[str, object], float]]:
         operand_hint, operand_confidence = self._dominant_operand_type(profile)
-        candidates: List[Tuple[float, str, Mapping[str, object]]] = []
+        candidates: List[
+            Tuple[float, float, bool, bool, str, Mapping[str, object]]
+        ] = []
 
         for manual_key, payload in self._manual_reference.items():
             if manual_key == profile.key:
                 continue
-            score = self._score_manual_candidate(
+            score_result = self._score_manual_candidate(
                 profile,
                 observation,
                 operand_hint,
@@ -1235,18 +1328,28 @@ class KnowledgeBase:
                 manual_key,
                 payload,
             )
-            if score is None:
+            if score_result is None:
                 continue
-            candidates.append((score, manual_key, payload))
+            score, structural, has_structural, allow_override = score_result
+            candidates.append(
+                (score, structural, has_structural, allow_override, manual_key, payload)
+            )
 
         if not candidates:
             return None
 
         candidates.sort(reverse=True, key=lambda item: item[0])
-        top_score, top_key, top_payload = candidates[0]
+        top_score, top_structural, top_has_structural, top_allow_override, top_key, top_payload = candidates[0]
         if len(candidates) > 1 and top_score - candidates[1][0] < 0.5:
             return None
-        return top_key, top_payload, top_score
+        return (
+            top_key,
+            top_payload,
+            top_score,
+            top_structural,
+            top_has_structural,
+            top_allow_override,
+        )
 
     def _score_manual_candidate(
         self,
@@ -1256,8 +1359,29 @@ class KnowledgeBase:
         operand_confidence: Optional[float],
         manual_key: str,
         payload: Mapping[str, object],
-    ) -> Optional[float]:
+    ) -> Optional[Tuple[float, float, bool, bool]]:
+        unknown_ratio = observation.unknown_ratio
+        allow_unknown_override = (
+            observation.known_samples == 0
+            and (unknown_ratio is None or unknown_ratio >= 1.0)
+        )
+
+        if (
+            observation.known_samples < self.MANUAL_MIN_KNOWN_STACK_SAMPLES
+            and not allow_unknown_override
+        ):
+            return None
+
+        if (
+            unknown_ratio is not None
+            and unknown_ratio > self.MANUAL_MAX_UNKNOWN_RATIO
+            and not allow_unknown_override
+        ):
+            return None
+
         score = 0.0
+        structural_score = 0.0
+        has_structural_context = False
 
         manual_delta = payload.get("stack_delta")
         if manual_delta is not None:
@@ -1296,10 +1420,32 @@ class KnowledgeBase:
 
         reference = self._profiles.get(manual_key)
         if reference is not None:
-            score += self._relationship_similarity(profile.preceding, reference.preceding)
-            score += self._relationship_similarity(profile.following, reference.following)
+            preceding_similarity = self._relationship_similarity(
+                profile.preceding, reference.preceding
+            )
+            if profile.preceding and reference.preceding:
+                if preceding_similarity < self.MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD:
+                    return None
+                structural_score += preceding_similarity
+                has_structural_context = True
 
-        return score if score >= 1.0 else None
+            following_similarity = self._relationship_similarity(
+                profile.following, reference.following
+            )
+            if profile.following and reference.following:
+                if following_similarity < self.MANUAL_NEIGHBOUR_SIMILARITY_THRESHOLD:
+                    return None
+                structural_score += following_similarity
+                has_structural_context = True
+
+        score += structural_score
+
+        return (
+            score,
+            structural_score,
+            has_structural_context,
+            allow_unknown_override,
+        ) if score >= 1.0 else None
 
     @staticmethod
     def _relationship_similarity(counter_a: Counter, counter_b: Counter) -> float:
