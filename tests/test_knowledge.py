@@ -110,3 +110,75 @@ def test_render_merge_report_flags_conflicts(tmp_path):
 
     assert "02:00" in summary
     assert "инициировать ручной просмотр трассировки" in summary
+
+
+def test_merge_profiles_infers_manual_annotations(tmp_path):
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "AA:00": {
+                    "name": "manual_literal",
+                    "summary": "Push literal value",
+                    "stack_delta": 1,
+                    "operand_hint": "small",
+                    "control_flow": "fallthrough",
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+
+    profile = OpcodeProfile("BB:00")
+    profile.count = 8
+    profile.stack_deltas = Counter({1: 8})
+    profile.operand_types = Counter({"small": 8})
+    profile.preceding = Counter({"00:00": 4})
+    profile.following = Counter({"00:01": 4})
+
+    report = knowledge.merge_profiles([profile], min_samples=3, confidence_threshold=0.5)
+
+    metadata = knowledge.instruction_metadata("BB:00")
+    assert metadata.mnemonic == "manual_literal"
+    assert metadata.summary == "Push literal value"
+    assert metadata.stack_delta == 1
+    assert metadata.operand_hint == "small"
+
+    update_fields = {update.field for update in report.updates if update.key == "BB:00"}
+    assert "name" in update_fields
+    assert "manual_source" in update_fields
+
+
+def test_missing_operand_hint_not_queued_for_review(tmp_path):
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "CC:00": {
+                    "name": "manual_cc",
+                    "summary": "Manual without operand hint",
+                    "stack_delta": 1,
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+
+    profile = OpcodeProfile("DD:00")
+    profile.count = 6
+    profile.stack_deltas = Counter({1: 6})
+    profile.preceding = Counter({"00:00": 2})
+    profile.following = Counter({"00:01": 2})
+
+    report = knowledge.merge_profiles([profile], min_samples=3, confidence_threshold=0.5)
+
+    for task in report.review_tasks:
+        assert "operand_hint" not in task.missing_annotations
+    annotations = knowledge._annotations.get("DD:00", {})
+    assert "operand_hint" not in annotations
