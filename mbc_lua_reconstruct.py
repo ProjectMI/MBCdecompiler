@@ -81,10 +81,9 @@ def main() -> None:
 
     module_text = reconstructor.render(functions)
 
-    if args.output:
-        args.output.write_text(module_text, "utf-8")
-    else:
-        print(module_text)
+    output_path = args.output or args.mbc.with_suffix(".lua")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(module_text, "utf-8")
 
 
 if __name__ == "__main__":  # pragma: no cover
