@@ -30,6 +30,30 @@ def _make_instruction(
     )
 
 
+def _string_chunks(text: str) -> list[int]:
+    data = text.encode("ascii")
+    if len(data) % 2 == 1:
+        data += b"\x00"
+    values: list[int] = []
+    for index in range(0, len(data), 2):
+        low = data[index]
+        high = data[index + 1]
+        values.append((high << 8) | low)
+    return values
+
+
+def _extend_with_string(
+    analyzer: ManualSemanticAnalyzer,
+    instructions: list[IRInstruction],
+    offset: int,
+    text: str,
+) -> int:
+    for chunk in _string_chunks(text):
+        instructions.append(_make_instruction(analyzer, offset, "01:00", chunk, None))
+        offset += 4
+    return offset
+
+
 def test_highlevel_reconstruction_generates_control_flow(tmp_path: Path) -> None:
     kb_path = tmp_path / "kb.json"
     manual_path = tmp_path / "manual_annotations.json"
@@ -141,16 +165,11 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     knowledge = KnowledgeBase.load(kb_path)
     analyzer = ManualSemanticAnalyzer(knowledge)
 
-    block = IRBlock(
-        start=0x0000,
-        instructions=[
-            _make_instruction(analyzer, 0x0000, "01:00", 0x6548, None),
-            _make_instruction(analyzer, 0x0004, "01:00", 0x6C6C, None),
-            _make_instruction(analyzer, 0x0008, "01:00", 0x006F, None),
-            _make_instruction(analyzer, 0x000C, "02:00", 0, "return"),
-        ],
-        successors=[],
-    )
+    instructions: list[IRInstruction] = []
+    offset = 0x0000
+    offset = _extend_with_string(analyzer, instructions, offset, "Hello")
+    instructions.append(_make_instruction(analyzer, offset, "02:00", 0, "return"))
+    block = IRBlock(start=0x0000, instructions=instructions, successors=[])
     program = IRProgram(segment_index=0, blocks={block.start: block})
 
     reconstructor = HighLevelReconstructor(knowledge)
@@ -158,3 +177,61 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     rendered = reconstructor.render([function])
 
     assert 'string literal sequence: "Hello"' in rendered
+    assert "-- string literal sequences:" in rendered
+    assert '-- - 0x000000 len=5 chunks=3: "Hello"' in rendered
+
+
+def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "02:00": {
+                    "name": "return_top",
+                    "summary": "Return top value",
+                    "stack_delta": -1,
+                    "control_flow": "return",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    instructions: list[IRInstruction] = []
+    offset = 0x0000
+    offset = _extend_with_string(
+        analyzer,
+        instructions,
+        offset,
+        "Player name setting function 1.0",
+    )
+    offset = _extend_with_string(analyzer, instructions, offset, "set_name")
+    offset = _extend_with_string(analyzer, instructions, offset, "Usage:")
+    offset = _extend_with_string(
+        analyzer,
+        instructions,
+        offset,
+        "    set_name <value>,",
+    )
+    instructions.append(_make_instruction(analyzer, offset, "02:00", 0, "return"))
+
+    block = IRBlock(start=0x0000, instructions=instructions, successors=[])
+    program = IRProgram(segment_index=4, blocks={block.start: block})
+
+    reconstructor = HighLevelReconstructor(knowledge)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert function.name == "set_name"
+    assert "function set_name()" in rendered
+    assert "-- string literal sequences:" in rendered
