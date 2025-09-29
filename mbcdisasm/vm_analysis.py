@@ -14,7 +14,6 @@ import json
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .literal_analysis import LiteralAnalyzer, LiteralDiagnostic, LiteralValue
 from .manual_semantics import InstructionSemantics
 
 
@@ -230,7 +229,6 @@ class VirtualMachineAnalyzer:
 
     def __init__(self, *, counter_start: int = 0) -> None:
         self._value_counter = counter_start
-        self._literal_formatter = LuaLiteralFormatter()
 
     def trace_block(self, block) -> VMBlockTrace:
         state = VMStackState(counter_start=self._value_counter)
@@ -276,9 +274,7 @@ class VirtualMachineAnalyzer:
         )
         operand_literal: Optional[str] = None
         if semantics.uses_operand:
-            operand_literal = self._literal_formatter.format_operand(
-                instruction.operand, semantics
-            )
+            operand_literal = _format_operand(instruction.operand)
         call_expression = _format_call(semantics, inputs, operand_literal)
         comment = _format_comment(semantics)
         return VMOperation(
@@ -371,6 +367,16 @@ def render_value_lifetimes(lifetimes: Dict[str, VMLifetime]) -> List[str]:
     return lines
 
 
+def _format_operand(operand: int) -> str:
+    signed = operand if operand < 0x8000 else operand - 0x10000
+    if -9 <= signed <= 9:
+        return str(signed)
+    text = _ascii_candidate(operand)
+    if text is not None:
+        return _lua_string(text)
+    return f"0x{operand:04X}"
+
+
 def _format_call(
     semantics: InstructionSemantics,
     inputs: Sequence[VMStackValue],
@@ -429,36 +435,25 @@ def _sanitize_identifier(name: str) -> str:
     return identifier
 
 
+def _ascii_candidate(operand: int) -> Optional[str]:
+    raw = operand.to_bytes(2, "little")
+    if all(32 <= byte <= 126 for byte in raw):
+        return raw.decode("ascii")
+    if raw[1] == 0 and 32 <= raw[0] <= 126:
+        return chr(raw[0])
+    return None
+
+
+def _lua_string(text: str) -> str:
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 class LuaLiteralFormatter:
     """Utility class mirroring the operand formatting used by the VM layer."""
 
-    def __init__(self, analyzer: Optional[LiteralAnalyzer] = None) -> None:
-        self._analyzer = analyzer or LiteralAnalyzer()
-
-    @property
-    def analyzer(self) -> LiteralAnalyzer:
-        """Expose the underlying :class:`LiteralAnalyzer` instance."""
-
-        return self._analyzer
-
-    def analyse_operand(
-        self, operand: int, semantics: Optional[InstructionSemantics] = None
-    ) -> LiteralValue:
-        """Return the structured literal representation for ``operand``."""
-
-        return self._analyzer.analyse(operand, semantics)
-
-    def analyse_with_diagnostics(
-        self, operand: int, semantics: Optional[InstructionSemantics] = None
-    ) -> LiteralDiagnostic:
-        """Return the literal and the decision trace used to obtain it."""
-
-        return self._analyzer.analyse_with_diagnostics(operand, semantics)
-
-    def format_operand(
-        self, operand: int, semantics: Optional[InstructionSemantics] = None
-    ) -> str:
-        return self.analyse_operand(operand, semantics).render()
+    def format_operand(self, operand: int) -> str:
+        return _format_operand(operand)
 
 
 def format_vm_block_trace(trace: VMBlockTrace) -> List[str]:

@@ -75,12 +75,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Suppress the module-level summary comment block",
     )
-    parser.add_argument(
-        "--literal-report",
-        type=Path,
-        default=None,
-        help="Write literal analysis diagnostics to the provided JSON file",
-    )
     return parser.parse_args()
 
 
@@ -131,12 +125,6 @@ def main() -> None:
     output_path = args.output or args.mbc.with_suffix(".lua")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(module_text, "utf-8")
-
-    if args.literal_report is not None:
-        report_path = args.literal_report
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_payload = reconstructor.literal_report.to_json()
-        report_path.write_text(report_payload, "utf-8")
 
 
 if __name__ == "__main__":  # pragma: no cover
