@@ -16,6 +16,7 @@ from mbcdisasm import (
     Segment,
     SegmentClassifier,
 )
+from mbcdisasm.data_segments import render_data_summaries, summarise_data_segments
 from mbcdisasm.highlevel import HighLevelReconstructor, HighLevelFunction
 from mbcdisasm.lua_formatter import LuaRenderOptions
 
@@ -75,6 +76,79 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Suppress the module-level summary comment block",
     )
+    parser.add_argument(
+        "--min-string-length",
+        type=int,
+        default=4,
+        help="Minimum length for printable strings extracted from data segments",
+    )
+    parser.add_argument(
+        "--data-hex-bytes",
+        type=int,
+        default=128,
+        help="Maximum number of bytes to include in each data segment hex preview",
+    )
+    parser.add_argument(
+        "--data-hex-width",
+        type=int,
+        default=16,
+        help="Number of bytes per row when rendering hex previews",
+    )
+    parser.add_argument(
+        "--no-data-hex",
+        action="store_true",
+        help="Skip hex previews when rendering data segments",
+    )
+    parser.add_argument(
+        "--data-histogram",
+        type=int,
+        default=6,
+        help="Number of dominant byte values to keep per data segment",
+    )
+    parser.add_argument(
+        "--data-run-threshold",
+        type=int,
+        default=8,
+        help="Minimum length for repeated byte runs to be reported",
+    )
+    parser.add_argument(
+        "--data-max-runs",
+        type=int,
+        default=3,
+        help="Maximum number of repeated byte runs to retain per segment",
+    )
+    parser.add_argument(
+        "--string-table",
+        action="store_true",
+        help="Aggregate repeated strings across segments and render a lookup table",
+    )
+    parser.add_argument(
+        "--string-table-min-occurrences",
+        type=int,
+        default=2,
+        help="Minimum number of occurrences for strings to appear in the aggregated table",
+    )
+    parser.add_argument(
+        "--data-stats",
+        action="store_true",
+        help="Include a statistical breakdown of the collected data segments",
+    )
+    parser.add_argument(
+        "--emit-data-table",
+        action="store_true",
+        help="Emit a Lua table describing data segments alongside comment summaries",
+    )
+    parser.add_argument(
+        "--data-table-name",
+        type=str,
+        default="__data_segments",
+        help="Name of the Lua table emitted when --emit-data-table is set",
+    )
+    parser.add_argument(
+        "--data-table-return",
+        action="store_true",
+        help="Append a return statement for the generated data table",
+    )
     return parser.parse_args()
 
 
@@ -121,6 +195,53 @@ def main() -> None:
         functions.append(reconstructor.from_ir(program))
 
     module_text = reconstructor.render(functions)
+
+    data_summaries = summarise_data_segments(
+        container.segments(),
+        min_length=args.min_string_length,
+        preview_bytes=args.data_hex_bytes,
+        preview_width=args.data_hex_width,
+        histogram_limit=args.data_histogram,
+        run_threshold=args.data_run_threshold,
+        max_runs=args.data_max_runs,
+    )
+    data_section = render_data_summaries(
+        data_summaries, include_hex=not args.no_data_hex
+    )
+    if data_section:
+        module_text = module_text.rstrip() + "\n\n" + data_section
+
+    if args.data_stats:
+        from mbcdisasm.data_segments import compute_segment_statistics, render_segment_statistics
+
+        stats = compute_segment_statistics(data_summaries)
+        stats_section = render_segment_statistics(stats)
+        if stats_section:
+            module_text = module_text.rstrip() + "\n\n" + stats_section
+
+    if args.string_table:
+        from mbcdisasm.data_segments import aggregate_strings, render_string_table
+
+        aggregated = aggregate_strings(
+            data_summaries, min_occurrences=args.string_table_min_occurrences
+        )
+        table_section = render_string_table(aggregated)
+        if table_section:
+            module_text = module_text.rstrip() + "\n\n" + table_section
+
+    if args.emit_data_table:
+        from mbcdisasm.data_segments import render_data_table
+
+        table_text = render_data_table(
+            data_summaries,
+            table_name=args.data_table_name,
+            include_strings=True,
+            include_histogram=True,
+            include_runs=True,
+            return_table=args.data_table_return,
+        )
+        if table_text:
+            module_text = module_text.rstrip() + "\n\n" + table_text
 
     output_path = args.output or args.mbc.with_suffix(".lua")
     output_path.parent.mkdir(parents=True, exist_ok=True)

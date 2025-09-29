@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mbcdisasm.highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from mbcdisasm.highlevel import (
+    FunctionMetadata,
+    HighLevelFunction,
+    HighLevelReconstructor,
+    StringLiteralSequence,
+)
 from mbcdisasm.lua_ast import Assignment, LiteralExpr, NameExpr, ReturnStatement, wrap_block
 from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
 from mbcdisasm.lua_formatter import (
@@ -184,6 +189,25 @@ def test_highlevel_function_summary_and_warnings() -> None:
     assert "-- stack reconstruction warnings:" in rendered
     assert "-- - stack underflow" in rendered
     assert "function segment_001()" in rendered
+
+
+def test_highlevel_function_string_metadata_block() -> None:
+    sequence = StringLiteralSequence(text="demo string", offsets=(0x1234, 0x1238))
+    metadata = FunctionMetadata(
+        block_count=1,
+        instruction_count=2,
+        string_sequences=[sequence],
+    )
+    function = HighLevelFunction(
+        name="segment_demo",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata,
+    )
+    rendered = function.render().splitlines()
+    assert "-- function summary:" in rendered
+    assert "-- - string literal sequences: 1" in rendered
+    assert "-- string literal sequences:" in rendered
+    assert '-- - 0x001234 len=11 chunks=2: "demo string"' in rendered
 
 
 def test_module_summary_toggle(tmp_path: Path) -> None:

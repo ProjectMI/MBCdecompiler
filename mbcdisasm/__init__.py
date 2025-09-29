@@ -19,8 +19,14 @@ from .ir import IRBuilder, IRProgram, write_ir_programs
 from .emulator import Emulator, EmulationReport, write_emulation_reports
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .ast import LuaReconstructor
-from .highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from .highlevel import (
+    FunctionMetadata,
+    HighLevelFunction,
+    HighLevelReconstructor,
+    StringLiteralSequence,
+)
 from .lua_formatter import LuaRenderOptions
+from .lua_literals import LuaLiteralFormatter
 from .segment_classifier import SegmentClassifier
 from .manual_semantics import (
     AnnotatedInstruction,
@@ -29,7 +35,6 @@ from .manual_semantics import (
     StackEffect,
 )
 from .vm_analysis import (
-    LuaLiteralFormatter,
     VMBlockTrace,
     VMInstructionState,
     VMInstructionTrace,
@@ -82,6 +87,7 @@ __all__ = [
     "LuaReconstructor",
     "HighLevelFunction",
     "HighLevelReconstructor",
+    "StringLiteralSequence",
     "FunctionMetadata",
     "LuaRenderOptions",
     "SegmentClassifier",
