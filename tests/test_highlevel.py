@@ -108,4 +108,13 @@ def test_highlevel_reconstruction_generates_control_flow(tmp_path: Path) -> None
     assert "local State =" in rendered
     assert "if cmp_" in rendered
     assert "while" not in rendered  # forward branch only
-    assert "return literal_" in rendered or "return State" in rendered
+    assert (
+        "return literal_" in rendered
+        or "return text_" in rendered
+        or "return enum_" in rendered
+        or "return State" in rendered
+    )
+
+    stats = reconstructor.literal_report.statistics()
+    assert stats.total == 3
+    assert stats.by_category.get("ENUM", 0) == 3

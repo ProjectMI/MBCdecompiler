@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .ir import IRBlock, IRInstruction, IRProgram
+from .literal_analysis import LiteralCategory, LiteralReportBuilder, LiteralValue
 from .knowledge import KnowledgeBase
 from .lua_ast import (
     Assignment,
@@ -58,8 +59,10 @@ class HighLevelStack:
         self._counter += 1
         return name
 
-    def push_literal(self, expression: LuaExpression) -> Tuple[List[LuaStatement], NameExpr]:
-        name = self.new_symbol("literal")
+    def push_literal(
+        self, expression: LuaExpression, *, prefix: str = "literal"
+    ) -> Tuple[List[LuaStatement], NameExpr]:
+        name = self.new_symbol(prefix)
         target = NameExpr(name)
         statement = Assignment([target], expression, is_local=True)
         self._values.append(target)
@@ -416,6 +419,7 @@ class HighLevelReconstructor:
     ) -> None:
         self.knowledge = knowledge
         self._literal_formatter = LuaLiteralFormatter()
+        self._literal_report = LiteralReportBuilder(self._literal_formatter.analyzer)
         self._enum_registry = EnumRegistry()
         self._comment_formatter = CommentFormatter()
         self._helper_registry = HelperRegistry()
@@ -465,6 +469,13 @@ class HighLevelReconstructor:
         return join_sections(sections)
 
     # ------------------------------------------------------------------
+    @property
+    def literal_report(self) -> LiteralReportBuilder:
+        """Return the report builder collecting literals across reconstructions."""
+
+        return self._literal_report
+
+    # ------------------------------------------------------------------
     def _register_enums(self, semantics: InstructionSemantics) -> None:
         if semantics.enum_namespace and semantics.enum_values:
             for value, label in semantics.enum_values.items():
@@ -477,9 +488,15 @@ class HighLevelReconstructor:
         semantics: InstructionSemantics,
         translator: BlockTranslator,
     ) -> List[LuaStatement]:
-        operand = self._operand_expression(semantics, instruction.operand)
-        statements, _ = translator.stack.push_literal(operand)
+        diagnostic = self._literal_formatter.analyse_with_diagnostics(
+            instruction.operand, semantics
+        )
+        literal_value = diagnostic.value
+        operand = self._expression_from_literal_value(literal_value)
+        prefix = self._literal_prefix(literal_value)
+        statements, _ = translator.stack.push_literal(operand, prefix=prefix)
         translator.literal_count += 1
+        self._literal_report.add_value(literal_value, diagnostic=diagnostic)
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_comparison(
@@ -634,13 +651,26 @@ class HighLevelReconstructor:
     def _operand_expression(
         self, semantics: InstructionSemantics, operand: int
     ) -> LuaExpression:
-        if semantics.enum_values and operand in semantics.enum_values:
-            label = semantics.enum_values[operand]
-            if semantics.enum_namespace:
-                return NameExpr(f"{semantics.enum_namespace}.{label}")
-            return NameExpr(label)
-        literal = self._literal_formatter.format_operand(operand)
-        return LiteralExpr(literal)
+        literal_value = self._literal_formatter.analyse_operand(operand, semantics)
+        return self._expression_from_literal_value(literal_value)
+
+    def _expression_from_literal_value(self, value: LiteralValue) -> LuaExpression:
+        if value.category is LiteralCategory.ENUM:
+            return NameExpr(value.text)
+        return LiteralExpr(value.render())
+
+    def _literal_prefix(self, value: LiteralValue) -> str:
+        if value.category in (LiteralCategory.STRING, LiteralCategory.CONTROL):
+            return "text"
+        if value.category is LiteralCategory.BOOLEAN:
+            return "flag"
+        if value.category is LiteralCategory.ENUM:
+            return "enum"
+        if value.category is LiteralCategory.MASK:
+            return "mask"
+        if value.category is LiteralCategory.HEX:
+            return "const"
+        return "literal"
 
     # ------------------------------------------------------------------
     def _decorate_with_comment(
