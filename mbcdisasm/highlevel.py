@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -46,29 +43,34 @@ from .lua_formatter import (
 )
 from .manual_semantics import InstructionSemantics
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
+from .string_utils import StackNameAllocator, StringNameSuggester
 from .vm_analysis import estimate_stack_io
 
 
 class HighLevelStack:
     """Track symbolic stack values during reconstruction."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, allocator: Optional[StackNameAllocator] = None) -> None:
         self._values: List[NameExpr] = []
-        self._counter = 0
+        self._allocator = allocator or StackNameAllocator()
+        self._value_hints: Dict[int, str] = {}
         self.warnings: List[str] = []
 
-    def new_symbol(self, prefix: str = "value") -> str:
-        name = f"{prefix}_{self._counter}"
-        self._counter += 1
-        return name
+    def new_symbol(self, prefix: str = "value", *, hint: Optional[str] = None) -> str:
+        return self._allocator.allocate(prefix, hint)
 
     def push_literal(
-        self, expression: LuaExpression, *, prefix: Optional[str] = None
+        self,
+        expression: LuaExpression,
+        *,
+        prefix: Optional[str] = None,
+        name_hint: Optional[str] = None,
     ) -> Tuple[List[LuaStatement], NameExpr]:
-        name = self.new_symbol(prefix or "literal")
+        name = self.new_symbol(prefix or "literal", hint=name_hint)
         target = NameExpr(name)
         statement = Assignment([target], expression, is_local=True)
         self._values.append(target)
+        self._register_hint(target, name_hint)
         return [statement], target
 
     def push_expression(
@@ -77,37 +79,70 @@ class HighLevelStack:
         *,
         prefix: str = "tmp",
         make_local: bool = False,
+        name_hint: Optional[str] = None,
     ) -> Tuple[List[LuaStatement], NameExpr]:
         if make_local:
-            name = self.new_symbol(prefix)
+            name = self.new_symbol(prefix, hint=name_hint)
             target = NameExpr(name)
             statement = Assignment([target], expression, is_local=True)
             self._values.append(target)
+            self._register_hint(target, name_hint)
             return [statement], target
         if isinstance(expression, NameExpr):
             self._values.append(expression)
             return [], expression
-        name = self.new_symbol(prefix)
+        name = self.new_symbol(prefix, hint=name_hint)
         target = NameExpr(name)
         statement = Assignment([target], expression, is_local=True)
         self._values.append(target)
+        self._register_hint(target, name_hint)
         return [statement], target
 
+    def rename_symbol(self, target: NameExpr, hint: str) -> None:
+        if not hint:
+            return
+        new_name = self._allocator.reserve(hint)
+        if new_name:
+            target.name = new_name
+            self._register_hint(target, hint)
+
+    def get_hint(self, expression: LuaExpression) -> Optional[str]:
+        if isinstance(expression, NameExpr):
+            return self._value_hints.get(id(expression))
+        return None
+
+    def _register_hint(self, target: NameExpr, hint: Optional[str]) -> None:
+        if hint:
+            self._value_hints[id(target)] = hint
+
     def push_call_results(
-        self, expression: CallExpr, outputs: int, prefix: str = "result"
+        self,
+        expression: CallExpr,
+        outputs: int,
+        prefix: str = "result",
+        name_hints: Optional[Sequence[Optional[str]]] = None,
     ) -> Tuple[List[LuaStatement], List[NameExpr]]:
         if outputs <= 0:
             return [], []
+        hints = list(name_hints or [])
         if outputs == 1:
-            name = self.new_symbol(prefix)
+            hint = hints[0] if hints else None
+            name = self.new_symbol(prefix, hint=hint)
             target = NameExpr(name)
             stmt = Assignment([target], expression, is_local=True)
             self._values.append(target)
+            self._register_hint(target, hint)
             return [stmt], [target]
-        targets = [NameExpr(self.new_symbol(prefix)) for _ in range(outputs)]
+        targets: List[NameExpr] = []
+        for index in range(outputs):
+            hint = hints[index] if index < len(hints) else None
+            name = self.new_symbol(prefix, hint=hint)
+            targets.append(NameExpr(name))
         stmt = MultiAssignment(targets, [expression], is_local=True)
-        for target in targets:
+        for index, target in enumerate(targets):
             self._values.append(target)
+            hint = hints[index] if index < len(hints) else None
+            self._register_hint(target, hint)
         return [stmt], targets
 
     def pop_single(self) -> NameExpr:
@@ -163,14 +198,38 @@ class StringLiteralSequence:
         return self.text[: limit - 3] + "..."
 
 
+@dataclass(frozen=True)
+class NamedStringSequence:
+    """Pair a collected string literal sequence with an assigned variable name."""
+
+    sequence: StringLiteralSequence
+    name: str
+
+    def preview_line(self, limit: int = 72) -> str:
+        text = escape_lua_string(self.sequence.preview(limit))
+        return (
+            f"- {self.name}: 0x{self.sequence.start_offset:06X}"
+            f" len={self.sequence.length()} chunks={self.sequence.chunk_count()}"
+            f" -> {text}"
+        )
+
+
 class StringLiteralCollector:
     """Group consecutive string literal assignments into annotated sequences."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        hint_provider: Optional[StringNameSuggester] = None,
+        stack: Optional[HighLevelStack] = None,
+    ) -> None:
         self._pending: List[List[LuaStatement]] = []
         self._fragments: List[str] = []
         self._offsets: List[int] = []
         self._sequences: List[StringLiteralSequence] = []
+        self._hint_provider = hint_provider
+        self._stack = stack
+        self._applied_hints: List[Tuple[StringLiteralSequence, str]] = []
 
     def reset(self) -> None:
         self._pending.clear()
@@ -198,6 +257,12 @@ class StringLiteralCollector:
         combined = "".join(self._fragments)
         sequence = StringLiteralSequence(text=combined, offsets=tuple(self._offsets))
         self._sequences.append(sequence)
+        if self._hint_provider is not None and self._stack is not None:
+            hint = self._hint_provider.literal_hint(combined)
+            target = self._first_assignment_target()
+            if hint and target is not None:
+                self._stack.rename_symbol(target, hint)
+                self._applied_hints.append((sequence, hint))
         comment = CommentStatement(
             f"string literal sequence: {escape_lua_string(combined)}"
             f" (len={len(combined)})"
@@ -217,6 +282,26 @@ class StringLiteralCollector:
         sequences = list(self._sequences)
         self._sequences.clear()
         return sequences
+
+    def drain_named_sequences(self) -> List[NamedStringSequence]:
+        if not self._applied_hints:
+            return []
+        named = [NamedStringSequence(sequence=seq, name=name) for seq, name in self._applied_hints]
+        self._applied_hints.clear()
+        return named
+
+    def _first_assignment_target(self) -> Optional[NameExpr]:
+        for group in self._pending:
+            for statement in group:
+                if isinstance(statement, Assignment) and statement.targets:
+                    target = statement.targets[0]
+                    if isinstance(target, NameExpr):
+                        return target
+                if isinstance(statement, MultiAssignment) and statement.targets:
+                    target = statement.targets[0]
+                    if isinstance(target, NameExpr):
+                        return target
+        return None
 
     @staticmethod
     def _string_value(expression: LuaExpression) -> Optional[str]:
@@ -238,6 +323,7 @@ class FunctionMetadata:
     branch_count: int = 0
     literal_count: int = 0
     string_sequences: Sequence[StringLiteralSequence] = field(default_factory=tuple)
+    named_strings: Sequence[NamedStringSequence] = field(default_factory=tuple)
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
@@ -250,6 +336,8 @@ class FunctionMetadata:
             lines.append(
                 f"- string literal sequences: {len(self.string_sequences)}"
             )
+        if self.named_strings:
+            lines.append(f"- named string hints: {len(self.named_strings)}")
         return lines
 
     def warning_lines(self) -> List[str]:
@@ -264,14 +352,26 @@ class FunctionMetadata:
         for sequence in list(self.string_sequences)[:limit]:
             text = escape_lua_string(sequence.preview(preview))
             lines.append(
-                "- 0x"
-                f"{sequence.start_offset:06X}"
+                f"- 0x{sequence.start_offset:06X}"
                 f" len={sequence.length()}"
                 f" chunks={sequence.chunk_count()}: {text}"
             )
         remaining = len(self.string_sequences) - limit
         if remaining > 0:
             lines.append(f"- ... ({remaining} additional sequences)")
+        return lines
+
+    def named_string_lines(
+        self, *, limit: int = 6, preview: int = 72
+    ) -> List[str]:
+        if not self.named_strings:
+            return []
+        lines: List[str] = []
+        for item in list(self.named_strings)[:limit]:
+            lines.append(item.preview_line(preview))
+        remaining = len(self.named_strings) - limit
+        if remaining > 0:
+            lines.append(f"- ... ({remaining} additional named strings)")
         return lines
 
 
@@ -288,6 +388,10 @@ class HighLevelFunction:
         summary = self.metadata.summary_lines()
         if summary:
             writer.write_comment_block(summary)
+            writer.write_line("")
+        named_lines = self.metadata.named_string_lines()
+        if named_lines:
+            writer.write_comment_block(["string literal names:"] + named_lines)
             writer.write_line("")
         string_lines = self.metadata.string_lines()
         if string_lines:
@@ -348,9 +452,12 @@ class BlockTranslator:
     def __init__(self, reconstructor: "HighLevelReconstructor", program: IRProgram) -> None:
         self._reconstructor = reconstructor
         self._program = program
-        self._stack = HighLevelStack()
-        self._string_collector = StringLiteralCollector()
+        self._stack = HighLevelStack(allocator=StackNameAllocator())
+        self._string_collector = StringLiteralCollector(
+            hint_provider=reconstructor._string_suggester, stack=self._stack
+        )
         self._collected_sequences: List[StringLiteralSequence] = []
+        self._named_sequences: List[NamedStringSequence] = []
         self.literal_count = 0
         self.helper_calls = 0
         self.branch_count = 0
@@ -427,6 +534,7 @@ class BlockTranslator:
             )
         statements.extend(self._string_collector.finalize())
         self._collected_sequences.extend(self._string_collector.drain_sequences())
+        self._named_sequences.extend(self._string_collector.drain_named_sequences())
         if terminator is None:
             target = block.successors[0] if block.successors else fallthrough
             terminator = JumpTerminator(target=target, fallthrough=fallthrough, comment=None)
@@ -449,6 +557,10 @@ class BlockTranslator:
     @property
     def string_sequences(self) -> List[StringLiteralSequence]:
         return list(self._collected_sequences)
+
+    @property
+    def named_sequences(self) -> List[NamedStringSequence]:
+        return list(self._named_sequences)
 
 
 class ControlFlowStructurer:
@@ -569,6 +681,7 @@ class HighLevelReconstructor:
         self.options = options or LuaRenderOptions()
         self._last_summary: Optional[str] = None
         self._used_function_names: Set[str] = set()
+        self._string_suggester = StringNameSuggester()
 
     # ------------------------------------------------------------------
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
@@ -581,6 +694,10 @@ class HighLevelReconstructor:
         string_sequences = sorted(
             translator.string_sequences, key=lambda seq: (seq.start_offset, seq.chunk_count())
         )
+        named_sequences = sorted(
+            translator.named_sequences,
+            key=lambda item: (item.sequence.start_offset, item.sequence.chunk_count()),
+        )
         base_name = self._derive_function_name(program, string_sequences)
         function_name = self._unique_function_name(base_name)
         metadata = FunctionMetadata(
@@ -591,6 +708,7 @@ class HighLevelReconstructor:
             branch_count=translator.branch_count,
             literal_count=translator.literal_count,
             string_sequences=tuple(string_sequences),
+            named_strings=tuple(named_sequences),
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
@@ -634,14 +752,19 @@ class HighLevelReconstructor:
     ) -> Tuple[List[LuaStatement], LuaExpression]:
         operand = operand_expr or self._operand_expression(semantics, instruction.operand)
         prefix: Optional[str] = None
+        name_hint: Optional[str] = None
         if isinstance(operand, LiteralExpr):
             if operand.kind == "string":
                 prefix = "string"
+                if operand.literal is not None:
+                    name_hint = self._string_suggester.literal_hint(str(operand.literal.value))
             elif operand.kind == "number":
                 prefix = "literal"
         elif isinstance(operand, NameExpr):
             prefix = "enum"
-        statements, _ = translator.stack.push_literal(operand, prefix=prefix)
+        statements, _ = translator.stack.push_literal(
+            operand, prefix=prefix, name_hint=name_hint
+        )
         translator.literal_count += 1
         decorated = self._decorate_with_comment(statements, semantics)
         return decorated, operand
@@ -655,8 +778,83 @@ class HighLevelReconstructor:
         lhs, rhs = translator.stack.pop_pair()
         operator = semantics.comparison_operator or "=="
         expression = BinaryExpr(lhs, operator, rhs)
-        statements, _ = translator.stack.push_expression(expression, prefix="cmp", make_local=True)
+        name_hint = self._comparison_name_hint(
+            translator.stack.get_hint(lhs), translator.stack.get_hint(rhs), operator
+        )
+        statements, _ = translator.stack.push_expression(
+            expression, prefix="cmp", make_local=True, name_hint=name_hint
+        )
         return self._decorate_with_comment(statements, semantics)
+
+    def _comparison_name_hint(
+        self,
+        lhs_hint: Optional[str],
+        rhs_hint: Optional[str],
+        operator: str,
+    ) -> Optional[str]:
+        hints = [hint for hint in (lhs_hint, rhs_hint) if hint]
+        if not hints:
+            return None
+        if operator == "==":
+            return f"is_{hints[0]}"
+        if operator == "~=":
+            return f"not_{hints[0]}"
+        token = self._comparison_token(operator)
+        if len(hints) >= 2:
+            return f"{hints[0]}_{token}_{hints[1]}"
+        return f"{hints[0]}_{token}"
+
+    @staticmethod
+    def _comparison_token(operator: str) -> str:
+        mapping = {
+            "==": "eq",
+            "~=": "ne",
+            "<": "lt",
+            "<=": "le",
+            ">": "gt",
+            ">=": "ge",
+        }
+        return mapping.get(operator, "cmp")
+
+    def _argument_hints(
+        self, args: Sequence[LuaExpression], translator: BlockTranslator
+    ) -> List[Optional[str]]:
+        hints: List[Optional[str]] = []
+        for arg in args:
+            hint = translator.stack.get_hint(arg)
+            if hint is not None:
+                hints.append(hint)
+                continue
+            if isinstance(arg, LiteralExpr):
+                literal = arg.literal
+                if literal is not None and literal.kind == "string":
+                    hints.append(self._string_suggester.literal_hint(str(literal.value)))
+                    continue
+            hints.append(None)
+        return hints
+
+    def _call_result_hints(
+        self,
+        outputs: int,
+        arg_hints: Sequence[Optional[str]],
+        semantics: InstructionSemantics,
+    ) -> List[Optional[str]]:
+        if outputs <= 0:
+            return []
+        base_hint = next((hint for hint in arg_hints if hint), None)
+        if base_hint is None:
+            return [None] * outputs
+        mnemonic = semantics.mnemonic or ""
+        if mnemonic.startswith("is_"):
+            base_hint = f"is_{base_hint}"
+        elif mnemonic.startswith("has_"):
+            base_hint = f"has_{base_hint}"
+        elif mnemonic.startswith("get_"):
+            base_hint = base_hint
+        hints = [base_hint]
+        while len(hints) < outputs:
+            hints.append(None)
+        return hints
 
     def _translate_branch(
         self,
@@ -703,6 +901,7 @@ class HighLevelReconstructor:
         args = translator.stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
+        arg_hints = self._argument_hints(args, translator)
         method = _snake_to_camel(semantics.mnemonic)
         target = NameExpr(semantics.struct_context or "struct")
         call_expr = MethodCallExpr(target, method, args)
@@ -718,7 +917,10 @@ class HighLevelReconstructor:
         self._helper_registry.register_method(signature)
         translator.helper_calls += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs, prefix="struct")
+            result_hints = self._call_result_hints(outputs, arg_hints, semantics)
+            statements, _ = translator.stack.push_call_results(
+                call_expr, outputs, prefix="struct", name_hints=result_hints
+            )
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -733,6 +935,7 @@ class HighLevelReconstructor:
         args = translator.stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
+        arg_hints = self._argument_hints(args, translator)
         call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
         signature = HelperSignature(
             name=semantics.mnemonic,
@@ -746,7 +949,10 @@ class HighLevelReconstructor:
         if outputs <= 0:
             statements = [CallStatement(call_expr)]
         else:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            result_hints = self._call_result_hints(outputs, arg_hints, semantics)
+            statements, _ = translator.stack.push_call_results(
+                call_expr, outputs, name_hints=result_hints
+            )
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_generic(
@@ -759,6 +965,7 @@ class HighLevelReconstructor:
         args = translator.stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
+        arg_hints = self._argument_hints(args, translator)
         call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
         signature = HelperSignature(
             name=semantics.mnemonic,
@@ -770,7 +977,10 @@ class HighLevelReconstructor:
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            result_hints = self._call_result_hints(outputs, arg_hints, semantics)
+            statements, _ = translator.stack.push_call_results(
+                call_expr, outputs, name_hints=result_hints
+            )
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -852,6 +1062,9 @@ class HighLevelReconstructor:
         string_total = sum(len(func.metadata.string_sequences) for func in functions)
         if string_total:
             lines.append(f"- string literal sequences: {string_total}")
+        named_total = sum(len(func.metadata.named_strings) for func in functions)
+        if named_total:
+            lines.append(f"- named string hints: {named_total}")
         return lines
 
     def _derive_function_name(
@@ -859,98 +1072,11 @@ class HighLevelReconstructor:
         program: IRProgram,
         sequences: Sequence[StringLiteralSequence],
     ) -> str:
-        candidate = self._select_string_name(program, sequences)
+        entry_offset = min(program.blocks) if program.blocks else 0
+        candidate = self._string_suggester.function_name(sequences, entry_offset)
         if candidate:
             return candidate
         return f"segment_{program.segment_index:03d}"
-
-    def _select_string_name(
-        self,
-        program: IRProgram,
-        sequences: Sequence[StringLiteralSequence],
-    ) -> Optional[str]:
-        if not sequences:
-            return None
-        entry_offset = min(program.blocks) if program.blocks else 0
-        raw_candidates: List[Tuple[StringLiteralSequence, str, int]] = []
-        frequency: Counter[str] = Counter()
-        for sequence in sequences:
-            text = sequence.text.strip()
-            if text and not any(ch.isspace() for ch in text):
-                sanitized = _sanitize_identifier(text)
-                if sanitized and sanitized.lower() not in _STRING_NAME_STOPWORDS:
-                    key = sanitized.lower()
-                    raw_candidates.append((sequence, sanitized, sequence.start_offset))
-                    frequency[key] += 1
-            for token, token_offset in _identifier_tokens(sequence):
-                sanitized = _sanitize_identifier(token)
-                if not sanitized:
-                    continue
-                lowered = sanitized.lower()
-                if lowered in _STRING_NAME_STOPWORDS:
-                    continue
-                raw_candidates.append((sequence, sanitized, token_offset))
-                frequency[lowered] += 1
-        if not raw_candidates:
-            return None
-        candidates: List[Tuple[Tuple[int, int, int, int, int, str], str]] = []
-        seen: set[str] = set()
-        for sequence, sanitized, offset in raw_candidates:
-            lowered = sanitized.lower()
-            if sanitized in seen:
-                continue
-            count = frequency[lowered]
-            score = self._score_name_candidate(
-                sequence,
-                sanitized,
-                entry_offset,
-                count=count,
-                candidate_offset=offset,
-            )
-            candidates.append((score, sanitized))
-            seen.add(sanitized)
-        if not candidates:
-            return None
-        candidates.sort(key=lambda item: item[0])
-        selected = candidates[0][1]
-        if selected.lower() in _LUA_KEYWORDS:
-            selected = f"{selected}_fn"
-        return selected
-
-    def _score_name_candidate(
-        self,
-        sequence: StringLiteralSequence,
-        sanitized: str,
-        entry_offset: int,
-        *,
-        count: int = 1,
-        candidate_offset: Optional[int] = None,
-    ) -> Tuple[int, int, int, int, int, str]:
-        offset = candidate_offset if candidate_offset is not None else sequence.start_offset
-        distance = max(0, offset - entry_offset)
-        underscore_penalty = 0 if "_" in sanitized else 1
-        lower = sum(1 for ch in sanitized if ch.islower())
-        upper = sum(1 for ch in sanitized if ch.isupper())
-        if lower and upper:
-            case_penalty = 0
-        elif lower:
-            case_penalty = 1
-        elif upper:
-            case_penalty = 2
-        else:
-            case_penalty = 3
-        digit_penalty = sum(1 for ch in sanitized if ch.isdigit())
-        length_penalty = len(sanitized)
-        tie_breaker = sanitized.lower()
-        return (
-            -count,
-            underscore_penalty,
-            distance,
-            case_penalty,
-            digit_penalty,
-            length_penalty,
-            tie_breaker,
-        )
 
     def _unique_function_name(self, base: str) -> str:
         candidate = base
@@ -960,107 +1086,6 @@ class HighLevelReconstructor:
             index += 1
         self._used_function_names.add(candidate)
         return candidate
-
-_LUA_KEYWORDS = {
-    "and",
-    "break",
-    "do",
-    "else",
-    "elseif",
-    "end",
-    "false",
-    "for",
-    "function",
-    "goto",
-    "if",
-    "in",
-    "local",
-    "nil",
-    "not",
-    "or",
-    "repeat",
-    "return",
-    "then",
-    "true",
-    "until",
-    "while",
-}
-
-_STRING_NAME_STOPWORDS = {"usage", "warning"}
-
-
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
-
-
-def _identifier_tokens(
-    sequence: StringLiteralSequence,
-) -> Iterable[Tuple[str, int]]:
-    text = sequence.text
-    if not text:
-        return []
-    offsets = sequence.offsets
-    limit = len(offsets) - 1
-    results: List[Tuple[str, int]] = []
-    for match in _IDENTIFIER_PATTERN.finditer(text):
-        start = match.start()
-        # Align tokens to instruction boundaries to avoid partial fragments.
-        if start % 2 != 0:
-            continue
-        chunk_index = start // 2
-        if chunk_index > limit:
-            chunk_index = limit
-        token = match.group(0)
-        underscore_index = token.find("_")
-        include_full = True
-        if underscore_index != -1 and any(
-            ch.isupper() for ch in token[underscore_index + 1 :]
-        ):
-            include_full = False
-        if include_full:
-            results.append((token, offsets[chunk_index]))
-        for rel_start, sub in _split_identifier_subtokens(token):
-            if rel_start == 0 and include_full:
-                continue
-            absolute = start + rel_start
-            if absolute % 2 != 0:
-                continue
-            sub_index = absolute // 2
-            if sub_index > limit:
-                sub_index = limit
-            results.append((sub, offsets[sub_index]))
-    return results
-
-
-def _split_identifier_subtokens(token: str) -> List[Tuple[int, str]]:
-    parts: List[Tuple[int, str]] = []
-    start = 0
-    for index in range(1, len(token)):
-        if token[index].isupper() and token[index - 1].islower():
-            if index - start >= 3:
-                parts.append((start, token[start:index]))
-            start = index
-    if len(token) - start >= 3:
-        parts.append((start, token[start:]))
-    return parts
-
-
-def _sanitize_identifier(text: str) -> Optional[str]:
-    if not text:
-        return None
-    pieces: List[str] = []
-    for char in text:
-        if char.isalnum() or char == "_":
-            pieces.append(char)
-        else:
-            pieces.append("_")
-    candidate = "".join(pieces)
-    candidate = re.sub(r"_+", "_", candidate).strip("_")
-    if not candidate:
-        return None
-    if candidate[0].isdigit():
-        candidate = f"_{candidate}"
-    return candidate
-
 
 def _snake_to_camel(name: str) -> str:
     parts = name.split("_")
