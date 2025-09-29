@@ -141,6 +141,7 @@ class LuaRenderOptions:
     emit_stub_metadata: bool = True
     emit_enum_metadata: bool = True
     emit_module_summary: bool = True
+    emit_literal_report: bool = True
 
 
 class CommentFormatter:

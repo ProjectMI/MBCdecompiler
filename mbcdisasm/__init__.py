@@ -19,11 +19,16 @@ from .ir import IRBuilder, IRProgram, write_ir_programs
 from .emulator import Emulator, EmulationReport, write_emulation_reports
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .ast import LuaReconstructor
-from .highlevel import (
-    FunctionMetadata,
-    HighLevelFunction,
-    HighLevelReconstructor,
-    StringLiteralSequence,
+from .highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from .literal_sequences import (
+    LiteralDescriptor,
+    LiteralRun,
+    LiteralRunReport,
+    LiteralStatistics,
+    build_literal_run_report,
+    compute_literal_statistics,
+    literal_report_to_dict,
+    literal_statistics_to_dict,
 )
 from .lua_formatter import LuaRenderOptions
 from .lua_literals import LuaLiteralFormatter
@@ -87,8 +92,15 @@ __all__ = [
     "LuaReconstructor",
     "HighLevelFunction",
     "HighLevelReconstructor",
-    "StringLiteralSequence",
     "FunctionMetadata",
+    "LiteralDescriptor",
+    "LiteralRun",
+    "LiteralRunReport",
+    "LiteralStatistics",
+    "compute_literal_statistics",
+    "build_literal_run_report",
+    "literal_report_to_dict",
+    "literal_statistics_to_dict",
     "LuaRenderOptions",
     "SegmentClassifier",
     "ManualSemanticAnalyzer",

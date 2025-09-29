@@ -93,6 +93,8 @@ def test_virtual_machine_analyzer_tracks_stack_depth() -> None:
 
     trace = analyzer.trace_block(block)
     assert len(trace.entry_stack) == 0
+    first_output = trace.instructions[0].operation.outputs[0]
+    assert first_output.comment == '4'
     assert trace.instructions[0].state.depth_after == 1
     assert trace.instructions[1].state.depth_before == 1
     warnings = trace.instructions[1].operation.warnings

@@ -45,6 +45,14 @@ from .lua_formatter import (
     join_sections,
 )
 from .manual_semantics import InstructionSemantics
+from .literal_sequences import (
+    LiteralRun,
+    LiteralRunTracker,
+    LiteralRunReport,
+    LiteralStatistics,
+    build_literal_run_report,
+    compute_literal_statistics,
+)
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
 from .vm_analysis import estimate_stack_io
 
@@ -53,7 +61,7 @@ class HighLevelStack:
     """Track symbolic stack values during reconstruction."""
 
     def __init__(self) -> None:
-        self._values: List[NameExpr] = []
+        self._values: List[LuaExpression] = []
         self._counter = 0
         self.warnings: List[str] = []
 
@@ -63,13 +71,10 @@ class HighLevelStack:
         return name
 
     def push_literal(
-        self, expression: LuaExpression, *, prefix: Optional[str] = None
-    ) -> Tuple[List[LuaStatement], NameExpr]:
-        name = self.new_symbol(prefix or "literal")
-        target = NameExpr(name)
-        statement = Assignment([target], expression, is_local=True)
-        self._values.append(target)
-        return [statement], target
+        self, expression: LuaExpression
+    ) -> Tuple[List[LuaStatement], LuaExpression]:
+        self._values.append(expression)
+        return [], expression
 
     def push_expression(
         self,
@@ -77,7 +82,7 @@ class HighLevelStack:
         *,
         prefix: str = "tmp",
         make_local: bool = False,
-    ) -> Tuple[List[LuaStatement], NameExpr]:
+    ) -> Tuple[List[LuaStatement], LuaExpression]:
         if make_local:
             name = self.new_symbol(prefix)
             target = NameExpr(name)
@@ -110,7 +115,7 @@ class HighLevelStack:
             self._values.append(target)
         return [stmt], targets
 
-    def pop_single(self) -> NameExpr:
+    def pop_single(self) -> LuaExpression:
         if self._values:
             return self._values.pop()
         placeholder = NameExpr(self.new_symbol("stack"))
@@ -119,48 +124,19 @@ class HighLevelStack:
         )
         return placeholder
 
-    def pop_many(self, count: int) -> List[NameExpr]:
+    def pop_many(self, count: int) -> List[LuaExpression]:
         items = [self.pop_single() for _ in range(count)]
         items.reverse()
         return items
 
-    def pop_pair(self) -> Tuple[NameExpr, NameExpr]:
+    def pop_pair(self) -> Tuple[LuaExpression, LuaExpression]:
         lhs, rhs = self.pop_many(2)
         return lhs, rhs
 
-    def flush(self) -> List[NameExpr]:
+    def flush(self) -> List[LuaExpression]:
         values = list(self._values)
         self._values.clear()
         return values
-
-
-@dataclass(frozen=True)
-class StringLiteralSequence:
-    """Metadata describing a detected string literal run inside a block."""
-
-    text: str
-    offsets: Tuple[int, ...]
-
-    @property
-    def start_offset(self) -> int:
-        return self.offsets[0]
-
-    @property
-    def end_offset(self) -> int:
-        return self.offsets[-1]
-
-    def chunk_count(self) -> int:
-        return len(self.offsets)
-
-    def length(self) -> int:
-        return len(self.text)
-
-    def preview(self, limit: int = 80) -> str:
-        if len(self.text) <= limit:
-            return self.text
-        if limit <= 3:
-            return "..."
-        return self.text[: limit - 3] + "..."
 
 
 class StringLiteralCollector:
@@ -170,7 +146,6 @@ class StringLiteralCollector:
         self._pending: List[List[LuaStatement]] = []
         self._fragments: List[str] = []
         self._offsets: List[int] = []
-        self._sequences: List[StringLiteralSequence] = []
 
     def reset(self) -> None:
         self._pending.clear()
@@ -196,8 +171,6 @@ class StringLiteralCollector:
         if not self._pending:
             return []
         combined = "".join(self._fragments)
-        sequence = StringLiteralSequence(text=combined, offsets=tuple(self._offsets))
-        self._sequences.append(sequence)
         comment = CommentStatement(
             f"string literal sequence: {escape_lua_string(combined)}"
             f" (len={len(combined)})"
@@ -210,13 +183,6 @@ class StringLiteralCollector:
 
     def finalize(self) -> List[LuaStatement]:
         return self.flush()
-
-    def drain_sequences(self) -> List[StringLiteralSequence]:
-        if not self._sequences:
-            return []
-        sequences = list(self._sequences)
-        self._sequences.clear()
-        return sequences
 
     @staticmethod
     def _string_value(expression: LuaExpression) -> Optional[str]:
@@ -237,7 +203,9 @@ class FunctionMetadata:
     helper_calls: int = 0
     branch_count: int = 0
     literal_count: int = 0
-    string_sequences: Sequence[StringLiteralSequence] = field(default_factory=tuple)
+    literal_runs: Sequence[LiteralRun] = field(default_factory=tuple)
+    literal_stats: Optional[LiteralStatistics] = None
+    literal_report: Optional[LiteralRunReport] = None
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
@@ -246,33 +214,52 @@ class FunctionMetadata:
         lines.append(f"- literal instructions: {self.literal_count}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
-        if self.string_sequences:
-            lines.append(
-                f"- string literal sequences: {len(self.string_sequences)}"
+        string_runs = [run for run in self.literal_runs if run.kind == "string"]
+        if string_runs:
+            lines.append(f"- string literal sequences: {len(string_runs)}")
+        numeric_runs = [run for run in self.literal_runs if run.kind == "number"]
+        if numeric_runs:
+            lines.append(f"- numeric literal runs: {len(numeric_runs)}")
+        if self.literal_stats and self.literal_stats.kind_counts:
+            breakdown = ", ".join(
+                f"{kind}={count}" for kind, count in sorted(self.literal_stats.kind_counts.items())
             )
+            lines.append(f"- literal run kinds: {breakdown}")
         return lines
 
     def warning_lines(self) -> List[str]:
         return [f"- {warning}" for warning in self.warnings]
 
-    def string_lines(
+    def literal_run_lines(
         self, *, limit: int = 8, preview: int = 72
     ) -> List[str]:
-        if not self.string_sequences:
+        if not self.literal_runs:
             return []
         lines: List[str] = []
-        for sequence in list(self.string_sequences)[:limit]:
-            text = escape_lua_string(sequence.preview(preview))
+        for run in list(self.literal_runs)[:limit]:
+            summary = run.render_preview(preview)
             lines.append(
                 "- 0x"
-                f"{sequence.start_offset:06X}"
-                f" len={sequence.length()}"
-                f" chunks={sequence.chunk_count()}: {text}"
+                f"{run.start_offset():06X}"
+                f" kind={run.kind}"
+                f" count={run.length()}: {summary}"
             )
-        remaining = len(self.string_sequences) - limit
+        remaining = len(self.literal_runs) - limit
         if remaining > 0:
-            lines.append(f"- ... ({remaining} additional sequences)")
+            lines.append(f"- ... ({remaining} additional runs)")
         return lines
+
+    def literal_statistics_lines(self) -> List[str]:
+        if not self.literal_stats:
+            return []
+        return self.literal_stats.summary_lines()
+
+    def literal_report_lines(self, *, block_limit: int = 3) -> List[str]:
+        if not self.literal_report or not self.literal_report.runs:
+            return []
+        summary = self.literal_report.summary_lines()
+        blocks = self.literal_report.block_lines(limit=block_limit)
+        return summary + blocks
 
 
 @dataclass
@@ -289,9 +276,17 @@ class HighLevelFunction:
         if summary:
             writer.write_comment_block(summary)
             writer.write_line("")
-        string_lines = self.metadata.string_lines()
-        if string_lines:
-            writer.write_comment_block(["string literal sequences:"] + string_lines)
+        literal_lines = self.metadata.literal_run_lines()
+        if literal_lines:
+            writer.write_comment_block(["literal runs:"] + literal_lines)
+            writer.write_line("")
+        report_lines = self.metadata.literal_report_lines()
+        if report_lines:
+            writer.write_comment_block(report_lines)
+            writer.write_line("")
+        stats_lines = self.metadata.literal_statistics_lines()
+        if stats_lines:
+            writer.write_comment_block(stats_lines)
             writer.write_line("")
         if self.metadata.warnings:
             writer.write_comment_block(
@@ -350,7 +345,7 @@ class BlockTranslator:
         self._program = program
         self._stack = HighLevelStack()
         self._string_collector = StringLiteralCollector()
-        self._collected_sequences: List[StringLiteralSequence] = []
+        self._literal_tracker = LiteralRunTracker()
         self.literal_count = 0
         self.helper_calls = 0
         self.branch_count = 0
@@ -362,8 +357,10 @@ class BlockTranslator:
         for idx, start in enumerate(order):
             block = self._program.blocks[start]
             next_offset = order[idx + 1] if idx + 1 < len(order) else None
+            self._literal_tracker.start_block(block.start)
             blocks[start] = self._translate_block(block, next_offset)
             self.instruction_total += len(block.instructions)
+        self._literal_tracker.finalize()
         return blocks
 
     # ------------------------------------------------------------------
@@ -385,11 +382,14 @@ class BlockTranslator:
                     self,
                     operand_expr=operand_expr,
                 )
+                self._literal_tracker.observe(instruction.offset, operand_expr)
                 queued = self._string_collector.enqueue(
                     instruction.offset, literal_statements, operand_expr
                 )
                 statements.extend(queued)
                 continue
+            else:
+                self._literal_tracker.break_sequence()
             statements.extend(self._string_collector.flush())
             if semantics.has_tag("comparison"):
                 statements.extend(
@@ -426,7 +426,7 @@ class BlockTranslator:
                 self._reconstructor._translate_generic(instruction, semantics, self)
             )
         statements.extend(self._string_collector.finalize())
-        self._collected_sequences.extend(self._string_collector.drain_sequences())
+        self._literal_tracker.break_sequence()
         if terminator is None:
             target = block.successors[0] if block.successors else fallthrough
             terminator = JumpTerminator(target=target, fallthrough=fallthrough, comment=None)
@@ -447,8 +447,8 @@ class BlockTranslator:
         return self._program
 
     @property
-    def string_sequences(self) -> List[StringLiteralSequence]:
-        return list(self._collected_sequences)
+    def literal_runs(self) -> Sequence[LiteralRun]:
+        return self._literal_tracker.runs()
 
 
 class ControlFlowStructurer:
@@ -578,10 +578,16 @@ class HighLevelReconstructor:
         entry = min(blocks)
         structurer = ControlFlowStructurer(blocks)
         body = structurer.structure(entry)
-        string_sequences = sorted(
-            translator.string_sequences, key=lambda seq: (seq.start_offset, seq.chunk_count())
+        literal_runs = sorted(
+            translator.literal_runs, key=lambda run: (run.start_offset(), -run.length())
         )
-        base_name = self._derive_function_name(program, string_sequences)
+        stats = compute_literal_statistics(literal_runs)
+        report = (
+            build_literal_run_report(literal_runs)
+            if self.options.emit_literal_report
+            else None
+        )
+        base_name = self._derive_function_name(program, literal_runs)
         function_name = self._unique_function_name(base_name)
         metadata = FunctionMetadata(
             block_count=len(blocks),
@@ -590,7 +596,9 @@ class HighLevelReconstructor:
             helper_calls=translator.helper_calls,
             branch_count=translator.branch_count,
             literal_count=translator.literal_count,
-            string_sequences=tuple(string_sequences),
+            literal_runs=tuple(literal_runs),
+            literal_stats=stats,
+            literal_report=report,
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
@@ -633,15 +641,7 @@ class HighLevelReconstructor:
         operand_expr: Optional[LuaExpression] = None,
     ) -> Tuple[List[LuaStatement], LuaExpression]:
         operand = operand_expr or self._operand_expression(semantics, instruction.operand)
-        prefix: Optional[str] = None
-        if isinstance(operand, LiteralExpr):
-            if operand.kind == "string":
-                prefix = "string"
-            elif operand.kind == "number":
-                prefix = "literal"
-        elif isinstance(operand, NameExpr):
-            prefix = "enum"
-        statements, _ = translator.stack.push_literal(operand, prefix=prefix)
+        statements, _ = translator.stack.push_literal(operand)
         translator.literal_count += 1
         decorated = self._decorate_with_comment(statements, semantics)
         return decorated, operand
@@ -849,15 +849,44 @@ class HighLevelReconstructor:
             )
         warnings = sum(len(func.metadata.warnings) for func in functions)
         lines.append(f"- stack warnings: {warnings}")
-        string_total = sum(len(func.metadata.string_sequences) for func in functions)
+        string_total = sum(
+            sum(1 for run in func.metadata.literal_runs if run.kind == "string")
+            for func in functions
+        )
         if string_total:
             lines.append(f"- string literal sequences: {string_total}")
+        numeric_total = sum(
+            sum(1 for run in func.metadata.literal_runs if run.kind == "number")
+            for func in functions
+        )
+        if numeric_total:
+            lines.append(f"- numeric literal runs: {numeric_total}")
+        if self.options.emit_literal_report:
+            all_runs: List[LiteralRun] = []
+            for func in functions:
+                all_runs.extend(func.metadata.literal_runs)
+            if all_runs:
+                report = build_literal_run_report(all_runs)
+                lines.append(f"- literal run blocks: {len(report.block_summaries)}")
+                tokens = report.top_tokens(limit=3)
+                if tokens:
+                    token_line = ", ".join(f"{token}:{count}" for token, count in tokens)
+                    lines.append(f"- literal tokens: {token_line}")
+                numbers = report.top_numbers(limit=3)
+                if numbers:
+                    number_line = ", ".join(f"{value}:{count}" for value, count in numbers)
+                    lines.append(f"- literal numbers: {number_line}")
+                previews = report.longest_previews(limit=2)
+                if previews:
+                    lines.append(
+                        "- notable literal runs: " + "; ".join(previews)
+                    )
         return lines
 
     def _derive_function_name(
         self,
         program: IRProgram,
-        sequences: Sequence[StringLiteralSequence],
+        sequences: Sequence[LiteralRun],
     ) -> str:
         candidate = self._select_string_name(program, sequences)
         if candidate:
@@ -867,20 +896,22 @@ class HighLevelReconstructor:
     def _select_string_name(
         self,
         program: IRProgram,
-        sequences: Sequence[StringLiteralSequence],
+        sequences: Sequence[LiteralRun],
     ) -> Optional[str]:
         if not sequences:
             return None
         entry_offset = min(program.blocks) if program.blocks else 0
-        raw_candidates: List[Tuple[StringLiteralSequence, str, int]] = []
+        raw_candidates: List[Tuple[LiteralRun, str, int]] = []
         frequency: Counter[str] = Counter()
         for sequence in sequences:
-            text = sequence.text.strip()
+            if sequence.kind != "string":
+                continue
+            text = (sequence.combined_string() or "").strip()
             if text and not any(ch.isspace() for ch in text):
                 sanitized = _sanitize_identifier(text)
                 if sanitized and sanitized.lower() not in _STRING_NAME_STOPWORDS:
                     key = sanitized.lower()
-                    raw_candidates.append((sequence, sanitized, sequence.start_offset))
+                    raw_candidates.append((sequence, sanitized, sequence.start_offset()))
                     frequency[key] += 1
             for token, token_offset in _identifier_tokens(sequence):
                 sanitized = _sanitize_identifier(token)
@@ -919,14 +950,14 @@ class HighLevelReconstructor:
 
     def _score_name_candidate(
         self,
-        sequence: StringLiteralSequence,
+        sequence: LiteralRun,
         sanitized: str,
         entry_offset: int,
         *,
         count: int = 1,
         candidate_offset: Optional[int] = None,
     ) -> Tuple[int, int, int, int, int, str]:
-        offset = candidate_offset if candidate_offset is not None else sequence.start_offset
+        offset = candidate_offset if candidate_offset is not None else sequence.start_offset()
         distance = max(0, offset - entry_offset)
         underscore_penalty = 0 if "_" in sanitized else 1
         lower = sum(1 for ch in sanitized if ch.islower())
@@ -993,9 +1024,11 @@ _IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
 
 
 def _identifier_tokens(
-    sequence: StringLiteralSequence,
+    sequence: LiteralRun,
 ) -> Iterable[Tuple[str, int]]:
-    text = sequence.text
+    if sequence.kind != "string":
+        return []
+    text = sequence.combined_string() or ""
     if not text:
         return []
     offsets = sequence.offsets
