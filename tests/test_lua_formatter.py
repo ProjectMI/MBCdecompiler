@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from mbcdisasm.highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from mbcdisasm.lua_ast import Assignment, LiteralExpr, NameExpr, ReturnStatement, wrap_block
 from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
 from mbcdisasm.lua_formatter import (
     CommentFormatter,
@@ -51,6 +52,13 @@ def _make_semantics(
         vm_method="",
         vm_call_style="",
     )
+
+
+def _render_lines(statements):
+    writer = LuaWriter()
+    for stmt in statements:
+        stmt.emit(writer)
+    return writer.render().splitlines()
 
 
 def test_lua_writer_label_spacing() -> None:
@@ -163,7 +171,7 @@ def test_highlevel_function_summary_and_warnings() -> None:
     metadata = FunctionMetadata(block_count=3, instruction_count=9, warnings=["stack underflow"])
     function = HighLevelFunction(
         name="segment_001",
-        statements=["::block_000000::", "return"],
+        body=wrap_block([ReturnStatement()]),
         metadata=metadata,
     )
     rendered = function.render().splitlines()
@@ -185,7 +193,7 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     metadata = FunctionMetadata(block_count=1, instruction_count=2)
     function = HighLevelFunction(
         name="segment_010",
-        statements=["::block_000000::", "return"],
+        body=wrap_block([ReturnStatement()]),
         metadata=metadata,
     )
     reconstructor._helper_registry.register_function(
@@ -238,8 +246,16 @@ def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
         branch_count=0,
         warnings=["placeholder"],
     )
-    fn_a = HighLevelFunction(name="segment_a", statements=["::block_000000::", "return"], metadata=metadata_a)
-    fn_b = HighLevelFunction(name="segment_b", statements=["::block_000010::", "return"], metadata=metadata_b)
+    fn_a = HighLevelFunction(
+        name="segment_a",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata_a,
+    )
+    fn_b = HighLevelFunction(
+        name="segment_b",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata_b,
+    )
 
     reconstructor._helper_registry.register_function(
         HelperSignature(
@@ -283,11 +299,17 @@ def test_comment_deduplication(tmp_path: Path) -> None:
         tags=("literal",),
     )
 
-    first = reconstructor._decorate_with_comment("local literal_0 = 0", literal_semantics)
-    second = reconstructor._decorate_with_comment("local literal_1 = 1", literal_semantics)
+    stmt_zero = Assignment([NameExpr("literal_0")], LiteralExpr("0"), is_local=True)
+    stmt_one = Assignment([NameExpr("literal_1")], LiteralExpr("1"), is_local=True)
 
-    assert any("--" in line for line in first), "first literal should carry a comment"
-    assert all("--" not in line for line in second), "duplicate comment should be suppressed"
+    first = reconstructor._decorate_with_comment([stmt_zero], literal_semantics)
+    second = reconstructor._decorate_with_comment([stmt_one], literal_semantics)
+
+    first_lines = _render_lines(first)
+    second_lines = _render_lines(second)
+
+    assert any(line.startswith("--") for line in first_lines), "first literal should carry a comment"
+    assert all("--" not in line for line in second_lines), "duplicate comment should be suppressed"
 
     # Introducing a different comment resets the deduplication window.
     other_semantics = _make_semantics(
@@ -295,9 +317,12 @@ def test_comment_deduplication(tmp_path: Path) -> None:
         summary="Primary reducer",
         tags=("generic",),
     )
-    reconstructor._decorate_with_comment("reduce_pair(x, y)", other_semantics)
-    again = reconstructor._decorate_with_comment("local literal_2 = 2", literal_semantics)
-    assert any("--" in line for line in again)
+    reducer_call = Assignment([NameExpr("result")], LiteralExpr("reduce_pair(x, y)"), is_local=True)
+    reconstructor._decorate_with_comment([reducer_call], other_semantics)
+    stmt_two = Assignment([NameExpr("literal_2")], LiteralExpr("2"), is_local=True)
+    again = reconstructor._decorate_with_comment([stmt_two], literal_semantics)
+    again_lines = _render_lines(again)
+    assert any(line.startswith("--") for line in again_lines)
 
 
 def test_function_metadata_counts(tmp_path: Path) -> None:
