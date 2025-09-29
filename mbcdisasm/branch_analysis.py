@@ -583,40 +583,99 @@ def _compute_dominators(graph: ControlFlowGraph) -> Dict[int, Set[int]]:
     if not blocks:
         return {}
 
-    start = blocks[0].start
-    doms: Dict[int, Set[int]] = {block.start: set(graph.blocks) for block in blocks}
-    doms[start] = {start}
+    # Represent sets as integer bitmasks to drastically reduce the cost of the
+    # iterative refinement.  Large functions contain hundreds of blocks and the
+    # original implementation repeatedly allocated ``set`` instances and
+    # performed expensive ``intersection`` operations for every predecessor.
+    # Bit operations avoid the quadratic behaviour while keeping the logic
+    # identical.
+    index_map = {block.start: index for index, block in enumerate(blocks)}
+    ordered_starts = [block.start for block in blocks]
+    full_mask = (1 << len(blocks)) - 1
+
+    masks: Dict[int, int] = {block.start: full_mask for block in blocks}
+    entry_start = blocks[0].start
+    masks[entry_start] = 1 << index_map[entry_start]
 
     changed = True
     while changed:
         changed = False
         for block in blocks[1:]:
+            block_index = index_map[block.start]
             preds = block.predecessors
             if not preds:
-                new_set = {block.start}
+                new_mask = 1 << block_index
             else:
-                pred_sets = [doms[pred] for pred in preds if pred in doms]
-                if pred_sets:
-                    intersection = set.intersection(*pred_sets)
-                else:
-                    intersection = set()
-                new_set = {block.start} | intersection
-            if new_set != doms[block.start]:
-                doms[block.start] = new_set
+                mask = full_mask
+                for pred in preds:
+                    mask &= masks.get(pred, full_mask)
+                new_mask = mask | (1 << block_index)
+            if new_mask != masks[block.start]:
+                masks[block.start] = new_mask
                 changed = True
-    return doms
+
+    def mask_to_set(mask: int) -> Set[int]:
+        result: Set[int] = set()
+        while mask:
+            lsb = mask & -mask
+            index = (lsb.bit_length() - 1)
+            result.add(ordered_starts[index])
+            mask ^= lsb
+        return result
+
+    return {start: mask_to_set(mask) for start, mask in masks.items()}
 
 
 def _compute_immediate_dominators(dominators: Mapping[int, Set[int]]) -> Dict[int, Optional[int]]:
+    all_nodes: Set[int] = set(dominators.keys())
+    for values in dominators.values():
+        all_nodes.update(values)
+
+    ordered_nodes = sorted(all_nodes)
+    index_map = {node: index for index, node in enumerate(ordered_nodes)}
+
+    def set_to_mask(values: Set[int]) -> int:
+        mask = 0
+        for value in values:
+            mask |= 1 << index_map[value]
+        return mask
+
+    masks: Dict[int, int] = {
+        node: set_to_mask(dominators.get(node, {node})) for node in ordered_nodes
+    }
+
     idoms: Dict[int, Optional[int]] = {}
-    for node, doms in dominators.items():
-        candidates = doms - {node}
-        idom = None
-        for candidate in candidates:
-            if all(candidate == other or candidate not in dominators[other] for other in candidates):
-                idom = candidate
+    for node in dominators:
+        node_index = index_map[node]
+        mask = masks[node] & ~(1 << node_index)
+        if not mask:
+            idoms[node] = None
+            continue
+
+        candidate_id = None
+        remaining = mask
+        while remaining:
+            lsb = remaining & -remaining
+            candidate_index = lsb.bit_length() - 1
+            candidate = ordered_nodes[candidate_index]
+            remaining ^= lsb
+
+            dominated = False
+            probe = mask & ~(1 << candidate_index)
+            while probe:
+                other_lsb = probe & -probe
+                other_index = other_lsb.bit_length() - 1
+                other_node = ordered_nodes[other_index]
+                if masks[other_node] & (1 << candidate_index):
+                    dominated = True
+                    break
+                probe ^= other_lsb
+            if not dominated:
+                candidate_id = candidate
                 break
-        idoms[node] = idom
+
+        idoms[node] = candidate_id
+
     return idoms
 
 
@@ -625,15 +684,17 @@ def _compute_post_dominators(graph: ControlFlowGraph) -> Dict[int, Set[int]]:
     if not blocks:
         return {}
 
+    ordered_starts = [block.start for block in blocks]
+    index_map = {start: index for index, start in enumerate(ordered_starts)}
+    full_mask = (1 << len(blocks)) - 1
+
     exits = [block.start for block in blocks if not block.successors]
     if not exits:
-        # The graph might not have explicit exits when the segment falls through
-        # into trailing data.  Treat the last block as the exit in that case.
         exits = [blocks[-1].start]
 
-    post_doms: Dict[int, Set[int]] = {block.start: set(graph.blocks) for block in blocks}
+    masks: Dict[int, int] = {block.start: full_mask for block in blocks}
     for exit_start in exits:
-        post_doms[exit_start] = {exit_start}
+        masks[exit_start] = 1 << index_map[exit_start]
 
     changed = True
     while changed:
@@ -642,37 +703,78 @@ def _compute_post_dominators(graph: ControlFlowGraph) -> Dict[int, Set[int]]:
             succs = block.successors
             if not succs:
                 continue
-            succ_sets = [post_doms[succ] for succ in succs if succ in post_doms]
-            if succ_sets:
-                intersection = set.intersection(*succ_sets)
-            else:
-                intersection = set()
-            new_set = {block.start} | intersection
-            if new_set != post_doms[block.start]:
-                post_doms[block.start] = new_set
+            mask = full_mask
+            for succ in succs:
+                mask &= masks.get(succ, full_mask)
+            new_mask = mask | (1 << index_map[block.start])
+            if new_mask != masks[block.start]:
+                masks[block.start] = new_mask
                 changed = True
-    return post_doms
+
+    def mask_to_set(mask: int) -> Set[int]:
+        result: Set[int] = set()
+        while mask:
+            lsb = mask & -mask
+            index = lsb.bit_length() - 1
+            result.add(ordered_starts[index])
+            mask ^= lsb
+        return result
+
+    return {start: mask_to_set(mask) for start, mask in masks.items()}
 
 
 def _compute_immediate_post_dominators(
     post_dominators: Mapping[int, Set[int]]
 ) -> Dict[int, Optional[int]]:
+    all_nodes: Set[int] = set(post_dominators.keys())
+    for values in post_dominators.values():
+        all_nodes.update(values)
+
+    ordered_nodes = sorted(all_nodes)
+    index_map = {node: index for index, node in enumerate(ordered_nodes)}
+
+    def set_to_mask(values: Set[int]) -> int:
+        mask = 0
+        for value in values:
+            mask |= 1 << index_map[value]
+        return mask
+
+    masks: Dict[int, int] = {
+        node: set_to_mask(post_dominators.get(node, {node})) for node in ordered_nodes
+    }
+
     immediate: Dict[int, Optional[int]] = {}
-    for node, pdoms in post_dominators.items():
-        candidates = sorted(pdoms - {node})
-        ipdom = None
-        for candidate in candidates:
+    for node in post_dominators:
+        node_index = index_map[node]
+        mask = masks[node] & ~(1 << node_index)
+        if not mask:
+            immediate[node] = None
+            continue
+
+        candidate_id = None
+        remaining = mask
+        while remaining:
+            lsb = remaining & -remaining
+            candidate_index = lsb.bit_length() - 1
+            candidate = ordered_nodes[candidate_index]
+            remaining ^= lsb
+
             dominated = False
-            for other in candidates:
-                if other == candidate:
-                    continue
-                if candidate in post_dominators.get(other, set()):
+            probe = mask & ~(1 << candidate_index)
+            while probe:
+                other_lsb = probe & -probe
+                other_index = other_lsb.bit_length() - 1
+                other_node = ordered_nodes[other_index]
+                if masks[other_node] & (1 << candidate_index):
                     dominated = True
                     break
+                probe ^= other_lsb
             if not dominated:
-                ipdom = candidate
+                candidate_id = candidate
                 break
-        immediate[node] = ipdom
+
+        immediate[node] = candidate_id
+
     return immediate
 
 
