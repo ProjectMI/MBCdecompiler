@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from .instruction import InstructionWord
+from .branch_inference import BranchInferenceEngine
 from .knowledge import InstructionMetadata, KnowledgeBase
 
 
@@ -40,6 +41,8 @@ class InstructionSemantics:
     manual_name: str
     summary: Optional[str]
     control_flow: Optional[str]
+    control_flow_confidence: Optional[float]
+    control_flow_reasons: Tuple[str, ...]
     stack_delta: Optional[float]
     stack_effect: StackEffect
     tags: Tuple[str, ...]
@@ -225,6 +228,7 @@ class ManualSemanticAnalyzer:
         self.knowledge = knowledge
         self._cache: Dict[str, InstructionSemantics] = {}
         self.enum_registry: Dict[str, Dict[int, str]] = {}
+        self._branch_inference = BranchInferenceEngine(knowledge)
 
     # ------------------------------------------------------------------
     # Public API
@@ -257,6 +261,8 @@ class ManualSemanticAnalyzer:
         manual_name = _string_field(manual, "name") or mnemonic
         summary = _string_field(manual, "summary") or metadata.summary
         control_flow = _string_field(manual, "control_flow") or metadata.control_flow
+        control_flow_confidence: Optional[float] = None
+        control_flow_reasons: Tuple[str, ...] = ()
 
         stack_delta = _coerce_optional_float(manual.get("stack_delta"))
         if stack_delta is None:
@@ -302,12 +308,45 @@ class ManualSemanticAnalyzer:
         vm_method = _sanitize_identifier(manual_name or mnemonic)
         vm_call_style = "literal" if "literal" in tags else "method"
 
+        if control_flow is None:
+            inferred = self._branch_inference.infer(
+                key,
+                mnemonic=mnemonic,
+                manual_name=manual_name,
+                summary=summary,
+                tags=tags,
+                operand_hint=operand_hint,
+                stack_inputs=stack_effect.inputs,
+                stack_outputs=stack_effect.outputs,
+            )
+            if inferred:
+                control_flow = inferred.control_flow
+                control_flow_confidence = inferred.confidence
+                control_flow_reasons = inferred.reasons
+                tags.add(control_flow)
+        else:
+            inferred = self._branch_inference.infer(
+                key,
+                mnemonic=mnemonic,
+                manual_name=manual_name,
+                summary=summary,
+                tags=tags,
+                operand_hint=operand_hint,
+                stack_inputs=stack_effect.inputs,
+                stack_outputs=stack_effect.outputs,
+            )
+            if inferred:
+                control_flow_confidence = inferred.confidence
+                control_flow_reasons = inferred.reasons
+
         semantics = InstructionSemantics(
             key=key,
             mnemonic=mnemonic,
             manual_name=manual_name,
             summary=summary,
             control_flow=control_flow,
+            control_flow_confidence=control_flow_confidence,
+            control_flow_reasons=control_flow_reasons,
             stack_delta=stack_delta,
             stack_effect=stack_effect,
             tags=tuple(sorted(tags)),

@@ -105,8 +105,9 @@ class ControlFlowGraphBuilder:
         offsets = {instr.word.offset: idx for idx, instr in enumerate(instructions)}
         available_offsets = set(offsets)
         for idx, instr in enumerate(instructions):
+            semantics = instr.semantics
             key = instr.label()
-            hint = self.knowledge.control_flow_hint(key)
+            hint = semantics.control_flow or self.knowledge.control_flow_hint(key)
             next_offset = instr.word.offset + WORD_SIZE
             if hint == "return" or hint == "stop":
                 if idx + 1 < len(instructions):
@@ -157,8 +158,9 @@ class ControlFlowGraphBuilder:
             if not block.instructions:
                 continue
             last = block.instructions[-1]
+            semantics = last.semantics
             key = last.label()
-            hint = self.knowledge.control_flow_hint(key)
+            hint = semantics.control_flow or self.knowledge.control_flow_hint(key)
             next_offset = last.word.offset + WORD_SIZE
             if hint == "return" or hint == "stop":
                 continue

@@ -3,6 +3,7 @@ from collections import Counter
 
 import pytest
 
+from mbcdisasm.manual_semantics import ManualSemanticAnalyzer
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeProfile
 
 
@@ -197,6 +198,33 @@ def test_manual_inference_handles_unknown_stack(tmp_path):
     }
     assert "manual_source" in update_fields
 
+
+def test_branch_inference_populates_control_flow(tmp_path):
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "AA:10": {
+                    "name": "branch_on_truth",
+                    "summary": "Conditional branch when the predicate succeeds",
+                    "stack_delta": -1,
+                    "tags": ["comparison"],
+                    "operand_hint": "relative_word",
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+    semantics = analyzer.describe_key("AA:10")
+
+    assert semantics.control_flow == "branch"
+    assert semantics.control_flow_confidence is not None
+    assert semantics.control_flow_confidence > 0.3
+    assert "branch" in semantics.tags
 
 def test_missing_operand_hint_not_queued_for_review(tmp_path):
     kb_path = tmp_path / "kb.json"

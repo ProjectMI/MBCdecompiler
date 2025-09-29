@@ -47,6 +47,8 @@ def _make_semantics(
         manual_name=mnemonic,
         summary=summary,
         control_flow=control_flow,
+        control_flow_confidence=None,
+        control_flow_reasons=(),
         stack_delta=0,
         stack_effect=StackEffect(inputs=inputs, outputs=outputs, delta=delta, source="test"),
         tags=tuple(tag.lower() for tag in tags),

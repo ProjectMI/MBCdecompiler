@@ -22,6 +22,8 @@ def _semantics(
         manual_name=mnemonic,
         summary=summary,
         control_flow=None,
+        control_flow_confidence=None,
+        control_flow_reasons=(),
         stack_delta=stack_delta,
         stack_effect=StackEffect(inputs=inputs, outputs=outputs, delta=stack_delta, source="test"),
         tags=tags,

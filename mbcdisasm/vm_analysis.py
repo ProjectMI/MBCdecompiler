@@ -126,6 +126,19 @@ class VMProgramTrace:
 
 
 @dataclass(frozen=True)
+class StackMergeEvent:
+    """Record describing how entry stacks were merged during analysis."""
+
+    target_block: int
+    source_block: int
+    position: int
+    existing_value: Optional[str]
+    incoming_value: Optional[str]
+    result_value: str
+    changed: bool
+
+
+@dataclass(frozen=True)
 class VMLifetime:
     """Describes how long a stack value persists within a trace."""
 
@@ -150,8 +163,13 @@ class VMLifetime:
 class VMStackState:
     """Mutable stack model used when reconstructing VM behaviour."""
 
-    def __init__(self, *, counter_start: int = 0) -> None:
-        self._stack: List[VMStackValue] = []
+    def __init__(
+        self,
+        *,
+        counter_start: int = 0,
+        initial_stack: Optional[Sequence[VMStackValue]] = None,
+    ) -> None:
+        self._stack: List[VMStackValue] = list(initial_stack) if initial_stack else []
         self._counter = counter_start
         self._placeholder_counter = 0
 
@@ -236,10 +254,20 @@ class VirtualMachineAnalyzer:
 
     def __init__(self, *, counter_start: int = 0) -> None:
         self._value_counter = counter_start
+        self._phi_cache: Dict[Tuple[str, ...], VMStackValue] = {}
+        self._phi_members: Dict[str, Tuple[str, ...]] = {}
+        self._merge_events: List[StackMergeEvent] = []
 
-    def trace_block(self, block) -> VMBlockTrace:
-        state = VMStackState(counter_start=self._value_counter)
-        entry_stack = state.snapshot()
+    def trace_block(
+        self,
+        block,
+        *,
+        entry_stack: Optional[Sequence[VMStackValue]] = None,
+    ) -> VMBlockTrace:
+        state = VMStackState(
+            counter_start=self._value_counter, initial_stack=entry_stack
+        )
+        entry_snapshot = state.snapshot()
         traces: List[VMInstructionTrace] = []
         for instruction in block.instructions:
             before = state.snapshot()
@@ -257,14 +285,53 @@ class VirtualMachineAnalyzer:
         return VMBlockTrace(
             start=block.start,
             instructions=traces,
-            entry_stack=entry_stack,
+            entry_stack=entry_snapshot,
             exit_stack=state.snapshot(),
         )
 
     def trace_program(self, program) -> "VMProgramTrace":
+        if not program.blocks:
+            return VMProgramTrace(program.segment_index, {})
+
         blocks: Dict[int, VMBlockTrace] = {}
-        for start in sorted(program.blocks):
-            blocks[start] = self.trace_block(program.blocks[start])
+        entry_states: Dict[int, Tuple[VMStackValue, ...]] = {}
+        worklist: List[int] = []
+        self._merge_events.clear()
+
+        ordered = sorted(program.blocks)
+        entry_start = ordered[0]
+        entry_states[entry_start] = tuple()
+        worklist.append(entry_start)
+
+        while worklist:
+            start = worklist.pop(0)
+            block = program.blocks[start]
+            entry_stack = entry_states.get(start, tuple())
+            trace = self.trace_block(block, entry_stack=entry_stack)
+            blocks[start] = trace
+            exit_stack = trace.exit_stack
+
+            for succ in block.successors:
+                if succ not in program.blocks:
+                    continue
+                merged, changed = self._merge_entry_state(
+                    target_block=succ,
+                    source_block=start,
+                    existing=entry_states.get(succ),
+                    incoming=exit_stack,
+                )
+                if changed or succ not in entry_states:
+                    entry_states[succ] = merged
+                    if succ not in worklist:
+                        worklist.append(succ)
+
+        # Ensure unreachable blocks still receive a trace for completeness.
+        for start in ordered:
+            if start not in blocks:
+                block = program.blocks[start]
+                trace = self.trace_block(block, entry_stack=tuple())
+                blocks[start] = trace
+
         return VMProgramTrace(program.segment_index, blocks)
 
     # ------------------------------------------------------------------
@@ -300,6 +367,145 @@ class VirtualMachineAnalyzer:
             comment=comment,
             warnings=tuple(sorted(set(warnings))),
         )
+
+    def merge_events(self) -> List[StackMergeEvent]:
+        return list(self._merge_events)
+
+    def _record_merge_event(
+        self,
+        *,
+        target_block: int,
+        source_block: int,
+        position: int,
+        existing: Optional[VMStackValue],
+        incoming: Optional[VMStackValue],
+        result: VMStackValue,
+        changed: bool,
+    ) -> None:
+        event = StackMergeEvent(
+            target_block=target_block,
+            source_block=source_block,
+            position=position,
+            existing_value=existing.name if existing is not None else None,
+            incoming_value=incoming.name if incoming is not None else None,
+            result_value=result.name,
+            changed=changed,
+        )
+        self._merge_events.append(event)
+
+    def _merge_entry_state(
+        self,
+        *,
+        target_block: int,
+        source_block: int,
+        existing: Optional[Tuple[VMStackValue, ...]],
+        incoming: Tuple[VMStackValue, ...],
+    ) -> Tuple[Tuple[VMStackValue, ...], bool]:
+        if existing is None:
+            for idx, value in enumerate(incoming):
+                self._record_merge_event(
+                    target_block=target_block,
+                    source_block=source_block,
+                    position=idx,
+                    existing=None,
+                    incoming=value,
+                    result=value,
+                    changed=True,
+                )
+            return incoming, True
+
+        max_len = max(len(existing), len(incoming))
+        merged: List[VMStackValue] = []
+        changed = False
+
+        for idx in range(max_len):
+            current = existing[idx] if idx < len(existing) else None
+            new_value = incoming[idx] if idx < len(incoming) else None
+
+            if current is None and new_value is None:
+                continue
+            if current is None:
+                merged.append(new_value)
+                self._record_merge_event(
+                    target_block=target_block,
+                    source_block=source_block,
+                    position=idx,
+                    existing=None,
+                    incoming=new_value,
+                    result=new_value,
+                    changed=True,
+                )
+                changed = True
+                continue
+            if new_value is None:
+                merged.append(current)
+                self._record_merge_event(
+                    target_block=target_block,
+                    source_block=source_block,
+                    position=idx,
+                    existing=current,
+                    incoming=None,
+                    result=current,
+                    changed=False,
+                )
+                continue
+
+            if self._value_identity(current) == self._value_identity(new_value):
+                merged.append(current)
+                self._record_merge_event(
+                    target_block=target_block,
+                    source_block=source_block,
+                    position=idx,
+                    existing=current,
+                    incoming=new_value,
+                    result=current,
+                    changed=False,
+                )
+                continue
+
+            merged_value = self._phi_for_values([current, new_value])
+            merged.append(merged_value)
+            self._record_merge_event(
+                target_block=target_block,
+                source_block=source_block,
+                position=idx,
+                existing=current,
+                incoming=new_value,
+                result=merged_value,
+                changed=True,
+            )
+            changed = True
+
+        if len(existing) > max_len:
+            merged.extend(existing[max_len:])
+        if len(merged) != len(existing):
+            changed = True
+
+        return tuple(merged), changed
+
+    def _value_identity(self, value: VMStackValue) -> Tuple[str, ...]:
+        return self._phi_members.get(value.name, (value.name,))
+
+    def _phi_for_values(self, values: Sequence[VMStackValue]) -> VMStackValue:
+        identities: List[str] = []
+        for value in values:
+            identities.extend(self._value_identity(value))
+        merged_identity = tuple(sorted(dict.fromkeys(identities)))
+        cached = self._phi_cache.get(merged_identity)
+        if cached is not None:
+            return cached
+
+        name = f"phi_{self._value_counter}"
+        self._value_counter += 1
+        value = VMStackValue(
+            name=name,
+            origin="phi",
+            comment=f"merge({', '.join(merged_identity)})",
+            offset=None,
+        )
+        self._phi_cache[merged_identity] = value
+        self._phi_members[name] = merged_identity
+        return value
 
 
 # ---------------------------------------------------------------------------

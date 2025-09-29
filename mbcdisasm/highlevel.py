@@ -54,89 +54,127 @@ from .literal_sequences import (
     compute_literal_statistics,
 )
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
-from .vm_analysis import estimate_stack_io
+from .vm_analysis import (
+    VMBlockTrace,
+    VMOperation,
+    VMProgramTrace,
+    VMStackValue,
+    VirtualMachineAnalyzer,
+)
+
+
+@dataclass
+class StackEntry:
+    value: VMStackValue
+    expression: LuaExpression
+
+
+class VMValueExpressionRegistry:
+    """Map VM stack values to reusable Lua expressions."""
+
+    def __init__(self) -> None:
+        self._expressions: Dict[str, LuaExpression] = {}
+
+    def ensure(self, value: VMStackValue) -> NameExpr:
+        existing = self._expressions.get(value.name)
+        if isinstance(existing, NameExpr):
+            return existing
+        symbol = _sanitize_stack_name(value.name)
+        expr = NameExpr(symbol)
+        self._expressions[value.name] = expr
+        return expr
+
+    def register(self, value: VMStackValue, expression: LuaExpression) -> LuaExpression:
+        self._expressions[value.name] = expression
+        return expression
+
+    def fetch(self, value: VMStackValue) -> Optional[LuaExpression]:
+        return self._expressions.get(value.name)
+
+
+def _sanitize_stack_name(name: str) -> str:
+    cleaned = [ch if ch.isalnum() or ch == '_' else '_' for ch in name]
+    if not cleaned:
+        return "value"
+    identifier = "".join(cleaned)
+    identifier = identifier.strip("_") or "value"
+    if identifier[0].isdigit():
+        identifier = f"value_{identifier}"
+    return identifier
 
 
 class HighLevelStack:
     """Track symbolic stack values during reconstruction."""
 
-    def __init__(self) -> None:
-        self._values: List[LuaExpression] = []
+    def __init__(self, registry: VMValueExpressionRegistry) -> None:
+        self._registry = registry
+        self._entries: List[StackEntry] = []
         self._counter = 0
         self.warnings: List[str] = []
+
+    def seed(self, values: Sequence[VMStackValue]) -> None:
+        self._entries = [StackEntry(value, self._registry.ensure(value)) for value in values]
 
     def new_symbol(self, prefix: str = "value") -> str:
         name = f"{prefix}_{self._counter}"
         self._counter += 1
         return name
 
-    def push_literal(
-        self, expression: LuaExpression
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
-        self._values.append(expression)
-        return [], expression
+    def pop_for_operation(self, operation: VMOperation) -> List[LuaExpression]:
+        popped: List[StackEntry] = []
+        for vm_value in reversed(operation.inputs):
+            entry = self._pop_entry(vm_value)
+            popped.append(entry)
+        popped.reverse()
+        return [entry.expression for entry in popped]
 
-    def push_expression(
-        self,
-        expression: LuaExpression,
-        *,
-        prefix: str = "tmp",
-        make_local: bool = False,
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
-        if make_local:
-            name = self.new_symbol(prefix)
-            target = NameExpr(name)
-            statement = Assignment([target], expression, is_local=True)
-            self._values.append(target)
-            return [statement], target
-        if isinstance(expression, NameExpr):
-            self._values.append(expression)
-            return [], expression
-        name = self.new_symbol(prefix)
-        target = NameExpr(name)
-        statement = Assignment([target], expression, is_local=True)
-        self._values.append(target)
-        return [statement], target
-
-    def push_call_results(
-        self, expression: CallExpr, outputs: int, prefix: str = "result"
-    ) -> Tuple[List[LuaStatement], List[NameExpr]]:
-        if outputs <= 0:
-            return [], []
-        if outputs == 1:
-            name = self.new_symbol(prefix)
-            target = NameExpr(name)
-            stmt = Assignment([target], expression, is_local=True)
-            self._values.append(target)
-            return [stmt], [target]
-        targets = [NameExpr(self.new_symbol(prefix)) for _ in range(outputs)]
-        stmt = MultiAssignment(targets, [expression], is_local=True)
-        for target in targets:
-            self._values.append(target)
-        return [stmt], targets
-
-    def pop_single(self) -> LuaExpression:
-        if self._values:
-            return self._values.pop()
-        placeholder = NameExpr(self.new_symbol("stack"))
-        self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
-        )
-        return placeholder
-
-    def pop_many(self, count: int) -> List[LuaExpression]:
-        items = [self.pop_single() for _ in range(count)]
-        items.reverse()
-        return items
-
-    def pop_pair(self) -> Tuple[LuaExpression, LuaExpression]:
-        lhs, rhs = self.pop_many(2)
-        return lhs, rhs
+    def push_for_operation(
+        self, operation: VMOperation, expressions: Sequence[LuaExpression]
+    ) -> List[StackEntry]:
+        entries: List[StackEntry] = []
+        for vm_value, expression in zip(operation.outputs, expressions):
+            self._registry.register(vm_value, expression)
+            entry = StackEntry(vm_value, expression)
+            self._entries.append(entry)
+            entries.append(entry)
+        return entries
 
     def flush(self) -> List[LuaExpression]:
-        values = list(self._values)
-        self._values.clear()
-        return values
+        expressions = [entry.expression for entry in self._entries]
+        self._entries.clear()
+        return expressions
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _pop_entry(self, vm_value: VMStackValue) -> StackEntry:
+        if not self._entries:
+            placeholder = NameExpr(self.new_symbol("stack"))
+            self.warnings.append(
+                f"underflow generated placeholder {placeholder.name} for {vm_value.name}"
+            )
+            self._registry.register(vm_value, placeholder)
+            return StackEntry(vm_value, placeholder)
+
+        entry = self._entries.pop()
+        if entry.value.name == vm_value.name:
+            return entry
+
+        for idx in range(len(self._entries) - 1, -1, -1):
+            candidate = self._entries[idx]
+            if candidate.value.name == vm_value.name:
+                self._entries.pop(idx)
+                self.warnings.append(
+                    f"stack reorder to satisfy value {vm_value.name}"
+                )
+                return candidate
+
+        placeholder = NameExpr(self.new_symbol("stack"))
+        self.warnings.append(
+            f"missing stack value {vm_value.name}, created {placeholder.name}"
+        )
+        self._registry.register(vm_value, placeholder)
+        return StackEntry(vm_value, placeholder)
 
 
 class StringLiteralCollector:
@@ -340,10 +378,18 @@ class BlockInfo:
 class BlockTranslator:
     """Translate IR blocks into :class:`BlockInfo` instances."""
 
-    def __init__(self, reconstructor: "HighLevelReconstructor", program: IRProgram) -> None:
+    def __init__(
+        self,
+        reconstructor: "HighLevelReconstructor",
+        program: IRProgram,
+        vm_trace: VMProgramTrace,
+    ) -> None:
         self._reconstructor = reconstructor
         self._program = program
-        self._stack = HighLevelStack()
+        self._vm_trace = vm_trace
+        self._value_registry = VMValueExpressionRegistry()
+        self._current_stack: Optional[HighLevelStack] = None
+        self._stack_warnings: List[str] = []
         self._string_collector = StringLiteralCollector()
         self._literal_tracker = LiteralRunTracker()
         self.literal_count = 0
@@ -357,19 +403,29 @@ class BlockTranslator:
         for idx, start in enumerate(order):
             block = self._program.blocks[start]
             next_offset = order[idx + 1] if idx + 1 < len(order) else None
+            trace = self._vm_trace.blocks.get(start)
+            stack = HighLevelStack(self._value_registry)
+            if trace is not None:
+                stack.seed(trace.entry_stack)
+            self._current_stack = stack
             self._literal_tracker.start_block(block.start)
-            blocks[start] = self._translate_block(block, next_offset)
+            blocks[start] = self._translate_block(block, trace, next_offset)
             self.instruction_total += len(block.instructions)
+            self._stack_warnings.extend(stack.warnings)
         self._literal_tracker.finalize()
+        self._current_stack = None
         return blocks
 
     # ------------------------------------------------------------------
-    def _translate_block(self, block: IRBlock, fallthrough: Optional[int]) -> BlockInfo:
+    def _translate_block(
+        self, block: IRBlock, trace: Optional[VMBlockTrace], fallthrough: Optional[int]
+    ) -> BlockInfo:
         statements: List[LuaStatement] = []
         terminator: Optional[Terminator] = None
         self._string_collector.reset()
         for index, instruction in enumerate(block.instructions):
             semantics = instruction.semantics
+            operation = trace.instructions[index].operation if trace else None
             self._reconstructor._register_enums(semantics)
             is_last = index == len(block.instructions) - 1
             if semantics.has_tag("literal"):
@@ -380,6 +436,7 @@ class BlockTranslator:
                     instruction,
                     semantics,
                     self,
+                    operation,
                     operand_expr=operand_expr,
                 )
                 self._literal_tracker.observe(instruction.offset, operand_expr)
@@ -393,7 +450,9 @@ class BlockTranslator:
             statements.extend(self._string_collector.flush())
             if semantics.has_tag("comparison"):
                 statements.extend(
-                    self._reconstructor._translate_comparison(instruction, semantics, self)
+                    self._reconstructor._translate_comparison(
+                        instruction, semantics, self, operation
+                    )
                 )
                 continue
             if semantics.control_flow == "branch" and is_last:
@@ -402,6 +461,7 @@ class BlockTranslator:
                     instruction,
                     semantics,
                     self,
+                    operation,
                     fallthrough,
                 )
                 continue
@@ -410,20 +470,27 @@ class BlockTranslator:
                     instruction,
                     semantics,
                     self,
+                    operation,
                 )
                 continue
             if semantics.has_tag("structure"):
                 statements.extend(
-                    self._reconstructor._translate_structure(instruction, semantics, self)
+                    self._reconstructor._translate_structure(
+                        instruction, semantics, self, operation
+                    )
                 )
                 continue
             if semantics.has_tag("call"):
                 statements.extend(
-                    self._reconstructor._translate_call(instruction, semantics, self)
+                    self._reconstructor._translate_call(
+                        instruction, semantics, self, operation
+                    )
                 )
                 continue
             statements.extend(
-                self._reconstructor._translate_generic(instruction, semantics, self)
+                self._reconstructor._translate_generic(
+                    instruction, semantics, self, operation
+                )
             )
         statements.extend(self._string_collector.finalize())
         self._literal_tracker.break_sequence()
@@ -440,7 +507,48 @@ class BlockTranslator:
     # ------------------------------------------------------------------
     @property
     def stack(self) -> HighLevelStack:
-        return self._stack
+        if self._current_stack is None:
+            raise RuntimeError("stack not initialised")
+        return self._current_stack
+
+    @property
+    def stack_warnings(self) -> Sequence[str]:
+        return tuple(self._stack_warnings)
+
+    def pop_inputs(self, operation: Optional[VMOperation]) -> List[LuaExpression]:
+        if operation is None:
+            return []
+        return self.stack.pop_for_operation(operation)
+
+    def assign_outputs(
+        self,
+        operation: Optional[VMOperation],
+        expressions: Sequence[LuaExpression],
+        *,
+        make_local: bool = True,
+    ) -> Tuple[List[LuaStatement], List[LuaExpression]]:
+        if operation is None or not operation.outputs:
+            return [], []
+
+        targets = [self._value_registry.ensure(value) for value in operation.outputs]
+        statements: List[LuaStatement] = []
+
+        if len(targets) == 1:
+            target = targets[0]
+            expr = expressions[0]
+            if isinstance(expr, NameExpr) and expr.name == target.name:
+                final_exprs = [expr]
+            else:
+                statements.append(Assignment([target], expr, is_local=make_local))
+                final_exprs = [target]
+        else:
+            statements.append(
+                MultiAssignment(targets, list(expressions), is_local=make_local)
+            )
+            final_exprs = list(targets)
+
+        self.stack.push_for_operation(operation, final_exprs)
+        return statements, final_exprs
 
     @property
     def program(self) -> IRProgram:
@@ -573,7 +681,9 @@ class HighLevelReconstructor:
     # ------------------------------------------------------------------
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
         self._last_summary = None
-        translator = BlockTranslator(self, program)
+        analyzer = VirtualMachineAnalyzer()
+        vm_trace = analyzer.trace_program(program)
+        translator = BlockTranslator(self, program, vm_trace)
         blocks = translator.translate()
         entry = min(blocks)
         structurer = ControlFlowStructurer(blocks)
@@ -592,7 +702,7 @@ class HighLevelReconstructor:
         metadata = FunctionMetadata(
             block_count=len(blocks),
             instruction_count=translator.instruction_total,
-            warnings=list(translator.stack.warnings),
+            warnings=list(translator.stack_warnings),
             helper_calls=translator.helper_calls,
             branch_count=translator.branch_count,
             literal_count=translator.literal_count,
@@ -637,12 +747,13 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
         *,
         operand_expr: Optional[LuaExpression] = None,
     ) -> Tuple[List[LuaStatement], LuaExpression]:
         operand = operand_expr or self._operand_expression(semantics, instruction.operand)
-        statements, _ = translator.stack.push_literal(operand)
         translator.literal_count += 1
+        statements, outputs = translator.assign_outputs(operation, [operand])
         decorated = self._decorate_with_comment(statements, semantics)
         return decorated, operand
 
@@ -651,11 +762,19 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
     ) -> List[LuaStatement]:
-        lhs, rhs = translator.stack.pop_pair()
+        inputs = translator.pop_inputs(operation)
+        if len(inputs) >= 2:
+            lhs, rhs = inputs[0], inputs[1]
+        elif len(inputs) == 1:
+            lhs, rhs = inputs[0], NameExpr(translator.stack.new_symbol("stack"))
+        else:
+            lhs = NameExpr(translator.stack.new_symbol("stack"))
+            rhs = NameExpr(translator.stack.new_symbol("stack"))
         operator = semantics.comparison_operator or "=="
         expression = BinaryExpr(lhs, operator, rhs)
-        statements, _ = translator.stack.push_expression(expression, prefix="cmp", make_local=True)
+        statements, _ = translator.assign_outputs(operation, [expression], make_local=True)
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_branch(
@@ -664,9 +783,14 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
         fallthrough: Optional[int],
     ) -> BranchTerminator:
-        condition = translator.stack.pop_single()
+        inputs = translator.pop_inputs(operation)
+        if inputs:
+            condition = inputs[-1]
+        else:
+            condition = NameExpr(translator.stack.new_symbol("cond"))
         # Determine targets based on IR metadata.
         true_target, false_target = self._select_branch_targets(
             block_start, translator, fallthrough
@@ -688,6 +812,7 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
     ) -> ReturnTerminator:
         values = translator.stack.flush()
         comment = self._comment_formatter.format_inline(semantics.summary or "")
@@ -698,27 +823,33 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
     ) -> List[LuaStatement]:
-        inputs, outputs = estimate_stack_io(semantics)
-        args = translator.stack.pop_many(inputs)
+        args = translator.pop_inputs(operation)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
         method = _snake_to_camel(semantics.mnemonic)
         target = NameExpr(semantics.struct_context or "struct")
         call_expr = MethodCallExpr(target, method, args)
+        input_count = (
+            len(operation.inputs) if operation is not None else semantics.stack_inputs or 0
+        )
+        output_count = (
+            len(operation.outputs) if operation is not None else semantics.stack_outputs or 0
+        )
         signature = MethodSignature(
             name=semantics.mnemonic,
             summary=semantics.summary or "",
-            inputs=inputs,
-            outputs=outputs,
+            inputs=input_count,
+            outputs=output_count,
             uses_operand=semantics.uses_operand,
             struct=semantics.struct_context or "struct",
             method=method,
         )
         self._helper_registry.register_method(signature)
         translator.helper_calls += 1
-        if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs, prefix="struct")
+        if operation and operation.outputs:
+            statements, _ = translator.assign_outputs(operation, [call_expr])
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -728,25 +859,31 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
     ) -> List[LuaStatement]:
-        inputs, outputs = estimate_stack_io(semantics)
-        args = translator.stack.pop_many(inputs)
+        args = translator.pop_inputs(operation)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
         call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
+        input_count = (
+            len(operation.inputs) if operation is not None else semantics.stack_inputs or 0
+        )
+        output_count = (
+            len(operation.outputs) if operation is not None else semantics.stack_outputs or 0
+        )
         signature = HelperSignature(
             name=semantics.mnemonic,
             summary=semantics.summary or "",
-            inputs=inputs,
-            outputs=outputs,
+            inputs=input_count,
+            outputs=output_count,
             uses_operand=semantics.uses_operand,
         )
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
-        if outputs <= 0:
-            statements = [CallStatement(call_expr)]
+        if operation and operation.outputs:
+            statements, _ = translator.assign_outputs(operation, [call_expr])
         else:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_generic(
@@ -754,23 +891,29 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
+        operation: Optional[VMOperation],
     ) -> List[LuaStatement]:
-        inputs, outputs = estimate_stack_io(semantics)
-        args = translator.stack.pop_many(inputs)
+        args = translator.pop_inputs(operation)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
         call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
+        input_count = (
+            len(operation.inputs) if operation is not None else semantics.stack_inputs or 0
+        )
+        output_count = (
+            len(operation.outputs) if operation is not None else semantics.stack_outputs or 0
+        )
         signature = HelperSignature(
             name=semantics.mnemonic,
             summary=semantics.summary or "",
-            inputs=inputs,
-            outputs=outputs,
+            inputs=input_count,
+            outputs=output_count,
             uses_operand=semantics.uses_operand,
         )
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
-        if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+        if operation and operation.outputs:
+            statements, _ = translator.assign_outputs(operation, [call_expr])
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
