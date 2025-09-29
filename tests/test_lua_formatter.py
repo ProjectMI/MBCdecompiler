@@ -207,7 +207,11 @@ def test_highlevel_function_string_metadata_block() -> None:
     assert "-- function summary:" in rendered
     assert "-- - string literal sequences: 1" in rendered
     assert "-- string literal sequences:" in rendered
-    assert '-- - 0x001234 len=11 chunks=2: "demo string"' in rendered
+    summary_line = next(
+        line for line in rendered if line.startswith("-- - 0x001234 len=11")
+    )
+    assert '"demo string"' in summary_line
+    assert "conf=" in summary_line
 
 
 def test_module_summary_toggle(tmp_path: Path) -> None:

@@ -23,8 +23,8 @@ from .highlevel import (
     FunctionMetadata,
     HighLevelFunction,
     HighLevelReconstructor,
-    StringLiteralSequence,
 )
+from .string_inference import StringAnalyzer, StringLiteralSequence
 from .lua_formatter import LuaRenderOptions
 from .lua_literals import LuaLiteralFormatter
 from .segment_classifier import SegmentClassifier
@@ -88,6 +88,7 @@ __all__ = [
     "HighLevelFunction",
     "HighLevelReconstructor",
     "StringLiteralSequence",
+    "StringAnalyzer",
     "FunctionMetadata",
     "LuaRenderOptions",
     "SegmentClassifier",

@@ -181,6 +181,50 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     assert '-- - 0x000000 len=5 chunks=3: "Hello"' in rendered
 
 
+def test_string_sequences_rename_locals_and_add_metadata(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "02:00": {
+                    "name": "return_top",
+                    "summary": "Return top value",
+                    "stack_delta": -1,
+                    "control_flow": "return",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    instructions: list[IRInstruction] = []
+    offset = 0x0000
+    offset = _extend_with_string(analyzer, instructions, offset, "SetHealth")
+    instructions.append(_make_instruction(analyzer, offset, "02:00", 0, "return"))
+
+    block = IRBlock(start=0x0000, instructions=instructions, successors=[])
+    program = IRProgram(segment_index=7, blocks={block.start: block})
+
+    reconstructor = HighLevelReconstructor(knowledge)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert "local sethealth_str" in rendered
+    assert "-- - string identifier hints: 1" in rendered
+    string_block = [line for line in rendered.splitlines() if line.startswith("-- - 0x000000")][0]
+    assert "id=SetHealth" in string_block
+
+
 def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
     kb_path = tmp_path / "kb.json"
     manual_path = tmp_path / "manual_annotations.json"
