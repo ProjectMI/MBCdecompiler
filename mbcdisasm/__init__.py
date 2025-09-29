@@ -19,7 +19,22 @@ from .ir import IRBuilder, IRProgram, write_ir_programs
 from .emulator import Emulator, EmulationReport, write_emulation_reports
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .ast import LuaReconstructor
-from .highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
+from .highlevel import (
+    FunctionMetadata,
+    HighLevelFunction,
+    HighLevelReconstructor,
+    StackValue,
+)
+from .inline_strings import (
+    InlineStringAccumulator,
+    InlineStringChunk,
+    InlineStringSequence,
+    InlineStringCollector,
+    InlineStringReport,
+    render_inline_tables,
+)
+from .string_utils import chunk_preview, printable_ratio
+from .string_tables import StringTable, StringTableEntry, parse_string_table
 from .lua_formatter import LuaRenderOptions
 from .segment_classifier import SegmentClassifier
 from .manual_semantics import (
@@ -83,6 +98,18 @@ __all__ = [
     "HighLevelFunction",
     "HighLevelReconstructor",
     "FunctionMetadata",
+    "StackValue",
+    "InlineStringAccumulator",
+    "InlineStringChunk",
+    "InlineStringSequence",
+    "InlineStringCollector",
+    "InlineStringReport",
+    "render_inline_tables",
+    "chunk_preview",
+    "printable_ratio",
+    "StringTable",
+    "StringTableEntry",
+    "parse_string_table",
     "LuaRenderOptions",
     "SegmentClassifier",
     "ManualSemanticAnalyzer",

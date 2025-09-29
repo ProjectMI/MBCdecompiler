@@ -141,6 +141,9 @@ class LuaRenderOptions:
     emit_stub_metadata: bool = True
     emit_enum_metadata: bool = True
     emit_module_summary: bool = True
+    emit_inline_comments: bool = True
+    inline_preview_limit: int = 72
+    inline_text_threshold: float = 0.65
 
 
 class CommentFormatter:

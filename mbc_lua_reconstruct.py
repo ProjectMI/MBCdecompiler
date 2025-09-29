@@ -61,6 +61,23 @@ def parse_args() -> argparse.Namespace:
         help="Maximum width for inline comments before they become standalone",
     )
     parser.add_argument(
+        "--no-inline-comments",
+        action="store_true",
+        help="Do not emit inline chunk previews inside the reconstructed Lua",
+    )
+    parser.add_argument(
+        "--inline-preview-limit",
+        type=int,
+        default=None,
+        help="Maximum number of characters to include in inline chunk previews",
+    )
+    parser.add_argument(
+        "--inline-text-threshold",
+        type=float,
+        default=None,
+        help="Printable ratio required for inline chunks to be treated as text",
+    )
+    parser.add_argument(
         "--no-stub-metadata",
         action="store_true",
         help="Skip emitting helper stub metadata (inputs/outputs annotations)",
@@ -111,6 +128,12 @@ def main() -> None:
         options.emit_enum_metadata = False
     if args.no_module_summary:
         options.emit_module_summary = False
+    if args.no_inline_comments:
+        options.emit_inline_comments = False
+    if args.inline_preview_limit:
+        options.inline_preview_limit = max(8, args.inline_preview_limit)
+    if args.inline_text_threshold is not None:
+        options.inline_text_threshold = max(0.0, min(1.0, args.inline_text_threshold))
 
     reconstructor = HighLevelReconstructor(knowledge, options=options)
 

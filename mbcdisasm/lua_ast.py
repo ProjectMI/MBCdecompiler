@@ -37,6 +37,7 @@ class LuaExpression:
 @dataclass
 class LiteralExpr(LuaExpression):
     value: str
+    py_value: object | None = None
 
     def render(self) -> str:
         return self.value

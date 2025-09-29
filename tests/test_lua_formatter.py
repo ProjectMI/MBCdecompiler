@@ -181,6 +181,8 @@ def test_highlevel_function_summary_and_warnings() -> None:
     assert "-- - literal instructions: 0" in rendered
     assert "-- - helper invocations: 0" in rendered
     assert "-- - branches: 0" in rendered
+    assert "-- - inline chunks: 0" in rendered
+    assert "-- - inline bytes: 0" in rendered
     assert "-- stack reconstruction warnings:" in rendered
     assert "-- - stack underflow" in rendered
     assert "function segment_001()" in rendered
@@ -215,6 +217,10 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     assert "- branch instructions: 0" in output
     assert "- enum namespaces: 1 (1 values)" in output
     assert "- stack warnings: 0" in output
+    assert "- inline string data: 0 entries (0 bytes)" in output
+    assert "- inline segments: 0" in output
+    assert "largest inline chunk" not in output
+    assert "average inline chunk" not in output
 
     no_summary = HighLevelReconstructor(
         knowledge,
@@ -287,6 +293,9 @@ def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
     assert "- literal instructions: 3" in rendered
     assert "- branch instructions: 1" in rendered
     assert "- stack warnings: 1" in rendered
+    assert "- inline string data: 0 entries (0 bytes)" in rendered
+    assert "- inline segments: 0" in rendered
+    assert "average inline chunk" not in rendered
 
 
 def test_comment_deduplication(tmp_path: Path) -> None:
@@ -393,8 +402,31 @@ def test_function_metadata_counts(tmp_path: Path) -> None:
     assert metadata.literal_count == 1
     assert metadata.helper_calls == 1
     assert metadata.branch_count == 1
+    assert metadata.inline_chunk_count == 0
+    assert metadata.inline_byte_count == 0
 
     rendered = function.render()
     assert "- literal instructions: 1" in rendered
     assert "- helper invocations: 1" in rendered
     assert "- branches: 1" in rendered
+    assert "- inline chunks: 0" in rendered
+    assert "- inline bytes: 0" in rendered
+
+
+def test_function_metadata_to_dict() -> None:
+    metadata = FunctionMetadata(
+        block_count=2,
+        instruction_count=5,
+        warnings=["warn"],
+        helper_calls=1,
+        branch_count=2,
+        literal_count=3,
+        inline_chunk_count=4,
+        inline_byte_count=16,
+    )
+    payload = metadata.to_dict()
+    assert payload["blocks"] == 2
+    assert payload["instructions"] == 5
+    assert payload["warnings"] == ["warn"]
+    assert payload["inline_chunks"] == 4
+    assert payload["inline_bytes"] == 16

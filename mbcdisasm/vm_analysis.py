@@ -274,7 +274,7 @@ class VirtualMachineAnalyzer:
         )
         operand_literal: Optional[str] = None
         if semantics.uses_operand:
-            operand_literal = _format_operand(instruction.operand)
+            operand_literal, _ = _format_operand(instruction.operand)
         call_expression = _format_call(semantics, inputs, operand_literal)
         comment = _format_comment(semantics)
         return VMOperation(
@@ -367,14 +367,14 @@ def render_value_lifetimes(lifetimes: Dict[str, VMLifetime]) -> List[str]:
     return lines
 
 
-def _format_operand(operand: int) -> str:
+def _format_operand(operand: int) -> Tuple[str, Optional[object]]:
     signed = operand if operand < 0x8000 else operand - 0x10000
     if -9 <= signed <= 9:
-        return str(signed)
+        return str(signed), signed
     text = _ascii_candidate(operand)
     if text is not None:
-        return _lua_string(text)
-    return f"0x{operand:04X}"
+        return _lua_string(text), text
+    return f"0x{operand:04X}", operand
 
 
 def _format_call(
@@ -445,14 +445,30 @@ def _ascii_candidate(operand: int) -> Optional[str]:
 
 
 def _lua_string(text: str) -> str:
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
+    parts: List[str] = []
+    for char in text:
+        code = ord(char)
+        if code == 0x5C:
+            parts.append("\\\\")
+        elif code == 0x22:
+            parts.append('\"')
+        elif code == 0x0A:
+            parts.append("\\n")
+        elif code == 0x0D:
+            parts.append("\\r")
+        elif code == 0x09:
+            parts.append("\\t")
+        elif 0x20 <= code <= 0x7E:
+            parts.append(char)
+        else:
+            parts.append(f"\\x{code:02X}")
+    return '"' + "".join(parts) + '"'
 
 
 class LuaLiteralFormatter:
     """Utility class mirroring the operand formatting used by the VM layer."""
 
-    def format_operand(self, operand: int) -> str:
+    def format_operand(self, operand: int) -> Tuple[str, Optional[object]]:
         return _format_operand(operand)
 
 
