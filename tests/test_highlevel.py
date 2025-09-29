@@ -4,6 +4,7 @@ from pathlib import Path
 from mbcdisasm.highlevel import HighLevelReconstructor
 from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
 from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.lua_formatter import LuaRenderOptions
 from mbcdisasm.manual_semantics import ManualSemanticAnalyzer
 from mbcdisasm.vm_analysis import estimate_stack_io
 
@@ -177,8 +178,12 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     rendered = reconstructor.render([function])
 
     assert 'string literal sequence: "Hello"' in rendered
-    assert "-- string literal sequences:" in rendered
-    assert '-- - 0x000000 len=5 chunks=3: "Hello"' in rendered
+    assert "-- literal runs:" in rendered
+    assert '-- - 0x000000 kind=string count=3: "Hello"' in rendered
+    assert "-- literal run report:" in rendered
+    assert "-- block 0x000000:" in rendered
+    assert "-- - literal tokens:" in rendered
+    assert 'literal statistics' in rendered
 
 
 def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
@@ -234,4 +239,47 @@ def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
 
     assert function.name == "set_name"
     assert "function set_name()" in rendered
-    assert "-- string literal sequences:" in rendered
+    assert "-- literal runs:" in rendered
+    assert 'literal statistics' in rendered
+
+
+def test_literal_report_toggle(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "02:00": {
+                    "name": "return_top",
+                    "summary": "Return top value",
+                    "stack_delta": -1,
+                    "control_flow": "return",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    instructions: list[IRInstruction] = []
+    offset = 0x0000
+    offset = _extend_with_string(analyzer, instructions, offset, "World")
+    instructions.append(_make_instruction(analyzer, offset, "02:00", 0, "return"))
+    block = IRBlock(start=0x0000, instructions=instructions, successors=[])
+    program = IRProgram(segment_index=0, blocks={block.start: block})
+
+    options = LuaRenderOptions(emit_literal_report=False)
+    reconstructor = HighLevelReconstructor(knowledge, options=options)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert "-- literal runs:" in rendered
+    assert "-- literal run report:" not in rendered

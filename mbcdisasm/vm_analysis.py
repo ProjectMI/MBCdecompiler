@@ -187,6 +187,7 @@ class VMStackState:
         count: int,
         *,
         offset: Optional[int],
+        comments: Optional[Sequence[Optional[str]]] = None,
     ) -> List[VMStackValue]:
         values: List[VMStackValue] = []
         if count <= 0:
@@ -195,10 +196,15 @@ class VMStackState:
         primary_origin = "literal" if semantics.has_tag("literal") else "result"
         for index in range(count):
             origin = primary_origin if index == 0 else f"{primary_origin}-extra"
+            comment = None
+            if comments and index < len(comments):
+                comment = comments[index]
+            if comment is None and index == 0:
+                comment = semantics.summary
             value = VMStackValue(
                 name=f"{base_name}_{self._counter}",
                 origin=origin,
-                comment=semantics.summary,
+                comment=comment,
                 offset=offset,
             )
             self._counter += 1
@@ -268,16 +274,20 @@ class VirtualMachineAnalyzer:
         semantics: InstructionSemantics = instruction.semantics
         inputs_count, outputs_count = estimate_stack_io(semantics)
         inputs, warnings = state.pop_values(inputs_count)
-        outputs = state.push_values(
-            semantics,
-            outputs_count,
-            offset=instruction.offset,
-        )
         operand_literal: Optional[str] = None
         if semantics.uses_operand:
             operand_literal = _LITERAL_FORMATTER.format_operand(
                 instruction.operand
             ).render()
+        literal_comments = None
+        if semantics.has_tag("literal") and operand_literal is not None:
+            literal_comments = [operand_literal]
+        outputs = state.push_values(
+            semantics,
+            outputs_count,
+            offset=instruction.offset,
+            comments=literal_comments,
+        )
         call_expression = _format_call(semantics, inputs, operand_literal)
         comment = _format_comment(semantics)
         return VMOperation(

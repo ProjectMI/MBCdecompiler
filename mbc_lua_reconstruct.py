@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -18,6 +19,7 @@ from mbcdisasm import (
 )
 from mbcdisasm.data_segments import render_data_summaries, summarise_data_segments
 from mbcdisasm.highlevel import HighLevelReconstructor, HighLevelFunction
+from mbcdisasm.literal_sequences import build_literal_run_report, literal_report_to_dict
 from mbcdisasm.lua_formatter import LuaRenderOptions
 
 
@@ -75,6 +77,11 @@ def parse_args() -> argparse.Namespace:
         "--no-module-summary",
         action="store_true",
         help="Suppress the module-level summary comment block",
+    )
+    parser.add_argument(
+        "--no-literal-report",
+        action="store_true",
+        help="Skip emitting aggregated literal report information",
     )
     parser.add_argument(
         "--min-string-length",
@@ -149,6 +156,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Append a return statement for the generated data table",
     )
+    parser.add_argument(
+        "--literal-report-json",
+        type=Path,
+        default=None,
+        help="Write literal run statistics to the specified JSON file",
+    )
     return parser.parse_args()
 
 
@@ -185,6 +198,8 @@ def main() -> None:
         options.emit_enum_metadata = False
     if args.no_module_summary:
         options.emit_module_summary = False
+    if args.no_literal_report:
+        options.emit_literal_report = False
 
     reconstructor = HighLevelReconstructor(knowledge, options=options)
 
@@ -195,6 +210,13 @@ def main() -> None:
         functions.append(reconstructor.from_ir(program))
 
     module_text = reconstructor.render(functions)
+
+    if args.literal_report_json:
+        all_runs = [run for func in functions for run in func.metadata.literal_runs]
+        report = build_literal_run_report(all_runs)
+        payload = literal_report_to_dict(report)
+        args.literal_report_json.parent.mkdir(parents=True, exist_ok=True)
+        args.literal_report_json.write_text(json.dumps(payload, indent=2), "utf-8")
 
     data_summaries = summarise_data_segments(
         container.segments(),

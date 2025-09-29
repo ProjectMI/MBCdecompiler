@@ -8,7 +8,11 @@ from mbcdisasm.highlevel import (
     FunctionMetadata,
     HighLevelFunction,
     HighLevelReconstructor,
-    StringLiteralSequence,
+)
+from mbcdisasm.literal_sequences import (
+    LiteralDescriptor,
+    LiteralRun,
+    compute_literal_statistics,
 )
 from mbcdisasm.lua_ast import Assignment, LiteralExpr, NameExpr, ReturnStatement, wrap_block
 from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
@@ -192,11 +196,28 @@ def test_highlevel_function_summary_and_warnings() -> None:
 
 
 def test_highlevel_function_string_metadata_block() -> None:
-    sequence = StringLiteralSequence(text="demo string", offsets=(0x1234, 0x1238))
+    descriptor_a = LiteralDescriptor(
+        kind="string",
+        text="demo ",
+        expression=LiteralExpr("\"demo \""),
+    )
+    descriptor_b = LiteralDescriptor(
+        kind="string",
+        text="string",
+        expression=LiteralExpr("\"string\""),
+    )
+    run = LiteralRun(
+        kind="string",
+        descriptors=(descriptor_a, descriptor_b),
+        offsets=(0x1234, 0x1238),
+        block_start=0x1200,
+    )
+    stats = compute_literal_statistics([run])
     metadata = FunctionMetadata(
         block_count=1,
         instruction_count=2,
-        string_sequences=[sequence],
+        literal_runs=[run],
+        literal_stats=stats,
     )
     function = HighLevelFunction(
         name="segment_demo",
@@ -206,8 +227,9 @@ def test_highlevel_function_string_metadata_block() -> None:
     rendered = function.render().splitlines()
     assert "-- function summary:" in rendered
     assert "-- - string literal sequences: 1" in rendered
-    assert "-- string literal sequences:" in rendered
-    assert '-- - 0x001234 len=11 chunks=2: "demo string"' in rendered
+    assert "-- literal runs:" in rendered
+    assert '-- - 0x001234 kind=string count=2: "demo string"' in rendered
+    assert any("literal statistics" in line for line in rendered)
 
 
 def test_module_summary_toggle(tmp_path: Path) -> None:
