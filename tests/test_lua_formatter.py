@@ -10,6 +10,7 @@ from mbcdisasm.highlevel import (
     HighLevelReconstructor,
     StringLiteralSequence,
 )
+from mbcdisasm.lua_optimizer import LiteralRunSummary
 from mbcdisasm.lua_ast import Assignment, LiteralExpr, NameExpr, ReturnStatement, wrap_block
 from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
 from mbcdisasm.lua_formatter import (
@@ -210,6 +211,61 @@ def test_highlevel_function_string_metadata_block() -> None:
     assert '-- - 0x001234 len=11 chunks=2: "demo string"' in rendered
 
 
+def test_highlevel_function_literal_run_metadata_block() -> None:
+    run = LiteralRunSummary(
+        prefix="literal",
+        first="literal_0",
+        last="literal_4",
+        count=5,
+        kind_breakdown=[("number", 5)],
+    )
+    metadata = FunctionMetadata(
+        block_count=1,
+        instruction_count=5,
+        literal_runs=[run],
+    )
+    function = HighLevelFunction(
+        name="segment_literals",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata,
+    )
+    rendered = function.render().splitlines()
+    assert "-- literal runs collapsed:" in rendered
+    assert "-- - literal: literal_0..literal_4 (5 values; number=5)" in rendered
+    assert "-- - literal runs: 1" in rendered
+
+
+def test_literal_run_metadata_includes_details() -> None:
+    run = LiteralRunSummary(
+        prefix="literal",
+        first="literal_0",
+        last="literal_2",
+        count=3,
+        kind_breakdown=[("number", 3)],
+        value_sample=["0", "1", "2", "3"],
+        numeric_range=(0, 5),
+        string_preview="ignored",
+        byte_size=12,
+    )
+    metadata = FunctionMetadata(
+        block_count=1,
+        instruction_count=3,
+        literal_runs=[run],
+        literal_bytes=12,
+    )
+    function = HighLevelFunction(
+        name="segment_detail",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata,
+    )
+    rendered = function.render().splitlines()
+    assert any(line.endswith("sample: 0, 1, 2, 3") for line in rendered)
+    assert "numeric range: 0..5" in "\n".join(rendered)
+    assert "string preview: ignored" in "\n".join(rendered)
+    assert "estimated bytes: 12" in "\n".join(rendered)
+    assert "-- - literal payload bytes: 12" in rendered
+
+
 def test_module_summary_toggle(tmp_path: Path) -> None:
     knowledge = KnowledgeBase.load(tmp_path / "kb_summary.json")
     options = LuaRenderOptions()
@@ -255,6 +311,54 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     )
     result = no_summary.render([function])
     assert "module summary" not in result
+
+
+def test_module_summary_includes_literal_registry(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase.load(tmp_path / "kb_multi.json")
+    reconstructor = HighLevelReconstructor(knowledge)
+
+    run_a = LiteralRunSummary(
+        prefix="literal",
+        first="literal_0",
+        last="literal_2",
+        count=3,
+        kind_breakdown=[("number", 3)],
+        byte_size=6,
+    )
+    run_b = LiteralRunSummary(
+        prefix="string",
+        first="string_0",
+        last="string_4",
+        count=5,
+        kind_breakdown=[("string", 5)],
+        byte_size=20,
+    )
+    fn_a = HighLevelFunction(
+        name="segment_literal",
+        body=wrap_block([ReturnStatement()]),
+        metadata=FunctionMetadata(
+            block_count=1,
+            instruction_count=3,
+            literal_runs=[run_a],
+            literal_bytes=6,
+        ),
+    )
+    fn_b = HighLevelFunction(
+        name="segment_string",
+        body=wrap_block([ReturnStatement()]),
+        metadata=FunctionMetadata(
+            block_count=1,
+            instruction_count=5,
+            literal_runs=[run_b],
+            literal_bytes=20,
+        ),
+    )
+
+    text = reconstructor.render([fn_a, fn_b])
+    assert "literal registry overview" in text
+    assert "literal: 1 runs; 6 bytes" in text
+    assert "string: 1 runs; 20 bytes" in text
+    assert "largest runs" in text
 
 
 def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:

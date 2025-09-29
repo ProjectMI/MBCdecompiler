@@ -46,6 +46,7 @@ from .lua_formatter import (
 )
 from .manual_semantics import InstructionSemantics
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
+from .lua_optimizer import LiteralRunRegistry, LiteralRunSummary, LuaStatementOptimizer
 from .vm_analysis import estimate_stack_io
 
 
@@ -238,12 +239,18 @@ class FunctionMetadata:
     branch_count: int = 0
     literal_count: int = 0
     string_sequences: Sequence[StringLiteralSequence] = field(default_factory=tuple)
+    literal_runs: Sequence[LiteralRunSummary] = field(default_factory=tuple)
+    literal_bytes: int = 0
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
         lines.append(f"- blocks: {self.block_count}")
         lines.append(f"- instructions: {self.instruction_count}")
         lines.append(f"- literal instructions: {self.literal_count}")
+        if self.literal_runs:
+            lines.append(f"- literal runs: {len(self.literal_runs)}")
+        if self.literal_bytes:
+            lines.append(f"- literal payload bytes: {self.literal_bytes}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
         if self.string_sequences:
@@ -274,6 +281,19 @@ class FunctionMetadata:
             lines.append(f"- ... ({remaining} additional sequences)")
         return lines
 
+    def literal_run_lines(self, *, limit: int = 12) -> List[str]:
+        if not self.literal_runs:
+            return []
+        runs = list(self.literal_runs)[:limit]
+        lines: List[str] = []
+        for summary in runs:
+            lines.append(summary.to_metadata_line())
+            lines.extend(summary.additional_metadata_lines())
+        remaining = len(self.literal_runs) - limit
+        if remaining > 0:
+            lines.append(f"- ... ({remaining} additional runs)")
+        return lines
+
 
 @dataclass
 class HighLevelFunction:
@@ -292,6 +312,10 @@ class HighLevelFunction:
         string_lines = self.metadata.string_lines()
         if string_lines:
             writer.write_comment_block(["string literal sequences:"] + string_lines)
+            writer.write_line("")
+        run_lines = self.metadata.literal_run_lines()
+        if run_lines:
+            writer.write_comment_block(["literal runs collapsed:"] + run_lines)
             writer.write_line("")
         if self.metadata.warnings:
             writer.write_comment_block(
@@ -351,10 +375,12 @@ class BlockTranslator:
         self._stack = HighLevelStack()
         self._string_collector = StringLiteralCollector()
         self._collected_sequences: List[StringLiteralSequence] = []
+        self._optimizer = LuaStatementOptimizer()
         self.literal_count = 0
         self.helper_calls = 0
         self.branch_count = 0
         self.instruction_total = 0
+        self._literal_runs: List[LiteralRunSummary] = []
 
     def translate(self) -> Dict[int, BlockInfo]:
         blocks: Dict[int, BlockInfo] = {}
@@ -426,6 +452,8 @@ class BlockTranslator:
                 self._reconstructor._translate_generic(instruction, semantics, self)
             )
         statements.extend(self._string_collector.finalize())
+        statements, summaries = self._optimizer.optimise(statements)
+        self._literal_runs.extend(summaries)
         self._collected_sequences.extend(self._string_collector.drain_sequences())
         if terminator is None:
             target = block.successors[0] if block.successors else fallthrough
@@ -449,6 +477,10 @@ class BlockTranslator:
     @property
     def string_sequences(self) -> List[StringLiteralSequence]:
         return list(self._collected_sequences)
+
+    @property
+    def literal_runs(self) -> List[LiteralRunSummary]:
+        return list(self._literal_runs)
 
 
 class ControlFlowStructurer:
@@ -583,6 +615,7 @@ class HighLevelReconstructor:
         )
         base_name = self._derive_function_name(program, string_sequences)
         function_name = self._unique_function_name(base_name)
+        total_literal_bytes = sum(summary.byte_size for summary in translator.literal_runs)
         metadata = FunctionMetadata(
             block_count=len(blocks),
             instruction_count=translator.instruction_total,
@@ -591,6 +624,8 @@ class HighLevelReconstructor:
             branch_count=translator.branch_count,
             literal_count=translator.literal_count,
             string_sequences=tuple(string_sequences),
+            literal_runs=tuple(translator.literal_runs),
+            literal_bytes=total_literal_bytes,
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
@@ -839,6 +874,16 @@ class HighLevelReconstructor:
         lines.append(f"- struct helpers: {helper_methods}")
         literal_total = sum(func.metadata.literal_count for func in functions)
         lines.append(f"- literal instructions: {literal_total}")
+        literal_runs = sum(len(func.metadata.literal_runs) for func in functions)
+        if literal_runs:
+            lines.append(f"- literal runs: {literal_runs}")
+        total_bytes = sum(func.metadata.literal_bytes for func in functions)
+        if total_bytes:
+            lines.append(f"- literal payload bytes: {total_bytes}")
+        registry = LiteralRunRegistry()
+        for function in functions:
+            registry.register_many(function.metadata.literal_runs)
+        lines.extend(registry.summary_lines(limit=5))
         branch_total = sum(func.metadata.branch_count for func in functions)
         lines.append(f"- branch instructions: {branch_total}")
         if not self._enum_registry.is_empty():

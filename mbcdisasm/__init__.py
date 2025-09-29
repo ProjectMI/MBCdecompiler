@@ -27,6 +27,12 @@ from .highlevel import (
 )
 from .lua_formatter import LuaRenderOptions
 from .lua_literals import LuaLiteralFormatter
+from .lua_optimizer import (
+    LiteralRunAnalyzer,
+    LiteralRunRegistry,
+    LiteralRunReporter,
+    LiteralRunSummary,
+)
 from .segment_classifier import SegmentClassifier
 from .manual_semantics import (
     AnnotatedInstruction,
@@ -89,6 +95,10 @@ __all__ = [
     "HighLevelReconstructor",
     "StringLiteralSequence",
     "FunctionMetadata",
+    "LiteralRunSummary",
+    "LiteralRunRegistry",
+    "LiteralRunReporter",
+    "LiteralRunAnalyzer",
     "LuaRenderOptions",
     "SegmentClassifier",
     "ManualSemanticAnalyzer",
