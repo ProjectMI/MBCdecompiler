@@ -34,6 +34,12 @@ from .manual_semantics import (
     ManualSemanticAnalyzer,
     StackEffect,
 )
+from .string_analysis import (
+    StringClassifier,
+    StringInsight,
+    summarise_insights,
+    token_histogram,
+)
 from .vm_analysis import (
     VMBlockTrace,
     VMInstructionState,
@@ -90,6 +96,10 @@ __all__ = [
     "StringLiteralSequence",
     "FunctionMetadata",
     "LuaRenderOptions",
+    "StringClassifier",
+    "StringInsight",
+    "summarise_insights",
+    "token_histogram",
     "SegmentClassifier",
     "ManualSemanticAnalyzer",
     "InstructionSemantics",

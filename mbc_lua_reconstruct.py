@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -75,6 +76,17 @@ def parse_args() -> argparse.Namespace:
         "--no-module-summary",
         action="store_true",
         help="Suppress the module-level summary comment block",
+    )
+    parser.add_argument(
+        "--no-string-catalog",
+        action="store_true",
+        help="Disable the aggregated string catalog section",
+    )
+    parser.add_argument(
+        "--string-insights",
+        type=Path,
+        default=None,
+        help="Write a JSON report summarising detected string literals",
     )
     parser.add_argument(
         "--min-string-length",
@@ -185,6 +197,8 @@ def main() -> None:
         options.emit_enum_metadata = False
     if args.no_module_summary:
         options.emit_module_summary = False
+    if args.no_string_catalog:
+        options.emit_string_catalog = False
 
     reconstructor = HighLevelReconstructor(knowledge, options=options)
 
@@ -195,6 +209,11 @@ def main() -> None:
         functions.append(reconstructor.from_ir(program))
 
     module_text = reconstructor.render(functions)
+    if args.string_insights:
+        insights = reconstructor.string_insight_report(functions)
+        args.string_insights.write_text(
+            json.dumps(insights, indent=2, ensure_ascii=False), "utf-8"
+        )
 
     data_summaries = summarise_data_segments(
         container.segments(),

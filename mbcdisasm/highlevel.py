@@ -5,8 +5,8 @@ from __future__ import annotations
 import re
 
 from collections import Counter
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .ir import IRBlock, IRInstruction, IRProgram
 from .knowledge import KnowledgeBase
@@ -46,6 +46,12 @@ from .lua_formatter import (
 )
 from .manual_semantics import InstructionSemantics
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
+from .string_analysis import (
+    StringClassifier,
+    StringInsight,
+    summarise_insights,
+    token_histogram,
+)
 from .vm_analysis import estimate_stack_io
 
 
@@ -55,12 +61,15 @@ class HighLevelStack:
     def __init__(self) -> None:
         self._values: List[NameExpr] = []
         self._counter = 0
+        self._used_names: Set[str] = set()
         self.warnings: List[str] = []
+        self._string_registry: Dict[str, Tuple[StringLiteralSequence, int]] = {}
+        self._sequence_consumers: Dict[int, List[str]] = {}
 
     def new_symbol(self, prefix: str = "value") -> str:
-        name = f"{prefix}_{self._counter}"
-        self._counter += 1
-        return name
+        candidate = self._reserve_candidate(prefix)
+        self._used_names.add(candidate)
+        return candidate
 
     def push_literal(
         self, expression: LuaExpression, *, prefix: Optional[str] = None
@@ -85,6 +94,7 @@ class HighLevelStack:
             self._values.append(target)
             return [statement], target
         if isinstance(expression, NameExpr):
+            self._register_existing_name(expression.name)
             self._values.append(expression)
             return [], expression
         name = self.new_symbol(prefix)
@@ -133,6 +143,147 @@ class HighLevelStack:
         self._values.clear()
         return values
 
+    # ------------------------------------------------------------------
+    def rename_symbol(self, target: NameExpr, suggested: str) -> Optional[str]:
+        """Rename *target* to a readable identifier derived from ``suggested``.
+
+        The method returns the new symbol name when renaming succeeds.  When
+        ``suggested`` cannot be converted into a valid Lua identifier the
+        original name is preserved and ``None`` is returned.
+        """
+
+        candidate = _sanitize_identifier(suggested)
+        if not candidate:
+            return None
+        candidate = _to_snake_case(candidate)
+        if not candidate:
+            return None
+        if candidate in _LUA_KEYWORDS:
+            candidate = f"{candidate}_value"
+        unique = self._ensure_unique(candidate)
+        if unique == target.name:
+            return unique
+        if target.name in self._used_names:
+            self._used_names.remove(target.name)
+        self._used_names.add(unique)
+        target.name = unique
+        return unique
+
+    # ------------------------------------------------------------------
+    def _ensure_unique(self, base: str) -> str:
+        if base not in self._used_names:
+            return base
+        index = 1
+        while True:
+            candidate = f"{base}_{index}"
+            if candidate not in self._used_names:
+                return candidate
+            index += 1
+
+    def _register_existing_name(self, name: str) -> None:
+        if not name:
+            return
+        self._used_names.add(name)
+
+    def _reserve_candidate(self, prefix: str) -> str:
+        while True:
+            name = f"{prefix}_{self._counter}"
+            self._counter += 1
+            if name not in self._used_names:
+                return name
+
+    # ------------------------------------------------------------------
+    def register_string_sequence(self, sequence: StringLiteralSequence) -> None:
+        self._sequence_consumers.setdefault(id(sequence), [])
+        for index, name in enumerate(sequence.symbol_names):
+            self._string_registry[name] = (sequence, index)
+
+    def match_sequence_suffix(
+        self, arguments: Sequence[LuaExpression]
+    ) -> Optional[StringLiteralSequence]:
+        candidate: Optional[StringLiteralSequence] = None
+        collected: List[int] = []
+        seen: Set[int] = set()
+        started = False
+        for expression in reversed(arguments):
+            if isinstance(expression, NameExpr):
+                entry = self._string_registry.get(expression.name)
+                if entry is None:
+                    if started:
+                        break
+                    return None
+                sequence, index = entry
+                if candidate is None:
+                    candidate = sequence
+                elif candidate is not sequence:
+                    break
+                if index in seen:
+                    break
+                seen.add(index)
+                collected.append(index)
+                started = True
+            else:
+                if started:
+                    break
+                continue
+        if candidate is None:
+            return None
+        expected = list(range(len(candidate.symbol_names)))
+        if not expected:
+            return None
+        if sorted(collected) != expected:
+            return None
+        return candidate
+
+    def note_sequence_consumer(
+        self, sequence: StringLiteralSequence, consumer: str
+    ) -> None:
+        consumer = consumer.strip()
+        if not consumer:
+            return
+        self._sequence_consumers.setdefault(id(sequence), []).append(consumer)
+
+    def sequence_consumers(self, sequence: StringLiteralSequence) -> Tuple[str, ...]:
+        return tuple(self._sequence_consumers.get(id(sequence), ()))
+
+    def rename_call_results(
+        self,
+        targets: Sequence[NameExpr],
+        sequence: Optional[StringLiteralSequence],
+        semantics: InstructionSemantics,
+    ) -> None:
+        if not targets:
+            return
+        if sequence is None:
+            return
+        base_name = sequence.base_name
+        if not base_name and sequence.insight and sequence.insight.tokens:
+            candidate = _sanitize_identifier(sequence.insight.tokens[0])
+            base_name = _to_snake_case(candidate) if candidate else None
+        if not base_name:
+            return
+        base_name = _to_snake_case(base_name) or base_name
+        if len(targets) == 1:
+            suffix = self._result_suffix(semantics)
+            candidate = f"{base_name}_{suffix}" if suffix else base_name
+            self.rename_symbol(targets[0], candidate)
+        else:
+            for index, target in enumerate(targets):
+                candidate = f"{base_name}_result_{index}"
+                self.rename_symbol(target, candidate)
+
+    def _result_suffix(self, semantics: InstructionSemantics) -> str:
+        manual = (semantics.manual_name or semantics.mnemonic or "").lower()
+        if any(keyword in manual for keyword in ("count", "number", "total")):
+            return "count"
+        if any(keyword in manual for keyword in ("flag", "status", "state")):
+            return "status"
+        if any(keyword in manual for keyword in ("id", "identifier")):
+            return "id"
+        if any(keyword in manual for keyword in ("name", "label", "string")):
+            return "value"
+        return "result"
+
 
 @dataclass(frozen=True)
 class StringLiteralSequence:
@@ -140,6 +291,11 @@ class StringLiteralSequence:
 
     text: str
     offsets: Tuple[int, ...]
+    symbol_names: Tuple[str, ...] = field(default_factory=tuple)
+    base_name: Optional[str] = None
+    insight: Optional[StringInsight] = None
+    comment: Optional[CommentStatement] = None
+    consumers: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def start_offset(self) -> int:
@@ -162,49 +318,114 @@ class StringLiteralSequence:
             return "..."
         return self.text[: limit - 3] + "..."
 
+    def annotation_strings(self) -> List[str]:
+        annotations: List[str] = []
+        if self.base_name:
+            annotations.append(f"name={self.base_name}")
+        if self.symbol_names:
+            annotations.append("locals=" + ", ".join(self.symbol_names))
+        if self.insight:
+            annotations.append(f"type={self.insight.classification}")
+            if self.insight.tokens:
+                sample = ", ".join(self.insight.tokens[:4])
+                annotations.append(f"tokens=[{sample}]")
+            if self.insight.entropy:
+                annotations.append(f"entropy={self.insight.entropy:.2f}")
+            if self.insight.case_style and self.insight.case_style != "neutral":
+                annotations.append(f"case={self.insight.case_style}")
+            if self.insight.token_density:
+                annotations.append(f"density={self.insight.token_density:.3f}")
+            if self.insight.printable_ratio < 1.0:
+                annotations.append(f"printable={self.insight.printable_ratio:.2f}")
+        if self.consumers:
+            preview = ", ".join(self.consumers[:3])
+            if len(self.consumers) > 3:
+                preview += ", …"
+            annotations.append(f"used_by=[{preview}]")
+        return annotations
+
+    def refresh_comment(self) -> None:
+        if not self.comment:
+            return
+        preview = escape_lua_string(self.preview())
+        annotations = self.annotation_strings()
+        suffix = f" ({'; '.join(annotations)})" if annotations else ""
+        self.comment.text = (
+            f"string literal sequence: {preview} (len={self.length()}){suffix}"
+        )
+
+    def with_consumers(self, consumers: Sequence[str]) -> "StringLiteralSequence":
+        if tuple(consumers) == self.consumers:
+            return self
+        updated = replace(self, consumers=tuple(consumers))
+        updated.refresh_comment()
+        return updated
+
 
 class StringLiteralCollector:
     """Group consecutive string literal assignments into annotated sequences."""
 
-    def __init__(self) -> None:
-        self._pending: List[List[LuaStatement]] = []
-        self._fragments: List[str] = []
-        self._offsets: List[int] = []
+    @dataclass
+    class _Chunk:
+        offset: int
+        text: str
+        statements: List[LuaStatement]
+        target: NameExpr
+
+    def __init__(
+        self,
+        stack: HighLevelStack,
+        classifier: Optional[StringClassifier] = None,
+    ) -> None:
+        self._stack = stack
+        self._pending: List[StringLiteralCollector._Chunk] = []
         self._sequences: List[StringLiteralSequence] = []
+        self._classifier = classifier or StringClassifier()
 
     def reset(self) -> None:
         self._pending.clear()
-        self._fragments.clear()
-        self._offsets.clear()
 
     def enqueue(
         self,
         offset: int,
         statements: List[LuaStatement],
         expression: LuaExpression,
+        target: NameExpr,
     ) -> List[LuaStatement]:
         literal_text = self._string_value(expression)
         if literal_text is None:
             flushed = self.flush()
             return flushed + statements
-        self._pending.append(statements)
-        self._fragments.append(literal_text)
-        self._offsets.append(offset)
+        self._pending.append(
+            StringLiteralCollector._Chunk(
+                offset=offset, text=literal_text, statements=statements, target=target
+            )
+        )
         return []
 
     def flush(self) -> List[LuaStatement]:
         if not self._pending:
             return []
-        combined = "".join(self._fragments)
-        sequence = StringLiteralSequence(text=combined, offsets=tuple(self._offsets))
-        self._sequences.append(sequence)
-        comment = CommentStatement(
-            f"string literal sequence: {escape_lua_string(combined)}"
-            f" (len={len(combined)})"
+        combined = "".join(chunk.text for chunk in self._pending)
+        offsets = tuple(chunk.offset for chunk in self._pending)
+        insight = self._classifier.classify(combined)
+        base_name = self._derive_base_name(combined, insight)
+        symbol_names = self._assign_names(base_name, insight)
+        comment = CommentStatement("")
+        sequence = StringLiteralSequence(
+            text=combined,
+            offsets=offsets,
+            symbol_names=symbol_names,
+            base_name=base_name,
+            insight=insight,
+            comment=comment,
         )
+        sequence.refresh_comment()
+        self._sequences.append(sequence)
+        self._stack.register_string_sequence(sequence)
         result: List[LuaStatement] = [comment]
-        for group in self._pending:
-            result.extend(group)
+        for chunk in self._pending:
+            result.extend(chunk.statements)
         self.reset()
         return result
 
@@ -216,7 +437,101 @@ class StringLiteralCollector:
             return []
         sequences = list(self._sequences)
         self._sequences.clear()
-        return sequences
+        enriched: List[StringLiteralSequence] = []
+        for sequence in sequences:
+            consumers = self._stack.sequence_consumers(sequence)
+            if consumers:
+                sequence = sequence.with_consumers(consumers)
+            else:
+                sequence.refresh_comment()
+            enriched.append(sequence)
+        return enriched
+
+    def _assign_names(
+        self, base_name: Optional[str], insight: Optional[StringInsight]
+    ) -> Tuple[str, ...]:
+        if not self._pending:
+            return tuple()
+        assigned: List[str] = []
+        tokens = list(insight.tokens) if insight else []
+        if base_name:
+            for index, chunk in enumerate(self._pending):
+                suffix = "" if len(self._pending) == 1 else f"_{index}"
+                candidate = f"{base_name}{suffix}"
+                renamed = self._stack.rename_symbol(chunk.target, candidate)
+                assigned.append(renamed or chunk.target.name)
+        else:
+            for index, chunk in enumerate(self._pending):
+                fallback = self._select_fallback_name(tokens, index, chunk)
+                renamed = self._stack.rename_symbol(chunk.target, fallback)
+                assigned.append(renamed or chunk.target.name)
+        return tuple(assigned)
+
+    def _derive_base_name(
+        self, text: str, insight: Optional[StringInsight]
+    ) -> Optional[str]:
+        if not text:
+            return None
+        trimmed = text.strip()
+        candidates: List[str] = []
+        if insight and insight.tokens:
+            for token in insight.tokens:
+                sanitized = _sanitize_identifier(token)
+                if sanitized and len(sanitized) >= 3:
+                    candidates.append(sanitized)
+        if trimmed:
+            sanitized = _sanitize_identifier(trimmed)
+            if sanitized and len(sanitized) >= 3:
+                candidates.append(sanitized)
+        if not insight or not insight.tokens:
+            for match in _IDENTIFIER_PATTERN.finditer(text):
+                token = match.group(0)
+                sanitized = _sanitize_identifier(token)
+                if not sanitized:
+                    continue
+                if len(sanitized) < 3:
+                    continue
+                candidates.append(sanitized)
+        if not candidates:
+            return None
+        unique: List[str] = []
+        seen: Set[str] = set()
+        for candidate in candidates:
+            lowered = candidate.lower()
+            if lowered in seen or lowered in _STRING_NAME_STOPWORDS:
+                continue
+            seen.add(lowered)
+            unique.append(candidate)
+        if not unique:
+            return None
+        unique.sort(key=self._score_candidate)
+        best = _to_snake_case(unique[0])
+        if not best:
+            return None
+        if best in _LUA_KEYWORDS:
+            best = f"{best}_str"
+        if len(best) > 48:
+            best = best[:48].rstrip("_")
+        return best
+
+    def _select_fallback_name(
+        self, tokens: Sequence[str], index: int, chunk: "StringLiteralCollector._Chunk"
+    ) -> str:
+        if tokens:
+            token = tokens[min(index, len(tokens) - 1)]
+            sanitized = _sanitize_identifier(token) or chunk.target.name
+            sanitized = _to_snake_case(sanitized) or sanitized
+            return sanitized
+        fallback = _sanitize_identifier(chunk.text.strip()) or chunk.target.name
+        fallback = _to_snake_case(fallback) or fallback
+        return fallback
+
+    @staticmethod
+    def _score_candidate(candidate: str) -> Tuple[int, int, int]:
+        length_penalty = -len(candidate)
+        digit_penalty = sum(ch.isdigit() for ch in candidate)
+        underscore_penalty = candidate.count("_")
+        return (underscore_penalty, digit_penalty, length_penalty)
 
     @staticmethod
     def _string_value(expression: LuaExpression) -> Optional[str]:
@@ -263,15 +578,39 @@ class FunctionMetadata:
         lines: List[str] = []
         for sequence in list(self.string_sequences)[:limit]:
             text = escape_lua_string(sequence.preview(preview))
-            lines.append(
+            detail = (
                 "- 0x"
                 f"{sequence.start_offset:06X}"
                 f" len={sequence.length()}"
                 f" chunks={sequence.chunk_count()}: {text}"
             )
+            annotations = []
+            for item in sequence.annotation_strings():
+                if item.startswith("locals="):
+                    payload = item[len("locals="):]
+                    annotations.append(f"symbols=[{payload}]")
+                else:
+                    annotations.append(item)
+            if annotations:
+                detail += " (" + ", ".join(annotations) + ")"
+            lines.append(detail)
         remaining = len(self.string_sequences) - limit
         if remaining > 0:
             lines.append(f"- ... ({remaining} additional sequences)")
+        return lines
+
+    def classification_lines(self) -> List[str]:
+        insights = [
+            sequence.insight for sequence in self.string_sequences if sequence.insight
+        ]
+        if not insights:
+            return []
+        _, histogram = summarise_insights(insights)
+        if not histogram:
+            return []
+        lines = ["string classification summary:"]
+        for name, count in histogram:
+            lines.append(f"- {name}: {count}")
         return lines
 
 
@@ -292,6 +631,10 @@ class HighLevelFunction:
         string_lines = self.metadata.string_lines()
         if string_lines:
             writer.write_comment_block(["string literal sequences:"] + string_lines)
+            writer.write_line("")
+        classification_lines = self.metadata.classification_lines()
+        if classification_lines:
+            writer.write_comment_block(classification_lines)
             writer.write_line("")
         if self.metadata.warnings:
             writer.write_comment_block(
@@ -349,7 +692,10 @@ class BlockTranslator:
         self._reconstructor = reconstructor
         self._program = program
         self._stack = HighLevelStack()
-        self._string_collector = StringLiteralCollector()
+        self._string_classifier = StringClassifier()
+        self._string_collector = StringLiteralCollector(
+            self._stack, classifier=self._string_classifier
+        )
         self._collected_sequences: List[StringLiteralSequence] = []
         self.literal_count = 0
         self.helper_calls = 0
@@ -379,14 +725,14 @@ class BlockTranslator:
                 operand_expr = self._reconstructor._operand_expression(
                     semantics, instruction.operand
                 )
-                literal_statements, operand_expr = self._reconstructor._translate_literal(
+                literal_statements, operand_expr, target = self._reconstructor._translate_literal(
                     instruction,
                     semantics,
                     self,
                     operand_expr=operand_expr,
                 )
                 queued = self._string_collector.enqueue(
-                    instruction.offset, literal_statements, operand_expr
+                    instruction.offset, literal_statements, operand_expr, target
                 )
                 statements.extend(queued)
                 continue
@@ -613,6 +959,12 @@ class HighLevelReconstructor:
                 options=self.options,
             )
             sections.append(writer.render())
+        if self.options.emit_string_catalog:
+            catalog_lines = self._string_catalog_lines(functions)
+            if catalog_lines:
+                writer = LuaWriter()
+                writer.write_comment_block(catalog_lines)
+                sections.append(writer.render())
         for function in functions:
             sections.append(function.render().rstrip())
         return join_sections(sections)
@@ -631,7 +983,7 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
         *,
         operand_expr: Optional[LuaExpression] = None,
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
+    ) -> Tuple[List[LuaStatement], LuaExpression, NameExpr]:
         operand = operand_expr or self._operand_expression(semantics, instruction.operand)
         prefix: Optional[str] = None
         if isinstance(operand, LiteralExpr):
@@ -641,10 +993,10 @@ class HighLevelReconstructor:
                 prefix = "literal"
         elif isinstance(operand, NameExpr):
             prefix = "enum"
-        statements, _ = translator.stack.push_literal(operand, prefix=prefix)
+        statements, target = translator.stack.push_literal(operand, prefix=prefix)
         translator.literal_count += 1
         decorated = self._decorate_with_comment(statements, semantics)
-        return decorated, operand
+        return decorated, operand, target
 
     def _translate_comparison(
         self,
@@ -703,6 +1055,11 @@ class HighLevelReconstructor:
         args = translator.stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
+        sequence = translator.stack.match_sequence_suffix(args)
+        if sequence:
+            translator.stack.note_sequence_consumer(
+                sequence, self._format_sequence_consumer(instruction, semantics)
+            )
         method = _snake_to_camel(semantics.mnemonic)
         target = NameExpr(semantics.struct_context or "struct")
         call_expr = MethodCallExpr(target, method, args)
@@ -718,7 +1075,10 @@ class HighLevelReconstructor:
         self._helper_registry.register_method(signature)
         translator.helper_calls += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs, prefix="struct")
+            statements, targets = translator.stack.push_call_results(
+                call_expr, outputs, prefix="struct"
+            )
+            translator.stack.rename_call_results(targets, sequence, semantics)
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -733,6 +1093,11 @@ class HighLevelReconstructor:
         args = translator.stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
+        sequence = translator.stack.match_sequence_suffix(args)
+        if sequence:
+            translator.stack.note_sequence_consumer(
+                sequence, self._format_sequence_consumer(instruction, semantics)
+            )
         call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
         signature = HelperSignature(
             name=semantics.mnemonic,
@@ -746,7 +1111,8 @@ class HighLevelReconstructor:
         if outputs <= 0:
             statements = [CallStatement(call_expr)]
         else:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            statements, targets = translator.stack.push_call_results(call_expr, outputs)
+            translator.stack.rename_call_results(targets, sequence, semantics)
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_generic(
@@ -759,6 +1125,11 @@ class HighLevelReconstructor:
         args = translator.stack.pop_many(inputs)
         if semantics.uses_operand:
             args.append(self._operand_expression(semantics, instruction.operand))
+        sequence = translator.stack.match_sequence_suffix(args)
+        if sequence:
+            translator.stack.note_sequence_consumer(
+                sequence, self._format_sequence_consumer(instruction, semantics)
+            )
         call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
         signature = HelperSignature(
             name=semantics.mnemonic,
@@ -770,7 +1141,8 @@ class HighLevelReconstructor:
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            statements, targets = translator.stack.push_call_results(call_expr, outputs)
+            translator.stack.rename_call_results(targets, sequence, semantics)
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -828,6 +1200,14 @@ class HighLevelReconstructor:
         self._last_summary = summary
         return True
 
+    def _format_sequence_consumer(
+        self, instruction: IRInstruction, semantics: InstructionSemantics
+    ) -> str:
+        label = (semantics.manual_name or semantics.mnemonic or "call").strip()
+        if not label:
+            label = semantics.mnemonic or "call"
+        return f"{label}@0x{instruction.offset:06X}"
+
     def _module_summary_lines(
         self, functions: Sequence[HighLevelFunction]
     ) -> List[str]:
@@ -852,7 +1232,70 @@ class HighLevelReconstructor:
         string_total = sum(len(func.metadata.string_sequences) for func in functions)
         if string_total:
             lines.append(f"- string literal sequences: {string_total}")
+            insight_values = [
+                sequence.insight
+                for func in functions
+                for sequence in func.metadata.string_sequences
+                if sequence.insight is not None
+            ]
+            if insight_values:
+                _, histogram = summarise_insights([insight for insight in insight_values if insight])
+                if histogram:
+                    preview = ", ".join(
+                        f"{name}={count}" for name, count in histogram[:4]
+                    )
+                    lines.append(f"- string categories: {preview}")
         return lines
+
+    def string_insight_report(
+        self, functions: Sequence[HighLevelFunction]
+    ) -> Dict[str, Any]:
+        entries: List[Dict[str, Any]] = []
+        insights: List[StringInsight] = []
+        for function in functions:
+            for sequence in function.metadata.string_sequences:
+                entry: Dict[str, Any] = {
+                    "function": function.name,
+                    "offset": sequence.start_offset,
+                    "end_offset": sequence.end_offset,
+                    "length": sequence.length(),
+                    "chunks": sequence.chunk_count(),
+                    "base_name": sequence.base_name,
+                    "symbol_names": list(sequence.symbol_names),
+                    "consumers": list(sequence.consumers),
+                    "text": sequence.text,
+                }
+                if sequence.insight:
+                    insights.append(sequence.insight)
+                    entry.update(
+                        {
+                            "classification": sequence.insight.classification,
+                            "tokens": list(sequence.insight.tokens),
+                            "entropy": sequence.insight.entropy,
+                            "case_style": sequence.insight.case_style,
+                            "printable_ratio": sequence.insight.printable_ratio,
+                            "token_density": sequence.insight.token_density,
+                            "hints": list(sequence.insight.hints),
+                        }
+                    )
+                entries.append(entry)
+        total, histogram = summarise_insights(insights)
+        entropy_total = 0.0
+        for insight in insights:
+            entropy_total += insight.entropy
+        average_entropy = round(entropy_total / total, 3) if total else 0.0
+        top_tokens = token_histogram(insights, limit=10)
+        return {
+            "functions": [function.name for function in functions],
+            "entry_count": len(entries),
+            "classifications": histogram,
+            "summary": {
+                "total_sequences": total,
+                "average_entropy": average_entropy,
+                "top_tokens": top_tokens,
+            },
+            "entries": entries,
+        }
 
     def _derive_function_name(
         self,
@@ -875,6 +1318,10 @@ class HighLevelReconstructor:
         raw_candidates: List[Tuple[StringLiteralSequence, str, int]] = []
         frequency: Counter[str] = Counter()
         for sequence in sequences:
+            if sequence.base_name:
+                lowered = sequence.base_name.lower()
+                raw_candidates.append((sequence, sequence.base_name, sequence.start_offset))
+                frequency[lowered] += 1
             text = sequence.text.strip()
             if text and not any(ch.isspace() for ch in text):
                 sanitized = _sanitize_identifier(text)
@@ -906,6 +1353,7 @@ class HighLevelReconstructor:
                 entry_offset,
                 count=count,
                 candidate_offset=offset,
+                insight=sequence.insight,
             )
             candidates.append((score, sanitized))
             seen.add(sanitized)
@@ -913,6 +1361,9 @@ class HighLevelReconstructor:
             return None
         candidates.sort(key=lambda item: item[0])
         selected = candidates[0][1]
+        snake = _to_snake_case(selected)
+        if snake:
+            selected = snake
         if selected.lower() in _LUA_KEYWORDS:
             selected = f"{selected}_fn"
         return selected
@@ -925,7 +1376,8 @@ class HighLevelReconstructor:
         *,
         count: int = 1,
         candidate_offset: Optional[int] = None,
-    ) -> Tuple[int, int, int, int, int, str]:
+        insight: Optional[StringInsight] = None,
+    ) -> Tuple[int, int, int, int, int, int, str]:
         offset = candidate_offset if candidate_offset is not None else sequence.start_offset
         distance = max(0, offset - entry_offset)
         underscore_penalty = 0 if "_" in sanitized else 1
@@ -941,6 +1393,14 @@ class HighLevelReconstructor:
             case_penalty = 3
         digit_penalty = sum(1 for ch in sanitized if ch.isdigit())
         length_penalty = len(sanitized)
+        classification_penalty = 0
+        if insight:
+            if insight.classification == "identifier":
+                classification_penalty = -1
+            elif insight.classification in {"keyword", "numeric"}:
+                classification_penalty = -1
+            elif insight.classification in {"sentence", "dialogue"}:
+                classification_penalty = 1
         tie_breaker = sanitized.lower()
         return (
             -count,
@@ -949,6 +1409,7 @@ class HighLevelReconstructor:
             case_penalty,
             digit_penalty,
             length_penalty,
+            classification_penalty,
             tie_breaker,
         )
 
@@ -960,6 +1421,64 @@ class HighLevelReconstructor:
             index += 1
         self._used_function_names.add(candidate)
         return candidate
+
+    def _string_catalog_lines(
+        self, functions: Sequence[HighLevelFunction]
+    ) -> List[str]:
+        catalog: Dict[str, List[Tuple[HighLevelFunction, StringLiteralSequence]]] = {}
+        for function in functions:
+            for sequence in function.metadata.string_sequences:
+                key = self._catalog_key(sequence)
+                catalog.setdefault(key, []).append((function, sequence))
+        if not catalog:
+            return []
+        lines: List[str] = ["string catalog:"]
+        for key in sorted(catalog):
+            group = catalog[key]
+            representative = group[0][1]
+            insight = representative.insight
+            classification = insight.classification if insight else "unknown"
+            tokens = ", ".join(insight.tokens[:4]) if insight and insight.tokens else ""
+            entropy = insight.entropy if insight else 0.0
+            case_style = insight.case_style if insight else "neutral"
+            density = insight.token_density if insight else 0.0
+            printable_ratio = insight.printable_ratio if insight else 1.0
+            preview = escape_lua_string(representative.preview(64))
+            header = (
+                f"- {key}: len={representative.length()} "
+                f"chunks={representative.chunk_count()} "
+                f"type={classification} entropy={entropy:.2f} preview={preview}"
+            )
+            if tokens:
+                header += f" tokens=[{tokens}]"
+            if case_style and case_style != "neutral":
+                header += f" case={case_style}"
+            if density:
+                header += f" density={density:.3f}"
+            if printable_ratio < 1.0:
+                header += f" printable={printable_ratio:.2f}"
+            if representative.consumers:
+                consumer_preview = ", ".join(representative.consumers[:3])
+                if len(representative.consumers) > 3:
+                    consumer_preview += ", …"
+                header += f" used_by=[{consumer_preview}]"
+            lines.append(header)
+            for function, sequence in group:
+                symbol_hint = ", ".join(sequence.symbol_names) if sequence.symbol_names else ""
+                hint = f" symbols=[{symbol_hint}]" if symbol_hint else ""
+                lines.append(
+                    "  * "
+                    f"{function.name} @0x{sequence.start_offset:06X}"
+                    f" -> 0x{sequence.end_offset:06X}" + hint
+                )
+        return lines
+
+    def _catalog_key(self, sequence: StringLiteralSequence) -> str:
+        if sequence.base_name:
+            return sequence.base_name
+        if sequence.symbol_names:
+            return sequence.symbol_names[0]
+        return f"literal_{sequence.start_offset:06X}"
 
 _LUA_KEYWORDS = {
     "and",
@@ -1065,3 +1584,23 @@ def _sanitize_identifier(text: str) -> Optional[str]:
 def _snake_to_camel(name: str) -> str:
     parts = name.split("_")
     return parts[0] + "".join(part.capitalize() for part in parts[1:])
+
+
+def _to_snake_case(name: str) -> str:
+    if not name:
+        return ""
+    result: List[str] = []
+    previous_lower = False
+    for char in name:
+        if char.isalnum() or char == "_":
+            if char.isupper() and previous_lower:
+                result.append("_")
+            result.append(char.lower())
+            previous_lower = char.islower() or char.isdigit()
+        else:
+            if result and result[-1] != "_":
+                result.append("_")
+            previous_lower = False
+    sanitized = "".join(result).strip("_")
+    sanitized = re.sub(r"_+", "_", sanitized)
+    return sanitized
