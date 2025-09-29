@@ -176,9 +176,11 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     function = reconstructor.from_ir(program)
     rendered = reconstructor.render([function])
 
-    assert 'string literal sequence: "Hello"' in rendered
+    assert "string literal sequence len=5" in rendered
+    assert "locals=Hello" in rendered
     assert "-- string literal sequences:" in rendered
-    assert '-- - 0x000000 len=5 chunks=3: "Hello"' in rendered
+    assert '-- - string literal sequence len=5 chunks=3 locals=Hello: "Hello"' in rendered
+    assert "local Hello =" in rendered
 
 
 def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:

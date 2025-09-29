@@ -8,6 +8,7 @@ from mbcdisasm.highlevel import (
     FunctionMetadata,
     HighLevelFunction,
     HighLevelReconstructor,
+    StringLiteralChunk,
     StringLiteralSequence,
 )
 from mbcdisasm.lua_ast import Assignment, LiteralExpr, NameExpr, ReturnStatement, wrap_block
@@ -23,6 +24,7 @@ from mbcdisasm.lua_formatter import (
 )
 from mbcdisasm.manual_semantics import InstructionSemantics, StackEffect
 from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.string_analysis import StringSequenceProfile, extract_identifier_tokens
 
 
 def _make_semantics(
@@ -192,7 +194,19 @@ def test_highlevel_function_summary_and_warnings() -> None:
 
 
 def test_highlevel_function_string_metadata_block() -> None:
-    sequence = StringLiteralSequence(text="demo string", offsets=(0x1234, 0x1238))
+    offsets = (0x1234, 0x1238)
+    profile = StringSequenceProfile(
+        text="demo string",
+        offsets=offsets,
+        tokens=tuple(extract_identifier_tokens("demo string", offsets)),
+    )
+    sequence = StringLiteralSequence(
+        profile=profile,
+        chunks=(
+            StringLiteralChunk(offset=0x1234, text="demo ", name="demo_label", renamed=True),
+            StringLiteralChunk(offset=0x1238, text="string", name="string_tail", renamed=False),
+        ),
+    )
     metadata = FunctionMetadata(
         block_count=1,
         instruction_count=2,
@@ -207,7 +221,10 @@ def test_highlevel_function_string_metadata_block() -> None:
     assert "-- function summary:" in rendered
     assert "-- - string literal sequences: 1" in rendered
     assert "-- string literal sequences:" in rendered
-    assert '-- - 0x001234 len=11 chunks=2: "demo string"' in rendered
+    assert (
+        '-- - string literal sequence len=11 chunks=2 locals=demo_label: "demo string"'
+        in rendered
+    )
 
 
 def test_module_summary_toggle(tmp_path: Path) -> None:

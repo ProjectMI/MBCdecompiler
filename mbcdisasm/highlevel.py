@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -46,6 +44,15 @@ from .lua_formatter import (
 )
 from .manual_semantics import InstructionSemantics
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
+from .string_analysis import (
+    NameCandidate,
+    StringSequenceProfile,
+    chunk_name_hints,
+    extract_identifier_tokens,
+    sanitize_identifier,
+    score_candidate,
+    sequence_base_candidates,
+)
 from .vm_analysis import estimate_stack_io
 
 
@@ -55,12 +62,52 @@ class HighLevelStack:
     def __init__(self) -> None:
         self._values: List[NameExpr] = []
         self._counter = 0
+        self._used: Set[str] = set()
         self.warnings: List[str] = []
 
-    def new_symbol(self, prefix: str = "value") -> str:
-        name = f"{prefix}_{self._counter}"
-        self._counter += 1
-        return name
+    def _ensure_unique(self, candidate: str) -> str:
+        if candidate not in self._used:
+            self._used.add(candidate)
+            return candidate
+        index = 1
+        base = candidate
+        while True:
+            candidate = f"{base}_{index}"
+            if candidate not in self._used:
+                self._used.add(candidate)
+                return candidate
+            index += 1
+
+    def new_symbol(self, prefix: str = "value", *, hint: Optional[str] = None) -> str:
+        if hint:
+            return self._ensure_unique(hint)
+        while True:
+            name = f"{prefix}_{self._counter}"
+            self._counter += 1
+            if name not in self._used:
+                self._used.add(name)
+                return name
+
+    def rename(self, target: NameExpr, candidate: str) -> str:
+        if not candidate:
+            return target.name
+        if candidate == target.name:
+            self._used.add(candidate)
+            return candidate
+        normalized = candidate
+        if normalized in self._used:
+            index = 1
+            base = normalized
+            while True:
+                normalized = f"{base}_{index}"
+                if normalized not in self._used:
+                    break
+                index += 1
+        if target.name in self._used:
+            self._used.discard(target.name)
+        target.name = normalized
+        self._used.add(normalized)
+        return normalized
 
     def push_literal(
         self, expression: LuaExpression, *, prefix: Optional[str] = None
@@ -85,6 +132,7 @@ class HighLevelStack:
             self._values.append(target)
             return [statement], target
         if isinstance(expression, NameExpr):
+            self._used.add(expression.name)
             self._values.append(expression)
             return [], expression
         name = self.new_symbol(prefix)
@@ -135,78 +183,142 @@ class HighLevelStack:
 
 
 @dataclass(frozen=True)
+class StringLiteralChunk:
+    offset: int
+    text: str
+    name: str
+    renamed: bool
+
+
+@dataclass(frozen=True)
 class StringLiteralSequence:
     """Metadata describing a detected string literal run inside a block."""
 
-    text: str
-    offsets: Tuple[int, ...]
+    profile: StringSequenceProfile
+    chunks: Tuple[StringLiteralChunk, ...]
+
+    @property
+    def text(self) -> str:
+        return self.profile.text
+
+    @property
+    def offsets(self) -> Tuple[int, ...]:
+        return self.profile.offsets
 
     @property
     def start_offset(self) -> int:
-        return self.offsets[0]
+        return self.profile.start_offset
 
     @property
     def end_offset(self) -> int:
-        return self.offsets[-1]
+        return self.profile.end_offset
 
     def chunk_count(self) -> int:
-        return len(self.offsets)
+        return len(self.chunks)
 
     def length(self) -> int:
-        return len(self.text)
+        return len(self.profile.text)
 
     def preview(self, limit: int = 80) -> str:
-        if len(self.text) <= limit:
-            return self.text
-        if limit <= 3:
-            return "..."
-        return self.text[: limit - 3] + "..."
+        return self.profile.preview(limit)
+
+    def chunk_names(self) -> Tuple[str, ...]:
+        return tuple(chunk.name for chunk in self.chunks)
+
+    def renamed_names(self) -> Tuple[str, ...]:
+        return tuple(chunk.name for chunk in self.chunks if chunk.renamed)
+
+    def render_comment(self, *, preview: int = 96) -> str:
+        length = len(self.profile.text)
+        pieces = [f"string literal sequence len={length}", f"chunks={self.chunk_count()}"]
+        renamed = self.renamed_names()
+        if renamed:
+            summary = list(renamed[:3])
+            if len(renamed) > 3:
+                summary.append("...")
+            pieces.append(f"locals={', '.join(summary)}")
+        preview_text = escape_lua_string(self.preview(preview))
+        return f"{' '.join(pieces)}: {preview_text}"
+
+
+@dataclass
+class _PendingChunk:
+    offset: int
+    statements: List[LuaStatement]
+    text: str
+    target: NameExpr
 
 
 class StringLiteralCollector:
     """Group consecutive string literal assignments into annotated sequences."""
 
-    def __init__(self) -> None:
-        self._pending: List[List[LuaStatement]] = []
-        self._fragments: List[str] = []
-        self._offsets: List[int] = []
+    def __init__(self, stack: HighLevelStack, *, stopwords: Sequence[str]) -> None:
+        self._stack = stack
+        self._stopwords = tuple(stopwords)
+        self._pending: List[_PendingChunk] = []
         self._sequences: List[StringLiteralSequence] = []
 
     def reset(self) -> None:
         self._pending.clear()
-        self._fragments.clear()
-        self._offsets.clear()
 
     def enqueue(
         self,
         offset: int,
         statements: List[LuaStatement],
         expression: LuaExpression,
+        target: NameExpr,
     ) -> List[LuaStatement]:
         literal_text = self._string_value(expression)
         if literal_text is None:
             flushed = self.flush()
             return flushed + statements
-        self._pending.append(statements)
-        self._fragments.append(literal_text)
-        self._offsets.append(offset)
+        self._pending.append(
+            _PendingChunk(offset=offset, statements=statements, text=literal_text, target=target)
+        )
         return []
 
     def flush(self) -> List[LuaStatement]:
         if not self._pending:
             return []
-        combined = "".join(self._fragments)
-        sequence = StringLiteralSequence(text=combined, offsets=tuple(self._offsets))
-        self._sequences.append(sequence)
-        comment = CommentStatement(
-            f"string literal sequence: {escape_lua_string(combined)}"
-            f" (len={len(combined)})"
+        offsets = [chunk.offset for chunk in self._pending]
+        fragments = [chunk.text for chunk in self._pending]
+        combined = "".join(fragments)
+        profile = StringSequenceProfile(
+            text=combined,
+            offsets=tuple(offsets),
+            tokens=tuple(extract_identifier_tokens(combined, offsets)),
         )
-        result: List[LuaStatement] = [comment]
-        for group in self._pending:
-            result.extend(group)
+        hints = chunk_name_hints(profile, fragments, stopwords=self._stopwords)
+        chunks: List[StringLiteralChunk] = []
+        statements: List[LuaStatement] = []
+        for index, chunk in enumerate(self._pending):
+            original_name = chunk.target.name
+            hint = hints[index] if index < len(hints) else None
+            new_name = original_name
+            renamed = False
+            if hint:
+                candidate = hint
+                if candidate.lower() in _LUA_KEYWORDS:
+                    candidate = f"{candidate}_str"
+                new_name = self._stack.rename(chunk.target, candidate)
+                renamed = new_name != original_name
+            chunks.append(
+                StringLiteralChunk(
+                    offset=chunk.offset,
+                    text=chunk.text,
+                    name=new_name,
+                    renamed=renamed,
+                )
+            )
+            statements.extend(chunk.statements)
+        sequence = StringLiteralSequence(
+            profile=profile,
+            chunks=tuple(chunks),
+        )
+        comment = sequence.render_comment()
+        self._sequences.append(sequence)
         self.reset()
-        return result
+        return [CommentStatement(comment), *statements]
 
     def finalize(self) -> List[LuaStatement]:
         return self.flush()
@@ -262,13 +374,8 @@ class FunctionMetadata:
             return []
         lines: List[str] = []
         for sequence in list(self.string_sequences)[:limit]:
-            text = escape_lua_string(sequence.preview(preview))
-            lines.append(
-                "- 0x"
-                f"{sequence.start_offset:06X}"
-                f" len={sequence.length()}"
-                f" chunks={sequence.chunk_count()}: {text}"
-            )
+            comment = sequence.render_comment(preview=preview)
+            lines.append(f"- {comment}")
         remaining = len(self.string_sequences) - limit
         if remaining > 0:
             lines.append(f"- ... ({remaining} additional sequences)")
@@ -349,7 +456,9 @@ class BlockTranslator:
         self._reconstructor = reconstructor
         self._program = program
         self._stack = HighLevelStack()
-        self._string_collector = StringLiteralCollector()
+        self._string_collector = StringLiteralCollector(
+            self._stack, stopwords=_STRING_NAME_STOPWORDS
+        )
         self._collected_sequences: List[StringLiteralSequence] = []
         self.literal_count = 0
         self.helper_calls = 0
@@ -379,14 +488,18 @@ class BlockTranslator:
                 operand_expr = self._reconstructor._operand_expression(
                     semantics, instruction.operand
                 )
-                literal_statements, operand_expr = self._reconstructor._translate_literal(
+                (
+                    literal_statements,
+                    operand_expr,
+                    target,
+                ) = self._reconstructor._translate_literal(
                     instruction,
                     semantics,
                     self,
                     operand_expr=operand_expr,
                 )
                 queued = self._string_collector.enqueue(
-                    instruction.offset, literal_statements, operand_expr
+                    instruction.offset, literal_statements, operand_expr, target
                 )
                 statements.extend(queued)
                 continue
@@ -631,7 +744,7 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
         *,
         operand_expr: Optional[LuaExpression] = None,
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
+    ) -> Tuple[List[LuaStatement], LuaExpression, NameExpr]:
         operand = operand_expr or self._operand_expression(semantics, instruction.operand)
         prefix: Optional[str] = None
         if isinstance(operand, LiteralExpr):
@@ -641,10 +754,10 @@ class HighLevelReconstructor:
                 prefix = "literal"
         elif isinstance(operand, NameExpr):
             prefix = "enum"
-        statements, _ = translator.stack.push_literal(operand, prefix=prefix)
+        statements, target = translator.stack.push_literal(operand, prefix=prefix)
         translator.literal_count += 1
         decorated = self._decorate_with_comment(statements, semantics)
-        return decorated, operand
+        return decorated, operand, target
 
     def _translate_comparison(
         self,
@@ -872,85 +985,62 @@ class HighLevelReconstructor:
         if not sequences:
             return None
         entry_offset = min(program.blocks) if program.blocks else 0
-        raw_candidates: List[Tuple[StringLiteralSequence, str, int]] = []
+        aggregated: List[NameCandidate] = []
         frequency: Counter[str] = Counter()
         for sequence in sequences:
-            text = sequence.text.strip()
-            if text and not any(ch.isspace() for ch in text):
-                sanitized = _sanitize_identifier(text)
-                if sanitized and sanitized.lower() not in _STRING_NAME_STOPWORDS:
-                    key = sanitized.lower()
-                    raw_candidates.append((sequence, sanitized, sequence.start_offset))
-                    frequency[key] += 1
-            for token, token_offset in _identifier_tokens(sequence):
-                sanitized = _sanitize_identifier(token)
-                if not sanitized:
-                    continue
-                lowered = sanitized.lower()
-                if lowered in _STRING_NAME_STOPWORDS:
-                    continue
-                raw_candidates.append((sequence, sanitized, token_offset))
-                frequency[lowered] += 1
-        if not raw_candidates:
-            return None
-        candidates: List[Tuple[Tuple[int, int, int, int, int, str], str]] = []
-        seen: set[str] = set()
-        for sequence, sanitized, offset in raw_candidates:
-            lowered = sanitized.lower()
-            if sanitized in seen:
-                continue
-            count = frequency[lowered]
-            score = self._score_name_candidate(
-                sequence,
-                sanitized,
-                entry_offset,
-                count=count,
-                candidate_offset=offset,
+            profile = sequence.profile
+            seq_candidates = sequence_base_candidates(
+                profile.text,
+                profile.offsets,
+                stopwords=_STRING_NAME_STOPWORDS,
             )
-            candidates.append((score, sanitized))
-            seen.add(sanitized)
-        if not candidates:
+            if not seq_candidates:
+                stripped = profile.text.strip()
+                if stripped and " " not in stripped:
+                    sanitized = sanitize_identifier(stripped)
+                    if sanitized and sanitized.lower() not in _STRING_NAME_STOPWORDS:
+                        seq_candidates = [
+                            NameCandidate(
+                                identifier=sanitized,
+                                normalized=sanitized.lower(),
+                                score=score_candidate(
+                                    sanitized,
+                                    entry_offset=entry_offset,
+                                    candidate_offset=sequence.start_offset,
+                                    count=1,
+                                ),
+                                source_offset=sequence.start_offset,
+                                chunk_index=0,
+                            )
+                        ]
+            for candidate in seq_candidates:
+                frequency[candidate.normalized] += 1
+                aggregated.append(candidate)
+        if not aggregated:
             return None
-        candidates.sort(key=lambda item: item[0])
-        selected = candidates[0][1]
-        if selected.lower() in _LUA_KEYWORDS:
-            selected = f"{selected}_fn"
-        return selected
-
-    def _score_name_candidate(
-        self,
-        sequence: StringLiteralSequence,
-        sanitized: str,
-        entry_offset: int,
-        *,
-        count: int = 1,
-        candidate_offset: Optional[int] = None,
-    ) -> Tuple[int, int, int, int, int, str]:
-        offset = candidate_offset if candidate_offset is not None else sequence.start_offset
-        distance = max(0, offset - entry_offset)
-        underscore_penalty = 0 if "_" in sanitized else 1
-        lower = sum(1 for ch in sanitized if ch.islower())
-        upper = sum(1 for ch in sanitized if ch.isupper())
-        if lower and upper:
-            case_penalty = 0
-        elif lower:
-            case_penalty = 1
-        elif upper:
-            case_penalty = 2
-        else:
-            case_penalty = 3
-        digit_penalty = sum(1 for ch in sanitized if ch.isdigit())
-        length_penalty = len(sanitized)
-        tie_breaker = sanitized.lower()
-        return (
-            -count,
-            underscore_penalty,
-            distance,
-            case_penalty,
-            digit_penalty,
-            length_penalty,
-            tie_breaker,
-        )
+        best_name: Optional[str] = None
+        best_score: Optional[Tuple[int, int, int, int, int, int, str]] = None
+        seen: set[str] = set()
+        for candidate in aggregated:
+            identifier = candidate.identifier
+            if identifier in seen:
+                continue
+            count = frequency[candidate.normalized]
+            score = score_candidate(
+                identifier,
+                entry_offset=entry_offset,
+                candidate_offset=candidate.source_offset,
+                count=count,
+            )
+            if best_score is None or score < best_score:
+                best_score = score
+                best_name = identifier
+            seen.add(identifier)
+        if best_name is None:
+            return None
+        if best_name.lower() in _LUA_KEYWORDS:
+            best_name = f"{best_name}_fn"
+        return best_name
 
     def _unique_function_name(self, base: str) -> str:
         candidate = base
@@ -987,79 +1077,6 @@ _LUA_KEYWORDS = {
 }
 
 _STRING_NAME_STOPWORDS = {"usage", "warning"}
-
-
-_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
-
-
-def _identifier_tokens(
-    sequence: StringLiteralSequence,
-) -> Iterable[Tuple[str, int]]:
-    text = sequence.text
-    if not text:
-        return []
-    offsets = sequence.offsets
-    limit = len(offsets) - 1
-    results: List[Tuple[str, int]] = []
-    for match in _IDENTIFIER_PATTERN.finditer(text):
-        start = match.start()
-        # Align tokens to instruction boundaries to avoid partial fragments.
-        if start % 2 != 0:
-            continue
-        chunk_index = start // 2
-        if chunk_index > limit:
-            chunk_index = limit
-        token = match.group(0)
-        underscore_index = token.find("_")
-        include_full = True
-        if underscore_index != -1 and any(
-            ch.isupper() for ch in token[underscore_index + 1 :]
-        ):
-            include_full = False
-        if include_full:
-            results.append((token, offsets[chunk_index]))
-        for rel_start, sub in _split_identifier_subtokens(token):
-            if rel_start == 0 and include_full:
-                continue
-            absolute = start + rel_start
-            if absolute % 2 != 0:
-                continue
-            sub_index = absolute // 2
-            if sub_index > limit:
-                sub_index = limit
-            results.append((sub, offsets[sub_index]))
-    return results
-
-
-def _split_identifier_subtokens(token: str) -> List[Tuple[int, str]]:
-    parts: List[Tuple[int, str]] = []
-    start = 0
-    for index in range(1, len(token)):
-        if token[index].isupper() and token[index - 1].islower():
-            if index - start >= 3:
-                parts.append((start, token[start:index]))
-            start = index
-    if len(token) - start >= 3:
-        parts.append((start, token[start:]))
-    return parts
-
-
-def _sanitize_identifier(text: str) -> Optional[str]:
-    if not text:
-        return None
-    pieces: List[str] = []
-    for char in text:
-        if char.isalnum() or char == "_":
-            pieces.append(char)
-        else:
-            pieces.append("_")
-    candidate = "".join(pieces)
-    candidate = re.sub(r"_+", "_", candidate).strip("_")
-    if not candidate:
-        return None
-    if candidate[0].isdigit():
-        candidate = f"_{candidate}"
-    return candidate
 
 
 def _snake_to_camel(name: str) -> str:
