@@ -108,4 +108,53 @@ def test_highlevel_reconstruction_generates_control_flow(tmp_path: Path) -> None
     assert "local State =" in rendered
     assert "if cmp_" in rendered
     assert "while" not in rendered  # forward branch only
-    assert "return literal_" in rendered or "return State" in rendered
+    assert (
+        "return literal_" in rendered
+        or "return enum_" in rendered
+        or "return State" in rendered
+    )
+
+
+def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "02:00": {
+                    "name": "return_top",
+                    "summary": "Return top value",
+                    "stack_delta": -1,
+                    "control_flow": "return",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    block = IRBlock(
+        start=0x0000,
+        instructions=[
+            _make_instruction(analyzer, 0x0000, "01:00", 0x6548, None),
+            _make_instruction(analyzer, 0x0004, "01:00", 0x6C6C, None),
+            _make_instruction(analyzer, 0x0008, "01:00", 0x006F, None),
+            _make_instruction(analyzer, 0x000C, "02:00", 0, "return"),
+        ],
+        successors=[],
+    )
+    program = IRProgram(segment_index=0, blocks={block.start: block})
+
+    reconstructor = HighLevelReconstructor(knowledge)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert 'string literal sequence: "Hello"' in rendered

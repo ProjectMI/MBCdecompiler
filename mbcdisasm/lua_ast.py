@@ -17,9 +17,10 @@ structurer) to analyse the emitted code before it becomes immutable text.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Union
 
 from .lua_formatter import LuaWriter
+from .lua_literals import LuaLiteral
 
 
 # ---------------------------------------------------------------------------
@@ -36,10 +37,24 @@ class LuaExpression:
 
 @dataclass
 class LiteralExpr(LuaExpression):
-    value: str
+    value: Union[str, LuaLiteral]
 
     def render(self) -> str:
+        if isinstance(self.value, LuaLiteral):
+            return self.value.render()
         return self.value
+
+    @property
+    def kind(self) -> str:
+        if isinstance(self.value, LuaLiteral):
+            return self.value.kind
+        return "unknown"
+
+    @property
+    def literal(self) -> Optional[LuaLiteral]:
+        if isinstance(self.value, LuaLiteral):
+            return self.value
+        return None
 
 
 @dataclass

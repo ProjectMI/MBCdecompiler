@@ -42,7 +42,8 @@ from .lua_formatter import (
     join_sections,
 )
 from .manual_semantics import InstructionSemantics
-from .vm_analysis import LuaLiteralFormatter, estimate_stack_io
+from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
+from .vm_analysis import estimate_stack_io
 
 
 class HighLevelStack:
@@ -58,8 +59,10 @@ class HighLevelStack:
         self._counter += 1
         return name
 
-    def push_literal(self, expression: LuaExpression) -> Tuple[List[LuaStatement], NameExpr]:
-        name = self.new_symbol("literal")
+    def push_literal(
+        self, expression: LuaExpression, *, prefix: Optional[str] = None
+    ) -> Tuple[List[LuaStatement], NameExpr]:
+        name = self.new_symbol(prefix or "literal")
         target = NameExpr(name)
         statement = Assignment([target], expression, is_local=True)
         self._values.append(target)
@@ -126,6 +129,54 @@ class HighLevelStack:
         values = list(self._values)
         self._values.clear()
         return values
+
+
+class StringLiteralCollector:
+    """Group consecutive string literal assignments into annotated sequences."""
+
+    def __init__(self) -> None:
+        self._pending: List[List[LuaStatement]] = []
+        self._fragments: List[str] = []
+
+    def reset(self) -> None:
+        self._pending.clear()
+        self._fragments.clear()
+
+    def enqueue(
+        self, statements: List[LuaStatement], expression: LuaExpression
+    ) -> List[LuaStatement]:
+        literal_text = self._string_value(expression)
+        if literal_text is None:
+            flushed = self.flush()
+            return flushed + statements
+        self._pending.append(statements)
+        self._fragments.append(literal_text)
+        return []
+
+    def flush(self) -> List[LuaStatement]:
+        if not self._pending:
+            return []
+        combined = "".join(self._fragments)
+        comment = CommentStatement(
+            f"string literal sequence: {escape_lua_string(combined)}"
+            f" (len={len(combined)})"
+        )
+        result: List[LuaStatement] = [comment]
+        for group in self._pending:
+            result.extend(group)
+        self.reset()
+        return result
+
+    def finalize(self) -> List[LuaStatement]:
+        return self.flush()
+
+    @staticmethod
+    def _string_value(expression: LuaExpression) -> Optional[str]:
+        if isinstance(expression, LiteralExpr):
+            literal = expression.literal
+            if literal is not None and literal.kind == "string":
+                return str(literal.value)
+        return None
 
 
 @dataclass
@@ -222,6 +273,7 @@ class BlockTranslator:
         self._reconstructor = reconstructor
         self._program = program
         self._stack = HighLevelStack()
+        self._string_collector = StringLiteralCollector()
         self.literal_count = 0
         self.helper_calls = 0
         self.branch_count = 0
@@ -241,15 +293,25 @@ class BlockTranslator:
     def _translate_block(self, block: IRBlock, fallthrough: Optional[int]) -> BlockInfo:
         statements: List[LuaStatement] = []
         terminator: Optional[Terminator] = None
+        self._string_collector.reset()
         for index, instruction in enumerate(block.instructions):
             semantics = instruction.semantics
             self._reconstructor._register_enums(semantics)
             is_last = index == len(block.instructions) - 1
             if semantics.has_tag("literal"):
-                statements.extend(
-                    self._reconstructor._translate_literal(instruction, semantics, self)
+                operand_expr = self._reconstructor._operand_expression(
+                    semantics, instruction.operand
                 )
+                literal_statements, operand_expr = self._reconstructor._translate_literal(
+                    instruction,
+                    semantics,
+                    self,
+                    operand_expr=operand_expr,
+                )
+                queued = self._string_collector.enqueue(literal_statements, operand_expr)
+                statements.extend(queued)
                 continue
+            statements.extend(self._string_collector.flush())
             if semantics.has_tag("comparison"):
                 statements.extend(
                     self._reconstructor._translate_comparison(instruction, semantics, self)
@@ -284,6 +346,7 @@ class BlockTranslator:
             statements.extend(
                 self._reconstructor._translate_generic(instruction, semantics, self)
             )
+        statements.extend(self._string_collector.finalize())
         if terminator is None:
             target = block.successors[0] if block.successors else fallthrough
             terminator = JumpTerminator(target=target, fallthrough=fallthrough, comment=None)
@@ -476,11 +539,22 @@ class HighLevelReconstructor:
         instruction: IRInstruction,
         semantics: InstructionSemantics,
         translator: BlockTranslator,
-    ) -> List[LuaStatement]:
-        operand = self._operand_expression(semantics, instruction.operand)
-        statements, _ = translator.stack.push_literal(operand)
+        *,
+        operand_expr: Optional[LuaExpression] = None,
+    ) -> Tuple[List[LuaStatement], LuaExpression]:
+        operand = operand_expr or self._operand_expression(semantics, instruction.operand)
+        prefix: Optional[str] = None
+        if isinstance(operand, LiteralExpr):
+            if operand.kind == "string":
+                prefix = "string"
+            elif operand.kind == "number":
+                prefix = "literal"
+        elif isinstance(operand, NameExpr):
+            prefix = "enum"
+        statements, _ = translator.stack.push_literal(operand, prefix=prefix)
         translator.literal_count += 1
-        return self._decorate_with_comment(statements, semantics)
+        decorated = self._decorate_with_comment(statements, semantics)
+        return decorated, operand
 
     def _translate_comparison(
         self,

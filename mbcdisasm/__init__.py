@@ -21,6 +21,7 @@ from .stack_model import StackDeltaEstimate, StackDeltaModeler
 from .ast import LuaReconstructor
 from .highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
 from .lua_formatter import LuaRenderOptions
+from .lua_literals import LuaLiteralFormatter
 from .segment_classifier import SegmentClassifier
 from .manual_semantics import (
     AnnotatedInstruction,
@@ -29,7 +30,6 @@ from .manual_semantics import (
     StackEffect,
 )
 from .vm_analysis import (
-    LuaLiteralFormatter,
     VMBlockTrace,
     VMInstructionState,
     VMInstructionTrace,
