@@ -35,6 +35,22 @@ def test_data_segment_string_extraction() -> None:
     assert "histogram" in rendered
 
 
+def test_code_segments_with_strings_are_reported() -> None:
+    data = b"\xAA\xBBHello\x00More\x00\xCC"
+    descriptor = SegmentDescriptor(index=11, start=0x500, end=0x500 + len(data))
+    segment = Segment(descriptor, data, "code")
+
+    summaries = summarise_data_segments([segment], min_length=4)
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary.is_code_segment
+    assert [s.text for s in summary.strings] == ["Hello", "More"]
+    assert summary.hex_preview
+
+    rendered = render_data_summaries(summaries)
+    assert "embedded printable strings located inside a code segment" in rendered
+
+
 def test_data_segment_hex_preview_configuration() -> None:
     descriptor = SegmentDescriptor(index=7, start=0x200, end=0x220)
     data = bytes(range(16))
@@ -93,6 +109,7 @@ def test_render_data_table_produces_lua_structure() -> None:
     lua_table = render_data_table(summaries, table_name="__tbl", return_table=True)
     assert "local __tbl = {" in lua_table
     assert "classification" in lua_table
+    assert "is_code = false" in lua_table
     assert "strings" in lua_table
     assert "return __tbl" in lua_table
 
@@ -100,16 +117,26 @@ def test_render_data_table_produces_lua_structure() -> None:
 def test_compute_segment_statistics() -> None:
     descriptor_a = SegmentDescriptor(index=3, start=0x300, end=0x320)
     descriptor_b = SegmentDescriptor(index=4, start=0x400, end=0x420)
+    code_data = b"\x01\x02omega\x00"
+    descriptor_code = SegmentDescriptor(
+        index=12, start=0x540, end=0x540 + len(code_data)
+    )
     seg_a = Segment(descriptor_a, b"alpha\x00beta\x00", "strings")
     seg_b = Segment(descriptor_b, b"\x00\x00", "blob")
-    summaries = summarise_data_segments([seg_a, seg_b], min_length=5, run_threshold=2)
+    seg_code = Segment(descriptor_code, code_data, "code")
+    summaries = summarise_data_segments(
+        [seg_a, seg_b, seg_code], min_length=5, run_threshold=2
+    )
+    assert any(summary.is_code_segment for summary in summaries)
 
     stats = compute_segment_statistics(summaries)
-    assert stats.segment_count == len(summaries)
+    assert stats.segment_count == 2
     assert stats.string_segments == 1
     assert stats.string_count == 1
     assert stats.total_string_length == len("alpha")
-    assert stats.total_bytes == sum(summary.length for summary in summaries)
+    assert stats.total_bytes == sum(
+        summary.length for summary in summaries if not summary.is_code_segment
+    )
     assert stats.common_bytes
     assert stats.longest_zero_run is not None
 

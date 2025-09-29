@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Dict, Iterable, List, Optional, Sequence
 
@@ -84,6 +84,7 @@ class DataSegmentSummary:
     byte_counts: Dict[int, int] = field(default_factory=dict)
     repeated_runs: Sequence[ByteRun] = field(default_factory=list)
     run_threshold: int = 0
+    is_code_segment: bool = False
 
     def has_strings(self) -> bool:
         return bool(self.strings)
@@ -125,6 +126,9 @@ class DataSegmentAnalyzer:
         histogram_limit: int = 6,
         run_threshold: int = 8,
         max_runs: int = 3,
+        include_code_segments: bool = True,
+        code_preview_bytes: int = 48,
+        max_code_previews: int = 4,
     ) -> None:
         self.min_string_length = max(1, min_string_length)
         self.preview_bytes = max(0, preview_bytes)
@@ -132,15 +136,109 @@ class DataSegmentAnalyzer:
         self.histogram_limit = max(1, histogram_limit)
         self.run_threshold = max(1, run_threshold)
         self.max_runs = max(0, max_runs)
+        self.include_code_segments = include_code_segments
+        self.code_preview_bytes = max(0, code_preview_bytes)
+        self.max_code_previews = max(0, max_code_previews)
 
     # ------------------------------------------------------------------
     def analyse(self, segment: Segment) -> DataSegmentSummary:
         strings = self._extract_strings(segment.data, segment.start)
-        preview = self._hex_preview(segment.data, segment.start)
-        printable_ratio = self._printable_ratio(segment.data)
-        histogram, counts = self._byte_frequencies(segment.data)
-        entropy = self._entropy(counts, len(segment.data))
-        runs = self._repeated_runs(segment, segment.data)
+        return self._summarise_segment(
+            segment,
+            strings,
+            include_preview=True,
+            include_statistics=True,
+        )
+
+    def analyse_segments(self, segments: Iterable[Segment]) -> List[DataSegmentSummary]:
+        summaries: List[DataSegmentSummary] = []
+        for segment in segments:
+            strings = self._extract_strings(segment.data, segment.start)
+            if segment.is_code:
+                if self.include_code_segments:
+                    strings = self._filter_code_strings(segment, strings)
+                if not self.include_code_segments or not strings:
+                    continue
+                summary = self._summarise_segment(
+                    segment,
+                    strings,
+                    include_preview=False,
+                    include_statistics=True,
+                )
+                previews = self._code_hex_preview(segment, strings)
+                if previews:
+                    summary = replace(summary, hex_preview=previews)
+                summaries.append(summary)
+                continue
+            summary = self._summarise_segment(
+                segment,
+                strings,
+                include_preview=True,
+                include_statistics=True,
+            )
+            if summary.strings or summary.hex_preview:
+                summaries.append(summary)
+        return summaries
+
+    def _filter_code_strings(
+        self, segment: Segment, strings: Sequence[ExtractedString]
+    ) -> List[ExtractedString]:
+        if not strings:
+            return []
+        filtered: List[ExtractedString] = []
+        data = segment.data
+        allowed_punctuation = set(" _-:.,()<>/%'\"!?=;[]{}")
+        for string in strings:
+            text = string.text
+            start = string.offset - segment.start
+            end = start + len(text)
+            prev_byte = data[start - 1] if start > 0 else None
+            next_byte = data[end] if end < len(data) else None
+            if next_byte != 0 and prev_byte != 0:
+                continue
+            if text and text[0].isdigit():
+                continue
+            if len(text) <= 4:
+                if text.startswith("_") and all(ch == "_" or ch.isalnum() for ch in text):
+                    filtered.append(string)
+                    continue
+                if text.isalpha() and (text.islower() or text.istitle()):
+                    filtered.append(string)
+                continue
+            letter_count = sum(ch.isalpha() for ch in text)
+            if letter_count < 3:
+                continue
+            if " " not in text and "_" not in text:
+                if any(ch.isdigit() or ch in "=+*/" for ch in text):
+                    continue
+            if not all(ch.isalnum() or ch in allowed_punctuation for ch in text):
+                continue
+            filtered.append(string)
+        return filtered
+
+    def _summarise_segment(
+        self,
+        segment: Segment,
+        strings: Sequence[ExtractedString],
+        *,
+        include_preview: bool,
+        include_statistics: bool,
+    ) -> DataSegmentSummary:
+        preview: Sequence[HexDumpLine] = []
+        printable_ratio = 0.0
+        histogram: Sequence[ByteFrequency] = []
+        counts: Dict[int, int] = {}
+        entropy = 0.0
+        runs: Sequence[ByteRun] = []
+
+        if include_preview:
+            preview = self._hex_preview(segment.data, segment.start)
+        if include_statistics:
+            printable_ratio = self._printable_ratio(segment.data)
+            histogram, counts = self._byte_frequencies(segment.data)
+            entropy = self._entropy(counts, len(segment.data))
+            runs = self._repeated_runs(segment, segment.data)
+
         return DataSegmentSummary(
             index=segment.index,
             start=segment.start,
@@ -154,17 +252,8 @@ class DataSegmentAnalyzer:
             byte_counts=counts,
             repeated_runs=runs,
             run_threshold=self.run_threshold,
+            is_code_segment=segment.is_code,
         )
-
-    def analyse_segments(self, segments: Iterable[Segment]) -> List[DataSegmentSummary]:
-        summaries: List[DataSegmentSummary] = []
-        for segment in segments:
-            if segment.is_code:
-                continue
-            summary = self.analyse(segment)
-            if summary.strings or summary.hex_preview:
-                summaries.append(summary)
-        return summaries
 
     # ------------------------------------------------------------------
     def _extract_strings(self, data: bytes, base_offset: int) -> List[ExtractedString]:
@@ -185,12 +274,26 @@ class DataSegmentAnalyzer:
             runs.append(ExtractedString(start, "".join(buffer)))
         return runs
 
-    def _hex_preview(self, data: bytes, base_offset: int) -> List[HexDumpLine]:
-        if self.preview_bytes <= 0 or not data:
+    def _hex_preview(
+        self,
+        data: bytes,
+        base_offset: int,
+        *,
+        start: int = 0,
+        limit: Optional[int] = None,
+    ) -> List[HexDumpLine]:
+        if not data:
             return []
-        limit = min(len(data), self.preview_bytes)
+        if limit is None:
+            limit = self.preview_bytes
+        if limit <= 0:
+            return []
+        start = max(0, min(start, len(data)))
+        end = min(len(data), start + limit)
+        if end <= start:
+            return []
         lines: List[HexDumpLine] = []
-        for offset in range(0, limit, self.preview_width):
+        for offset in range(start, end, self.preview_width):
             chunk = data[offset : offset + self.preview_width]
             hex_bytes = " ".join(f"{byte:02X}" for byte in chunk)
             ascii = "".join(
@@ -199,6 +302,33 @@ class DataSegmentAnalyzer:
             )
             lines.append(HexDumpLine(base_offset + offset, hex_bytes, ascii))
         return lines
+
+    def _code_hex_preview(
+        self,
+        segment: Segment,
+        strings: Sequence[ExtractedString],
+    ) -> List[HexDumpLine]:
+        if not self.code_preview_bytes or not self.max_code_previews:
+            return []
+        previews: List[HexDumpLine] = []
+        seen_offsets: set[int] = set()
+        limit = min(len(strings), self.max_code_previews)
+        for string in strings[:limit]:
+            relative_start = string.offset - segment.start
+            start = max(0, relative_start - self.code_preview_bytes)
+            length = len(string.text)
+            preview_length = length + 2 * self.code_preview_bytes
+            for line in self._hex_preview(
+                segment.data,
+                segment.start,
+                start=start,
+                limit=preview_length,
+            ):
+                if line.offset in seen_offsets:
+                    continue
+                seen_offsets.add(line.offset)
+                previews.append(line)
+        return previews
 
     def _printable_ratio(self, data: bytes) -> float:
         if not data:
@@ -279,6 +409,9 @@ def summarise_data_segments(
     histogram_limit: int = 6,
     run_threshold: int = 8,
     max_runs: int = 3,
+    include_code_segments: bool = True,
+    code_preview_bytes: int = 48,
+    max_code_previews: int = 4,
 ) -> List[DataSegmentSummary]:
     analyzer = DataSegmentAnalyzer(
         min_string_length=min_length,
@@ -287,6 +420,9 @@ def summarise_data_segments(
         histogram_limit=histogram_limit,
         run_threshold=run_threshold,
         max_runs=max_runs,
+        include_code_segments=include_code_segments,
+        code_preview_bytes=code_preview_bytes,
+        max_code_previews=max_code_previews,
     )
     return analyzer.analyse_segments(segments)
 
@@ -314,6 +450,10 @@ def render_data_summaries(
             f" class={summary.classification} printable={summary.printable_ratio:.2f}"
         )
         writer.write_comment(header)
+        if summary.is_code_segment and summary.strings:
+            writer.write_comment(
+                "    embedded printable strings located inside a code segment"
+            )
         writer.write_comment(f"    {summary.stats_summary()}")
         writer.write_comment(
             f"    bytes: entropy={summary.entropy:.2f} histogram={summary.histogram_summary()}"
@@ -418,6 +558,9 @@ def render_data_table(
                 writer.write_line(
                     f"classification = {escape_lua_string(summary.classification)},"
                 )
+                writer.write_line(
+                    f"is_code = {'true' if summary.is_code_segment else 'false'},"
+                )
                 writer.write_line(f"printable = {summary.printable_ratio:.3f},")
                 writer.write_line(f"entropy = {summary.entropy:.3f},")
                 if include_histogram and summary.byte_histogram:
@@ -509,6 +652,26 @@ class SegmentStatistics:
 
 
 def compute_segment_statistics(summaries: Sequence[DataSegmentSummary]) -> SegmentStatistics:
+    data_summaries = [summary for summary in summaries if not summary.is_code_segment]
+    if not data_summaries:
+        return SegmentStatistics(
+            classifications={},
+            segment_count=0,
+            string_segments=0,
+            string_count=0,
+            total_string_length=0,
+            total_bytes=0,
+            average_printable_ratio=0.0,
+            printable_min=0.0,
+            printable_max=0.0,
+            entropy_min=0.0,
+            entropy_max=0.0,
+            entropy_average=0.0,
+            zero_run_segments=0,
+            longest_zero_run=None,
+            common_bytes=tuple(),
+        )
+
     counts: dict[str, int] = {}
     string_segments = 0
     string_count = 0
@@ -522,7 +685,7 @@ def compute_segment_statistics(summaries: Sequence[DataSegmentSummary]) -> Segme
     zero_runs: List[ByteRun] = []
     aggregate_counts: Counter[int] = Counter()
 
-    for summary in summaries:
+    for summary in data_summaries:
         counts[summary.classification] = counts.get(summary.classification, 0) + 1
         if summary.strings:
             string_segments += 1
@@ -567,7 +730,7 @@ def compute_segment_statistics(summaries: Sequence[DataSegmentSummary]) -> Segme
 
     return SegmentStatistics(
         classifications=dict(sorted(counts.items())),
-        segment_count=len(summaries),
+        segment_count=len(data_summaries),
         string_segments=string_segments,
         string_count=string_count,
         total_string_length=total_string_length,
