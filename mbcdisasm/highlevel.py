@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .ir import IRBlock, IRInstruction, IRProgram
 from .knowledge import KnowledgeBase
@@ -12,22 +12,27 @@ from .lua_ast import (
     BlankLine,
     BlockStatement,
     BinaryExpr,
+    BreakStatement,
     CallExpr,
     CallStatement,
     CommentStatement,
+    GenericForStatement,
     IfClause,
     IfStatement,
     LuaExpression,
     LiteralExpr,
     MethodCallExpr,
     MultiAssignment,
+    NumericForStatement,
     NameExpr,
     LuaStatement,
+    RepeatStatement,
     ReturnStatement,
     SwitchCase,
     SwitchStatement,
     TableExpr,
     TableField,
+    UnaryExpr,
     WhileStatement,
     wrap_block,
 )
@@ -42,28 +47,61 @@ from .lua_formatter import (
     join_sections,
 )
 from .manual_semantics import InstructionSemantics
+from .naming import NameAllocator, derive_stack_symbol_name, sanitize_identifier
 from .vm_analysis import LuaLiteralFormatter, estimate_stack_io
+
+
+@dataclass
+class StackVariable:
+    """Book-keeping entry describing a symbolic stack value."""
+
+    name: str
+    origin: str
+    source: Optional[LuaExpression] = None
+    comment: Optional[str] = None
+    semantics: Optional[InstructionSemantics] = None
+
+    @property
+    def name_expr(self) -> NameExpr:
+        return NameExpr(self.name)
+
+
+@dataclass
+class StackParameter:
+    """Description of a function parameter inferred from stack usage."""
+
+    name: str
+    index: int
+    origin: str = "inferred"
 
 
 class HighLevelStack:
     """Track symbolic stack values during reconstruction."""
 
     def __init__(self) -> None:
-        self._values: List[NameExpr] = []
-        self._counter = 0
+        self._values: List[StackVariable] = []
+        self._allocator = NameAllocator()
+        self._parameters: List[StackParameter] = []
         self.warnings: List[str] = []
+        self._registry: Dict[str, StackVariable] = {}
 
-    def new_symbol(self, prefix: str = "value") -> str:
-        name = f"{prefix}_{self._counter}"
-        self._counter += 1
-        return name
-
-    def push_literal(self, expression: LuaExpression) -> Tuple[List[LuaStatement], NameExpr]:
-        name = self.new_symbol("literal")
-        target = NameExpr(name)
-        statement = Assignment([target], expression, is_local=True)
-        self._values.append(target)
-        return [statement], target
+    # ------------------------------------------------------------------
+    def push_literal(
+        self,
+        expression: LuaExpression,
+        *,
+        semantics: Optional[InstructionSemantics] = None,
+    ) -> Tuple[List[LuaStatement], NameExpr]:
+        base = self._literal_base(expression)
+        variable = self._create_variable(
+            base,
+            origin="literal",
+            source=expression,
+            semantics=semantics,
+        )
+        statement = Assignment([variable.name_expr], expression, is_local=True)
+        self._values.append(variable)
+        return [statement], variable.name_expr
 
     def push_expression(
         self,
@@ -71,47 +109,67 @@ class HighLevelStack:
         *,
         prefix: str = "tmp",
         make_local: bool = False,
+        base_name: Optional[str] = None,
+        origin: str = "expression",
+        semantics: Optional[InstructionSemantics] = None,
     ) -> Tuple[List[LuaStatement], NameExpr]:
-        if make_local:
-            name = self.new_symbol(prefix)
-            target = NameExpr(name)
-            statement = Assignment([target], expression, is_local=True)
-            self._values.append(target)
-            return [statement], target
-        if isinstance(expression, NameExpr):
-            self._values.append(expression)
+        if not make_local and isinstance(expression, NameExpr):
+            alias = StackVariable(name=expression.name, origin="alias")
+            self._values.append(alias)
             return [], expression
-        name = self.new_symbol(prefix)
-        target = NameExpr(name)
-        statement = Assignment([target], expression, is_local=True)
-        self._values.append(target)
-        return [statement], target
+        base = base_name or prefix
+        variable = self._create_variable(
+            base,
+            origin=origin,
+            source=expression,
+            semantics=semantics,
+        )
+        statement = Assignment([variable.name_expr], expression, is_local=True)
+        self._values.append(variable)
+        return [statement], variable.name_expr
 
     def push_call_results(
-        self, expression: CallExpr, outputs: int, prefix: str = "result"
+        self,
+        expression: CallExpr,
+        outputs: int,
+        *,
+        base_name: Optional[str] = None,
+        origin: str = "call",
+        semantics: Optional[InstructionSemantics] = None,
     ) -> Tuple[List[LuaStatement], List[NameExpr]]:
         if outputs <= 0:
             return [], []
+        base = base_name or "result"
         if outputs == 1:
-            name = self.new_symbol(prefix)
-            target = NameExpr(name)
-            stmt = Assignment([target], expression, is_local=True)
-            self._values.append(target)
-            return [stmt], [target]
-        targets = [NameExpr(self.new_symbol(prefix)) for _ in range(outputs)]
-        stmt = MultiAssignment(targets, [expression], is_local=True)
-        for target in targets:
-            self._values.append(target)
-        return [stmt], targets
+            variable = self._create_variable(
+                base,
+                origin=origin,
+                source=expression,
+                semantics=semantics,
+            )
+            statement = Assignment([variable.name_expr], expression, is_local=True)
+            self._values.append(variable)
+            return [statement], [variable.name_expr]
+        variables = [
+            self._create_variable(
+                base,
+                origin=origin,
+                source=expression,
+                semantics=semantics,
+            )
+            for _ in range(outputs)
+        ]
+        targets = [variable.name_expr for variable in variables]
+        statement = MultiAssignment(targets, [expression], is_local=True)
+        self._values.extend(variables)
+        return [statement], targets
 
     def pop_single(self) -> NameExpr:
         if self._values:
-            return self._values.pop()
-        placeholder = NameExpr(self.new_symbol("stack"))
-        self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
-        )
-        return placeholder
+            variable = self._values.pop()
+            return variable.name_expr
+        parameter = self._declare_parameter()
+        return NameExpr(parameter.name)
 
     def pop_many(self, count: int) -> List[NameExpr]:
         items = [self.pop_single() for _ in range(count)]
@@ -123,9 +181,84 @@ class HighLevelStack:
         return lhs, rhs
 
     def flush(self) -> List[NameExpr]:
-        values = list(self._values)
+        values = [variable.name_expr for variable in self._values]
         self._values.clear()
         return values
+
+    # ------------------------------------------------------------------
+    def parameters(self) -> Sequence[StackParameter]:
+        return list(self._parameters)
+
+    def variable_metadata(self) -> Dict[str, StackVariable]:
+        return dict(self._registry)
+
+    # Internal helpers -------------------------------------------------
+    def _create_variable(
+        self,
+        base: str,
+        *,
+        origin: str,
+        source: Optional[LuaExpression] = None,
+        semantics: Optional[InstructionSemantics] = None,
+    ) -> StackVariable:
+        name = self._allocator.allocate(base)
+        variable = StackVariable(
+            name=name,
+            origin=origin,
+            source=source,
+            semantics=semantics,
+        )
+        self._registry[name] = variable
+        return variable
+
+    def _declare_parameter(self) -> StackParameter:
+        index = len(self._parameters)
+        name = f"arg_{index}"
+        parameter = StackParameter(name=name, index=index)
+        self._parameters.append(parameter)
+        self.warnings.append(f"inferred function argument {name}")
+        return parameter
+
+    def _literal_base(self, expression: LuaExpression) -> str:
+        if isinstance(expression, LiteralExpr):
+            value = expression.value
+            if value.startswith('"') and value.endswith('"'):
+                inner = _decode_lua_string(value[1:-1])
+                if inner:
+                    snippet = inner[:8]
+                    hint = sanitize_identifier(snippet, "literal")
+                    if hint and hint != "literal":
+                        return f"str_{hint}" if not hint.startswith("literal") else hint
+        return "literal"
+
+
+def _decode_lua_string(text: str) -> str:
+    """Best-effort unescape of a Lua string literal body."""
+
+    result: List[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text):
+            index += 1
+            escape = text[index]
+            if escape == "n":
+                result.append("\n")
+            elif escape == "r":
+                result.append("\r")
+            elif escape == "t":
+                result.append("\t")
+            elif escape == "\\":
+                result.append("\\")
+            elif escape == '"':
+                result.append('"')
+            else:
+                result.append(escape)
+            index += 1
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
 
 
 @dataclass
@@ -138,18 +271,51 @@ class FunctionMetadata:
     helper_calls: int = 0
     branch_count: int = 0
     literal_count: int = 0
+    parameter_count: int = 0
+    variable_count: int = 0
+    string_constants: Dict[str, str] = field(default_factory=dict)
+    parameter_usage: Dict[str, int] = field(default_factory=dict)
+    helper_breakdown: Dict[str, int] = field(default_factory=dict)
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
         lines.append(f"- blocks: {self.block_count}")
         lines.append(f"- instructions: {self.instruction_count}")
+        lines.append(f"- parameters: {self.parameter_count}")
         lines.append(f"- literal instructions: {self.literal_count}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
+        lines.append(f"- locals: {self.variable_count}")
+        if self.string_constants:
+            lines.append(f"- string literals: {len(self.string_constants)}")
+        if self.parameter_usage:
+            total_reads = sum(self.parameter_usage.values())
+            lines.append(f"- parameter reads: {total_reads}")
         return lines
 
     def warning_lines(self) -> List[str]:
         return [f"- {warning}" for warning in self.warnings]
+
+    def string_literal_lines(self) -> List[str]:
+        lines = ["string literals:"]
+        for name in sorted(self.string_constants):
+            value = self.string_constants[name]
+            lines.append(f"- {name}: {value}")
+        return lines
+
+    def parameter_usage_lines(self) -> List[str]:
+        lines = ["parameter usage:"]
+        for name in sorted(self.parameter_usage):
+            count = self.parameter_usage[name]
+            lines.append(f"- {name}: {count}")
+        return lines
+
+    def helper_lines(self) -> List[str]:
+        lines = ["helper usage:"]
+        for name in sorted(self.helper_breakdown):
+            count = self.helper_breakdown[name]
+            lines.append(f"- {name}: {count}")
+        return lines
 
 
 @dataclass
@@ -157,6 +323,7 @@ class HighLevelFunction:
     """Container describing a reconstructed Lua function."""
 
     name: str
+    parameters: Sequence[str]
     body: BlockStatement
     metadata: FunctionMetadata
 
@@ -171,7 +338,17 @@ class HighLevelFunction:
                 ["stack reconstruction warnings:"] + self.metadata.warning_lines()
             )
             writer.write_line("")
-        writer.write_line(f"function {self.name}()")
+        if self.metadata.string_constants:
+            writer.write_comment_block(self.metadata.string_literal_lines())
+            writer.write_line("")
+        if self.metadata.parameter_usage:
+            writer.write_comment_block(self.metadata.parameter_usage_lines())
+            writer.write_line("")
+        if self.metadata.helper_breakdown:
+            writer.write_comment_block(self.metadata.helper_lines())
+            writer.write_line("")
+        signature = ", ".join(self.parameters)
+        writer.write_line(f"function {self.name}({signature})")
         with writer.indented():
             self.body.emit(writer)
         writer.write_line("end")
@@ -431,15 +608,38 @@ class HighLevelReconstructor:
         structurer = ControlFlowStructurer(blocks)
         body = structurer.structure(entry)
         function_name = f"segment_{program.segment_index:03d}"
+        parameters = [parameter.name for parameter in translator.stack.parameters()]
+        variable_metadata = translator.stack.variable_metadata()
+        renamer = VariableRenamer(variable_metadata)
+        renamer.reserve_names(parameters)
+        mapping = renamer.build_mapping()
+        warnings = list(translator.stack.warnings)
+        if mapping:
+            renamer.apply(body, mapping)
+            parameters = renamer.rename_parameters(parameters, mapping)
+            warnings = renamer.rename_warnings(warnings, mapping)
+        usage_analyzer = VariableUsageAnalyzer(parameters)
+        usage_report = usage_analyzer.inspect(body)
+        helper_invocations = sum(usage_report.helper_calls.values())
         metadata = FunctionMetadata(
             block_count=len(blocks),
             instruction_count=translator.instruction_total,
-            warnings=list(translator.stack.warnings),
-            helper_calls=translator.helper_calls,
+            warnings=warnings,
+            helper_calls=helper_invocations or translator.helper_calls,
             branch_count=translator.branch_count,
             literal_count=translator.literal_count,
+            parameter_count=len(parameters),
         )
-        return HighLevelFunction(name=function_name, body=body, metadata=metadata)
+        metadata.variable_count = usage_report.local_count()
+        metadata.string_constants = dict(usage_report.string_literals)
+        metadata.parameter_usage = dict(usage_report.parameter_usage)
+        metadata.helper_breakdown = dict(usage_report.helper_calls)
+        return HighLevelFunction(
+            name=function_name,
+            parameters=parameters,
+            body=body,
+            metadata=metadata,
+        )
 
     # ------------------------------------------------------------------
     def render(self, functions: Sequence[HighLevelFunction]) -> str:
@@ -478,7 +678,7 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
     ) -> List[LuaStatement]:
         operand = self._operand_expression(semantics, instruction.operand)
-        statements, _ = translator.stack.push_literal(operand)
+        statements, _ = translator.stack.push_literal(operand, semantics=semantics)
         translator.literal_count += 1
         return self._decorate_with_comment(statements, semantics)
 
@@ -491,7 +691,14 @@ class HighLevelReconstructor:
         lhs, rhs = translator.stack.pop_pair()
         operator = semantics.comparison_operator or "=="
         expression = BinaryExpr(lhs, operator, rhs)
-        statements, _ = translator.stack.push_expression(expression, prefix="cmp", make_local=True)
+        base = derive_stack_symbol_name(semantics, fallback="cmp")
+        statements, _ = translator.stack.push_expression(
+            expression,
+            prefix=base,
+            base_name=base,
+            make_local=True,
+            origin="comparison",
+        )
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_branch(
@@ -554,7 +761,14 @@ class HighLevelReconstructor:
         self._helper_registry.register_method(signature)
         translator.helper_calls += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs, prefix="struct")
+            base = derive_stack_symbol_name(semantics, fallback="struct")
+            statements, _ = translator.stack.push_call_results(
+                call_expr,
+                outputs,
+                base_name=base,
+                origin="structure",
+                semantics=semantics,
+            )
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -582,7 +796,13 @@ class HighLevelReconstructor:
         if outputs <= 0:
             statements = [CallStatement(call_expr)]
         else:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            base = derive_stack_symbol_name(semantics, fallback="result")
+            statements, _ = translator.stack.push_call_results(
+                call_expr,
+                outputs,
+                base_name=base,
+                semantics=semantics,
+            )
         return self._decorate_with_comment(statements, semantics)
 
     def _translate_generic(
@@ -606,7 +826,13 @@ class HighLevelReconstructor:
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
+            base = derive_stack_symbol_name(semantics, fallback="result")
+            statements, _ = translator.stack.push_call_results(
+                call_expr,
+                outputs,
+                base_name=base,
+                semantics=semantics,
+            )
         else:
             statements = [CallStatement(call_expr)]
         return self._decorate_with_comment(statements, semantics)
@@ -669,6 +895,8 @@ class HighLevelReconstructor:
     ) -> List[str]:
         lines = ["module summary:"]
         lines.append(f"- functions: {len(functions)}")
+        parameter_total = sum(func.metadata.parameter_count for func in functions)
+        lines.append(f"- inferred parameters: {parameter_total}")
         helper_functions = self._helper_registry.function_count()
         helper_methods = self._helper_registry.method_count()
         lines.append(f"- helper functions: {helper_functions}")
@@ -686,6 +914,340 @@ class HighLevelReconstructor:
         warnings = sum(len(func.metadata.warnings) for func in functions)
         lines.append(f"- stack warnings: {warnings}")
         return lines
+
+
+class VariableRenamer:
+    """Best-effort variable renaming based on reconstruction metadata."""
+
+    def __init__(self, variables: Mapping[str, StackVariable]) -> None:
+        self._variables = variables
+        self._used: set[str] = set()
+
+    def reserve_names(self, names: Iterable[str]) -> None:
+        for name in names:
+            if not name:
+                continue
+            self._used.add(sanitize_identifier(name, name))
+
+    def build_mapping(self) -> Dict[str, str]:
+        mapping: Dict[str, str] = {}
+        for name in sorted(self._variables):
+            variable = self._variables[name]
+            suggestion = self._suggest_name(variable)
+            new_name = self._make_unique(suggestion, current=name)
+            if new_name != name:
+                mapping[name] = new_name
+                variable.name = new_name
+            self._used.add(new_name)
+        return mapping
+
+    def _make_unique(self, base: str, *, current: str) -> str:
+        cleaned = sanitize_identifier(base, current or "value")
+        candidate = cleaned
+        if candidate == current and candidate not in self._used:
+            return candidate
+        suffix = 1
+        while candidate in self._used and candidate != current:
+            candidate = f"{cleaned}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _suggest_name(self, variable: StackVariable) -> str:
+        semantics = variable.semantics
+        if semantics and semantics.enum_namespace:
+            base = f"{semantics.enum_namespace}_value"
+            return sanitize_identifier(base, "value")
+        if variable.origin == "literal" and isinstance(variable.source, LiteralExpr):
+            text = variable.source.value
+            if text.startswith('"') and text.endswith('"'):
+                inner = _decode_lua_string(text[1:-1])
+                if inner:
+                    snippet = sanitize_identifier(inner[:12], "text")
+                    return f"text_{snippet}" if snippet else "text_literal"
+            cleaned = sanitize_identifier(text, "literal")
+            return f"literal_{cleaned}" if cleaned else "literal"
+        if semantics:
+            if semantics.manual_name:
+                return sanitize_identifier(semantics.manual_name, "value")
+            if semantics.mnemonic:
+                return sanitize_identifier(semantics.mnemonic, "value")
+        if variable.origin:
+            return sanitize_identifier(variable.origin, "value")
+        return sanitize_identifier(variable.name, "value")
+
+    def apply(self, block: BlockStatement, mapping: Mapping[str, str]) -> None:
+        if not mapping:
+            return
+        self._rename_block(block, mapping)
+
+    def rename_parameters(
+        self, parameters: Sequence[str], mapping: Mapping[str, str]
+    ) -> List[str]:
+        return [mapping.get(name, name) for name in parameters]
+
+    def rename_warnings(
+        self, warnings: Sequence[str], mapping: Mapping[str, str]
+    ) -> List[str]:
+        renamed: List[str] = []
+        for warning in warnings:
+            updated = warning
+            for old, new in mapping.items():
+                if old in updated:
+                    updated = updated.replace(old, new)
+            renamed.append(updated)
+        return renamed
+
+    def _rename_block(
+        self, block: BlockStatement, mapping: Mapping[str, str]
+    ) -> None:
+        for statement in block.statements:
+            self._rename_statement(statement, mapping)
+
+    def _rename_statement(
+        self, statement: LuaStatement, mapping: Mapping[str, str]
+    ) -> None:
+        if isinstance(statement, Assignment):
+            for target in statement.targets:
+                self._rename_expression(target, mapping)
+            self._rename_expression(statement.value, mapping)
+        elif isinstance(statement, MultiAssignment):
+            for target in statement.targets:
+                self._rename_expression(target, mapping)
+            for value in statement.values:
+                self._rename_expression(value, mapping)
+        elif isinstance(statement, CallStatement):
+            self._rename_expression(statement.expression, mapping)
+        elif isinstance(statement, ReturnStatement):
+            for value in statement.values:
+                self._rename_expression(value, mapping)
+        elif isinstance(statement, IfStatement):
+            for clause in statement.clauses:
+                if clause.condition is not None:
+                    self._rename_expression(clause.condition, mapping)
+                self._rename_block(clause.body, mapping)
+        elif isinstance(statement, WhileStatement):
+            self._rename_expression(statement.condition, mapping)
+            self._rename_block(statement.body, mapping)
+        elif isinstance(statement, RepeatStatement):
+            self._rename_block(statement.body, mapping)
+            self._rename_expression(statement.condition, mapping)
+        elif isinstance(statement, NumericForStatement):
+            self._rename_expression(statement.variable, mapping)
+            self._rename_expression(statement.start, mapping)
+            self._rename_expression(statement.stop, mapping)
+            if statement.step is not None:
+                self._rename_expression(statement.step, mapping)
+            self._rename_block(statement.body, mapping)
+        elif isinstance(statement, GenericForStatement):
+            for var in statement.variables:
+                self._rename_expression(var, mapping)
+            for expr in statement.iterator:
+                self._rename_expression(expr, mapping)
+            self._rename_block(statement.body, mapping)
+        elif isinstance(statement, SwitchStatement):
+            self._rename_expression(statement.expression, mapping)
+            for case in statement.cases:
+                for value in case.values:
+                    self._rename_expression(value, mapping)
+                self._rename_block(case.body, mapping)
+            if statement.default is not None:
+                self._rename_block(statement.default, mapping)
+        elif isinstance(statement, BlockStatement):
+            self._rename_block(statement, mapping)
+        else:
+            # Comment, blank lines and break statements require no updates.
+            return
+
+    def _rename_expression(
+        self, expression: LuaExpression, mapping: Mapping[str, str]
+    ) -> None:
+        if isinstance(expression, NameExpr):
+            if expression.name in mapping:
+                expression.name = mapping[expression.name]
+        elif isinstance(expression, BinaryExpr):
+            self._rename_expression(expression.left, mapping)
+            self._rename_expression(expression.right, mapping)
+        elif isinstance(expression, UnaryExpr):
+            self._rename_expression(expression.operand, mapping)
+        elif isinstance(expression, CallExpr):
+            self._rename_expression(expression.callee, mapping)
+            for arg in expression.arguments:
+                self._rename_expression(arg, mapping)
+        elif isinstance(expression, MethodCallExpr):
+            self._rename_expression(expression.target, mapping)
+            for arg in expression.arguments:
+                self._rename_expression(arg, mapping)
+        elif isinstance(expression, TableExpr):
+            for field in expression.fields:
+                self._rename_table_field(field, mapping)
+
+    def _rename_table_field(
+        self, field: TableField, mapping: Mapping[str, str]
+    ) -> None:
+        if field.key is not None:
+            self._rename_expression(field.key, mapping)
+        self._rename_expression(field.value, mapping)
+
+
+@dataclass
+class UsageReport:
+    local_names: set[str] = field(default_factory=set)
+    parameter_usage: Dict[str, int] = field(default_factory=dict)
+    string_literals: Dict[str, str] = field(default_factory=dict)
+    helper_calls: Dict[str, int] = field(default_factory=dict)
+
+    def local_count(self) -> int:
+        return len(self.local_names)
+
+
+class VariableUsageAnalyzer:
+    """Inspect the emitted AST and gather usage statistics."""
+
+    def __init__(
+        self,
+        parameters: Sequence[str],
+        *,
+        helper_names: Optional[Iterable[str]] = None,
+    ) -> None:
+        self._parameters = set(parameters)
+        self._helper_names = set(helper_names or []) if helper_names is not None else None
+
+    def inspect(self, block: BlockStatement) -> UsageReport:
+        report = UsageReport()
+        self._visit_block(block, report)
+        return report
+
+    # ------------------------------------------------------------------
+    def _visit_block(self, block: BlockStatement, report: UsageReport) -> None:
+        for statement in block.statements:
+            self._visit_statement(statement, report)
+
+    def _visit_statement(self, statement: LuaStatement, report: UsageReport) -> None:
+        if isinstance(statement, Assignment):
+            for target in statement.targets:
+                if isinstance(target, NameExpr):
+                    if (
+                        statement.is_local
+                        and target.name not in self._parameters
+                    ):
+                        report.local_names.add(target.name)
+                        self._record_literal(target.name, statement.value, report)
+            self._visit_expression(statement.value, report)
+        elif isinstance(statement, MultiAssignment):
+            self._handle_multi_assignment(statement, report)
+        elif isinstance(statement, CallStatement):
+            self._visit_expression(statement.expression, report)
+        elif isinstance(statement, ReturnStatement):
+            for value in statement.values:
+                self._visit_expression(value, report)
+        elif isinstance(statement, IfStatement):
+            for clause in statement.clauses:
+                if clause.condition is not None:
+                    self._visit_expression(clause.condition, report)
+                self._visit_block(clause.body, report)
+        elif isinstance(statement, WhileStatement):
+            self._visit_expression(statement.condition, report)
+            self._visit_block(statement.body, report)
+        elif isinstance(statement, RepeatStatement):
+            self._visit_block(statement.body, report)
+            self._visit_expression(statement.condition, report)
+        elif isinstance(statement, NumericForStatement):
+            if isinstance(statement.variable, NameExpr):
+                report.local_names.add(statement.variable.name)
+            self._visit_expression(statement.start, report)
+            self._visit_expression(statement.stop, report)
+            if statement.step is not None:
+                self._visit_expression(statement.step, report)
+            self._visit_block(statement.body, report)
+        elif isinstance(statement, GenericForStatement):
+            for variable in statement.variables:
+                if isinstance(variable, NameExpr):
+                    report.local_names.add(variable.name)
+            for iterator in statement.iterator:
+                self._visit_expression(iterator, report)
+            self._visit_block(statement.body, report)
+        elif isinstance(statement, SwitchStatement):
+            self._visit_expression(statement.expression, report)
+            for case in statement.cases:
+                for value in case.values:
+                    self._visit_expression(value, report)
+                self._visit_block(case.body, report)
+            if statement.default is not None:
+                self._visit_block(statement.default, report)
+        elif isinstance(statement, BlockStatement):
+            self._visit_block(statement, report)
+
+    def _handle_multi_assignment(
+        self, statement: MultiAssignment, report: UsageReport
+    ) -> None:
+        values = list(statement.values)
+        for index, target in enumerate(statement.targets):
+            if isinstance(target, NameExpr):
+                if statement.is_local and target.name not in self._parameters:
+                    report.local_names.add(target.name)
+                if index < len(values):
+                    self._record_literal(target.name, values[index], report)
+        for value in values:
+            self._visit_expression(value, report)
+
+    def _visit_expression(self, expression: LuaExpression, report: UsageReport) -> None:
+        if isinstance(expression, NameExpr):
+            self._record_name_usage(expression.name, report)
+        elif isinstance(expression, BinaryExpr):
+            self._visit_expression(expression.left, report)
+            self._visit_expression(expression.right, report)
+        elif isinstance(expression, UnaryExpr):
+            self._visit_expression(expression.operand, report)
+        elif isinstance(expression, CallExpr):
+            self._record_call(expression, report)
+            self._visit_expression(expression.callee, report)
+            for argument in expression.arguments:
+                self._visit_expression(argument, report)
+        elif isinstance(expression, MethodCallExpr):
+            self._record_method_call(expression, report)
+            self._visit_expression(expression.target, report)
+            for argument in expression.arguments:
+                self._visit_expression(argument, report)
+        elif isinstance(expression, TableExpr):
+            for field in expression.fields:
+                if field.key is not None:
+                    self._visit_expression(field.key, report)
+                self._visit_expression(field.value, report)
+
+    def _record_literal(
+        self, name: str, value: LuaExpression, report: UsageReport
+    ) -> None:
+        if name in self._parameters:
+            return
+        if isinstance(value, LiteralExpr):
+            literal = value.value
+            if literal.startswith('"') and literal.endswith('"'):
+                report.string_literals.setdefault(name, literal)
+
+    def _record_name_usage(self, name: str, report: UsageReport) -> None:
+        if name in self._parameters:
+            report.parameter_usage[name] = report.parameter_usage.get(name, 0) + 1
+
+    def _record_call(self, call: CallExpr, report: UsageReport) -> None:
+        if isinstance(call.callee, NameExpr):
+            helper = call.callee.name
+            if self._helper_names is None or helper in self._helper_names:
+                report.helper_calls[helper] = report.helper_calls.get(helper, 0) + 1
+
+    def _record_method_call(
+        self, call: MethodCallExpr, report: UsageReport
+    ) -> None:
+        target = self._expression_label(call.target)
+        helper = f"{target}:{call.method}" if target else call.method
+        if self._helper_names is None or helper in self._helper_names:
+            report.helper_calls[helper] = report.helper_calls.get(helper, 0) + 1
+
+    def _expression_label(self, expression: LuaExpression) -> str:
+        if isinstance(expression, NameExpr):
+            return expression.name
+        if isinstance(expression, MethodCallExpr):
+            return f"{self._expression_label(expression.target)}:{expression.method}"
+        return ""
 
 def _snake_to_camel(name: str) -> str:
     parts = name.split("_")

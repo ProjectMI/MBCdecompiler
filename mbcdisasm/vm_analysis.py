@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .manual_semantics import InstructionSemantics
+from .naming import derive_stack_symbol_name
 
 
 # ---------------------------------------------------------------------------
@@ -409,43 +410,65 @@ def _format_comment(semantics: InstructionSemantics) -> Optional[str]:
 
 
 def _value_base_name(semantics: InstructionSemantics) -> str:
-    if semantics.has_tag("literal"):
-        base = "literal"
-    elif semantics.has_tag("comparison"):
-        base = "cmp"
-    elif semantics.control_flow == "branch":
-        base = "cond"
-    else:
-        base = semantics.vm_method or semantics.manual_name or semantics.mnemonic
-    return _sanitize_identifier(base or "value")
+    return derive_stack_symbol_name(semantics)
 
 
-def _sanitize_identifier(name: str) -> str:
-    cleaned = [ch.lower() if ch.isalnum() else "_" for ch in name]
-    if not cleaned:
-        return "value"
-    identifier = "".join(cleaned)
-    while identifier.startswith("_"):
-        identifier = identifier[1:]
-    identifier = identifier.strip("_")
-    if not identifier:
-        identifier = "value"
-    if identifier[0].isdigit():
-        identifier = "v_" + identifier
-    return identifier
+_ASCII_ESCAPES = {
+    7: "\a",
+    8: "\b",
+    9: "\t",
+    10: "\n",
+    11: "\v",
+    12: "\f",
+    13: "\r",
+}
 
 
 def _ascii_candidate(operand: int) -> Optional[str]:
     raw = operand.to_bytes(2, "little")
-    if all(32 <= byte <= 126 for byte in raw):
-        return raw.decode("ascii")
-    if raw[1] == 0 and 32 <= raw[0] <= 126:
-        return chr(raw[0])
-    return None
+
+    def decode(byte: int) -> Optional[str]:
+        if byte == 0:
+            return ""
+        if 32 <= byte <= 126:
+            return chr(byte)
+        if byte in _ASCII_ESCAPES:
+            return _ASCII_ESCAPES[byte]
+        return None
+
+    first = decode(raw[0])
+    second = decode(raw[1])
+    if first is None or second is None:
+        return None
+    text = first + second
+    return text or None
+
+
+_LUA_ESCAPE_MAP = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\a": "\\a",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+    "\v": "\\v",
+}
 
 
 def _lua_string(text: str) -> str:
-    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    pieces: List[str] = []
+    for char in text:
+        if char in _LUA_ESCAPE_MAP:
+            pieces.append(_LUA_ESCAPE_MAP[char])
+            continue
+        code = ord(char)
+        if 32 <= code <= 126:
+            pieces.append(char)
+        else:
+            pieces.append(f"\\x{code:02X}")
+    escaped = "".join(pieces)
     return f'"{escaped}"'
 
 

@@ -2,6 +2,7 @@ from mbcdisasm.ir import IRBlock, IRInstruction, IRProgram
 from mbcdisasm.manual_semantics import InstructionSemantics, StackEffect
 from mbcdisasm.vm_analysis import (
     VirtualMachineAnalyzer,
+    LuaLiteralFormatter,
     analyze_block_lifetimes,
     analyze_program_lifetimes,
     format_vm_block_trace,
@@ -182,3 +183,15 @@ def test_render_vm_program_includes_summary_header() -> None:
     assert "blocks=2" in summary
     assert count_operations(trace) == 3
     assert count_operations(trace.block_order()[0]) == 2
+
+
+def test_literal_formatter_handles_control_ascii() -> None:
+    formatter = LuaLiteralFormatter()
+    # 0x0A09 -> "\t\n" because the operand is little-endian.
+    assert formatter.format_operand(0x0A09) == '"\\t\\n"'
+    # Mixed printable / zero should collapse to a single character string.
+    assert formatter.format_operand(0x0021) == '"!"'
+    # Additional control characters are escaped using their named sequences.
+    assert formatter.format_operand(0x0708) == '"\\b\\a"'
+    # Non printable bytes are rendered as hexadecimal unless they encode a small integer.
+    assert formatter.format_operand(0x0000) == "0"
