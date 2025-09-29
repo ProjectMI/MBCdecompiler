@@ -20,6 +20,8 @@ from typing import (
     cast,
 )
 
+from .flow_analysis import FlowClassifier, FlowDescriptor
+
 
 def _normalize_stack_delta_key(value: object) -> object:
     """Normalise stack delta keys while preserving fractional values."""
@@ -379,6 +381,9 @@ class InstructionMetadata:
     control_flow: Optional[str]
     flow_target: Optional[str]
     summary: Optional[str]
+    declared_flow: Optional[str]
+    flow_confidence: float
+    flow_reason: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -438,6 +443,13 @@ class KnowledgeBase:
         self._annotations = data.setdefault("annotations", {})
         self._manual_reference: Dict[str, Mapping[str, object]] = {}
         self._merge_manual_annotations()
+        self._flow_metadata_index: Dict[str, Mapping[str, object]] = {}
+        self._refresh_flow_metadata_index()
+        self._flow_classifier = FlowClassifier(
+            self._manual_reference,
+            self._flow_metadata_index,
+            {key: profile.to_json() for key, profile in self._profiles.items()},
+        )
         self._review_tasks: Dict[Tuple[str, str], ReviewTask] = {}
         for entry in data.get("review_tasks", []):
             if isinstance(entry, Mapping):
@@ -465,6 +477,8 @@ class KnowledgeBase:
             profile = OpcodeProfile(key)
             self._profiles[key] = profile
             self._data.setdefault("opcode_modes", {})[key] = profile.to_json()
+            if hasattr(self, "_flow_classifier"):
+                self._flow_classifier.update_profile(key, profile.to_json())
         return profile
 
     def assess_profile(self, profile: OpcodeProfile) -> ProfileAssessment:
@@ -606,6 +620,7 @@ class KnowledgeBase:
                 operand_confidence = None
 
         control_flow = self.control_flow_hint(key)
+        flow_descriptor = self.control_flow_descriptor(key)
         flow_target = self.flow_target_hint(key)
 
         summary: Optional[str] = None
@@ -626,6 +641,9 @@ class KnowledgeBase:
             control_flow=control_flow,
             flow_target=flow_target,
             summary=summary,
+            declared_flow=flow_descriptor.declared,
+            flow_confidence=flow_descriptor.confidence,
+            flow_reason=flow_descriptor.primary_note,
         )
 
     def manual_annotation(self, key: str) -> Mapping[str, object]:
@@ -640,21 +658,15 @@ class KnowledgeBase:
         return {}
 
     def control_flow_hint(self, key: str) -> Optional[str]:
-        """Return the declared control-flow semantics for ``key``.
+        """Return the inferred control-flow semantics for ``key``."""
 
-        The knowledge base may contain optional annotations that describe the
-        behavioural role of an opcode/mode combination.  The recognised values
-        are intentionally broad (``jump``, ``branch``, ``call``, ``return``,
-        ``stop``) so the rest of the toolkit can derive basic graph structures
-        without needing instruction-level semantics.  Unknown entries return
-        :data:`None` which callers should treat as straight-line execution.
-        """
+        return self.control_flow_descriptor(key).kind
 
-        ann = self._annotations.get(key, {})
-        value = ann.get("control_flow")
-        if value is None:
-            return None
-        return str(value)
+    def control_flow_descriptor(self, key: str) -> FlowDescriptor:
+        """Return the detailed control-flow descriptor for ``key``."""
+
+        self._ensure_flow_entry(key)
+        return self._flow_classifier.descriptor(key)
 
     def flow_target_hint(self, key: str) -> Optional[str]:
         """Return the strategy used to resolve branch targets for ``key``.
@@ -712,6 +724,9 @@ class KnowledgeBase:
                 existing.following.update(profile.following)
                 store[profile.key] = existing.to_json()
                 target = existing
+
+            if hasattr(self, "_flow_classifier"):
+                self._flow_classifier.update_profile(target.key, target.to_json())
 
             observation = StackObservation.from_profile(target)
             observations.append(observation)
@@ -1247,6 +1262,48 @@ class KnowledgeBase:
                     ann.setdefault("stack_source", "manual")
                 if not ann_is_mutable:
                     self._annotations[key_str] = ann
+        self._refresh_flow_metadata_index()
+        self._flow_classifier = FlowClassifier(
+            self._manual_reference,
+            self._flow_metadata_index,
+            {key: profile.to_json() for key, profile in self._profiles.items()},
+        )
+
+    def _refresh_flow_metadata_index(self) -> None:
+        """Synchronise the metadata view consumed by the flow classifier."""
+
+        index: Dict[str, Dict[str, object]] = {}
+        for key in self._annotations:
+            index[key] = self._build_flow_metadata_payload(key)
+        self._flow_metadata_index = index
+        classifier = getattr(self, "_flow_classifier", None)
+        if classifier is not None:
+            for key, payload in index.items():
+                classifier.update_metadata(key, payload)
+
+    def _build_flow_metadata_payload(self, key: str) -> Dict[str, object]:
+        payload: Dict[str, object] = {}
+        annotation = self._annotations.get(key)
+        if isinstance(annotation, Mapping):
+            payload.update(annotation)
+        manual = self._manual_reference.get(key)
+        if isinstance(manual, Mapping):
+            for field, value in manual.items():
+                payload.setdefault(field, value)
+        payload.setdefault("mnemonic", payload.get("name", f"opcode_{key}"))
+        return payload
+
+    def _ensure_flow_entry(self, key: str) -> None:
+        payload = self._build_flow_metadata_payload(key)
+        existing = self._flow_metadata_index.get(key)
+        if existing != payload:
+            self._flow_metadata_index[key] = payload
+            if hasattr(self, "_flow_classifier"):
+                self._flow_classifier.update_metadata(key, payload)
+        profile = self._profiles.get(key)
+        if hasattr(self, "_flow_classifier"):
+            profile_payload = profile.to_json() if profile is not None else None
+            self._flow_classifier.update_profile(key, profile_payload)
 
     def apply_semantic_annotations(
         self,

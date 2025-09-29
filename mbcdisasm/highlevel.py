@@ -55,20 +55,29 @@ from .literal_sequences import (
 )
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
 from .vm_analysis import estimate_stack_io
+from .stack_balance import StackBalanceAnalyzer, StackSeedPlan, StackUnderflowProvider
 
 
 class HighLevelStack:
     """Track symbolic stack values during reconstruction."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, underflow_provider=None) -> None:
         self._values: List[LuaExpression] = []
         self._counter = 0
         self.warnings: List[str] = []
+        self._underflow_provider = underflow_provider
 
     def new_symbol(self, prefix: str = "value") -> str:
         name = f"{prefix}_{self._counter}"
         self._counter += 1
         return name
+
+    def seed(self, values: Iterable[LuaExpression]) -> None:
+        for value in values:
+            self._values.append(value)
+
+    def set_underflow_provider(self, provider) -> None:
+        self._underflow_provider = provider
 
     def push_literal(
         self, expression: LuaExpression
@@ -118,10 +127,13 @@ class HighLevelStack:
     def pop_single(self) -> LuaExpression:
         if self._values:
             return self._values.pop()
+        if self._underflow_provider is not None:
+            expr, warning = self._underflow_provider()
+            if warning:
+                self.warnings.append(warning)
+            return expr
         placeholder = NameExpr(self.new_symbol("stack"))
-        self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
-        )
+        self.warnings.append(f"underflow generated placeholder {placeholder.name}")
         return placeholder
 
     def pop_many(self, count: int) -> List[LuaExpression]:
@@ -206,6 +218,7 @@ class FunctionMetadata:
     literal_runs: Sequence[LiteralRun] = field(default_factory=tuple)
     literal_stats: Optional[LiteralStatistics] = None
     literal_report: Optional[LiteralRunReport] = None
+    stack_seed_depth: int = 0
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
@@ -214,6 +227,8 @@ class FunctionMetadata:
         lines.append(f"- literal instructions: {self.literal_count}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
+        if self.stack_seed_depth:
+            lines.append(f"- initial stack seed depth: {self.stack_seed_depth}")
         string_runs = [run for run in self.literal_runs if run.kind == "string"]
         if string_runs:
             lines.append(f"- string literal sequences: {len(string_runs)}")
@@ -340,10 +355,20 @@ class BlockInfo:
 class BlockTranslator:
     """Translate IR blocks into :class:`BlockInfo` instances."""
 
-    def __init__(self, reconstructor: "HighLevelReconstructor", program: IRProgram) -> None:
+    def __init__(
+        self,
+        reconstructor: "HighLevelReconstructor",
+        program: IRProgram,
+        *,
+        stack_plan: Optional[StackSeedPlan] = None,
+    ) -> None:
         self._reconstructor = reconstructor
         self._program = program
-        self._stack = HighLevelStack()
+        provider = StackUnderflowProvider(stack_plan) if stack_plan else None
+        self._stack = HighLevelStack(underflow_provider=provider)
+        if provider is not None:
+            self._stack.seed(provider.seed())
+        self._stack_plan = stack_plan
         self._string_collector = StringLiteralCollector()
         self._literal_tracker = LiteralRunTracker()
         self.literal_count = 0
@@ -573,7 +598,8 @@ class HighLevelReconstructor:
     # ------------------------------------------------------------------
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
         self._last_summary = None
-        translator = BlockTranslator(self, program)
+        stack_plan = StackBalanceAnalyzer(program).plan()
+        translator = BlockTranslator(self, program, stack_plan=stack_plan)
         blocks = translator.translate()
         entry = min(blocks)
         structurer = ControlFlowStructurer(blocks)
@@ -599,6 +625,7 @@ class HighLevelReconstructor:
             literal_runs=tuple(literal_runs),
             literal_stats=stats,
             literal_report=report,
+            stack_seed_depth=stack_plan.initial_depth,
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
