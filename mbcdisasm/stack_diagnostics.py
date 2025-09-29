@@ -209,6 +209,35 @@ class StackDiagnostics:
 # ---------------------------------------------------------------------------
 
 
+class _TokenGenerator:
+    """Generate stable symbolic tokens for stack simulation."""
+
+    def __init__(self) -> None:
+        self._counter = 0
+        self._value_cache: Dict[Tuple[int, int, int], str] = {}
+        self._phi_cache: Dict[Tuple[int, int], str] = {}
+
+    def _next(self, prefix: str) -> str:
+        self._counter += 1
+        return f"{prefix}_{self._counter}"
+
+    def value(self, block_start: int, offset: int, index: int) -> str:
+        key = (block_start, offset, index)
+        cached = self._value_cache.get(key)
+        if cached is None:
+            cached = self._next("value")
+            self._value_cache[key] = cached
+        return cached
+
+    def phi(self, block_start: int, index: int) -> str:
+        key = (block_start, index)
+        cached = self._phi_cache.get(key)
+        if cached is None:
+            cached = self._next("phi")
+            self._phi_cache[key] = cached
+        return cached
+
+
 def analyze_stack(program: IRProgram) -> StackDiagnostics:
     """Perform a symbolic stack walk for ``program``."""
 
@@ -223,12 +252,7 @@ def analyze_stack(program: IRProgram) -> StackDiagnostics:
     block_states: Dict[int, BlockStackState] = {}
     worklist: deque[int] = deque([entry])
     processed: Dict[int, List[str]] = {}
-    token_counter = 0
-
-    def new_token(prefix: str = "value") -> str:
-        nonlocal token_counter
-        token_counter += 1
-        return f"{prefix}_{token_counter}"
+    tokens = _TokenGenerator()
 
     while worklist:
         start = worklist.popleft()
@@ -239,14 +263,14 @@ def analyze_stack(program: IRProgram) -> StackDiagnostics:
         processed[start] = list(entry_tokens)
 
         block = blocks[start]
-        state, exit_tokens = _simulate_block(block, entry_tokens, new_token)
+        state, exit_tokens = _simulate_block(block, entry_tokens, tokens)
         block_states[start] = state
 
         for successor in block.successors:
             if successor not in blocks:
                 continue
             merged, changed = _merge_token_sequences(
-                token_seeds.get(successor), exit_tokens, new_token
+                token_seeds.get(successor), exit_tokens, tokens, successor
             )
             if merged is not None:
                 token_seeds[successor] = merged
@@ -263,7 +287,7 @@ def analyze_stack(program: IRProgram) -> StackDiagnostics:
 def _simulate_block(
     block: IRBlock,
     entry_tokens: Sequence[str],
-    new_token,
+    tokens: _TokenGenerator,
 ) -> Tuple[BlockStackState, List[str]]:
     stack: List[str] = list(entry_tokens)
     events: List[StackEvent] = []
@@ -288,7 +312,10 @@ def _simulate_block(
         else:
             for _ in range(inputs):
                 stack.pop()
-        produced = [new_token("value") for _ in range(outputs)]
+        produced = [
+            tokens.value(block.start, instruction.offset, index)
+            for index in range(outputs)
+        ]
         stack.extend(produced)
         if len(stack) > max_depth:
             max_depth = len(stack)
@@ -319,7 +346,8 @@ def _simulate_block(
 def _merge_token_sequences(
     existing: Optional[List[str]],
     incoming: List[str],
-    new_token,
+    tokens: _TokenGenerator,
+    successor: int,
 ) -> Tuple[Optional[List[str]], bool]:
     if existing is None:
         return list(incoming), True
@@ -334,26 +362,24 @@ def _merge_token_sequences(
         rhs_kind = _token_kind(rhs)
 
         if lhs is None and rhs is None:
-            token = new_token("phi")
-            changed = True
+            token = tokens.phi(successor, index)
         elif lhs is None:
-            token = rhs if rhs is not None else new_token("phi")
-            changed = True
+            token = rhs if rhs is not None else tokens.phi(successor, index)
         elif rhs is None:
             if lhs_kind == "phi":
                 token = lhs
             else:
-                token = new_token("phi")
-                changed = True
+                token = tokens.phi(successor, index)
         elif lhs == rhs:
             token = lhs
         elif lhs_kind == "phi" and rhs_kind != "phi":
             token = rhs
-            changed = True
         elif rhs_kind == "phi" and lhs_kind != "phi":
             token = lhs
         else:
-            token = new_token("phi")
+            token = tokens.phi(successor, index)
+        current = existing[index] if index < len(existing) else None
+        if token != current:
             changed = True
         merged.append(token)
 
