@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional
 
+from .branch_analysis import BranchDescriptor, BranchGraph, describe_branches
 from .ir import IRBlock, IRProgram
 from .vm_analysis import VMBlockTrace, VMOperation, VirtualMachineAnalyzer
 
@@ -111,6 +112,52 @@ class LuaVMOperation(LuaStatement):
 
 
 @dataclass
+class LuaBranchSummary(LuaStatement):
+    """Summarises the control flow decisions taken by a branch instruction."""
+
+    descriptor: BranchDescriptor
+
+    def render(self) -> List[str]:
+        descriptor = self.descriptor
+        header = f"-- branch {descriptor.mnemonic} [{descriptor.classification}]"
+        if descriptor.comment:
+            header += f" :: {descriptor.comment}"
+        lines = [header]
+        for edge in descriptor.edges:
+            target = "exit" if edge.target is None else f"0x{edge.target:06X}"
+            qualifiers: List[str] = []
+            if edge.is_backward:
+                qualifiers.append("back")
+            if edge.is_fallthrough:
+                qualifiers.append("fallthrough")
+            if edge.comment:
+                qualifiers.append(edge.comment)
+            suffix = f" ({', '.join(qualifiers)})" if qualifiers else ""
+            lines.append(f"--   -> {edge.role}: {target}{suffix}")
+        return lines
+
+    def metadata(self) -> Optional[dict]:
+        descriptor = self.descriptor
+        return {
+            "type": "branch",
+            "offset": descriptor.instruction_offset,
+            "mnemonic": descriptor.mnemonic,
+            "classification": descriptor.classification,
+            "comment": descriptor.comment,
+            "edges": [
+                {
+                    "role": edge.role,
+                    "target": edge.target,
+                    "is_backward": edge.is_backward,
+                    "is_fallthrough": edge.is_fallthrough,
+                    **({"comment": edge.comment} if edge.comment else {}),
+                }
+                for edge in descriptor.edges
+            ],
+        }
+
+
+@dataclass
 class LuaFunction:
     name: str
     statements: List[LuaStatement]
@@ -168,8 +215,13 @@ class LuaReconstructor:
 
     def __init__(self, analyzer: Optional[VirtualMachineAnalyzer] = None) -> None:
         self._analyzer = analyzer or VirtualMachineAnalyzer()
+        self._branch_graph: Optional[BranchGraph] = None
+        self._branch_by_block: Dict[int, BranchDescriptor] = {}
 
     def from_ir(self, segment_index: int, program: IRProgram) -> LuaFunction:
+        branch_graph = describe_branches(program)
+        self._branch_graph = branch_graph
+        self._branch_by_block = {descriptor.block_start: descriptor for descriptor in branch_graph}
         statements: List[LuaStatement] = [
             LuaRawStatement("local stack = {}"),
             LuaRawStatement("local vm = {}"),
@@ -179,11 +231,18 @@ class LuaReconstructor:
             if idx > 0:
                 statements.append(LuaBlankLine())
             statements.extend(self._emit_block(trace))
+            descriptor = self._branch_by_block.get(trace.start)
+            if descriptor is not None:
+                statements.append(LuaBranchSummary(descriptor))
         name = f"segment_{segment_index:03d}"
         return LuaFunction(name=name, statements=statements)
 
     def render(self, function: LuaFunction) -> str:
         return function.render()
+
+    @property
+    def branch_graph(self) -> Optional[BranchGraph]:
+        return self._branch_graph
 
     def _emit_block(self, trace: VMBlockTrace) -> List[LuaStatement]:
         statements: List[LuaStatement] = [LuaLabel(f"block_{trace.start:06X}")]

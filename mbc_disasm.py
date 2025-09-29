@@ -15,6 +15,11 @@ from mbcdisasm import (
     KnowledgeBase,
     ManualSemanticAnalyzer,
     MbcContainer,
+    build_branch_reports,
+    render_branch_reports,
+    write_branch_reports,
+    build_stack_profile_reports,
+    render_stack_profile_reports,
 )
 from mbcdisasm.ast import LuaReconstructor
 from mbcdisasm.cfg import ControlFlowGraphBuilder, render_cfgs
@@ -32,6 +37,8 @@ class DisassemblyPlan:
     cfg_path: Optional[Path]
     ir_path: Optional[Path]
     ast_path: Optional[Path]
+    branch_path: Optional[Path]
+    stack_summary_path: Optional[Path]
     emulation_path: Optional[Path]
     knowledge_path: Path
     segment_indices: tuple[int, ...]
@@ -51,6 +58,8 @@ class DisassemblyPlan:
             cfg_path=args.cfg_out,
             ir_path=args.ir_out,
             ast_path=args.ast_out,
+            branch_path=args.branch_out,
+            stack_summary_path=args.stack_summary_out,
             emulation_path=args.emulation_out,
             knowledge_path=args.knowledge_base,
             segment_indices=segment_indices,
@@ -71,6 +80,10 @@ class DisassemblyPlan:
             yield ("ir", self.ir_path)
         if self.ast_path:
             yield ("ast", self.ast_path)
+        if self.branch_path:
+            yield ("branch", self.branch_path)
+        if self.stack_summary_path:
+            yield ("stack-summary", self.stack_summary_path)
         if self.emulation_path:
             yield ("emulation", self.emulation_path)
 
@@ -139,6 +152,16 @@ def parse_args() -> argparse.Namespace:
         "--ast-out",
         type=Path,
         help="Write the pseudo-Lua reconstruction to the provided path",
+    )
+    parser.add_argument(
+        "--branch-out",
+        type=Path,
+        help="Write branch analysis summaries to the provided path",
+    )
+    parser.add_argument(
+        "--stack-summary-out",
+        type=Path,
+        help="Write stack profile summaries to the provided path",
     )
     parser.add_argument(
         "--emulation-out",
@@ -256,6 +279,15 @@ def main() -> None:
                 lua_blobs.append(reconstructor.render(function).rstrip())
             plan.ast_path.write_text("\n\n".join(lua_blobs) + "\n", "utf-8")
             print(f"ast written to {plan.ast_path}")
+        if plan.branch_path:
+            reports = build_branch_reports(programs)
+            write_branch_reports(reports, plan.branch_path)
+            print(f"branch report written to {plan.branch_path}")
+        if plan.stack_summary_path:
+            stack_reports = build_stack_profile_reports(programs)
+            text = render_stack_profile_reports(stack_reports)
+            plan.stack_summary_path.write_text(text, "utf-8")
+            print(f"stack summary written to {plan.stack_summary_path}")
 
     if plan.emulation_path:
         emulator = Emulator(

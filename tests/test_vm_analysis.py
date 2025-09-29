@@ -92,17 +92,17 @@ def test_virtual_machine_analyzer_tracks_stack_depth() -> None:
     )
 
     trace = analyzer.trace_block(block)
-    assert len(trace.entry_stack) == 0
+    assert len(trace.entry_stack) == 1
     first_output = trace.instructions[0].operation.outputs[0]
     assert first_output.comment == '4'
-    assert trace.instructions[0].state.depth_after == 1
-    assert trace.instructions[1].state.depth_before == 1
+    assert trace.instructions[0].state.depth_after == 2
+    assert trace.instructions[1].state.depth_before == 2
     warnings = trace.instructions[1].operation.warnings
-    assert "underflow" in warnings
+    assert not warnings
 
     formatted = "\n".join(format_vm_block_trace(trace))
-    assert "depth 0->1" in formatted
-    assert "depth 1->0" in formatted
+    assert "depth 1->2" in formatted
+    assert "depth 2->0" in formatted
 
     lifetimes = analyze_block_lifetimes(trace)
     literal = lifetimes["literal_0"]
@@ -110,13 +110,14 @@ def test_virtual_machine_analyzer_tracks_stack_depth() -> None:
     assert literal.consumed_offsets == (0x14,)
     assert not literal.survives
 
-    placeholder = lifetimes["missing_0"]
-    assert placeholder.created_offset is None
-    assert placeholder.consumed_offsets == (0x14,)
-    assert not placeholder.survives
+    parameter = lifetimes["param_0"]
+    assert parameter.created_offset is None
+    assert parameter.consumed_offsets == (0x14,)
+    assert not parameter.survives
 
     lifetime_lines = render_value_lifetimes(lifetimes)
     assert any("literal_0" in line for line in lifetime_lines)
+    assert any("param_0" in line for line in lifetime_lines)
     lifetime_dict = lifetimes_to_dict(lifetimes)
     assert lifetime_dict["literal_0"]["created_offset"] == 0x10
     lifetime_json = lifetimes_to_json(lifetimes, indent=0)
@@ -125,6 +126,7 @@ def test_virtual_machine_analyzer_tracks_stack_depth() -> None:
     trace_dict = vm_block_trace_to_dict(trace)
     assert trace_dict["start"] == 0x10
     assert trace_dict["instructions"][0]["offset"] == 0x10
+    assert trace_dict["entry_depth"] == 1
     trace_json = vm_block_trace_to_json(trace, indent=0)
     assert '"offset": 16' in trace_json
 

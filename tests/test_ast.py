@@ -93,20 +93,65 @@ class LuaReconstructorTest(unittest.TestCase):
         self.assertIn("vm:push_literal_small(5)", rendered)
         self.assertIn("stack[#stack + 1] = literal_0", rendered)
         self.assertIn("stack[#stack] = nil", rendered)
-        self.assertIn("warnings: underflow", rendered)
+        self.assertNotIn("underflow", rendered)
 
         metadata = function.metadata()
         self.assertTrue(any(item["type"] == "operation" for item in metadata))
         json_payload = function.to_json(indent=0)
         self.assertIn('"type": "operation"', json_payload)
         self.assertEqual(function.operation_count(), 2)
-        self.assertGreaterEqual(function.warning_count(), 1)
+        self.assertEqual(function.warning_count(), 0)
         summary = function.summary()
         self.assertEqual(summary["operations"], function.operation_count())
-        self.assertTrue(summary["has_warnings"])
+        self.assertFalse(summary["has_warnings"])
         self.assertTrue(summary["labels"])
-        self.assertTrue(function.has_warnings())
+        self.assertFalse(function.has_warnings())
         self.assertTrue(any(label.startswith("block_") for label in function.labels()))
+
+    def test_branch_summary_is_emitted(self) -> None:
+        branch_semantics = _semantics(
+            "10:00",
+            "branch_if",
+            summary="conditional",
+            stack_delta=-1,
+            inputs=1,
+            outputs=0,
+            tags=("comparison",),
+        )
+        instructions = [
+            IRInstruction(
+                offset=0x20,
+                key="10:00",
+                mnemonic="branch_if",
+                operand=0,
+                stack_delta=-1,
+                control_flow="branch",
+                semantics=branch_semantics,
+                stack_inputs=1,
+                stack_outputs=0,
+            )
+        ]
+        block = IRBlock(start=0x20, instructions=instructions, successors=[0x40, 0x60])
+        true_block = IRBlock(start=0x40, instructions=[], successors=[])
+        false_block = IRBlock(start=0x60, instructions=[], successors=[])
+        program = IRProgram(
+            segment_index=4,
+            blocks={
+                block.start: block,
+                true_block.start: true_block,
+                false_block.start: false_block,
+            },
+        )
+
+        reconstructor = LuaReconstructor()
+        function = reconstructor.from_ir(4, program)
+        rendered = reconstructor.render(function)
+
+        self.assertIn("-- branch branch_if [branch]", rendered)
+        self.assertIn("--   -> true:", rendered)
+        self.assertIn("--   -> false:", rendered)
+        branch_entries = [item for item in function.metadata() if item.get("type") == "branch"]
+        self.assertTrue(branch_entries)
 
 
 if __name__ == "__main__":  # pragma: no cover

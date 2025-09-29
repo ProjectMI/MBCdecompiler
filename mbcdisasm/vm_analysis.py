@@ -150,8 +150,13 @@ class VMLifetime:
 class VMStackState:
     """Mutable stack model used when reconstructing VM behaviour."""
 
-    def __init__(self, *, counter_start: int = 0) -> None:
-        self._stack: List[VMStackValue] = []
+    def __init__(
+        self,
+        *,
+        counter_start: int = 0,
+        initial_stack: Optional[Sequence[VMStackValue]] = None,
+    ) -> None:
+        self._stack: List[VMStackValue] = list(initial_stack or ())
         self._counter = counter_start
         self._placeholder_counter = 0
 
@@ -238,7 +243,11 @@ class VirtualMachineAnalyzer:
         self._value_counter = counter_start
 
     def trace_block(self, block) -> VMBlockTrace:
-        state = VMStackState(counter_start=self._value_counter)
+        initial_stack = self._initial_stack(block)
+        state = VMStackState(
+            counter_start=self._value_counter,
+            initial_stack=initial_stack,
+        )
         entry_stack = state.snapshot()
         traces: List[VMInstructionTrace] = []
         for instruction in block.instructions:
@@ -300,6 +309,34 @@ class VirtualMachineAnalyzer:
             comment=comment,
             warnings=tuple(sorted(set(warnings))),
         )
+
+    def _initial_stack(self, block) -> Tuple[VMStackValue, ...]:
+        required = self._minimum_entry_depth(block)
+        if required <= 0:
+            return ()
+        values: List[VMStackValue] = []
+        for index in range(required):
+            values.append(
+                VMStackValue(
+                    name=f"param_{index}",
+                    origin="parameter",
+                    comment=f"seeded for block 0x{block.start:06X}",
+                    offset=None,
+                )
+            )
+        return tuple(values)
+
+    def _minimum_entry_depth(self, block) -> int:
+        depth = 0
+        minimum = 0
+        for instruction in block.instructions:
+            semantics = instruction.semantics
+            inputs, outputs = estimate_stack_io(semantics)
+            depth -= inputs
+            if depth < minimum:
+                minimum = depth
+            depth += outputs
+        return max(0, -minimum)
 
 
 # ---------------------------------------------------------------------------
