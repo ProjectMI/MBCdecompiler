@@ -168,9 +168,15 @@ def test_enum_registry_metadata_toggle() -> None:
 
 
 def test_highlevel_function_summary_and_warnings() -> None:
-    metadata = FunctionMetadata(block_count=3, instruction_count=9, warnings=["stack underflow"])
+    metadata = FunctionMetadata(
+        block_count=3,
+        instruction_count=9,
+        warnings=["stack underflow"],
+        parameter_count=0,
+    )
     function = HighLevelFunction(
         name="segment_001",
+        parameters=[],
         body=wrap_block([ReturnStatement()]),
         metadata=metadata,
     )
@@ -178,12 +184,47 @@ def test_highlevel_function_summary_and_warnings() -> None:
     assert rendered[0] == "-- function summary:"
     assert "-- - blocks: 3" in rendered
     assert "-- - instructions: 9" in rendered
+    assert "-- - parameters: 0" in rendered
     assert "-- - literal instructions: 0" in rendered
     assert "-- - helper invocations: 0" in rendered
     assert "-- - branches: 0" in rendered
+    assert "-- - locals: 0" in rendered
     assert "-- stack reconstruction warnings:" in rendered
     assert "-- - stack underflow" in rendered
     assert "function segment_001()" in rendered
+
+
+def test_highlevel_function_renders_metadata_sections() -> None:
+    metadata = FunctionMetadata(
+        block_count=2,
+        instruction_count=5,
+        helper_calls=3,
+        branch_count=1,
+        literal_count=2,
+        parameter_count=1,
+    )
+    metadata.warnings = []
+    metadata.variable_count = 4
+    metadata.string_constants = {"text_value": '"demo"'}
+    metadata.parameter_usage = {"arg_0": 2}
+    metadata.helper_breakdown = {"process_value": 3}
+    function = HighLevelFunction(
+        name="segment_123",
+        parameters=["arg_0"],
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata,
+    )
+
+    rendered = function.render().splitlines()
+    assert rendered[0] == "-- function summary:"
+    assert "-- - locals: 4" in rendered
+    assert "-- string literals:" in rendered
+    assert "-- - text_value: \"demo\"" in rendered
+    assert "-- parameter usage:" in rendered
+    assert "-- - arg_0: 2" in rendered
+    assert "-- helper usage:" in rendered
+    assert "-- - process_value: 3" in rendered
+    assert "function segment_123(arg_0)" in rendered
 
 
 def test_module_summary_toggle(tmp_path: Path) -> None:
@@ -193,6 +234,7 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     metadata = FunctionMetadata(block_count=1, instruction_count=2)
     function = HighLevelFunction(
         name="segment_010",
+        parameters=[],
         body=wrap_block([ReturnStatement()]),
         metadata=metadata,
     )
@@ -209,6 +251,7 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     output = reconstructor.render([function])
     assert "module summary:" in output
     assert "- functions: 1" in output
+    assert "- inferred parameters: 0" in output
     assert "- helper functions: 1" in output
     assert "- struct helpers: 0" in output
     assert "- literal instructions: 0" in output
@@ -248,11 +291,13 @@ def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
     )
     fn_a = HighLevelFunction(
         name="segment_a",
+        parameters=[],
         body=wrap_block([ReturnStatement()]),
         metadata=metadata_a,
     )
     fn_b = HighLevelFunction(
         name="segment_b",
+        parameters=[],
         body=wrap_block([ReturnStatement()]),
         metadata=metadata_b,
     )
@@ -282,6 +327,7 @@ def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
     rendered = reconstructor.render([fn_a, fn_b])
     assert "module summary:" in rendered
     assert "- functions: 2" in rendered
+    assert "- inferred parameters: 0" in rendered
     assert "- helper functions: 1" in rendered
     assert "- struct helpers: 1" in rendered
     assert "- literal instructions: 3" in rendered
