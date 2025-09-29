@@ -9,6 +9,7 @@ from mbcdisasm.highlevel import (
     HighLevelFunction,
     HighLevelReconstructor,
 )
+from mbcdisasm.helper_report import build_helper_report
 from mbcdisasm.literal_sequences import (
     LiteralDescriptor,
     LiteralRun,
@@ -97,6 +98,7 @@ def test_helper_registry_metadata_toggle() -> None:
             inputs=2,
             outputs=0,
             uses_operand=False,
+            tags=("binary",),
         )
     )
     registry.register_method(
@@ -108,6 +110,7 @@ def test_helper_registry_metadata_toggle() -> None:
             uses_operand=True,
             struct="struct",
             method="structuredFieldStore",
+            tags=("store",),
         )
     )
 
@@ -126,6 +129,26 @@ def test_helper_registry_metadata_toggle() -> None:
     assert "inputs=2; outputs=0" not in text_no_meta
 
 
+def test_helper_stub_emits_placeholder_results() -> None:
+    registry = HelperRegistry()
+    registry.register_function(
+        HelperSignature(
+            name="helper_op",
+            summary="Combine values",
+            inputs=2,
+            outputs=2,
+            uses_operand=True,
+            tags=("binary",),
+        )
+    )
+    writer = LuaWriter()
+    registry.render(writer, CommentFormatter())
+    lines = writer.render().splitlines()
+    assert any("local result_1 = {" in line for line in lines)
+    assert any("operand = operand" in line for line in lines)
+    assert any("return result_1, result_2" in line for line in lines)
+
+
 def test_helper_and_enum_counts() -> None:
     registry = HelperRegistry()
     registry.register_function(
@@ -135,6 +158,7 @@ def test_helper_and_enum_counts() -> None:
             inputs=2,
             outputs=0,
             uses_operand=False,
+            tags=("binary",),
         )
     )
     registry.register_method(
@@ -146,6 +170,7 @@ def test_helper_and_enum_counts() -> None:
             uses_operand=False,
             struct="struct",
             method="structuredFieldStore",
+            tags=("store",),
         )
     )
     assert registry.function_count() == 1
@@ -158,6 +183,29 @@ def test_helper_and_enum_counts() -> None:
     enums.register("other", 3, "THREE")
     assert enums.namespace_count() == 2
     assert enums.total_values() == 3
+
+
+def test_helper_usage_report_generates_summary() -> None:
+    registry = HelperRegistry()
+    registry.register_function(
+        HelperSignature(
+            name="alpha",
+            summary="Example helper",
+            inputs=1,
+            outputs=1,
+            uses_operand=False,
+            tags=("unary",),
+        )
+    )
+    registry.record_function_call("alpha")
+    registry.record_function_call("alpha")
+
+    report = build_helper_report(registry)
+    lines = report.summary_lines()
+    assert lines
+    text = "\n".join(lines)
+    assert "helper usage:" in text
+    assert "alpha" in text
 
 
 def test_enum_registry_metadata_toggle() -> None:

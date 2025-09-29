@@ -54,7 +54,15 @@ from .literal_sequences import (
     compute_literal_statistics,
 )
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
-from .vm_analysis import estimate_stack_io
+from .helper_report import build_helper_report
+from .stack_annotations import StackSummary, summarise_stack_behaviour
+from .vm_analysis import (
+    VMBlockTrace,
+    VMProgramTrace,
+    VMStackValue,
+    VirtualMachineAnalyzer,
+    estimate_stack_io,
+)
 
 
 class HighLevelStack:
@@ -64,6 +72,9 @@ class HighLevelStack:
         self._values: List[LuaExpression] = []
         self._counter = 0
         self.warnings: List[str] = []
+        self._bindings: Dict[str, LuaExpression] = {}
+        self._placeholder_notes: Set[str] = set()
+        self._unbound_notes: Set[str] = set()
 
     def new_symbol(self, prefix: str = "value") -> str:
         name = f"{prefix}_{self._counter}"
@@ -118,10 +129,13 @@ class HighLevelStack:
     def pop_single(self) -> LuaExpression:
         if self._values:
             return self._values.pop()
-        placeholder = NameExpr(self.new_symbol("stack"))
-        self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
+        placeholder = LiteralExpr(
+            LuaLiteral("nil", None, "nil", comment="synthetic stack underflow")
         )
+        note_id = f"synthetic:{self._counter}"
+        if note_id not in self._placeholder_notes:
+            self.warnings.append("synthetic stack placeholder emitted")
+            self._placeholder_notes.add(note_id)
         return placeholder
 
     def pop_many(self, count: int) -> List[LuaExpression]:
@@ -137,6 +151,70 @@ class HighLevelStack:
         values = list(self._values)
         self._values.clear()
         return values
+
+    # ------------------------------------------------------------------
+    # Synchronisation helpers
+    # ------------------------------------------------------------------
+    def enter_block(self, entry_stack: Sequence[VMStackValue]) -> None:
+        self._values = [self._expression_for_value(value) for value in entry_stack]
+
+    def prepare_for_instruction(
+        self,
+        before_state: Sequence[VMStackValue],
+        inputs: Sequence[VMStackValue],
+    ) -> None:
+        base = list(before_state)
+        missing = max(0, len(inputs) - len(base))
+        prefix = list(inputs[:missing]) if missing else []
+        combined = prefix + base
+        self._values = [self._expression_for_value(value) for value in combined]
+
+    def bind_outputs(self, outputs: Sequence[VMStackValue]) -> None:
+        if not outputs:
+            return
+        count = min(len(outputs), len(self._values))
+        for vm_value, expression in zip(outputs[-count:], self._values[-count:]):
+            self._bindings[vm_value.name] = expression
+
+    def finalise_instruction(self, after_state: Sequence[VMStackValue]) -> None:
+        self._values = [self._expression_for_value(value) for value in after_state]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _expression_for_value(self, value: VMStackValue) -> LuaExpression:
+        existing = self._bindings.get(value.name)
+        if existing is not None:
+            return existing
+        expression = self._create_placeholder(value)
+        self._bindings[value.name] = expression
+        return expression
+
+    def _create_placeholder(self, value: VMStackValue) -> LuaExpression:
+        if value.origin == "placeholder":
+            literal = LuaLiteral("nil", None, "nil", comment=value.comment)
+            expression: LuaExpression = LiteralExpr(literal)
+            note_key = f"placeholder:{value.name}"
+            if note_key not in self._placeholder_notes:
+                location = (
+                    f" @0x{value.offset:06X}" if value.offset is not None else ""
+                )
+                detail = value.comment or "missing stack value"
+                self.warnings.append(
+                    f"stack placeholder inserted{location}: {detail}"
+                )
+                self._placeholder_notes.add(note_key)
+            return expression
+        expression = NameExpr(value.name)
+        note_key = f"unbound:{value.name}"
+        if note_key not in self._unbound_notes:
+            location = f" @0x{value.offset:06X}" if value.offset is not None else ""
+            detail = value.comment or value.origin
+            self.warnings.append(
+                f"unbound stack value {value.name}{location}: {detail}"
+            )
+            self._unbound_notes.add(note_key)
+        return expression
 
 
 class StringLiteralCollector:
@@ -206,6 +284,7 @@ class FunctionMetadata:
     literal_runs: Sequence[LiteralRun] = field(default_factory=tuple)
     literal_stats: Optional[LiteralStatistics] = None
     literal_report: Optional[LiteralRunReport] = None
+    stack_summary: Optional[StackSummary] = None
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
@@ -261,6 +340,26 @@ class FunctionMetadata:
         blocks = self.literal_report.block_lines(limit=block_limit)
         return summary + blocks
 
+    def stack_summary_lines(self) -> List[str]:
+        if not self.stack_summary:
+            return []
+        return self.stack_summary.summary_lines()
+
+    def stack_anomaly_lines(self) -> List[str]:
+        if not self.stack_summary:
+            return []
+        return self.stack_summary.anomaly_lines()
+
+    def stack_lifetime_lines(self) -> List[str]:
+        if not self.stack_summary:
+            return []
+        return self.stack_summary.lifetime_lines()
+
+    def stack_operation_lines(self) -> List[str]:
+        if not self.stack_summary:
+            return []
+        return self.stack_summary.operation_lines()
+
 
 @dataclass
 class HighLevelFunction:
@@ -292,6 +391,22 @@ class HighLevelFunction:
             writer.write_comment_block(
                 ["stack reconstruction warnings:"] + self.metadata.warning_lines()
             )
+            writer.write_line("")
+        stack_lines = self.metadata.stack_summary_lines()
+        if stack_lines:
+            writer.write_comment_block(stack_lines)
+            writer.write_line("")
+        anomaly_lines = self.metadata.stack_anomaly_lines()
+        if anomaly_lines:
+            writer.write_comment_block(anomaly_lines)
+            writer.write_line("")
+        lifetime_lines = self.metadata.stack_lifetime_lines()
+        if lifetime_lines:
+            writer.write_comment_block(lifetime_lines)
+            writer.write_line("")
+        operation_lines = self.metadata.stack_operation_lines()
+        if operation_lines:
+            writer.write_comment_block(operation_lines)
             writer.write_line("")
         writer.write_line(f"function {self.name}()")
         with writer.indented():
@@ -340,9 +455,15 @@ class BlockInfo:
 class BlockTranslator:
     """Translate IR blocks into :class:`BlockInfo` instances."""
 
-    def __init__(self, reconstructor: "HighLevelReconstructor", program: IRProgram) -> None:
+    def __init__(
+        self,
+        reconstructor: "HighLevelReconstructor",
+        program: IRProgram,
+        trace: VMProgramTrace,
+    ) -> None:
         self._reconstructor = reconstructor
         self._program = program
+        self._trace = trace
         self._stack = HighLevelStack()
         self._string_collector = StringLiteralCollector()
         self._literal_tracker = LiteralRunTracker()
@@ -356,22 +477,38 @@ class BlockTranslator:
         order = sorted(self._program.blocks)
         for idx, start in enumerate(order):
             block = self._program.blocks[start]
+            block_trace = self._trace.blocks.get(start)
             next_offset = order[idx + 1] if idx + 1 < len(order) else None
             self._literal_tracker.start_block(block.start)
-            blocks[start] = self._translate_block(block, next_offset)
+            blocks[start] = self._translate_block(block, block_trace, next_offset)
             self.instruction_total += len(block.instructions)
         self._literal_tracker.finalize()
         return blocks
 
     # ------------------------------------------------------------------
-    def _translate_block(self, block: IRBlock, fallthrough: Optional[int]) -> BlockInfo:
+    def _translate_block(
+        self,
+        block: IRBlock,
+        block_trace: Optional[VMBlockTrace],
+        fallthrough: Optional[int],
+    ) -> BlockInfo:
         statements: List[LuaStatement] = []
         terminator: Optional[Terminator] = None
         self._string_collector.reset()
+        if block_trace is not None:
+            self._stack.enter_block(block_trace.entry_stack)
+        else:
+            self._stack.enter_block(())
         for index, instruction in enumerate(block.instructions):
             semantics = instruction.semantics
             self._reconstructor._register_enums(semantics)
             is_last = index == len(block.instructions) - 1
+            trace_info = None
+            if block_trace is not None and index < len(block_trace.instructions):
+                trace_info = block_trace.instructions[index]
+                self._stack.prepare_for_instruction(
+                    trace_info.state.before, trace_info.operation.inputs
+                )
             if semantics.has_tag("literal"):
                 operand_expr = self._reconstructor._operand_expression(
                     semantics, instruction.operand
@@ -396,7 +533,7 @@ class BlockTranslator:
                     self._reconstructor._translate_comparison(instruction, semantics, self)
                 )
                 continue
-            if semantics.control_flow == "branch" and is_last:
+            if semantics.control_flow == "branch":
                 terminator = self._reconstructor._translate_branch(
                     block.start,
                     instruction,
@@ -404,14 +541,32 @@ class BlockTranslator:
                     self,
                     fallthrough,
                 )
-                continue
-            if semantics.control_flow == "return" and is_last:
+                if trace_info is not None:
+                    self._stack.bind_outputs(trace_info.operation.outputs)
+                    self._stack.finalise_instruction(trace_info.state.after)
+                break
+            if semantics.control_flow == "return":
                 terminator = self._reconstructor._translate_return(
                     instruction,
                     semantics,
                     self,
                 )
-                continue
+                if trace_info is not None:
+                    self._stack.bind_outputs(trace_info.operation.outputs)
+                    self._stack.finalise_instruction(trace_info.state.after)
+                break
+            if semantics.control_flow == "jump" and is_last:
+                terminator = self._reconstructor._translate_jump(
+                    block.start,
+                    instruction,
+                    semantics,
+                    self,
+                    fallthrough,
+                )
+                if trace_info is not None:
+                    self._stack.bind_outputs(trace_info.operation.outputs)
+                    self._stack.finalise_instruction(trace_info.state.after)
+                break
             if semantics.has_tag("structure"):
                 statements.extend(
                     self._reconstructor._translate_structure(instruction, semantics, self)
@@ -425,11 +580,16 @@ class BlockTranslator:
             statements.extend(
                 self._reconstructor._translate_generic(instruction, semantics, self)
             )
+            if trace_info is not None:
+                self._stack.bind_outputs(trace_info.operation.outputs)
+                self._stack.finalise_instruction(trace_info.state.after)
         statements.extend(self._string_collector.finalize())
         self._literal_tracker.break_sequence()
         if terminator is None:
             target = block.successors[0] if block.successors else fallthrough
             terminator = JumpTerminator(target=target, fallthrough=fallthrough, comment=None)
+        if block_trace is not None:
+            self._stack.finalise_instruction(block_trace.exit_stack)
         return BlockInfo(
             start=block.start,
             statements=statements,
@@ -529,27 +689,40 @@ class ControlFlowStructurer:
         ):
             body_statements = self._structure_sequence(false_target, stop=current)
             body = wrap_block(body_statements)
-            if terminator.comment:
-                body.statements.insert(0, CommentStatement(terminator.comment))
+            for line in reversed(self._branch_annotation_lines(terminator)):
+                body.statements.insert(0, CommentStatement(line))
             return WhileStatement(condition, body), fallthrough
 
         if true_target is not None and false_target is None:
             then_body = wrap_block(self._structure_sequence(true_target, fallthrough))
             clauses = [IfClause(condition=condition, body=then_body)]
-            if terminator.comment:
-                then_body.statements.insert(0, CommentStatement(terminator.comment))
+            for line in reversed(self._branch_annotation_lines(terminator)):
+                then_body.statements.insert(0, CommentStatement(line))
             return IfStatement(clauses), fallthrough
 
         if true_target is not None and false_target is not None:
             then_body = wrap_block(self._structure_sequence(true_target, fallthrough))
             else_body = wrap_block(self._structure_sequence(false_target, fallthrough))
             clauses = [IfClause(condition=condition, body=then_body), IfClause(None, else_body)]
-            if terminator.comment:
-                then_body.statements.insert(0, CommentStatement(terminator.comment))
+            for line in reversed(self._branch_annotation_lines(terminator)):
+                then_body.statements.insert(0, CommentStatement(line))
             return IfStatement(clauses), fallthrough
 
         comment = terminator.comment or "unstructured branch"
         return CommentStatement(comment), fallthrough
+
+    def _branch_annotation_lines(self, terminator: BranchTerminator) -> List[str]:
+        lines: List[str] = []
+        if terminator.comment:
+            lines.append(terminator.comment)
+        if terminator.enum_namespace and terminator.enum_values:
+            mappings = ", ".join(
+                f"{value}={label}" for value, label in sorted(terminator.enum_values.items())
+            )
+            lines.append(
+                f"enum {terminator.enum_namespace}: {mappings}"
+            )
+        return lines
 
 
 class HighLevelReconstructor:
@@ -573,7 +746,9 @@ class HighLevelReconstructor:
     # ------------------------------------------------------------------
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
         self._last_summary = None
-        translator = BlockTranslator(self, program)
+        analyzer = VirtualMachineAnalyzer()
+        program_trace = analyzer.trace_program(program)
+        translator = BlockTranslator(self, program, program_trace)
         blocks = translator.translate()
         entry = min(blocks)
         structurer = ControlFlowStructurer(blocks)
@@ -587,6 +762,7 @@ class HighLevelReconstructor:
             if self.options.emit_literal_report
             else None
         )
+        stack_summary = summarise_stack_behaviour(program, analyzer=analyzer, trace=program_trace)
         base_name = self._derive_function_name(program, literal_runs)
         function_name = self._unique_function_name(base_name)
         metadata = FunctionMetadata(
@@ -599,6 +775,7 @@ class HighLevelReconstructor:
             literal_runs=tuple(literal_runs),
             literal_stats=stats,
             literal_report=report,
+            stack_summary=stack_summary,
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
@@ -609,6 +786,11 @@ class HighLevelReconstructor:
             summary_writer = LuaWriter()
             summary_writer.write_comment_block(self._module_summary_lines(functions))
             sections.append(summary_writer.render())
+        usage_report = build_helper_report(self._helper_registry)
+        if not usage_report.is_empty():
+            usage_writer = LuaWriter()
+            usage_writer.write_comment_block(usage_report.summary_lines())
+            sections.append(usage_writer.render())
         if not self._enum_registry.is_empty():
             writer = LuaWriter()
             self._enum_registry.render(writer, options=self.options)
@@ -693,6 +875,19 @@ class HighLevelReconstructor:
         comment = self._comment_formatter.format_inline(semantics.summary or "")
         return ReturnTerminator(values=values, comment=comment)
 
+    def _translate_jump(
+        self,
+        block_start: int,
+        instruction: IRInstruction,
+        semantics: InstructionSemantics,
+        translator: BlockTranslator,
+        fallthrough: Optional[int],
+    ) -> JumpTerminator:
+        comment = self._comment_formatter.format_inline(semantics.summary or "")
+        block = translator.program.blocks.get(block_start)
+        target = block.successors[0] if block and block.successors else None
+        return JumpTerminator(target=target, fallthrough=fallthrough, comment=comment or None)
+
     def _translate_structure(
         self,
         instruction: IRInstruction,
@@ -712,10 +907,12 @@ class HighLevelReconstructor:
             inputs=inputs,
             outputs=outputs,
             uses_operand=semantics.uses_operand,
+            tags=semantics.tags,
             struct=semantics.struct_context or "struct",
             method=method,
         )
         self._helper_registry.register_method(signature)
+        self._helper_registry.record_method_call(signature.struct, signature.method)
         translator.helper_calls += 1
         if outputs > 0:
             statements, _ = translator.stack.push_call_results(call_expr, outputs, prefix="struct")
@@ -740,8 +937,10 @@ class HighLevelReconstructor:
             inputs=inputs,
             outputs=outputs,
             uses_operand=semantics.uses_operand,
+            tags=semantics.tags,
         )
         self._helper_registry.register_function(signature)
+        self._helper_registry.record_function_call(signature.name)
         translator.helper_calls += 1
         if outputs <= 0:
             statements = [CallStatement(call_expr)]
@@ -766,8 +965,10 @@ class HighLevelReconstructor:
             inputs=inputs,
             outputs=outputs,
             uses_operand=semantics.uses_operand,
+            tags=semantics.tags,
         )
         self._helper_registry.register_function(signature)
+        self._helper_registry.record_function_call(signature.name)
         translator.helper_calls += 1
         if outputs > 0:
             statements, _ = translator.stack.push_call_results(call_expr, outputs)
@@ -881,6 +1082,15 @@ class HighLevelReconstructor:
                     lines.append(
                         "- notable literal runs: " + "; ".join(previews)
                     )
+        summaries = [func.metadata.stack_summary for func in functions if func.metadata.stack_summary]
+        if summaries:
+            min_depth = min(summary.min_depth for summary in summaries)
+            max_depth = max(summary.max_depth for summary in summaries)
+            total_underflows = sum(summary.total_underflows for summary in summaries)
+            placeholders = sum(summary.placeholder_values for summary in summaries)
+            lines.append(f"- stack depth range: {min_depth}..{max_depth}")
+            lines.append(f"- stack underflows: {total_underflows}")
+            lines.append(f"- stack placeholders: {placeholders}")
         return lines
 
     def _derive_function_name(

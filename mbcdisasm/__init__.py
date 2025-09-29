@@ -33,11 +33,17 @@ from .literal_sequences import (
 from .lua_formatter import LuaRenderOptions
 from .lua_literals import LuaLiteralFormatter
 from .segment_classifier import SegmentClassifier
+from .helper_report import build_helper_report, HelperReport, HelperUsageEntry
 from .manual_semantics import (
     AnnotatedInstruction,
     InstructionSemantics,
     ManualSemanticAnalyzer,
     StackEffect,
+)
+from .stack_annotations import (
+    BlockStackSummary,
+    StackSummary,
+    summarise_stack_behaviour,
 )
 from .vm_analysis import (
     VMBlockTrace,
@@ -107,6 +113,12 @@ __all__ = [
     "InstructionSemantics",
     "AnnotatedInstruction",
     "StackEffect",
+    "BlockStackSummary",
+    "StackSummary",
+    "summarise_stack_behaviour",
+    "HelperReport",
+    "HelperUsageEntry",
+    "build_helper_report",
     "VirtualMachineAnalyzer",
     "VMOperation",
     "VMInstructionTrace",

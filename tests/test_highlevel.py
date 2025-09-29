@@ -184,6 +184,80 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     assert "-- block 0x000000:" in rendered
     assert "-- - literal tokens:" in rendered
     assert 'literal statistics' in rendered
+    assert "-- stack summary:" in rendered
+    assert "-- stack operations:" in rendered
+
+
+def test_stack_anomalies_injected_into_render(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "drop_value",
+                    "summary": "Consume without producing",
+                    "stack_delta": -1,
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    block = IRBlock(
+        start=0,
+        instructions=[_make_instruction(analyzer, 0, "01:00", 0, None)],
+        successors=[],
+    )
+    program = IRProgram(segment_index=3, blocks={block.start: block})
+
+    reconstructor = HighLevelReconstructor(knowledge)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert "-- stack anomalies:" in rendered
+    assert "placeholder" in rendered
+
+
+def test_vm_trace_alignment_avoids_underflow_warning(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "10:00": {
+                    "name": "consume_value",
+                    "summary": "Drop top of stack",
+                    "stack_delta": -1,
+                }
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    block = IRBlock(
+        start=0x0000,
+        instructions=[
+            _make_instruction(analyzer, 0x0000, "10:00", 0, None),
+        ],
+        successors=[],
+    )
+    program = IRProgram(segment_index=0, blocks={block.start: block})
+
+    reconstructor = HighLevelReconstructor(knowledge)
+    function = reconstructor.from_ir(program)
+
+    assert not any(
+        "underflow generated placeholder" in warning
+        for warning in function.metadata.warnings
+    )
+    assert any("stack placeholder" in warning for warning in function.metadata.warnings)
 
 
 def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:

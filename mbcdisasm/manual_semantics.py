@@ -161,6 +161,13 @@ class ManualSemanticAnalyzer:
         "erase",
         "erases",
         "removing",
+        "strip",
+        "strips",
+        "shrink",
+        "shrinks",
+        "reduce",
+        "reduces",
+        "reducing",
     }
 
     _OUTPUT_KEYWORDS = {
@@ -203,6 +210,99 @@ class ManualSemanticAnalyzer:
         "loaders",
         "fan",
         "fans",
+        "spawn",
+        "spawns",
+        "refresh",
+        "refreshes",
+        "supply",
+        "supplies",
+    }
+
+    _BINARY_KEYWORDS = {
+        "binary",
+        "pair",
+        "double",
+        "dual",
+        "reduce",
+        "combine",
+        "merge",
+        "both",
+        "either",
+        "fuse",
+        "couple",
+        "twinned",
+    }
+
+    _TERNARY_KEYWORDS = {
+        "triple",
+        "ternary",
+        "triad",
+        "trio",
+        "triple",
+        "third",
+    }
+
+    _UNARY_KEYWORDS = {
+        "single",
+        "unary",
+        "negate",
+        "invert",
+        "flip",
+        "toggle",
+        "not",
+        "solo",
+    }
+
+    _DUPLICATE_KEYWORDS = {
+        "duplicate",
+        "dup",
+        "mirror",
+        "clone",
+        "copy",
+        "repeat",
+        "replicate",
+        "fan",
+        "broadcast",
+    }
+
+    _LITERAL_HINTS = {
+        "literal",
+        "const",
+        "constant",
+        "immediate",
+        "immed",
+        "value",
+        "seed",
+        "load",
+        "push",
+        "embed",
+        "inline",
+    }
+
+    _STATEFUL_KEYWORDS = {
+        "state",
+        "counter",
+        "cursor",
+        "iterator",
+        "context",
+        "update",
+        "store",
+        "commit",
+        "write",
+        "persist",
+        "cache",
+        "buffer",
+    }
+
+    _SIDE_EFFECT_KEYWORDS = {
+        "store",
+        "write",
+        "commit",
+        "persist",
+        "flush",
+        "save",
+        "record",
+        "emit",
     }
 
     _COMPARISON_KEYWORDS = [
@@ -269,7 +369,17 @@ class ManualSemanticAnalyzer:
         else:
             operand_usage = operand_hint != "none"
 
-        tags = self._collect_tags(manual_name, summary, control_flow, manual)
+        tags = self._collect_tags(
+            key,
+            manual_name,
+            summary,
+            control_flow,
+            manual,
+            metadata=metadata,
+            stack_delta=stack_delta,
+            operand_hint=operand_hint,
+            uses_operand=operand_usage,
+        )
         comparison_operator = self._comparison_operator(manual_name, manual, metadata)
         struct_context = _string_field(manual, "struct") or _string_field(manual, "structure")
 
@@ -299,8 +409,10 @@ class ManualSemanticAnalyzer:
             tags,
         )
 
+        literal_tag = "literal" in tags
+
         vm_method = _sanitize_identifier(manual_name or mnemonic)
-        vm_call_style = "literal" if "literal" in tags else "method"
+        vm_call_style = "literal" if literal_tag else "method"
 
         semantics = InstructionSemantics(
             key=key,
@@ -326,10 +438,16 @@ class ManualSemanticAnalyzer:
 
     def _collect_tags(
         self,
+        key: str,
         manual_name: str,
         summary: Optional[str],
         control_flow: Optional[str],
         manual: Mapping[str, object],
+        *,
+        metadata: InstructionMetadata,
+        stack_delta: Optional[float],
+        operand_hint: Optional[str],
+        uses_operand: bool,
     ) -> set[str]:
         tags: set[str] = set()
         raw_tags = manual.get("tags")
@@ -340,36 +458,70 @@ class ManualSemanticAnalyzer:
             tags.add(category.lower())
 
         text = f"{manual_name} {summary or ''}".lower()
-        if "literal" in text:
+        metadata_summary = (metadata.summary or "").lower()
+        combined_text = f"{text} {metadata_summary}".strip()
+        operand_hint_lower = (operand_hint or "").lower()
+
+        if "literal" in text or "literal" in metadata_summary:
             tags.add("literal")
-        if "compare" in text or "cmp" in text or "comparison" in text:
+        if "compare" in combined_text or "cmp" in combined_text or "comparison" in combined_text:
             tags.add("comparison")
-        if "branch" in text or control_flow == "branch":
+        if "branch" in combined_text or control_flow == "branch" or metadata.control_flow == "branch":
             tags.add("branch")
-        if "jump" in text or control_flow == "jump":
+        if "jump" in combined_text or control_flow == "jump" or metadata.control_flow == "jump":
             tags.add("jump")
-        if control_flow == "call" or "call" in text:
+        if control_flow == "call" or metadata.control_flow == "call" or "call" in combined_text:
             tags.add("call")
-        if control_flow == "return" or "return" in text:
+        if control_flow == "return" or metadata.control_flow == "return" or "return" in combined_text:
             tags.add("return")
-        if "loop" in text:
+        if "loop" in combined_text:
             tags.add("loop")
-        if "structure" in text or "structured" in text:
+        if "structure" in combined_text or "structured" in combined_text:
             tags.add("structure")
-        if "dispatch" in text:
+        if "dispatch" in combined_text:
             tags.add("dispatch")
-        if "cleanup" in text or "teardown" in text:
+        if "cleanup" in combined_text or "teardown" in combined_text:
             tags.add("cleanup")
-        if "marker" in text or "tag" in text:
+        if "marker" in combined_text or "tag" in combined_text:
             tags.add("marker")
-        if "load" in text or "fetch" in text:
+        if "load" in combined_text or "fetch" in combined_text:
             tags.add("load")
-        if "store" in text or "commit" in text:
+        if "store" in combined_text or "commit" in combined_text:
             tags.add("store")
-        if "dup" in text or "duplicate" in text:
+        if any(keyword in combined_text for keyword in self._DUPLICATE_KEYWORDS):
             tags.add("duplicate")
-        if "pop" in text or "consume" in text:
+        if "pop" in combined_text or "consume" in combined_text or "teardown" in combined_text:
             tags.add("pop")
+
+        if any(keyword in combined_text for keyword in self._BINARY_KEYWORDS):
+            tags.add("binary")
+        if any(keyword in combined_text for keyword in self._TERNARY_KEYWORDS):
+            tags.add("ternary")
+        if any(keyword in combined_text for keyword in self._UNARY_KEYWORDS):
+            tags.add("unary")
+
+        if stack_delta is not None:
+            if stack_delta > 0 and (
+                key.startswith("00:")
+                or uses_operand
+                or operand_hint_lower in {"zero", "small", "medium", "large", "literal", "immediate"}
+            ):
+                tags.add("literal")
+            if stack_delta < 0 and "cleanup" not in tags:
+                tags.add("consume")
+
+        if operand_hint_lower and operand_hint_lower not in {"none", "unknown"}:
+            if any(hint in operand_hint_lower for hint in self._LITERAL_HINTS):
+                tags.add("literal")
+
+        if any(keyword in combined_text for keyword in self._STATEFUL_KEYWORDS):
+            tags.add("stateful")
+        if any(keyword in combined_text for keyword in self._SIDE_EFFECT_KEYWORDS):
+            tags.add("side-effect")
+
+        if key.endswith(":00") and metadata.control_flow is None and stack_delta:
+            if stack_delta > 0:
+                tags.add("literal")
         return tags
 
     def _comparison_operator(
@@ -413,10 +565,26 @@ class ManualSemanticAnalyzer:
         text = f"{manual_name} {summary or ''}".lower()
         quantity = self._extract_quantity(text)
 
+        tag_set = set(tag.lower() for tag in tags)
+
         has_output_hint = any(keyword in text for keyword in self._OUTPUT_KEYWORDS)
         has_input_hint = any(keyword in text for keyword in self._INPUT_KEYWORDS)
         inputs = manual_inputs
         outputs = manual_outputs
+
+        if "unary" in tag_set and (inputs is None or inputs < 1):
+            inputs = 1
+        if "binary" in tag_set and (inputs is None or inputs < 2):
+            inputs = 2
+        if "ternary" in tag_set and (inputs is None or inputs < 3):
+            inputs = 3
+        if "duplicate" in tag_set:
+            if inputs is None or inputs < 1:
+                inputs = 1
+            if outputs is None:
+                outputs = inputs + 1
+            else:
+                outputs = max(outputs, inputs + 1)
 
         if inputs is None and has_input_hint and quantity is not None:
             inputs = max(quantity, 0)
@@ -451,6 +619,11 @@ class ManualSemanticAnalyzer:
             elif has_output_hint and quantity is not None:
                 outputs = max(0, quantity)
 
+        if "consume" in tag_set and outputs is None:
+            outputs = 0
+        if "consume" in tag_set and outputs is not None and outputs > 0:
+            outputs = 0
+
         if inputs is None:
             inputs = 0
         if outputs is None:
@@ -468,7 +641,7 @@ class ManualSemanticAnalyzer:
         effect_source = "manual"
         if manual_inputs is None and manual_outputs is None:
             effect_source = "heuristic"
-        if "literal" in tags and outputs == 0 and rounded_delta:
+        if "literal" in tag_set and outputs == 0 and rounded_delta:
             outputs = max(outputs, rounded_delta)
         return StackEffect(inputs, outputs, float(rounded_delta), effect_source)
 

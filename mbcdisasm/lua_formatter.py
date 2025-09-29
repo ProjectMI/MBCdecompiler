@@ -20,6 +20,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
+from .lua_literals import escape_lua_string
+
 
 class LuaWriter:
     """Incremental Lua pretty printer.
@@ -199,12 +201,16 @@ class HelperSignature:
     inputs: int
     outputs: int
     uses_operand: bool
+    tags: Tuple[str, ...] = field(default_factory=tuple)
 
     def parameters(self) -> List[str]:
         params = [f"arg{i}" for i in range(1, self.inputs + 1)]
         if self.uses_operand:
             params.append("operand")
         return params
+
+    def input_parameters(self) -> List[str]:
+        return [f"arg{i}" for i in range(1, self.inputs + 1)]
 
     def return_stub(self) -> Optional[str]:
         if self.outputs <= 0:
@@ -239,6 +245,8 @@ class HelperRegistry:
 
     _functions: Dict[str, HelperSignature] = field(default_factory=dict)
     _methods: Dict[str, Dict[str, MethodSignature]] = field(default_factory=dict)
+    _function_calls: Dict[str, int] = field(default_factory=dict)
+    _method_calls: Dict[Tuple[str, str], int] = field(default_factory=dict)
 
     def register_function(self, signature: HelperSignature) -> None:
         existing = self._functions.get(signature.name)
@@ -249,6 +257,9 @@ class HelperRegistry:
             return
         self._functions[signature.name] = signature
 
+    def record_function_call(self, name: str) -> None:
+        self._function_calls[name] = self._function_calls.get(name, 0) + 1
+
     def register_method(self, signature: MethodSignature) -> None:
         bucket = self._methods.setdefault(signature.struct, {})
         existing = bucket.get(signature.method)
@@ -257,6 +268,10 @@ class HelperRegistry:
                 existing.summary = signature.summary
             return
         bucket[signature.method] = signature
+
+    def record_method_call(self, struct: str, method: str) -> None:
+        key = (struct, method)
+        self._method_calls[key] = self._method_calls.get(key, 0) + 1
 
     # ------------------------------------------------------------------
     # rendering helpers
@@ -284,9 +299,7 @@ class HelperRegistry:
                     if opts.emit_stub_metadata:
                         for line in signature.metadata_lines():
                             writer.write_comment(line)
-                    stub = signature.return_stub()
-                    if stub:
-                        writer.write_line(stub)
+                    self._render_stub_body(writer, signature)
                 writer.write_line("end")
                 writer.ensure_blank_line()
 
@@ -300,11 +313,72 @@ class HelperRegistry:
                 if opts.emit_stub_metadata:
                     for line in signature.metadata_lines():
                         writer.write_comment(line)
-                stub = signature.return_stub()
-                if stub:
-                    writer.write_line(stub)
+                self._render_stub_body(writer, signature)
             writer.write_line("end")
             writer.ensure_blank_line()
+
+    def _render_stub_body(self, writer: LuaWriter, signature: HelperSignature) -> None:
+        if signature.outputs <= 0:
+            if signature.summary:
+                writer.write_comment("TODO: side-effect only helper")
+            return
+
+        literal_tag = "literal" in signature.tags
+        comparison_tag = "comparison" in signature.tags
+        binary_tag = "binary" in signature.tags
+        unary_tag = "unary" in signature.tags
+
+        if literal_tag:
+            if signature.uses_operand:
+                writer.write_line("return operand")
+            elif signature.inputs > 0:
+                writer.write_line("return arg1")
+            else:
+                writer.write_line("return true")
+            return
+
+        if comparison_tag:
+            if signature.inputs >= 2:
+                writer.write_line("return arg1 == arg2")
+            elif signature.inputs == 1:
+                writer.write_line("return arg1 ~= nil")
+            else:
+                writer.write_line("return false")
+            return
+
+        if signature.outputs == 1 and unary_tag and signature.inputs >= 1:
+            writer.write_line("return arg1")
+            return
+
+        input_params = signature.input_parameters()
+        result_names: List[str] = []
+        for index in range(signature.outputs):
+            name = f"result_{index + 1}"
+            writer.write_line(f"local {name} = {{")
+            with writer.indented():
+                writer.write_line(f"opcode = {escape_lua_string(signature.name)},")
+                if signature.summary:
+                    writer.write_line(
+                        f"summary = {escape_lua_string(signature.summary)},"
+                    )
+                if input_params:
+                    writer.write_line("inputs = {")
+                    with writer.indented():
+                        for param in input_params:
+                            writer.write_line(f"{param},")
+                    writer.write_line("},")
+                if signature.uses_operand:
+                    writer.write_line("operand = operand,")
+                writer.write_line(f"index = {index + 1},")
+                if binary_tag and len(input_params) >= 2:
+                    writer.write_line("kind = 'binary',")
+            writer.write_line("}")
+            result_names.append(name)
+
+        if signature.outputs == 1:
+            writer.write_line(f"return {result_names[0]}")
+        else:
+            writer.write_line("return " + ", ".join(result_names))
 
     def is_empty(self) -> bool:
         return not self._functions and not self._methods
@@ -317,6 +391,26 @@ class HelperRegistry:
 
     def struct_count(self) -> int:
         return len(self._methods)
+
+    def function_usage(self) -> List[Tuple[HelperSignature, int]]:
+        usage: List[Tuple[HelperSignature, int]] = []
+        for name, signature in self._functions.items():
+            count = self._function_calls.get(name, 0)
+            usage.append((signature, count))
+        usage.sort(key=lambda item: (-item[1], item[0].name))
+        return usage
+
+    def method_usage(self) -> List[Tuple[MethodSignature, int]]:
+        usage: List[Tuple[MethodSignature, int]] = []
+        for struct, methods in self._methods.items():
+            for method_name, signature in methods.items():
+                count = self._method_calls.get((struct, method_name), 0)
+                usage.append((signature, count))
+        usage.sort(key=lambda item: (-item[1], item[0].name))
+        return usage
+
+    def has_usage_data(self) -> bool:
+        return bool(self._function_calls or self._method_calls)
 
 
 @dataclass

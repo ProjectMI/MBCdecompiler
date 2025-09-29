@@ -312,6 +312,9 @@ def estimate_stack_io(semantics: InstructionSemantics) -> Tuple[int, int]:
 
     inputs = semantics.stack_inputs if semantics.stack_inputs is not None else 0
     outputs = semantics.stack_outputs if semantics.stack_outputs is not None else 0
+    if semantics.stack_effect:
+        inputs = max(inputs, semantics.stack_effect.inputs)
+        outputs = max(outputs, semantics.stack_effect.outputs)
     delta = semantics.stack_effect.delta if semantics.stack_effect else semantics.stack_delta
 
     if semantics.has_tag("comparison"):
