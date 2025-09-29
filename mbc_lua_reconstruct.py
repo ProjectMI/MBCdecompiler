@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -19,6 +20,17 @@ from mbcdisasm import (
 from mbcdisasm.data_segments import render_data_summaries, summarise_data_segments
 from mbcdisasm.highlevel import HighLevelReconstructor, HighLevelFunction
 from mbcdisasm.lua_formatter import LuaRenderOptions
+from mbcdisasm.literal_runs import (
+    accumulate_statistics,
+    group_literal_runs_by_kind,
+    group_literal_runs_by_pattern,
+    literal_run_histogram,
+    literal_run_note_lines,
+    literal_run_pattern_histogram,
+    longest_literal_runs,
+    render_literal_runs_table,
+    serialize_literal_runs,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,6 +61,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Write the reconstructed Lua module to the provided path",
+    )
+    parser.add_argument(
+        "--literal-report",
+        type=Path,
+        default=None,
+        help="Write a JSON report summarising literal run statistics",
     )
     parser.add_argument(
         "--keep-duplicate-comments",
@@ -195,6 +213,63 @@ def main() -> None:
         functions.append(reconstructor.from_ir(program))
 
     module_text = reconstructor.render(functions)
+
+    if args.literal_report:
+        module_runs = [
+            run for function in functions for run in function.metadata.literal_runs
+        ]
+        stats = accumulate_statistics(module_runs)
+        grouped = group_literal_runs_by_kind(module_runs)
+        report = {
+            "module": {
+                "stats": stats.to_dict(),
+                "summary_lines": stats.summary_lines(),
+                "histogram": literal_run_histogram(module_runs),
+                "pattern_histogram": literal_run_pattern_histogram(module_runs),
+                "notes": literal_run_note_lines(module_runs),
+                "by_kind": {kind: len(runs) for kind, runs in grouped.items()},
+                "by_pattern": {
+                    pattern: len(runs)
+                    for pattern, runs in group_literal_runs_by_pattern(module_runs).items()
+                },
+                "top_runs": serialize_literal_runs(
+                    longest_literal_runs(module_runs, limit=8)
+                ),
+                "table": render_literal_runs_table(
+                    longest_literal_runs(module_runs, limit=8)
+                ),
+            },
+            "functions": [
+                {
+                    "name": function.name,
+                    "literal_runs": function.metadata.literal_run_report(),
+                    "histogram": literal_run_histogram(function.metadata.literal_runs),
+                    "pattern_histogram": literal_run_pattern_histogram(
+                        function.metadata.literal_runs
+                    ),
+                    "notes": literal_run_note_lines(function.metadata.literal_runs),
+                    "summary_lines": function.metadata.literal_run_lines(limit=32),
+                    "pattern_lines": function.metadata.literal_pattern_lines(limit=32),
+                    "note_lines": function.metadata.literal_note_lines(limit=32),
+                    "top_runs": serialize_literal_runs(
+                        longest_literal_runs(function.metadata.literal_runs, limit=4)
+                    ),
+                    "table": render_literal_runs_table(
+                        longest_literal_runs(function.metadata.literal_runs, limit=4)
+                    ),
+                    "by_pattern": {
+                        pattern: len(runs)
+                        for pattern, runs in group_literal_runs_by_pattern(
+                            function.metadata.literal_runs
+                        ).items()
+                    },
+                }
+                for function in functions
+            ],
+        }
+        args.literal_report.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False), "utf-8"
+        )
 
     data_summaries = summarise_data_segments(
         container.segments(),

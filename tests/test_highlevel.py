@@ -178,7 +178,12 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
 
     assert 'string literal sequence: "Hello"' in rendered
     assert "-- string literal sequences:" in rendered
+    assert "-- literal runs:" in rendered
     assert '-- - 0x000000 len=5 chunks=3: "Hello"' in rendered
+    assert "  - chunks:" in rendered
+    assert "- runs small (2-3):" in rendered
+    assert "-- literal run patterns:" in rendered
+    assert "pattern string:printable" in rendered
 
 
 def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
@@ -235,3 +240,56 @@ def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
     assert function.name == "set_name"
     assert "function set_name()" in rendered
     assert "-- string literal sequences:" in rendered
+
+
+def test_numeric_literal_runs_are_collapsed(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "02:00": {
+                    "name": "return_top",
+                    "summary": "Return top value",
+                    "stack_delta": -1,
+                    "control_flow": "return",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    instructions = [
+        _make_instruction(analyzer, 0x0000, "01:00", 1, None),
+        _make_instruction(analyzer, 0x0004, "01:00", 2, None),
+        _make_instruction(analyzer, 0x0008, "02:00", 0, "return"),
+    ]
+    block = IRBlock(start=0x0000, instructions=instructions, successors=[])
+    program = IRProgram(segment_index=5, blocks={block.start: block})
+
+    reconstructor = HighLevelReconstructor(knowledge)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert "local literal_0, literal_1 =" in rendered
+    assert "-- literal runs:" in rendered
+    assert "- 0x000000-0x000004 number count=2" in rendered
+    assert "- literal runs: 1 (values=2)" in rendered
+    assert "  - range: 1..2 (span=1)" in rendered
+    assert "- runs small (2-3): 1" in rendered
+    assert "-- literal run patterns:" in rendered
+    assert "number:progression" in rendered
+    assert "-- literal run notes:" in rendered
+    assert "values fit within byte range" in rendered
+
+    report = function.metadata.literal_run_report()
+    assert report and report[0]["kind"] == "number"
