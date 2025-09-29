@@ -53,7 +53,6 @@ from .vm_analysis import (
     summarise_program,
     count_operations,
 )
-from .naming import NameAllocator, derive_stack_symbol_name, sanitize_identifier
 
 __all__ = [
     "SegmentIndex",
@@ -113,7 +112,4 @@ __all__ = [
     "vm_program_trace_to_json",
     "summarise_program",
     "count_operations",
-    "sanitize_identifier",
-    "NameAllocator",
-    "derive_stack_symbol_name",
 ]
