@@ -142,6 +142,8 @@ class LuaRenderOptions:
     emit_enum_metadata: bool = True
     emit_module_summary: bool = True
     emit_literal_report: bool = True
+    emit_stack_diagnostics: bool = True
+    emit_control_flow_summary: bool = True
 
 
 class CommentFormatter:
@@ -206,12 +208,19 @@ class HelperSignature:
             params.append("operand")
         return params
 
+    def stub_name(self) -> str:
+        return self.name
+
     def return_stub(self) -> Optional[str]:
         if self.outputs <= 0:
             return None
+        stub_id = self.stub_name()
         if self.outputs == 1:
-            return "return nil"
-        values = ", ".join("nil" for _ in range(self.outputs))
+            return f'return __stack_result("{stub_id}")'
+        values = ", ".join(
+            f'__stack_result("{stub_id}", {index})'
+            for index in range(1, self.outputs + 1)
+        )
         return f"return {values}"
 
     def metadata_lines(self) -> List[str]:
@@ -231,6 +240,11 @@ class MethodSignature(HelperSignature):
 
     struct: str = "struct"
     method: str = ""
+
+    def stub_name(self) -> str:
+        if not self.method:
+            return self.struct
+        return f"{self.struct}:{self.method}"
 
 
 @dataclass
@@ -269,6 +283,8 @@ class HelperRegistry:
         options: Optional[LuaRenderOptions] = None,
     ) -> None:
         opts = options or LuaRenderOptions()
+        if self._needs_placeholder_factory():
+            self._emit_placeholder_factory(writer)
         for struct_name, methods in sorted(self._methods.items()):
             writer.write_line(f"local {struct_name} = {{}}")
             writer.ensure_blank_line()
@@ -286,6 +302,9 @@ class HelperRegistry:
                             writer.write_comment(line)
                     stub = signature.return_stub()
                     if stub:
+                        writer.write_comment(
+                            "placeholder result to keep stack balanced"
+                        )
                         writer.write_line(stub)
                 writer.write_line("end")
                 writer.ensure_blank_line()
@@ -302,6 +321,7 @@ class HelperRegistry:
                         writer.write_comment(line)
                 stub = signature.return_stub()
                 if stub:
+                    writer.write_comment("placeholder result to keep stack balanced")
                     writer.write_line(stub)
             writer.write_line("end")
             writer.ensure_blank_line()
@@ -317,6 +337,32 @@ class HelperRegistry:
 
     def struct_count(self) -> int:
         return len(self._methods)
+
+    def _needs_placeholder_factory(self) -> bool:
+        for signature in self._functions.values():
+            if signature.outputs > 0:
+                return True
+        for methods in self._methods.values():
+            for signature in methods.values():
+                if signature.outputs > 0:
+                    return True
+        return False
+
+    def _emit_placeholder_factory(self, writer: LuaWriter) -> None:
+        writer.write_line("local function __stack_result(name, index)")
+        with writer.indented():
+            writer.write_comment(
+                "Create descriptive placeholders for helper stubs to keep stack flow intact."
+            )
+            writer.write_line("if index ~= nil then")
+            with writer.indented():
+                writer.write_line(
+                    "return string.format(\"<%s:%d>\", tostring(name), index)"
+                )
+            writer.write_line("end")
+            writer.write_line("return string.format(\"<%s>\", tostring(name))")
+        writer.write_line("end")
+        writer.ensure_blank_line()
 
 
 @dataclass

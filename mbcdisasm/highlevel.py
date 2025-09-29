@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from collections import Counter
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -54,6 +54,8 @@ from .literal_sequences import (
     compute_literal_statistics,
 )
 from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
+from .stack_diagnostics import analyze_stack, render_stack_diagnostics
+from .control_flow_summary import summarise_control_flow, render_control_flow_summary
 from .vm_analysis import estimate_stack_io
 
 
@@ -69,6 +71,26 @@ class HighLevelStack:
         name = f"{prefix}_{self._counter}"
         self._counter += 1
         return name
+
+    def snapshot(self) -> List[LuaExpression]:
+        """Return a shallow copy of the current stack values."""
+
+        return list(self._values)
+
+    def restore(self, values: Sequence[LuaExpression]) -> None:
+        """Replace the current stack contents with ``values``."""
+
+        self._values = list(values)
+
+    def new_placeholder(self, prefix: str = "stack", *, reason: str) -> LuaExpression:
+        """Create a placeholder expression describing an unknown stack value."""
+
+        token = self.new_symbol(prefix)
+        label = f"<{token}>"
+        literal = LuaLiteral("string", label, escape_lua_string(label))
+        placeholder = LiteralExpr(literal)
+        self.warnings.append(f"{reason}: {label}")
+        return placeholder
 
     def push_literal(
         self, expression: LuaExpression
@@ -118,11 +140,7 @@ class HighLevelStack:
     def pop_single(self) -> LuaExpression:
         if self._values:
             return self._values.pop()
-        placeholder = NameExpr(self.new_symbol("stack"))
-        self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
-        )
-        return placeholder
+        return self.new_placeholder(prefix="stack", reason="stack underflow placeholder")
 
     def pop_many(self, count: int) -> List[LuaExpression]:
         items = [self.pop_single() for _ in range(count)]
@@ -206,14 +224,53 @@ class FunctionMetadata:
     literal_runs: Sequence[LiteralRun] = field(default_factory=tuple)
     literal_stats: Optional[LiteralStatistics] = None
     literal_report: Optional[LiteralRunReport] = None
+    max_stack_depth: int = 0
+    stack_underflows: int = 0
+    stack_comment: Optional[List[str]] = None
+    control_flow_comment: Optional[List[str]] = None
+    loop_header_count: int = 0
+    unreachable_blocks: int = 0
+    reachable_blocks: int = 0
+    exit_blocks: Sequence[int] = field(default_factory=tuple)
+    branch_blocks: Sequence[int] = field(default_factory=tuple)
+    merge_blocks: Sequence[int] = field(default_factory=tuple)
+    critical_edges: Sequence[Tuple[int, int]] = field(default_factory=tuple)
+    cyclomatic_complexity: int = 0
+    connected_components: int = 0
+    average_successors: float = 0.0
+    edge_count: int = 0
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
         lines.append(f"- blocks: {self.block_count}")
+        if self.reachable_blocks:
+            lines.append(f"- reachable blocks: {self.reachable_blocks}")
         lines.append(f"- instructions: {self.instruction_count}")
         lines.append(f"- literal instructions: {self.literal_count}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
+        lines.append(f"- max stack depth: {self.max_stack_depth}")
+        lines.append(f"- stack underflows: {self.stack_underflows}")
+        if self.loop_header_count:
+            lines.append(f"- loop headers: {self.loop_header_count}")
+        if self.unreachable_blocks:
+            lines.append(f"- unreachable blocks: {self.unreachable_blocks}")
+        if self.exit_blocks:
+            lines.append(f"- exits: {len(self.exit_blocks)}")
+        if self.branch_blocks:
+            lines.append(f"- branch points: {len(self.branch_blocks)}")
+        if self.merge_blocks:
+            lines.append(f"- merge points: {len(self.merge_blocks)}")
+        if self.critical_edges:
+            lines.append(f"- critical edges: {len(self.critical_edges)}")
+        if self.cyclomatic_complexity:
+            lines.append(f"- cyclomatic complexity: {self.cyclomatic_complexity}")
+        if self.connected_components:
+            lines.append(f"- components: {self.connected_components}")
+        if self.average_successors:
+            lines.append(
+                f"- average successors per block: {self.average_successors:.2f}"
+            )
         string_runs = [run for run in self.literal_runs if run.kind == "string"]
         if string_runs:
             lines.append(f"- string literal sequences: {len(string_runs)}")
@@ -261,6 +318,16 @@ class FunctionMetadata:
         blocks = self.literal_report.block_lines(limit=block_limit)
         return summary + blocks
 
+    def stack_comment_lines(self) -> List[str]:
+        if not self.stack_comment:
+            return []
+        return list(self.stack_comment)
+
+    def control_flow_lines(self) -> List[str]:
+        if not self.control_flow_comment:
+            return []
+        return list(self.control_flow_comment)
+
 
 @dataclass
 class HighLevelFunction:
@@ -292,6 +359,14 @@ class HighLevelFunction:
             writer.write_comment_block(
                 ["stack reconstruction warnings:"] + self.metadata.warning_lines()
             )
+            writer.write_line("")
+        stack_lines = self.metadata.stack_comment_lines()
+        if stack_lines:
+            writer.write_comment_block(stack_lines)
+            writer.write_line("")
+        flow_lines = self.metadata.control_flow_lines()
+        if flow_lines:
+            writer.write_comment_block(flow_lines)
             writer.write_line("")
         writer.write_line(f"function {self.name}()")
         with writer.indented():
@@ -346,6 +421,7 @@ class BlockTranslator:
         self._stack = HighLevelStack()
         self._string_collector = StringLiteralCollector()
         self._literal_tracker = LiteralRunTracker()
+        self._entry_stacks: Dict[int, List[LuaExpression]] = {}
         self.literal_count = 0
         self.helper_calls = 0
         self.branch_count = 0
@@ -354,11 +430,16 @@ class BlockTranslator:
     def translate(self) -> Dict[int, BlockInfo]:
         blocks: Dict[int, BlockInfo] = {}
         order = sorted(self._program.blocks)
+        self._initialise_entry_states(order)
         for idx, start in enumerate(order):
             block = self._program.blocks[start]
             next_offset = order[idx + 1] if idx + 1 < len(order) else None
             self._literal_tracker.start_block(block.start)
-            blocks[start] = self._translate_block(block, next_offset)
+            entry_stack = self._entry_stack_state(start)
+            self._stack.restore(entry_stack)
+            info = self._translate_block(block, next_offset)
+            blocks[start] = info
+            self._propagate_successors(block.start, info.terminator, next_offset)
             self.instruction_total += len(block.instructions)
         self._literal_tracker.finalize()
         return blocks
@@ -436,6 +517,249 @@ class BlockTranslator:
             terminator=terminator,
             successors=list(block.successors),
         )
+
+    # ------------------------------------------------------------------
+    def _initialise_entry_states(self, order: Sequence[int]) -> None:
+        if not order:
+            return
+
+        token_states: Dict[int, List[str]] = {order[0]: []}
+        worklist: deque[int] = deque([order[0]])
+        value_counter = 0
+        phi_counter = 0
+
+        def new_value_token() -> str:
+            nonlocal value_counter
+            value_counter += 1
+            return f"value_{value_counter}"
+
+        def new_phi_token() -> str:
+            nonlocal phi_counter
+            phi_counter += 1
+            return f"phi_{phi_counter}"
+
+        def merge_states(
+            existing: Optional[List[str]],
+            incoming: List[str],
+        ) -> Tuple[List[str], bool]:
+            if existing is None:
+                return list(incoming), True
+            length = max(len(existing), len(incoming))
+            merged: List[str] = []
+            changed = False
+            for index in range(length):
+                lhs = existing[index] if index < len(existing) else None
+                rhs = incoming[index] if index < len(incoming) else None
+                token: Optional[str]
+                if lhs is None and rhs is None:
+                    token = new_phi_token()
+                elif lhs is None:
+                    if rhs is not None and rhs.startswith("phi_"):
+                        token = rhs
+                    else:
+                        token = new_phi_token()
+                elif rhs is None:
+                    if lhs.startswith("phi_"):
+                        token = lhs
+                    else:
+                        token = new_phi_token()
+                elif lhs == rhs:
+                    token = lhs
+                elif lhs.startswith("phi_"):
+                    token = lhs
+                elif rhs.startswith("phi_"):
+                    token = rhs
+                else:
+                    token = new_phi_token()
+                merged.append(token)
+                if index >= len(existing) or existing[index] != token:
+                    changed = True
+            if len(existing) > length:
+                changed = True
+                merged.extend(existing[length:])
+            return merged, changed
+
+        while worklist:
+            start = worklist.popleft()
+            block = self._program.blocks[start]
+            stack_tokens = list(token_states.get(start, []))
+            for instruction in block.instructions:
+                inputs = instruction.stack_inputs
+                outputs = instruction.stack_outputs
+                for _ in range(inputs):
+                    if stack_tokens:
+                        stack_tokens.pop()
+                for _ in range(outputs):
+                    stack_tokens.append(new_value_token())
+            exit_tokens = list(stack_tokens)
+            if not block.successors:
+                continue
+            for successor in block.successors:
+                if successor not in self._program.blocks:
+                    continue
+                merged, changed = merge_states(token_states.get(successor), exit_tokens)
+                if changed:
+                    token_states[successor] = merged
+                    worklist.append(successor)
+
+        for start, tokens in token_states.items():
+            expressions = [self._token_expression(token) for token in tokens]
+            self._entry_stacks[start] = expressions
+
+    def _entry_stack_state(self, block_start: int) -> List[LuaExpression]:
+        state = self._entry_stacks.get(block_start)
+        if state is None:
+            return []
+        return list(state)
+
+    def _propagate_successors(
+        self,
+        block_start: int,
+        terminator: Optional[Terminator],
+        fallthrough: Optional[int],
+    ) -> None:
+        if terminator is None:
+            if fallthrough is not None:
+                self._merge_entry_stack(fallthrough, self._stack.snapshot())
+            return
+
+        snapshot = self._stack.snapshot()
+        targets: Set[int] = set()
+
+        if isinstance(terminator, BranchTerminator):
+            for target in (terminator.true_target, terminator.false_target, terminator.fallthrough):
+                if target is not None:
+                    targets.add(target)
+        elif isinstance(terminator, JumpTerminator):
+            if terminator.target is not None:
+                targets.add(terminator.target)
+            if terminator.fallthrough is not None:
+                targets.add(terminator.fallthrough)
+            elif fallthrough is not None:
+                targets.add(fallthrough)
+        elif isinstance(terminator, ReturnTerminator):
+            return
+        else:
+            if fallthrough is not None:
+                targets.add(fallthrough)
+
+        if not targets:
+            return
+
+        for target in targets:
+            self._merge_entry_stack(target, snapshot)
+
+    def _merge_entry_stack(self, target: int, snapshot: Sequence[LuaExpression]) -> None:
+        if target not in self._program.blocks:
+            return
+        incoming = list(snapshot)
+        existing = self._entry_stacks.get(target)
+        if existing is None:
+            self._entry_stacks[target] = incoming
+            return
+        merged = self._merge_stack_states(target, existing, incoming)
+        self._entry_stacks[target] = merged
+
+    def _merge_stack_states(
+        self,
+        block_start: int,
+        existing: Sequence[LuaExpression],
+        incoming: Sequence[LuaExpression],
+    ) -> List[LuaExpression]:
+        if not existing:
+            return list(incoming)
+        if not incoming:
+            return [
+                self._merge_slot(block_start, index, value, None)
+                for index, value in enumerate(existing)
+            ]
+        length = max(len(existing), len(incoming))
+        merged: List[LuaExpression] = []
+        for index in range(length):
+            lhs = existing[index] if index < len(existing) else None
+            rhs = incoming[index] if index < len(incoming) else None
+            merged.append(self._merge_slot(block_start, index, lhs, rhs))
+        return merged
+
+    def _merge_slot(
+        self,
+        block_start: int,
+        index: int,
+        lhs: Optional[LuaExpression],
+        rhs: Optional[LuaExpression],
+    ) -> LuaExpression:
+        lhs_kind = self._placeholder_kind(lhs)
+        rhs_kind = self._placeholder_kind(rhs)
+
+        if lhs is None and rhs is None:
+            return self._stack.new_placeholder(
+                prefix="phi",
+                reason=(
+                    f"stack merge missing value for block 0x{block_start:06X} slot {index}"
+                ),
+            )
+        if lhs is None:
+            if rhs is not None and rhs_kind:
+                return rhs
+            return self._stack.new_placeholder(
+                prefix="phi",
+                reason=(
+                    f"stack merge introduced placeholder for block 0x{block_start:06X} slot {index}"
+                ),
+            )
+        if rhs is None:
+            if lhs_kind:
+                return lhs
+            return self._stack.new_placeholder(
+                prefix="phi",
+                reason=(
+                    f"stack merge introduced placeholder for block 0x{block_start:06X} slot {index}"
+                ),
+            )
+        if lhs == rhs:
+            return lhs
+        if lhs_kind and not rhs_kind:
+            return rhs
+        if rhs_kind and not lhs_kind:
+            return lhs
+        if lhs_kind and rhs_kind:
+            if lhs_kind == rhs_kind:
+                return lhs
+            if lhs_kind == "phi" or rhs_kind == "phi":
+                return lhs if lhs_kind == "phi" else rhs
+            if lhs_kind == "seed":
+                return rhs
+            if rhs_kind == "seed":
+                return lhs
+        return self._stack.new_placeholder(
+            prefix="phi",
+            reason=(
+                f"stack merge resolved conflict for block 0x{block_start:06X} slot {index}"
+            ),
+        )
+
+    def _is_placeholder(self, value: Optional[LuaExpression]) -> bool:
+        return self._placeholder_kind(value) is not None
+
+    def _placeholder_kind(self, value: Optional[LuaExpression]) -> Optional[str]:
+        if not isinstance(value, LiteralExpr):
+            return None
+        literal = value.literal
+        if literal is None or literal.kind != "string":
+            return None
+        text = str(literal.value)
+        if text.startswith("<stack_"):
+            return "stack"
+        if text.startswith("<phi_"):
+            return "phi"
+        if text.startswith("<value_"):
+            return "seed"
+        return None
+
+    def _token_expression(self, token: str) -> LuaExpression:
+        label = f"<{token}>"
+        literal = LuaLiteral("string", label, escape_lua_string(label))
+        return LiteralExpr(literal)
 
     # ------------------------------------------------------------------
     @property
@@ -589,6 +913,40 @@ class HighLevelReconstructor:
         )
         base_name = self._derive_function_name(program, literal_runs)
         function_name = self._unique_function_name(base_name)
+        stack_comment: Optional[List[str]] = None
+        max_stack_depth = 0
+        stack_underflows = 0
+        flow_comment: Optional[List[str]] = None
+        loop_header_count = 0
+        unreachable_blocks = 0
+        reachable_blocks = 0
+        exit_blocks: Sequence[int] = ()
+        branch_blocks: Sequence[int] = ()
+        merge_blocks: Sequence[int] = ()
+        critical_edges: Sequence[Tuple[int, int]] = ()
+        cyclomatic_complexity = 0
+        connected_components = 0
+        average_successors = 0.0
+        edge_count = 0
+        if self.options.emit_stack_diagnostics:
+            diagnostics = analyze_stack(program)
+            max_stack_depth = diagnostics.max_depth
+            stack_underflows = diagnostics.total_underflows
+            stack_comment = render_stack_diagnostics(diagnostics)
+        if self.options.emit_control_flow_summary:
+            flow_metrics = summarise_control_flow(program)
+            flow_comment = render_control_flow_summary(flow_metrics)
+            loop_header_count = len(flow_metrics.loop_headers)
+            unreachable_blocks = len(flow_metrics.unreachable)
+            reachable_blocks = flow_metrics.reachable_blocks
+            exit_blocks = tuple(flow_metrics.exit_blocks)
+            branch_blocks = tuple(flow_metrics.branch_blocks)
+            merge_blocks = tuple(flow_metrics.merge_blocks)
+            critical_edges = tuple(flow_metrics.critical_edges)
+            cyclomatic_complexity = flow_metrics.cyclomatic_complexity
+            connected_components = flow_metrics.connected_components
+            average_successors = flow_metrics.average_successors
+            edge_count = flow_metrics.edge_count
         metadata = FunctionMetadata(
             block_count=len(blocks),
             instruction_count=translator.instruction_total,
@@ -599,6 +957,21 @@ class HighLevelReconstructor:
             literal_runs=tuple(literal_runs),
             literal_stats=stats,
             literal_report=report,
+            max_stack_depth=max_stack_depth,
+            stack_underflows=stack_underflows,
+            stack_comment=stack_comment,
+            control_flow_comment=flow_comment,
+            loop_header_count=loop_header_count,
+            unreachable_blocks=unreachable_blocks,
+            reachable_blocks=reachable_blocks,
+            exit_blocks=exit_blocks,
+            branch_blocks=branch_blocks,
+            merge_blocks=merge_blocks,
+            critical_edges=critical_edges,
+            cyclomatic_complexity=cyclomatic_complexity,
+            connected_components=connected_components,
+            average_successors=average_successors,
+            edge_count=edge_count,
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
@@ -841,6 +1214,38 @@ class HighLevelReconstructor:
         lines.append(f"- literal instructions: {literal_total}")
         branch_total = sum(func.metadata.branch_count for func in functions)
         lines.append(f"- branch instructions: {branch_total}")
+        reachable_total = sum(func.metadata.reachable_blocks for func in functions)
+        lines.append(f"- reachable blocks: {reachable_total}")
+        exit_total = sum(len(func.metadata.exit_blocks) for func in functions)
+        lines.append(f"- exit blocks: {exit_total}")
+        branch_points = sum(len(func.metadata.branch_blocks) for func in functions)
+        lines.append(f"- branch points: {branch_points}")
+        merge_points = sum(len(func.metadata.merge_blocks) for func in functions)
+        lines.append(f"- merge points: {merge_points}")
+        critical_total = sum(len(func.metadata.critical_edges) for func in functions)
+        lines.append(f"- critical edges: {critical_total}")
+        total_edges = sum(func.metadata.edge_count for func in functions)
+        if total_edges:
+            lines.append(f"- total edges: {total_edges}")
+        max_depth = max((func.metadata.max_stack_depth for func in functions), default=0)
+        lines.append(f"- max stack depth: {max_depth}")
+        underflows = sum(func.metadata.stack_underflows for func in functions)
+        lines.append(f"- stack underflows: {underflows}")
+        total_loops = sum(func.metadata.loop_header_count for func in functions)
+        lines.append(f"- total loop headers: {total_loops}")
+        total_unreachable = sum(func.metadata.unreachable_blocks for func in functions)
+        lines.append(f"- unreachable blocks: {total_unreachable}")
+        component_total = sum(func.metadata.connected_components for func in functions)
+        if component_total:
+            lines.append(f"- control-flow components: {component_total}")
+        complexity_total = sum(
+            func.metadata.cyclomatic_complexity for func in functions
+        )
+        if complexity_total:
+            lines.append(f"- total cyclomatic complexity: {complexity_total}")
+        if reachable_total:
+            avg_successors = total_edges / max(reachable_total, 1)
+            lines.append(f"- avg successors per block: {avg_successors:.2f}")
         if not self._enum_registry.is_empty():
             lines.append(
                 "- enum namespaces: "

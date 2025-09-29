@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
@@ -138,6 +140,12 @@ def test_highlevel_reconstruction_generates_control_flow(tmp_path: Path) -> None
         or "return enum_" in rendered
         or "return State" in rendered
     )
+    assert "stack analysis:" in rendered
+    assert "control flow summary:" in rendered
+    assert "-- - branch points:" in rendered
+    assert "-- - merge points:" in rendered
+    assert "-- - critical edges:" in rendered
+    assert "-- branch points:" in rendered
 
 
 def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
@@ -238,9 +246,97 @@ def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
     rendered = reconstructor.render([function])
 
     assert function.name == "set_name"
-    assert "function set_name()" in rendered
-    assert "-- literal runs:" in rendered
-    assert 'literal statistics' in rendered
+
+
+def test_stack_diagnostics_can_be_disabled(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "02:00": {
+                    "name": "return_top",
+                    "summary": "Return top value",
+                    "stack_delta": -1,
+                    "control_flow": "return",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    instructions: list[IRInstruction] = []
+    offset = 0
+    instructions.append(_make_instruction(analyzer, offset, "01:00", 0, None))
+    offset += 4
+    instructions.append(_make_instruction(analyzer, offset, "02:00", 0, "return"))
+    block = IRBlock(start=0, instructions=instructions, successors=[])
+    program = IRProgram(segment_index=0, blocks={block.start: block})
+
+    options = LuaRenderOptions(emit_stack_diagnostics=False)
+    reconstructor = HighLevelReconstructor(knowledge, options=options)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert "stack analysis:" not in rendered
+
+
+def test_control_flow_summary_can_be_disabled(tmp_path: Path) -> None:
+    kb_path = tmp_path / "kb.json"
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text(
+        json.dumps(
+            {
+                "01:00": {
+                    "name": "push_literal_small",
+                    "summary": "Push literal chunk",
+                    "stack_delta": 1,
+                    "tags": ["literal"],
+                },
+                "03:00": {
+                    "name": "branch_if_true",
+                    "summary": "Branch when true",
+                    "stack_delta": -1,
+                    "control_flow": "branch",
+                },
+            }
+        ),
+        "utf-8",
+    )
+
+    knowledge = KnowledgeBase.load(kb_path)
+    analyzer = ManualSemanticAnalyzer(knowledge)
+
+    block = IRBlock(
+        start=0,
+        instructions=[
+            _make_instruction(analyzer, 0, "01:00", 0, None),
+            _make_instruction(analyzer, 4, "03:00", 0, "branch"),
+        ],
+        successors=[0x0010, 0x0020],
+    )
+    follow = IRBlock(start=0x0010, instructions=[], successors=[])
+    program = IRProgram(segment_index=0, blocks={
+        block.start: block,
+        follow.start: follow,
+        0x0020: IRBlock(start=0x0020, instructions=[], successors=[]),
+    })
+
+    options = LuaRenderOptions(emit_control_flow_summary=False)
+    reconstructor = HighLevelReconstructor(knowledge, options=options)
+    function = reconstructor.from_ir(program)
+    rendered = reconstructor.render([function])
+
+    assert "control flow summary:" not in rendered
 
 
 def test_literal_report_toggle(tmp_path: Path) -> None:

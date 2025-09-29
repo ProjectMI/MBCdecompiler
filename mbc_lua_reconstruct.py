@@ -79,6 +79,16 @@ def parse_args() -> argparse.Namespace:
         help="Suppress the module-level summary comment block",
     )
     parser.add_argument(
+        "--no-stack-diagnostics",
+        action="store_true",
+        help="Disable stack diagnostics comments in generated Lua",
+    )
+    parser.add_argument(
+        "--no-control-flow-summary",
+        action="store_true",
+        help="Skip control flow summary comments",
+    )
+    parser.add_argument(
         "--no-literal-report",
         action="store_true",
         help="Skip emitting aggregated literal report information",
@@ -198,6 +208,10 @@ def main() -> None:
         options.emit_enum_metadata = False
     if args.no_module_summary:
         options.emit_module_summary = False
+    if args.no_stack_diagnostics:
+        options.emit_stack_diagnostics = False
+    if args.no_control_flow_summary:
+        options.emit_control_flow_summary = False
     if args.no_literal_report:
         options.emit_literal_report = False
 
