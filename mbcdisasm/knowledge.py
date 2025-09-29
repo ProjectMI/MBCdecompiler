@@ -556,6 +556,11 @@ class KnowledgeBase:
             return weighted / total
         return None
 
+    def opcode_profile(self, key: str) -> Optional[OpcodeProfile]:
+        """Return the stored :class:`OpcodeProfile` for ``key`` if available."""
+
+        return self._profiles.get(key)
+
     def describe(self, key: str) -> str:
         return self.instruction_metadata(key).mnemonic
 

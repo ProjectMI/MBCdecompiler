@@ -32,7 +32,7 @@ class BasicBlock:
 class ControlFlowGraph:
     """Container for the CFG associated with a segment."""
 
-    segment: Segment
+    segment: Optional[Segment]
     blocks: Dict[int, BasicBlock]
     remainder: int = 0
 
@@ -40,9 +40,11 @@ class ControlFlowGraph:
         return [self.blocks[offset] for offset in sorted(self.blocks)]
 
     def to_text(self) -> str:
-        lines: List[str] = [
-            f"segment {self.segment.index} cfg (start=0x{self.segment.start:06X})"
-        ]
+        if self.segment is not None:
+            header = f"segment {self.segment.index} cfg (start=0x{self.segment.start:06X})"
+        else:
+            header = "segment <unknown> cfg"
+        lines: List[str] = [header]
         for block in self.block_order():
             lines.append(
                 f"  block 0x{block.start:06X} size={len(block.instructions)} succ={[hex(s) for s in sorted(block.successors)]}"

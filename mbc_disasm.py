@@ -7,7 +7,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, Optional, Sequence, List
 
 from mbcdisasm import (
     Analyzer,
@@ -20,6 +20,9 @@ from mbcdisasm.ast import LuaReconstructor
 from mbcdisasm.cfg import ControlFlowGraphBuilder, render_cfgs
 from mbcdisasm.emulator import Emulator, render_reports, write_emulation_reports
 from mbcdisasm.ir import IRBuilder, render_ir_programs, write_ir_programs
+from mbcdisasm.branch_analysis import render_branch_report
+from mbcdisasm.branch_patterns import analyse_branch_patterns, render_branch_patterns
+from mbcdisasm.stack_analysis import render_stack_seed_report
 from mbcdisasm.segment_classifier import SegmentClassifier
 
 
@@ -33,6 +36,8 @@ class DisassemblyPlan:
     ir_path: Optional[Path]
     ast_path: Optional[Path]
     emulation_path: Optional[Path]
+    branch_report_path: Optional[Path]
+    stack_report_path: Optional[Path]
     knowledge_path: Path
     segment_indices: tuple[int, ...]
     missing_segments: tuple[int, ...]
@@ -52,6 +57,8 @@ class DisassemblyPlan:
             ir_path=args.ir_out,
             ast_path=args.ast_out,
             emulation_path=args.emulation_out,
+            branch_report_path=args.branch_report_out,
+            stack_report_path=args.stack_report_out,
             knowledge_path=args.knowledge_base,
             segment_indices=segment_indices,
             missing_segments=missing,
@@ -73,6 +80,10 @@ class DisassemblyPlan:
             yield ("ast", self.ast_path)
         if self.emulation_path:
             yield ("emulation", self.emulation_path)
+        if self.branch_report_path:
+            yield ("branch_report", self.branch_report_path)
+        if self.stack_report_path:
+            yield ("stack_report", self.stack_report_path)
 
     def selection_summary(self) -> str:
         if self.segment_indices:
@@ -144,6 +155,16 @@ def parse_args() -> argparse.Namespace:
         "--emulation-out",
         type=Path,
         help="Write stack emulation traces to the provided path",
+    )
+    parser.add_argument(
+        "--branch-report-out",
+        type=Path,
+        help="Write a detailed branch analysis report",
+    )
+    parser.add_argument(
+        "--stack-report-out",
+        type=Path,
+        help="Write stack seed diagnostics to the provided path",
     )
     return parser.parse_args()
 
@@ -223,7 +244,16 @@ def main() -> None:
 
     selected_segments = list(_selected_segments(container, plan.segment_indices))
 
-    if plan.cfg_path or plan.ir_path or plan.ast_path:
+    need_cfg = any(
+        (
+            plan.cfg_path,
+            plan.ir_path,
+            plan.ast_path,
+            plan.branch_report_path,
+            plan.stack_report_path,
+        )
+    )
+    if need_cfg:
         cfg_builder = ControlFlowGraphBuilder(knowledge, semantic_analyzer=semantic_analyzer)
         cfgs = [
             cfg_builder.build(segment, max_instructions=args.max_instr)
@@ -233,8 +263,16 @@ def main() -> None:
             plan.cfg_path.write_text(render_cfgs(cfgs), "utf-8")
             print(f"cfg written to {plan.cfg_path}")
 
-    if plan.ir_path or plan.ast_path:
-        if "cfgs" not in locals():
+    need_ir = any(
+        (
+            plan.ir_path,
+            plan.ast_path,
+            plan.branch_report_path,
+            plan.stack_report_path,
+        )
+    )
+    if need_ir:
+        if not need_cfg:
             cfg_builder = ControlFlowGraphBuilder(knowledge, semantic_analyzer=semantic_analyzer)
             cfgs = [
                 cfg_builder.build(segment, max_instructions=args.max_instr)
@@ -256,6 +294,32 @@ def main() -> None:
                 lua_blobs.append(reconstructor.render(function).rstrip())
             plan.ast_path.write_text("\n\n".join(lua_blobs) + "\n", "utf-8")
             print(f"ast written to {plan.ast_path}")
+        if plan.branch_report_path:
+            report_sections: List[str] = []
+            for segment, program in zip(selected_segments, programs):
+                registry = program.branch_registry(knowledge)
+                structure_report = render_branch_report(registry.structure).rstrip()
+                pattern_registry = analyse_branch_patterns(registry)
+                pattern_report = render_branch_patterns(pattern_registry).rstrip()
+                section = "\n".join(
+                    [
+                        f"segment {segment.index} branch analysis:",
+                        structure_report,
+                        pattern_report,
+                    ]
+                )
+                report_sections.append(section.strip())
+            plan.branch_report_path.write_text("\n\n".join(report_sections) + "\n", "utf-8")
+            print(f"branch report written to {plan.branch_report_path}")
+        if plan.stack_report_path:
+            stack_sections: List[str] = []
+            for segment, program in zip(selected_segments, programs):
+                report = render_stack_seed_report(program, knowledge).rstrip()
+                stack_sections.append(
+                    f"segment {segment.index} stack seed report:\n{report}"
+                )
+            plan.stack_report_path.write_text("\n\n".join(stack_sections) + "\n", "utf-8")
+            print(f"stack seed report written to {plan.stack_report_path}")
 
     if plan.emulation_path:
         emulator = Emulator(

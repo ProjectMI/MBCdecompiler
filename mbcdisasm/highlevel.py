@@ -6,9 +6,17 @@ import re
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .ir import IRBlock, IRInstruction, IRProgram
+from .branch_analysis import BranchRegistry, BranchDescriptor, BranchKind
+from .branch_patterns import (
+    BranchPatternRegistry,
+    ConditionalPattern,
+    DispatchPattern,
+    analyse_branch_patterns,
+)
+from .stack_analysis import StackSeedPlan, build_stack_seed_plan
 from .knowledge import KnowledgeBase
 from .lua_ast import (
     Assignment,
@@ -64,6 +72,20 @@ class HighLevelStack:
         self._values: List[LuaExpression] = []
         self._counter = 0
         self.warnings: List[str] = []
+        self._block_start: Optional[int] = None
+        self._placeholder_callback: Optional[Callable[[Optional[int], int], LuaExpression]] = None
+        self._placeholder_index: int = 0
+
+    def begin_block(
+        self,
+        block_start: int,
+        seeds: Sequence[LuaExpression],
+        placeholder_callback: Optional[Callable[[Optional[int], int], LuaExpression]] = None,
+    ) -> None:
+        self._values = list(seeds)
+        self._block_start = block_start
+        self._placeholder_callback = placeholder_callback
+        self._placeholder_index = 0
 
     def new_symbol(self, prefix: str = "value") -> str:
         name = f"{prefix}_{self._counter}"
@@ -118,9 +140,16 @@ class HighLevelStack:
     def pop_single(self) -> LuaExpression:
         if self._values:
             return self._values.pop()
-        placeholder = NameExpr(self.new_symbol("stack"))
+        if self._placeholder_callback is not None:
+            placeholder = self._placeholder_callback(
+                self._block_start,
+                self._placeholder_index,
+            )
+            self._placeholder_index += 1
+        else:
+            placeholder = NameExpr(self.new_symbol("stack"))
         self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
+            f"underflow generated placeholder {getattr(placeholder, 'name', repr(placeholder))}"
         )
         return placeholder
 
@@ -320,6 +349,7 @@ class JumpTerminator(Terminator):
 
 @dataclass
 class BranchTerminator(Terminator):
+    descriptor: BranchDescriptor
     condition: LuaExpression
     true_target: Optional[int]
     false_target: Optional[int]
@@ -327,6 +357,8 @@ class BranchTerminator(Terminator):
     comment: Optional[str]
     enum_namespace: Optional[str] = None
     enum_values: Dict[int, str] = field(default_factory=dict)
+    pattern: Optional[ConditionalPattern] = None
+    dispatch_pattern: Optional[DispatchPattern] = None
 
 
 @dataclass
@@ -340,9 +372,19 @@ class BlockInfo:
 class BlockTranslator:
     """Translate IR blocks into :class:`BlockInfo` instances."""
 
-    def __init__(self, reconstructor: "HighLevelReconstructor", program: IRProgram) -> None:
+    def __init__(
+        self,
+        reconstructor: "HighLevelReconstructor",
+        program: IRProgram,
+        branch_registry: BranchRegistry,
+        seed_plan: StackSeedPlan,
+        patterns: BranchPatternRegistry,
+    ) -> None:
         self._reconstructor = reconstructor
         self._program = program
+        self._branches = branch_registry
+        self._seed_plan = seed_plan
+        self._patterns = patterns
         self._stack = HighLevelStack()
         self._string_collector = StringLiteralCollector()
         self._literal_tracker = LiteralRunTracker()
@@ -350,6 +392,10 @@ class BlockTranslator:
         self.helper_calls = 0
         self.branch_count = 0
         self.instruction_total = 0
+
+    @property
+    def patterns(self) -> BranchPatternRegistry:
+        return self._patterns
 
     def translate(self) -> Dict[int, BlockInfo]:
         blocks: Dict[int, BlockInfo] = {}
@@ -368,6 +414,9 @@ class BlockTranslator:
         statements: List[LuaStatement] = []
         terminator: Optional[Terminator] = None
         self._string_collector.reset()
+        seeds = self._seed_plan.seed_expressions(block.start)
+        placeholder_callback = self._seed_plan.placeholder_expression
+        self._stack.begin_block(block.start, seeds, placeholder_callback)
         for index, instruction in enumerate(block.instructions):
             semantics = instruction.semantics
             self._reconstructor._register_enums(semantics)
@@ -396,11 +445,13 @@ class BlockTranslator:
                     self._reconstructor._translate_comparison(instruction, semantics, self)
                 )
                 continue
-            if semantics.control_flow == "branch" and is_last:
+            descriptor = self._branches.branch_at(block.start)
+            if descriptor and is_last and descriptor.kind not in {BranchKind.EXIT, BranchKind.UNKNOWN}:
                 terminator = self._reconstructor._translate_branch(
                     block.start,
                     instruction,
                     semantics,
+                    descriptor,
                     self,
                     fallthrough,
                 )
@@ -454,8 +505,15 @@ class BlockTranslator:
 class ControlFlowStructurer:
     """Best effort structuring of :class:`BlockInfo` sequences."""
 
-    def __init__(self, blocks: Dict[int, BlockInfo]) -> None:
+    def __init__(
+        self,
+        blocks: Dict[int, BlockInfo],
+        patterns: BranchPatternRegistry,
+        branches: BranchRegistry,
+    ) -> None:
         self._blocks = blocks
+        self._patterns = patterns
+        self._branches = branches
         self._emitted: set[int] = set()
         self._predecessors: Dict[int, set[int]] = self._compute_predecessors(blocks)
 
@@ -514,12 +572,76 @@ class ControlFlowStructurer:
     def _handle_branch(
         self, current: int, terminator: BranchTerminator
     ) -> Tuple[LuaStatement, Optional[int]]:
+        descriptor = terminator.descriptor
+        pattern = terminator.pattern
+
+        if descriptor.kind == BranchKind.DISPATCH and terminator.dispatch_pattern is not None:
+            return self._handle_dispatch(current, terminator)
+
+        if pattern and pattern.style == "loop_guard":
+            return self._handle_loop_branch(current, terminator, pattern)
+
+        if pattern and pattern.join_block is not None:
+            return self._handle_structured_branch(current, terminator, pattern)
+
+        return self._handle_fallback_branch(current, terminator)
+
+    def _handle_loop_branch(
+        self, current: int, terminator: BranchTerminator, pattern: ConditionalPattern
+    ) -> Tuple[LuaStatement, Optional[int]]:
+        body_target = pattern.loop_body_target or terminator.true_target
+        exit_target = (
+            pattern.loop_exit_target
+            or terminator.false_target
+            or terminator.fallthrough
+        )
+        if body_target is None:
+            comment = terminator.comment or "loop guard without body"
+            return CommentStatement(comment), exit_target
+        body_statements = self._structure_sequence(body_target, stop=current)
+        body = wrap_block(body_statements)
+        if terminator.comment:
+            body.statements.insert(0, CommentStatement(terminator.comment))
+        return WhileStatement(terminator.condition, body), exit_target
+
+    def _handle_structured_branch(
+        self, current: int, terminator: BranchTerminator, pattern: ConditionalPattern
+    ) -> Tuple[LuaStatement, Optional[int]]:
+        join = pattern.join_block or terminator.fallthrough
+        true_target = pattern.true_target
+        false_target = pattern.false_target
+        clauses: List[IfClause] = []
+        if true_target is not None and true_target != join:
+            then_block = wrap_block(self._structure_sequence(true_target, join))
+        else:
+            then_block = wrap_block([])
+        clauses.append(IfClause(condition=terminator.condition, body=then_block))
+        if terminator.comment:
+            then_block.statements.insert(0, CommentStatement(terminator.comment))
+        next_block = join
+        if false_target is not None and false_target != join:
+            else_block = wrap_block(self._structure_sequence(false_target, join))
+            clauses.append(IfClause(None, else_block))
+        elif join is None and false_target is not None:
+            else_block = wrap_block(self._structure_sequence(false_target, None))
+            clauses.append(IfClause(None, else_block))
+        return IfStatement(clauses), next_block
+
+    def _handle_dispatch(
+        self, current: int, terminator: BranchTerminator
+    ) -> Tuple[LuaStatement, Optional[int]]:
+        descriptor = terminator.descriptor
+        comment = terminator.comment or descriptor.describe()
+        return CommentStatement(comment), terminator.fallthrough
+
+    def _handle_fallback_branch(
+        self, current: int, terminator: BranchTerminator
+    ) -> Tuple[LuaStatement, Optional[int]]:
         condition = terminator.condition
         true_target = terminator.true_target
         false_target = terminator.false_target or terminator.fallthrough
         fallthrough = terminator.fallthrough
 
-        # Loop heuristic: condition guarding a backward edge.
         if (
             true_target is not None
             and true_target in self._blocks
@@ -573,10 +695,15 @@ class HighLevelReconstructor:
     # ------------------------------------------------------------------
     def from_ir(self, program: IRProgram) -> HighLevelFunction:
         self._last_summary = None
-        translator = BlockTranslator(self, program)
+        branch_registry = program.branch_registry(self.knowledge)
+        pattern_registry = analyse_branch_patterns(branch_registry)
+        seed_plan = build_stack_seed_plan(program, self.knowledge)
+        translator = BlockTranslator(
+            self, program, branch_registry, seed_plan, pattern_registry
+        )
         blocks = translator.translate()
         entry = min(blocks)
-        structurer = ControlFlowStructurer(blocks)
+        structurer = ControlFlowStructurer(blocks, pattern_registry, branch_registry)
         body = structurer.structure(entry)
         literal_runs = sorted(
             translator.literal_runs, key=lambda run: (run.start_offset(), -run.length())
@@ -663,17 +790,24 @@ class HighLevelReconstructor:
         block_start: int,
         instruction: IRInstruction,
         semantics: InstructionSemantics,
+        descriptor: BranchDescriptor,
         translator: BlockTranslator,
         fallthrough: Optional[int],
     ) -> BranchTerminator:
-        condition = translator.stack.pop_single()
-        # Determine targets based on IR metadata.
+        condition = self._derive_branch_condition(descriptor, translator)
         true_target, false_target = self._select_branch_targets(
-            block_start, translator, fallthrough
+            block_start, translator, descriptor, fallthrough
+        )
+        pattern = translator.patterns.conditional(block_start)
+        dispatch_pattern = (
+            translator.patterns.dispatch(block_start)
+            if descriptor.kind == BranchKind.DISPATCH
+            else None
         )
         translator.branch_count += 1
         comment = self._comment_formatter.format_inline(semantics.summary or "")
         return BranchTerminator(
+            descriptor=descriptor,
             condition=condition,
             true_target=true_target,
             false_target=false_target,
@@ -681,6 +815,8 @@ class HighLevelReconstructor:
             comment=comment if comment else None,
             enum_namespace=semantics.enum_namespace,
             enum_values=dict(semantics.enum_values),
+            pattern=pattern,
+            dispatch_pattern=dispatch_pattern,
         )
 
     def _translate_return(
@@ -779,20 +915,60 @@ class HighLevelReconstructor:
         self,
         block_start: int,
         translator: BlockTranslator,
+        descriptor: BranchDescriptor,
         fallthrough: Optional[int],
     ) -> Tuple[Optional[int], Optional[int]]:
-        block = translator.program.blocks[block_start]
-        succ = list(block.successors)
-        false_target = None
-        true_target = None
-        if fallthrough is not None and fallthrough in succ:
-            false_target = fallthrough
-            succ = [value for value in succ if value != fallthrough]
-        if succ:
-            true_target = succ[0]
-        elif fallthrough is not None:
-            true_target = fallthrough
+        true_target: Optional[int] = None
+        false_target: Optional[int] = None
+
+        if descriptor.kind == BranchKind.DISPATCH:
+            # Multi-way dispatch is modelled as branching to the first recorded
+            # target while preserving others as part of the terminator metadata.
+            if descriptor.outcomes:
+                true_target = descriptor.outcomes[0].target
+            if descriptor.fallthrough is not None:
+                false_target = descriptor.fallthrough
+        else:
+            for outcome in descriptor.outcomes:
+                if outcome.target == descriptor.fallthrough or (
+                    descriptor.fallthrough is None and outcome.target is None
+                ):
+                    false_target = outcome.target
+                else:
+                    true_target = outcome.target
+
+            if true_target is None and descriptor.fallthrough is not None:
+                true_target = descriptor.fallthrough
+
+        # As a safety net fallback to the IR metadata when the descriptor lacks
+        # edges (e.g. unresolved targets).
+        if true_target is None and false_target is None:
+            block = translator.program.blocks[block_start]
+            succ = list(block.successors)
+            if fallthrough is not None and fallthrough in succ:
+                false_target = fallthrough
+                succ = [value for value in succ if value != fallthrough]
+            if succ:
+                true_target = succ[0]
+            elif fallthrough is not None:
+                true_target = fallthrough
         return true_target, false_target
+
+    def _derive_branch_condition(
+        self, descriptor: BranchDescriptor, translator: BlockTranslator
+    ) -> LuaExpression:
+        stack_inputs = descriptor.stack_inputs
+        if stack_inputs <= 0 or descriptor.kind == BranchKind.PREDICATED:
+            translator.stack.warnings.append("branch predicate synthesised from mnemonic")
+            return NameExpr(descriptor.semantics.mnemonic)
+
+        if stack_inputs == 1:
+            return translator.stack.pop_single()
+
+        operands = translator.stack.pop_many(stack_inputs)
+        combined = TableExpr([TableField(None, operand) for operand in operands])
+        translator.stack.warnings.append("branch consumed multiple values")
+        return combined
 
     # ------------------------------------------------------------------
     def _operand_expression(

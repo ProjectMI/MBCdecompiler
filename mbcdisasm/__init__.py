@@ -18,6 +18,36 @@ from .cfg import ControlFlowGraphBuilder, ControlFlowGraph
 from .ir import IRBuilder, IRProgram, write_ir_programs
 from .emulator import Emulator, EmulationReport, write_emulation_reports
 from .stack_model import StackDeltaEstimate, StackDeltaModeler
+from .branch_analysis import (
+    BranchKind,
+    BranchDescriptor,
+    BranchOutcome,
+    BranchRegistry,
+    BranchStructure,
+    BranchResolver,
+    analyse_branches,
+)
+from .branch_patterns import (
+    BranchPatternRegistry,
+    BranchPatternAnalyzer,
+    ConditionalPattern,
+    DispatchPattern,
+    LoopPattern,
+    TailCallPattern,
+    analyse_branch_patterns,
+    render_branch_patterns,
+)
+from .stack_analysis import (
+    StackSeedPlan,
+    StackSeedAnalyzer,
+    StackSeedReport,
+    StackSeedDiagnostics,
+    UnderflowEvent,
+    build_stack_seed_plan,
+    build_stack_seed_report,
+    render_stack_seed_report,
+    stack_seed_report_to_json,
+)
 from .ast import LuaReconstructor
 from .highlevel import FunctionMetadata, HighLevelFunction, HighLevelReconstructor
 from .literal_sequences import (
@@ -89,6 +119,30 @@ __all__ = [
     "write_emulation_reports",
     "StackDeltaEstimate",
     "StackDeltaModeler",
+    "BranchKind",
+    "BranchDescriptor",
+    "BranchOutcome",
+    "BranchStructure",
+    "BranchRegistry",
+    "BranchResolver",
+    "analyse_branches",
+    "BranchPatternRegistry",
+    "BranchPatternAnalyzer",
+    "ConditionalPattern",
+    "DispatchPattern",
+    "LoopPattern",
+    "TailCallPattern",
+    "analyse_branch_patterns",
+    "render_branch_patterns",
+    "StackSeedPlan",
+    "StackSeedAnalyzer",
+    "StackSeedReport",
+    "StackSeedDiagnostics",
+    "UnderflowEvent",
+    "build_stack_seed_plan",
+    "build_stack_seed_report",
+    "render_stack_seed_report",
+    "stack_seed_report_to_json",
     "LuaReconstructor",
     "HighLevelFunction",
     "HighLevelReconstructor",
