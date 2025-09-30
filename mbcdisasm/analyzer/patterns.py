@@ -138,6 +138,9 @@ def default_patterns() -> PatternRegistry:
     registry = PatternRegistry()
     registry.extend(
         [
+            literal_run_pattern(),
+            ascii_run_pattern(),
+            marker_run_pattern(),
             literal_pipeline(),
             ascii_pipeline(),
             reduce_pipeline(),
@@ -147,6 +150,75 @@ def default_patterns() -> PatternRegistry:
         ]
     )
     return registry
+
+
+def literal_run_pattern() -> PipelinePattern:
+    """Return a pattern that matches dense literal pushes."""
+
+    tokens = tuple(
+        PatternToken(
+            kinds=(
+                InstructionKind.LITERAL,
+                InstructionKind.ASCII_CHUNK,
+                InstructionKind.PUSH,
+            ),
+            min_delta=0,
+            max_delta=1,
+            description="literal burst",
+        )
+        for _ in range(4)
+    )
+    return PipelinePattern(
+        name="literal_bulk",
+        category="literal",
+        tokens=tokens,
+        allow_extra=True,
+        description="Sequence of literal pushes (≥4 instructions)",
+    )
+
+
+def ascii_run_pattern() -> PipelinePattern:
+    """Return a pattern that matches clusters of ASCII chunks."""
+
+    tokens = tuple(
+        PatternToken(
+            kinds=(InstructionKind.ASCII_CHUNK,),
+            min_delta=0,
+            max_delta=0,
+            description="ascii chunk",
+        )
+        for _ in range(3)
+    )
+    return PipelinePattern(
+        name="ascii_stream",
+        category="literal",
+        tokens=tokens,
+        allow_extra=True,
+        stack_change=0,
+        description="Run of inline ASCII words",
+    )
+
+
+def marker_run_pattern() -> PipelinePattern:
+    """Return a pattern matching stack-neutral literal markers."""
+
+    tokens = tuple(
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=0,
+            description="literal marker",
+        )
+        for _ in range(3)
+    )
+    return PipelinePattern(
+        name="marker_cluster",
+        category="literal",
+        tokens=tokens,
+        allow_extra=True,
+        stack_change=0,
+        description="Cluster of literal markers",
+    )
 
 
 def literal_pipeline() -> PipelinePattern:

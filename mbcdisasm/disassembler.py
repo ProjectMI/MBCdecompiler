@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence
 
 from .analyzer import PipelineAnalyzer
+from .analyzer.instruction_profile import resolve_opcode_info
 from .instruction import InstructionWord, read_instructions
 from .knowledge import KnowledgeBase
 from .mbc import MbcContainer, Segment
@@ -57,12 +58,14 @@ class Disassembler:
         if report and report.statistics:
             stats = report.statistics
             dominant = stats.dominant_category() or "n/a"
+            recognised = stats.recognised_ratio()
             lines.append(
-                "; pipeline stats: blocks={blocks} instructions={instr} stackΔ={delta:+d} dominant={dominant}".format(
+                "; pipeline stats: blocks={blocks} instructions={instr} stackΔ={delta:+d} dominant={dominant} recognised={recognised:.2f}".format(
                     blocks=stats.block_count,
                     instr=stats.instruction_count,
                     delta=stats.total_stack_delta,
                     dominant=dominant,
+                    recognised=recognised,
                 )
             )
         if report and report.warnings:
@@ -87,10 +90,16 @@ class Disassembler:
 
     def _format_instruction(self, instruction: InstructionWord) -> str:
         key = instruction.label()
-        info = self.knowledge.lookup(key)
+        info, heuristic = resolve_opcode_info(instruction, self.knowledge)
 
         mnemonic = info.mnemonic if info else f"op_{instruction.opcode:02X}_{instruction.mode:02X}"
-        summary = f" ; {info.summary}" if info and info.summary else ""
+        summary = ""
+        if info and info.summary:
+            summary = f" ; {info.summary}"
+            if heuristic:
+                summary += " (heuristic)"
+        elif heuristic:
+            summary = " ; heuristic"
 
         return (
             f"{instruction.offset:08X}: {instruction.raw:08X}    "

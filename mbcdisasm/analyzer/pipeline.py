@@ -16,6 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
+from .signatures import SignatureDetector
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -47,6 +48,7 @@ class PipelineAnalyzer:
         self.diagnostics = DiagnosticBuilder()
         self.statistics_builder = StatisticsBuilder()
         self.automaton = DeterministicAutomaton(self.registry)
+        self.signatures = SignatureDetector()
 
     # ------------------------------------------------------------------
     # public API
@@ -137,6 +139,16 @@ class PipelineAnalyzer:
                 confidence *= 0.85
                 notes.append("uncertain stack delta")
             return category, confidence, notes
+
+        signature = self.signatures.detect(profiles, stack)
+        if signature is not None:
+            notes.append(f"signature={signature.name}")
+            notes.extend(signature.notes)
+            confidence = max(self.settings.min_confidence, signature.confidence)
+            if stack.uncertain:
+                confidence *= 0.85
+                notes.append("uncertain stack delta")
+            return signature.category, confidence, notes
 
         dominant = dominant_kind(profiles)
         category = "unknown"

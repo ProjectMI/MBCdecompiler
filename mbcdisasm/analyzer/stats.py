@@ -73,6 +73,16 @@ class PipelineStatistics:
             return None
         return max(self.categories.items(), key=lambda item: item[1].count)[0]
 
+    def recognised_ratio(self) -> float:
+        """Return the fraction of blocks assigned a non-unknown category."""
+
+        if not self.block_count:
+            return 0.0
+        unknown = self.categories.get("unknown")
+        unknown_count = unknown.count if unknown else 0
+        recognised = self.block_count - unknown_count
+        return recognised / self.block_count
+
     def describe(self) -> str:
         pieces = [f"blocks={self.block_count}", f"instr={self.instruction_count}", f"stackΔ={self.total_stack_delta:+d}"]
         for category, stats in self.categories.items():
