@@ -12,48 +12,38 @@ python mbc_lua_reconstruct.py <adb> <mbc>
 
 Key options:
 
-- `- `--segment <id ...>` limits the work to selected segment indices.
-- `- `--max-instr <count>` truncates each segment disassembly after the specified number of instructions.
-- `- `--opcode-limit <count>` caps the length of the opcode coverage table shown on stdout.
-- `- `--disasm-out <path>` overrides the default `<mbc name>.disasm.txt` output path.
-- `- `--analysis-out <path>` writes a JSON summary of the current run.
-- `- `--knowledge-base <path>` points to the opcode knowledge base JSON document (default `knowledge/opcode_profiles.json`).
-- `- `--update-knowledge` merges the observed statistics back into the knowledge base and
-  automatically refreshes stack delta annotations when the new samples are
-  confident.
-
-- `--segment SEGMENTS 
-- `--max-instr MAX_INSTR 
-- `--knowledge-base KNOWLEDGE_BASE
-- `--output OUTPUT 
-- `--keep-duplicate-comments
-- `--inline-comment-width INLINE_COMMENT_WIDTH 
-- `--no-stub-metadata 
-- `--no-enum-metadata
-- `--no-module-summary 
-- `--no-literal-report 
-- `--min-string-length MIN_STRING_LENGTH
-- `--data-hex-bytes DATA_HEX_BYTES 
-- `--data-hex-width DATA_HEX_WIDTH 
-- `--no-data-hex
-- `--data-histogram DATA_HISTOGRAM 
-- `--data-run-threshold DATA_RUN_THRESHOLD
-- `--data-max-runs DATA_MAX_RUNS 
-- `--string-table
-- `--string-table-min-occurrences STRING_TABLE_MIN_OCCURRENCES 
-- `--data-stats
-- `--emit-data-table 
-- `--data-table-name DATA_TABLE_NAME 
-- `--data-table-return
-- `--literal-report-json LITERAL_REPORT_JSON 
-- `--analysis-text ANALYSIS_TEXT
-- `--analysis-json ANALYSIS_JSON 
-- `--analysis-markdown ANALYSIS_MARKDOWN
-- `--analysis-csv ANALYSIS_CSV 
-- `--analysis-helper-csv ANALYSIS_HELPER_CSV
-- `--analysis-summary 
-- `--analysis-warning-report ANALYSIS_WARNING_REPORT
-- `--analysis-warning-stdout
+- --segment SEGMENTS 
+- --max-instr MAX_INSTR 
+- --knowledge-base KNOWLEDGE_BASE
+- --output OUTPUT 
+- --keep-duplicate-comments
+- --inline-comment-width INLINE_COMMENT_WIDTH 
+- --no-stub-metadata 
+- --no-enum-metadata
+- --no-module-summary 
+- --no-literal-report 
+- --min-string-length MIN_STRING_LENGTH
+- --data-hex-bytes DATA_HEX_BYTES 
+- --data-hex-width DATA_HEX_WIDTH 
+- --no-data-hex
+- --data-histogram DATA_HISTOGRAM 
+- --data-run-threshold DATA_RUN_THRESHOLD
+- --data-max-runs DATA_MAX_RUNS 
+- --string-table
+- --string-table-min-occurrences STRING_TABLE_MIN_OCCURRENCES 
+- --data-stats
+- --emit-data-table 
+- --data-table-name DATA_TABLE_NAME 
+- --data-table-return
+- --literal-report-json LITERAL_REPORT_JSON 
+- --analysis-text ANALYSIS_TEXT
+- --analysis-json ANALYSIS_JSON 
+- --analysis-markdown ANALYSIS_MARKDOWN
+- --analysis-csv ANALYSIS_CSV 
+- --analysis-helper-csv ANALYSIS_HELPER_CSV
+- --analysis-summary 
+- --analysis-warning-report ANALYSIS_WARNING_REPORT
+- --analysis-warning-stdout
 
 ### Quick summaries
 
