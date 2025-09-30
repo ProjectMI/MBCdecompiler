@@ -144,6 +144,8 @@ def default_patterns() -> PatternRegistry:
             call_preparation_pipeline(),
             return_pipeline(),
             indirect_load_pipeline(),
+            marker_literal_pipeline(),
+            marker_return_pipeline(),
         ]
     )
     return registry
@@ -322,4 +324,71 @@ def indirect_load_pipeline() -> PipelinePattern:
         category="indirect",
         tokens=tokens,
         description="Push base/key then resolve table entry",
+    )
+
+
+def marker_literal_pipeline() -> PipelinePattern:
+    """Return the pattern for literal payloads prefixed with markers."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.MARKER,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="marker prefix",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL, InstructionKind.PUSH, InstructionKind.ASCII_CHUNK),
+            min_delta=1,
+            description="payload literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.REDUCE, InstructionKind.MARKER, InstructionKind.STACK_TEARDOWN),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+            description="reducer or trailer marker",
+        ),
+    )
+    return PipelinePattern(
+        name="marker_literal",
+        category="literal",
+        tokens=tokens,
+        allow_extra=True,
+        description="Marker annotated literal payload",
+    )
+
+
+def marker_return_pipeline() -> PipelinePattern:
+    """Return a pattern for marker-wrapped return sequences."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.MARKER,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="marker header",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.STACK_TEARDOWN, InstructionKind.MARKER),
+            min_delta=-3,
+            max_delta=0,
+            allow_unknown=True,
+            description="optional teardown",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.RETURN, InstructionKind.TERMINATOR),
+            min_delta=-2,
+            max_delta=0,
+            description="return",
+        ),
+    )
+    return PipelinePattern(
+        name="marker_return",
+        category="return",
+        tokens=tokens,
+        allow_extra=True,
+        description="Marker framed return sequence",
     )

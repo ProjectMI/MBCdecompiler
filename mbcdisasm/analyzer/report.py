@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, dominant_kind
 from .patterns import PatternMatch
 from .stack import StackSummary
 from .stats import PipelineStatistics
+
+if TYPE_CHECKING:  # pragma: no cover - for type hints only
+    from .block_refiner import RefinementSummary
 
 
 @dataclass
@@ -70,6 +73,7 @@ class PipelineReport:
     blocks: Tuple[PipelineBlock, ...]
     warnings: Tuple[str, ...] = tuple()
     statistics: Optional[PipelineStatistics] = None
+    refinement: Optional["RefinementSummary"] = None
 
     def describe(self) -> str:
         lines = ["Pipeline analysis report:"]
@@ -81,6 +85,8 @@ class PipelineReport:
                 lines.append("  - " + warning)
         if self.statistics:
             lines.append("Statistics: " + self.statistics.describe())
+        if self.refinement:
+            lines.append("Refinement: " + self.refinement.describe())
         return "\n".join(lines)
 
     def filter_by_category(self, category: str) -> Tuple[PipelineBlock, ...]:
@@ -91,7 +97,7 @@ class PipelineReport:
 
     @classmethod
     def empty(cls) -> "PipelineReport":
-        return cls(blocks=tuple(), warnings=tuple(), statistics=None)
+        return cls(blocks=tuple(), warnings=tuple(), statistics=None, refinement=None)
 
 
 def build_block(

@@ -19,6 +19,7 @@ from .patterns import PatternMatch, PatternRegistry, default_patterns
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
+from .block_refiner import BlockRefiner
 
 
 @dataclass
@@ -47,6 +48,7 @@ class PipelineAnalyzer:
         self.diagnostics = DiagnosticBuilder()
         self.statistics_builder = StatisticsBuilder()
         self.automaton = DeterministicAutomaton(self.registry)
+        self.refiner = BlockRefiner()
 
     # ------------------------------------------------------------------
     # public API
@@ -57,9 +59,16 @@ class PipelineAnalyzer:
             return PipelineReport.empty()
         events = self._compute_events(profiles)
         blocks = self._segment_into_blocks(profiles, events)
+        blocks = list(self.refiner.refine(blocks))
         warnings = self._generate_warnings(blocks)
         statistics = self.statistics_builder.collect(blocks)
-        return PipelineReport(blocks=tuple(blocks), warnings=tuple(warnings), statistics=statistics)
+        refinement = self.refiner.summarise(blocks)
+        return PipelineReport(
+            blocks=tuple(blocks),
+            warnings=tuple(warnings),
+            statistics=statistics,
+            refinement=refinement,
+        )
 
     analyze_segment = analyse_segment  # alias for US spelling
 
@@ -142,7 +151,7 @@ class PipelineAnalyzer:
         category = "unknown"
         confidence = self.settings.min_confidence
 
-        if dominant in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+        if dominant in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH, InstructionKind.MARKER}:
             category = "literal"
             confidence = 0.55
         elif dominant in {InstructionKind.REDUCE, InstructionKind.ARITHMETIC}:
@@ -173,6 +182,10 @@ class PipelineAnalyzer:
 
         if "return_sequence" in feature_map or "stack_teardown" in feature_map:
             category = "return"
+            confidence = max(confidence, 0.6)
+
+        if "marker_chain" in feature_map or "marker_block" in feature_map:
+            category = "literal"
             confidence = max(confidence, 0.6)
 
         if stack.change > 0 and category == "compute":

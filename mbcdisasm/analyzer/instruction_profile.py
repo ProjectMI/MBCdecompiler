@@ -24,6 +24,7 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
+from .lexicon import has_keyword
 
 
 class InstructionKind(Enum):
@@ -54,6 +55,7 @@ class InstructionKind(Enum):
     ARITHMETIC = auto()
     LOGICAL = auto()
     BITWISE = auto()
+    MARKER = auto()
     META = auto()
     UNKNOWN = auto()
 
@@ -89,6 +91,12 @@ class StackEffectHint:
 
         if info is None:
             return cls(nominal=0, minimum=0, maximum=0, confidence=0.25)
+
+        summary = info.summary or ""
+        if summary:
+            lowered = summary.casefold()
+            if "не изменяют" in lowered or "не изменяет" in lowered or has_keyword(summary, "marker"):
+                return cls(nominal=0, minimum=0, maximum=0, confidence=0.9)
 
         if info.stack_delta is not None:
             delta = int(info.stack_delta)
@@ -228,59 +236,34 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
         if "control" in control:
             return InstructionKind.CONTROL
 
-    if info.category:
-        category = info.category.lower()
-        if "literal" in category:
-            return InstructionKind.LITERAL
-        if "ascii" in category:
-            return InstructionKind.ASCII_CHUNK
-        if "push" in category:
-            return InstructionKind.PUSH
-        if "reduce" in category or "fold" in category:
-            return InstructionKind.REDUCE
-        if "teardown" in category or "pop" in category:
-            return InstructionKind.STACK_TEARDOWN
-        if "copy" in category or "dup" in category:
-            return InstructionKind.STACK_COPY
-        if "test" in category:
-            return InstructionKind.TEST
-        if "indirect" in category or "table" in category:
-            return InstructionKind.INDIRECT
-        if "tailcall" in category:
-            return InstructionKind.TAILCALL
-        if "return" in category:
-            return InstructionKind.RETURN
-        if "terminator" in category:
-            return InstructionKind.TERMINATOR
+    texts = tuple(filter(None, (info.category, info.summary, info.mnemonic)))
 
-    mnemonic = (info.mnemonic or "").lower()
-    summary = (info.summary or "").lower()
+    keyword_order = (
+        ("marker", InstructionKind.MARKER),
+        ("literal", InstructionKind.LITERAL),
+        ("ascii", InstructionKind.ASCII_CHUNK),
+        ("push", InstructionKind.PUSH),
+        ("reduce", InstructionKind.REDUCE),
+        ("stack_teardown", InstructionKind.STACK_TEARDOWN),
+        ("copy", InstructionKind.STACK_COPY),
+        ("test", InstructionKind.TEST),
+        ("indirect", InstructionKind.INDIRECT),
+        ("table", InstructionKind.TABLE_LOOKUP),
+        ("call", InstructionKind.CALL),
+        ("return", InstructionKind.RETURN),
+        ("terminator", InstructionKind.TERMINATOR),
+        ("arithmetic", InstructionKind.ARITHMETIC),
+        ("logical", InstructionKind.LOGICAL),
+        ("bitwise", InstructionKind.BITWISE),
+        ("meta", InstructionKind.META),
+    )
 
-    for source in (mnemonic, summary):
-        if not source:
-            continue
-        if "literal" in source or "const" in source:
-            return InstructionKind.LITERAL
-        if "push" in source and "stack" in source:
-            return InstructionKind.PUSH
-        if "reduce" in source or "fold" in source:
-            return InstructionKind.REDUCE
-        if "test" in source and "branch" in source:
-            return InstructionKind.TEST
-        if "stack" in source and ("clear" in source or "teardown" in source or "drop" in source):
-            return InstructionKind.STACK_TEARDOWN
-        if "duplicate" in source or "copy" in source:
-            return InstructionKind.STACK_COPY
-        if "table" in source or "index" in source:
-            return InstructionKind.TABLE_LOOKUP
-        if "arith" in source or "math" in source:
-            return InstructionKind.ARITHMETIC
-        if "logic" in source or "boolean" in source:
-            return InstructionKind.LOGICAL
-        if "bit" in source:
-            return InstructionKind.BITWISE
-        if "meta" in source or "helper" in source:
-            return InstructionKind.META
+    for keyword, kind in keyword_order:
+        for text in texts:
+            if has_keyword(text, keyword):
+                if kind is InstructionKind.CALL and "tail" in (text.casefold() if text else ""):
+                    return InstructionKind.TAILCALL
+                return kind
 
     return guess_kind_from_opcode(word)
 
@@ -302,8 +285,11 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x16}:
         return InstructionKind.CALL
 
-    if opcode in {0x41, 0x47, 0x90, 0xDC, 0xF4}:
+    if opcode in {0x41, 0x47, 0x90, 0xDC}:
         return InstructionKind.ASCII_CHUNK
+
+    if opcode in {0x14, 0x40, 0xE4, 0xF4}:
+        return InstructionKind.MARKER
 
     if opcode in {0x01}:
         return InstructionKind.STACK_TEARDOWN
@@ -329,7 +315,7 @@ def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
     if kind is InstructionKind.ASCII_CHUNK and profile.stack_hint.nominal == 0:
         return 1
 
-    if kind is InstructionKind.LITERAL and profile.stack_hint.nominal == 0:
+    if kind in {InstructionKind.LITERAL, InstructionKind.MARKER} and profile.stack_hint.nominal == 0:
         return 1
 
     if kind is InstructionKind.PUSH and profile.stack_hint.nominal == 0:

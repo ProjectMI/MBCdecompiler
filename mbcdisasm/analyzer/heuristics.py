@@ -71,6 +71,10 @@ class HeuristicSettings:
     call_weight: float = 0.3
     return_weight: float = 0.25
     indirect_weight: float = 0.2
+    marker_weight: float = 0.12
+    ascii_weight: float = 0.1
+    coverage_bonus: float = 0.08
+    sparse_penalty: float = -0.08
     max_literal_gap: int = 2
     max_call_gap: int = 3
 
@@ -93,10 +97,13 @@ class HeuristicEngine:
 
         features.extend(self._stack_features(stack))
         features.extend(self._literal_features(profiles))
+        features.extend(self._marker_features(profiles))
+        features.extend(self._ascii_features(profiles))
         features.extend(self._call_features(profiles, following))
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
         features.extend(self._context_features(previous, following))
+        features.extend(self._density_features(profiles))
 
         confidence = sum(feature.score for feature in features)
         confidence = max(0.0, min(1.0, confidence))
@@ -138,6 +145,7 @@ class HeuristicEngine:
                 InstructionKind.ASCII_CHUNK,
                 InstructionKind.PUSH,
                 InstructionKind.TABLE_LOOKUP,
+                InstructionKind.MARKER,
             },
         )
         features: List[LocalFeature] = []
@@ -145,6 +153,16 @@ class HeuristicEngine:
             weight = self.settings.literal_weight * len(literal_like)
             evidence = tuple(profile.label for profile in literal_like[:3])
             features.append(LocalFeature(name="literal_chain", score=weight, evidence=evidence))
+        push_ops = filter_profiles(profiles, {InstructionKind.PUSH})
+        if push_ops:
+            weight = self.settings.push_weight * len(push_ops)
+            features.append(
+                LocalFeature(
+                    name="push_sequence",
+                    score=weight,
+                    evidence=tuple(profile.label for profile in push_ops[:3]),
+                )
+            )
         gaps = self._literal_gaps(profiles)
         if gaps:
             for gap in gaps:
@@ -155,7 +173,12 @@ class HeuristicEngine:
         gaps: List[int] = []
         run = 0
         for profile in profiles:
-            if profile.kind in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+            if profile.kind in {
+                InstructionKind.LITERAL,
+                InstructionKind.ASCII_CHUNK,
+                InstructionKind.PUSH,
+                InstructionKind.MARKER,
+            }:
                 run += 1
                 continue
             if run:
@@ -165,6 +188,86 @@ class HeuristicEngine:
         if run and run <= self.settings.max_literal_gap:
             gaps.append(run)
         return gaps
+
+    def _marker_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        markers = filter_profiles(profiles, {InstructionKind.MARKER})
+        features: List[LocalFeature] = []
+        if not markers:
+            return features
+
+        weight = self.settings.marker_weight * len(markers)
+        evidence = tuple(profile.label for profile in markers[:3])
+        features.append(LocalFeature(name="marker_chain", score=weight, evidence=evidence))
+
+        longest = self._longest_marker_run(profiles)
+        if longest >= 2:
+            features.append(LocalFeature(name="marker_run", score=0.05 * longest, evidence=(str(longest),)))
+
+        if len(markers) == len(profiles):
+            features.append(
+                LocalFeature(
+                    name="marker_block",
+                    score=weight * 0.5,
+                    evidence=(markers[0].label, markers[-1].label),
+                )
+            )
+
+        if profiles and profiles[0].kind is InstructionKind.MARKER:
+            features.append(LocalFeature(name="marker_prefix", score=0.03, evidence=(profiles[0].label,)))
+        if profiles and profiles[-1].kind is InstructionKind.MARKER:
+            features.append(LocalFeature(name="marker_suffix", score=0.03, evidence=(profiles[-1].label,)))
+
+        return features
+
+    def _longest_marker_run(self, profiles: Sequence[InstructionProfile]) -> int:
+        best = 0
+        run = 0
+        for profile in profiles:
+            if profile.kind is InstructionKind.MARKER:
+                run += 1
+                best = max(best, run)
+            else:
+                run = 0
+        return best
+
+    def _ascii_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        ascii_chunks = filter_profiles(profiles, {InstructionKind.ASCII_CHUNK})
+        features: List[LocalFeature] = []
+        if not ascii_chunks:
+            return features
+
+        weight = self.settings.ascii_weight * len(ascii_chunks)
+        evidence = tuple(profile.label for profile in ascii_chunks[:3])
+        features.append(LocalFeature(name="ascii_payload", score=weight, evidence=evidence))
+
+        reducers = filter_profiles(profiles, {InstructionKind.REDUCE})
+        if reducers:
+            features.append(
+                LocalFeature(
+                    name="ascii_reduce_hint",
+                    score=0.05 * len(reducers),
+                    evidence=tuple(profile.label for profile in reducers[:2]),
+                )
+            )
+
+        return features
+
+    def _density_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        features: List[LocalFeature] = []
+        if not profiles:
+            return features
+
+        known = sum(1 for profile in profiles if profile.kind is not InstructionKind.UNKNOWN)
+        ratio = known / len(profiles)
+
+        if known == len(profiles):
+            features.append(LocalFeature(name="full_recognition", score=self.settings.coverage_bonus))
+        elif ratio >= 0.6:
+            features.append(LocalFeature(name="partial_recognition", score=self.settings.coverage_bonus * 0.5, evidence=(f"{ratio:.2f}",)))
+        else:
+            features.append(LocalFeature(name="sparse_block", score=self.settings.sparse_penalty, evidence=(f"{ratio:.2f}",)))
+
+        return features
 
     def _call_features(
         self,
@@ -245,4 +348,8 @@ class HeuristicEngine:
             features.append(LocalFeature(name="pre_control", score=0.05, evidence=(previous.label,)))
         if following and following.is_control():
             features.append(LocalFeature(name="post_control", score=0.05, evidence=(following.label,)))
+        if previous and previous.kind is InstructionKind.MARKER:
+            features.append(LocalFeature(name="marker_context", score=0.02, evidence=(previous.label,)))
+        if following and following.kind is InstructionKind.MARKER:
+            features.append(LocalFeature(name="marker_context", score=0.02, evidence=(following.label,)))
         return features

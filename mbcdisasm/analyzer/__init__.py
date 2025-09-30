@@ -43,5 +43,15 @@ patterns that need manual review.
 
 from .pipeline import PipelineAnalyzer
 from .report import PipelineBlock, PipelineReport
+from .comparison import ReportComparator, describe_diff
+from .insights import build_report_table, format_report_table
 
-__all__ = ["PipelineAnalyzer", "PipelineBlock", "PipelineReport"]
+__all__ = [
+    "PipelineAnalyzer",
+    "PipelineBlock",
+    "PipelineReport",
+    "ReportComparator",
+    "describe_diff",
+    "build_report_table",
+    "format_report_table",
+]

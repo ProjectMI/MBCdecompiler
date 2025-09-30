@@ -65,6 +65,8 @@ class Disassembler:
                     dominant=dominant,
                 )
             )
+        if report and report.refinement:
+            lines.append("; pipeline refinement: " + report.refinement.describe())
         if report and report.warnings:
             lines.append("; pipeline warnings:")
             for warning in report.warnings:
