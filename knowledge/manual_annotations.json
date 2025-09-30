@@ -326,5 +326,40 @@
   },
   "unclassified": {
     "opcodes": []
+  },
+  "29:*": {
+    "category": "tailcall_dispatch",
+    "diapasone": "0x00–0xFF",
+    "comment": "Все моды хвостовых вызовов; наиболее частый 0x10"
+  },
+  "30:*": {
+    "category": "return_values",
+    "diapasone": "0x00–0xFF",
+    "comment": "Возвраты с параметризацией по количеству/месту значений; часто 0x29, 0x69"
+  },
+  "22:*": {
+    "category": "jump_relative",
+    "diapasone": "0x00–0xFF",
+    "comment": "Безусловные прыжки с различными модификаторами"
+  },
+  "26:*": {
+    "category": "test_branch",
+    "diapasone": "0x00–0xFF",
+    "comment": "Условные тестовые ветвления; например 0x2C"
+  },
+  "27:*": {
+    "category": "testset_branch",
+    "diapasone": "0x00–0xFF",
+    "comment": "TestSet-ветвления всех модов"
+  },
+  "FF:*": {
+    "category": "terminator",
+    "diapasone": "0x00–0xFF",
+    "comment": "Терминаторы всех модов; часто встречаются 0x00, 0x30, 0x69"
+  },
+  "16:*": {
+    "category": "call_helpers",
+    "diapasone": "0x00–0xFF",
+    "comment": "Вспомогательные вызовы с разными модами (00, 04, 64, 84, AC, D0 и др.)"
   }
 }
