@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Mapping, Optional
@@ -43,8 +44,11 @@ class KnowledgeBase:
                 mnemonic = str(entry.get("name") or key)
                 summary = entry.get("summary")
                 for label in entry.get("opcodes", []):
-                    if isinstance(label, str):
-                        annotations[label.upper()] = OpcodeInfo(mnemonic=mnemonic, summary=summary)
+                    if not isinstance(label, str):
+                        continue
+                    normalized = _normalize_label(label)
+                    if normalized is not None:
+                        annotations[normalized] = OpcodeInfo(mnemonic=mnemonic, summary=summary)
 
         return cls(annotations)
 
@@ -52,3 +56,45 @@ class KnowledgeBase:
         """Return manual information for the requested opcode label."""
 
         return self._annotations.get(label.upper())
+
+
+def _parse_component(component: str) -> int:
+    """Parse a single opcode component which may be hex or decimal."""
+
+    token = component.strip()
+    if not token:
+        raise ValueError("empty component")
+
+    if token.lower().startswith("0x"):
+        return int(token, 16)
+
+    if any(ch in string.hexdigits[10:] for ch in token):
+        return int(token, 16)
+
+    return int(token, 10)
+
+
+def _normalize_label(label: str) -> Optional[str]:
+    """Convert mixed-format labels to canonical hexadecimal form."""
+
+    token = label.strip()
+    if not token:
+        return None
+
+    if ":" not in token:
+        return token.upper()
+
+    parts = token.split(":")
+    if len(parts) != 2:
+        return token.upper()
+
+    try:
+        opcode = _parse_component(parts[0])
+        mode = _parse_component(parts[1])
+    except ValueError:
+        return token.upper()
+
+    if not (0 <= opcode <= 0xFF and 0 <= mode <= 0xFF):
+        return None
+
+    return f"{opcode:02X}:{mode:02X}"
