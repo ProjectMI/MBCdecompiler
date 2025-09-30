@@ -8,6 +8,7 @@ from mbcdisasm.highlevel import (
     FunctionMetadata,
     HighLevelFunction,
     HighLevelReconstructor,
+    StackEvent,
 )
 from mbcdisasm.literal_sequences import (
     LiteralDescriptor,
@@ -193,6 +194,46 @@ def test_highlevel_function_summary_and_warnings() -> None:
     assert "-- stack reconstruction warnings:" in rendered
     assert "-- - stack underflow" in rendered
     assert "function segment_001()" in rendered
+
+
+def test_function_metadata_stack_depth_sections() -> None:
+    events = (
+        StackEvent(
+            action="push",
+            value="tmp_0",
+            origin=0x10,
+            comment=None,
+            depth_before=0,
+            depth_after=1,
+        ),
+        StackEvent(
+            action="pop",
+            value="tmp_0",
+            origin=0x14,
+            comment="placeholder",
+            depth_before=1,
+            depth_after=-1,
+        ),
+    )
+    metadata = FunctionMetadata(
+        block_count=2,
+        instruction_count=5,
+        stack_events=events,
+        stack_depth_min=-1,
+        stack_depth_max=3,
+        stack_depth_final=-1,
+        stack_underflows=2,
+    )
+
+    summary = metadata.summary_lines()
+    assert "- peak stack depth: 3" in summary
+    assert "- deepest underflow depth: -1 (events=2)" in summary
+    assert "- final stack depth: -1" in summary
+
+    stack_summary = metadata.stack_event_summary_lines()
+    assert "- peak stack depth: 3" in stack_summary
+    assert "- minimum stack depth: -1 (underflows=2)" in stack_summary
+    assert "depth=-1" in " ".join(stack_summary)
 
 
 def test_highlevel_function_string_metadata_block() -> None:

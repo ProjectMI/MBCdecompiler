@@ -18,6 +18,7 @@ from .lua_ast import (
     CallExpr,
     CallStatement,
     CommentStatement,
+    CommentedStatement,
     IfClause,
     IfStatement,
     LuaExpression,
@@ -57,13 +58,67 @@ from .lua_literals import LuaLiteral, LuaLiteralFormatter, escape_lua_string
 from .vm_analysis import estimate_stack_io
 
 
+@dataclass
+class StackValue:
+    """Represents a symbolic value stored on the evaluation stack."""
+
+    expression: LuaExpression
+    origin: Optional[int] = None
+    comments: List[str] = field(default_factory=list)
+
+    def add_comment(self, text: str) -> None:
+        if not text:
+            return
+        if text not in self.comments:
+            self.comments.append(text)
+
+    def add_comments(self, comments: Iterable[str]) -> None:
+        for comment in comments:
+            self.add_comment(comment)
+
+    def take_comments(self) -> List[str]:
+        comments = list(self.comments)
+        self.comments.clear()
+        return comments
+
+
+@dataclass
+class InstructionTraceInfo:
+    """Aggregated usage information for a single instruction."""
+
+    offset: int
+    mnemonic: str
+    summary: str
+    usages: List[Tuple[str, str]] = field(default_factory=list)
+
+    def add_usage(self, role: str, comment: str) -> None:
+        self.usages.append((role, comment))
+
+
+@dataclass
+class StackEvent:
+    """Records a single stack mutation during reconstruction."""
+
+    action: str
+    value: str
+    origin: Optional[int]
+    comment: Optional[str] = None
+    depth_before: int = 0
+    depth_after: int = 0
+
+
 class HighLevelStack:
     """Track symbolic stack values during reconstruction."""
 
     def __init__(self) -> None:
-        self._values: List[LuaExpression] = []
+        self._values: List[StackValue] = []
         self._counter = 0
         self.warnings: List[str] = []
+        self._events: List[StackEvent] = []
+        self._depth = 0
+        self._min_depth = 0
+        self._max_depth = 0
+        self._underflow_events = 0
 
     def new_symbol(self, prefix: str = "value") -> str:
         name = f"{prefix}_{self._counter}"
@@ -71,10 +126,15 @@ class HighLevelStack:
         return name
 
     def push_literal(
-        self, expression: LuaExpression
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
-        self._values.append(expression)
-        return [], expression
+        self,
+        expression: LuaExpression,
+        *,
+        origin: Optional[int] = None,
+    ) -> Tuple[List[LuaStatement], StackValue]:
+        value = StackValue(expression=expression, origin=origin)
+        self._values.append(value)
+        self._record_push(expression.render(), origin)
+        return [], value
 
     def push_expression(
         self,
@@ -82,107 +142,198 @@ class HighLevelStack:
         *,
         prefix: str = "tmp",
         make_local: bool = False,
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
-        if make_local:
+        origin: Optional[int] = None,
+    ) -> Tuple[List[LuaStatement], StackValue]:
+        if make_local or not isinstance(expression, NameExpr):
             name = self.new_symbol(prefix)
             target = NameExpr(name)
             statement = Assignment([target], expression, is_local=True)
-            self._values.append(target)
-            return [statement], target
-        if isinstance(expression, NameExpr):
-            self._values.append(expression)
-            return [], expression
-        name = self.new_symbol(prefix)
-        target = NameExpr(name)
-        statement = Assignment([target], expression, is_local=True)
-        self._values.append(target)
-        return [statement], target
+            value = StackValue(target, origin=origin)
+            self._values.append(value)
+            self._record_push(target.render(), origin)
+            return [statement], value
+        value = StackValue(expression, origin=origin)
+        self._values.append(value)
+        self._record_push(expression.render(), origin)
+        return [], value
 
     def push_call_results(
-        self, expression: CallExpr, outputs: int, prefix: str = "result"
-    ) -> Tuple[List[LuaStatement], List[NameExpr]]:
+        self,
+        expression: CallExpr,
+        outputs: int,
+        prefix: str = "result",
+        *,
+        origin: Optional[int] = None,
+    ) -> Tuple[List[LuaStatement], List[StackValue]]:
         if outputs <= 0:
             return [], []
         if outputs == 1:
             name = self.new_symbol(prefix)
             target = NameExpr(name)
             stmt = Assignment([target], expression, is_local=True)
-            self._values.append(target)
-            return [stmt], [target]
+            value = StackValue(target, origin=origin)
+            self._values.append(value)
+            self._record_push(target.render(), origin)
+            return [stmt], [value]
         targets = [NameExpr(self.new_symbol(prefix)) for _ in range(outputs)]
         stmt = MultiAssignment(targets, [expression], is_local=True)
+        values = [StackValue(target, origin=origin) for target in targets]
+        self._values.extend(values)
         for target in targets:
-            self._values.append(target)
-        return [stmt], targets
+            self._record_push(target.render(), origin)
+        return [stmt], values
 
-    def pop_single(self) -> LuaExpression:
+    def pop_single(self) -> StackValue:
         if self._values:
-            return self._values.pop()
+            value = self._values.pop()
+            self._record_pop("pop", value.expression.render(), value.origin)
+            return value
         placeholder = NameExpr(self.new_symbol("stack"))
-        self.warnings.append(
-            f"underflow generated placeholder {placeholder.name}"
-        )
-        return placeholder
+        warning = f"underflow generated placeholder {placeholder.name}"
+        self.warnings.append(warning)
+        value = StackValue(placeholder)
+        value.add_comment(warning)
+        self._record_pop("pop", placeholder.render(), None, warning)
+        return value
 
-    def pop_many(self, count: int) -> List[LuaExpression]:
+    def pop_many(self, count: int) -> List[StackValue]:
         items = [self.pop_single() for _ in range(count)]
         items.reverse()
         return items
 
-    def pop_pair(self) -> Tuple[LuaExpression, LuaExpression]:
+    def pop_pair(self) -> Tuple[StackValue, StackValue]:
         lhs, rhs = self.pop_many(2)
         return lhs, rhs
 
-    def flush(self) -> List[LuaExpression]:
-        values = list(self._values)
-        self._values.clear()
-        return values
+    def flush(self) -> List[StackValue]:
+        if not self._values:
+            return []
+        flushed: List[StackValue] = []
+        while self._values:
+            value = self._values.pop()
+            self._record_pop("flush", value.expression.render(), value.origin)
+            flushed.append(value)
+        flushed.reverse()
+        return flushed
+
+    def annotate_top(self, comment: str) -> None:
+        if not self._values:
+            return
+        self._values[-1].add_comment(comment)
+
+    def events(self) -> Sequence[StackEvent]:
+        return tuple(self._events)
+
+    @property
+    def depth(self) -> int:
+        return self._depth
+
+    @property
+    def min_depth(self) -> int:
+        return self._min_depth
+
+    @property
+    def max_depth(self) -> int:
+        return self._max_depth
+
+    @property
+    def underflow_events(self) -> int:
+        return self._underflow_events
+
+    def _log_event(
+        self,
+        action: str,
+        value_repr: str,
+        origin: Optional[int],
+        comment: Optional[str] = None,
+        *,
+        depth_before: Optional[int] = None,
+        depth_after: Optional[int] = None,
+    ) -> None:
+        before = self._depth if depth_before is None else depth_before
+        after = self._depth if depth_after is None else depth_after
+        self._events.append(
+            StackEvent(
+                action,
+                value_repr,
+                origin,
+                comment,
+                before,
+                after,
+            )
+        )
+
+    def _record_push(self, value_repr: str, origin: Optional[int]) -> None:
+        before = self._depth
+        self._depth += 1
+        self._max_depth = max(self._max_depth, self._depth)
+        self._log_event(
+            "push",
+            value_repr,
+            origin,
+            depth_before=before,
+            depth_after=self._depth,
+        )
+
+    def _record_pop(
+        self,
+        action: str,
+        value_repr: str,
+        origin: Optional[int],
+        comment: Optional[str] = None,
+    ) -> None:
+        before = self._depth
+        self._depth -= 1
+        self._min_depth = min(self._min_depth, self._depth)
+        if self._depth < 0:
+            self._underflow_events += 1
+        self._log_event(
+            action,
+            value_repr,
+            origin,
+            comment,
+            depth_before=before,
+            depth_after=self._depth,
+        )
 
 
 class StringLiteralCollector:
     """Group consecutive string literal assignments into annotated sequences."""
 
     def __init__(self) -> None:
-        self._pending: List[List[LuaStatement]] = []
+        self._pending: List[StackValue] = []
         self._fragments: List[str] = []
-        self._offsets: List[int] = []
 
     def reset(self) -> None:
         self._pending.clear()
         self._fragments.clear()
-        self._offsets.clear()
 
-    def enqueue(
-        self,
-        offset: int,
-        statements: List[LuaStatement],
-        expression: LuaExpression,
-    ) -> List[LuaStatement]:
-        literal_text = self._string_value(expression)
+    def enqueue(self, _offset: int, value: StackValue) -> None:
+        literal_text = self._string_value(value.expression)
         if literal_text is None:
-            flushed = self.flush()
-            return flushed + statements
-        self._pending.append(statements)
+            self.flush()
+            return
+        self._pending.append(value)
         self._fragments.append(literal_text)
-        self._offsets.append(offset)
-        return []
 
-    def flush(self) -> List[LuaStatement]:
+    def flush(self) -> None:
         if not self._pending:
-            return []
+            return
         combined = "".join(self._fragments)
-        comment = CommentStatement(
+        sequence_comment = (
             f"string literal sequence: {escape_lua_string(combined)}"
             f" (len={len(combined)})"
         )
-        result: List[LuaStatement] = [comment]
-        for group in self._pending:
-            result.extend(group)
+        for idx, value in enumerate(self._pending):
+            if idx == 0:
+                value.add_comment(sequence_comment)
+            else:
+                fragment = escape_lua_string(self._fragments[idx])
+                value.add_comment(f"string literal fragment {idx + 1}: {fragment}")
         self.reset()
-        return result
 
-    def finalize(self) -> List[LuaStatement]:
-        return self.flush()
+    def finalize(self) -> None:
+        self.flush()
 
     @staticmethod
     def _string_value(expression: LuaExpression) -> Optional[str]:
@@ -206,6 +357,16 @@ class FunctionMetadata:
     literal_runs: Sequence[LiteralRun] = field(default_factory=tuple)
     literal_stats: Optional[LiteralStatistics] = None
     literal_report: Optional[LiteralRunReport] = None
+    value_comments: List[Tuple[str, Optional[int], str]] = field(default_factory=list)
+    instruction_trace: Dict[int, InstructionTraceInfo] = field(default_factory=dict)
+    stack_events: Sequence[StackEvent] = field(default_factory=tuple)
+    helper_usage: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {"function": {}, "method": {}}
+    )
+    stack_depth_min: int = 0
+    stack_depth_max: int = 0
+    stack_depth_final: int = 0
+    stack_underflows: int = 0
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
@@ -214,6 +375,15 @@ class FunctionMetadata:
         lines.append(f"- literal instructions: {self.literal_count}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
+        if self.stack_depth_max:
+            lines.append(f"- peak stack depth: {self.stack_depth_max}")
+        if self.stack_depth_min < 0:
+            lines.append(
+                f"- deepest underflow depth: {self.stack_depth_min}"
+                f" (events={self.stack_underflows})"
+            )
+        if self.stack_depth_final:
+            lines.append(f"- final stack depth: {self.stack_depth_final}")
         string_runs = [run for run in self.literal_runs if run.kind == "string"]
         if string_runs:
             lines.append(f"- string literal sequences: {len(string_runs)}")
@@ -261,6 +431,129 @@ class FunctionMetadata:
         blocks = self.literal_report.block_lines(limit=block_limit)
         return summary + blocks
 
+    def value_comment_summary_lines(self, *, limit: int = 6) -> List[str]:
+        if not self.value_comments:
+            return []
+        counter: Counter[str] = Counter()
+        origins: Dict[str, List[str]] = {}
+        for role, origin, comment in self.value_comments:
+            key = comment
+            counter[key] += 1
+            if origin is not None:
+                entry = f"{role} @0x{origin:06X}"
+            else:
+                entry = role
+            origins.setdefault(key, []).append(entry)
+        lines = ["value provenance summary:"]
+        for comment, count in counter.most_common(limit):
+            contexts = ", ".join(sorted(set(origins.get(comment, []))))
+            if contexts:
+                lines.append(f"- {comment} ×{count} ({contexts})")
+            else:
+                lines.append(f"- {comment} ×{count}")
+        remaining = sum(counter.values()) - sum(count for _, count in counter.most_common(limit))
+        if remaining > 0:
+            lines.append(f"- ... {remaining} additional occurrences")
+        return lines
+
+    def instruction_trace_lines(self, *, limit: int = 12) -> List[str]:
+        if not self.instruction_trace:
+            return []
+        lines = ["instruction usage trace:"]
+        count = 0
+        for offset in sorted(self.instruction_trace):
+            info = self.instruction_trace[offset]
+            header = f"- 0x{offset:06X}: {info.mnemonic}"
+            if info.summary:
+                header += f" — {info.summary}"
+            lines.append(header)
+            if info.usages:
+                for role, comment in info.usages:
+                    lines.append(f"    • {role} -> {comment}")
+            else:
+                lines.append("    • no recorded stack usage")
+            count += 1
+            if count >= limit:
+                break
+        remaining = len(self.instruction_trace) - count
+        if remaining > 0:
+            lines.append(f"- ... {remaining} additional instructions")
+        return lines
+
+    def stack_event_summary_lines(self, *, limit: int = 5) -> List[str]:
+        if not self.stack_events:
+            return []
+        action_counter = Counter(event.action for event in self.stack_events)
+        lines = ["stack event summary:"]
+        for action in ("push", "pop", "flush"):
+            if action_counter.get(action):
+                lines.append(f"- {action} events: {action_counter[action]}")
+        if self.stack_depth_max:
+            lines.append(f"- peak stack depth: {self.stack_depth_max}")
+        if self.stack_depth_min < 0:
+            lines.append(
+                f"- minimum stack depth: {self.stack_depth_min}"
+                f" (underflows={self.stack_underflows})"
+            )
+        elif self.stack_depth_min > 0:
+            lines.append(f"- minimum stack depth: {self.stack_depth_min}")
+        if self.stack_depth_final:
+            lines.append(f"- final stack depth: {self.stack_depth_final}")
+        push_counter = Counter(
+            event.value for event in self.stack_events if event.action == "push"
+        )
+        if push_counter:
+            top_pushes = ", ".join(
+                f"{value}×{count}"
+                for value, count in push_counter.most_common(limit)
+            )
+            lines.append(f"- common push values: {top_pushes}")
+            remaining = sum(push_counter.values()) - sum(
+                count for _, count in push_counter.most_common(limit)
+            )
+            if remaining > 0:
+                lines.append(f"- ... {remaining} additional push occurrences")
+        noteworthy = [event for event in self.stack_events if event.comment]
+        if noteworthy:
+            lines.append("- noteworthy stack anomalies:")
+            for event in noteworthy[:limit]:
+                origin = f" @0x{event.origin:06X}" if event.origin is not None else ""
+                depth = f" depth={event.depth_after}"
+                lines.append(
+                    f"  • {event.action}{origin}: {event.comment}"
+                    f" ({event.value};{depth})"
+                )
+            extra = len(noteworthy) - min(len(noteworthy), limit)
+            if extra > 0:
+                lines.append(f"  • ... {extra} additional events with comments")
+        return lines
+
+    def helper_usage_lines(self, *, limit: int = 6) -> List[str]:
+        function_usage = self.helper_usage.get("function", {})
+        method_usage = self.helper_usage.get("method", {})
+        if not function_usage and not method_usage:
+            return []
+        lines = ["helper usage summary:"]
+        if function_usage:
+            lines.append("- helper functions:")
+            for name, count in sorted(
+                function_usage.items(), key=lambda item: (-item[1], item[0])
+            )[:limit]:
+                lines.append(f"  • {name}: {count}")
+            remaining = len(function_usage) - min(len(function_usage), limit)
+            if remaining > 0:
+                lines.append(f"  • ... {remaining} additional function helpers")
+        if method_usage:
+            lines.append("- struct methods:")
+            for name, count in sorted(
+                method_usage.items(), key=lambda item: (-item[1], item[0])
+            )[:limit]:
+                lines.append(f"  • {name}: {count}")
+            remaining = len(method_usage) - min(len(method_usage), limit)
+            if remaining > 0:
+                lines.append(f"  • ... {remaining} additional methods")
+        return lines
+
 
 @dataclass
 class HighLevelFunction:
@@ -287,6 +580,22 @@ class HighLevelFunction:
         stats_lines = self.metadata.literal_statistics_lines()
         if stats_lines:
             writer.write_comment_block(stats_lines)
+            writer.write_line("")
+        helper_lines = self.metadata.helper_usage_lines()
+        if helper_lines:
+            writer.write_comment_block(helper_lines)
+            writer.write_line("")
+        provenance_lines = self.metadata.value_comment_summary_lines()
+        if provenance_lines:
+            writer.write_comment_block(provenance_lines)
+            writer.write_line("")
+        trace_lines = self.metadata.instruction_trace_lines()
+        if trace_lines:
+            writer.write_comment_block(trace_lines)
+            writer.write_line("")
+        stack_lines = self.metadata.stack_event_summary_lines()
+        if stack_lines:
+            writer.write_comment_block(stack_lines)
             writer.write_line("")
         if self.metadata.warnings:
             writer.write_comment_block(
@@ -350,6 +659,9 @@ class BlockTranslator:
         self.helper_calls = 0
         self.branch_count = 0
         self.instruction_total = 0
+        self.value_comment_log: List[Tuple[str, Optional[int], str]] = []
+        self.trace_map: Dict[int, InstructionTraceInfo] = {}
+        self.helper_usage_counter: Counter[Tuple[str, str]] = Counter()
 
     def translate(self) -> Dict[int, BlockInfo]:
         blocks: Dict[int, BlockInfo] = {}
@@ -372,25 +684,31 @@ class BlockTranslator:
             semantics = instruction.semantics
             self._reconstructor._register_enums(semantics)
             is_last = index == len(block.instructions) - 1
+            self.trace_map.setdefault(
+                instruction.offset,
+                InstructionTraceInfo(
+                    offset=instruction.offset,
+                    mnemonic=semantics.mnemonic,
+                    summary=semantics.summary or "",
+                ),
+            )
             if semantics.has_tag("literal"):
                 operand_expr = self._reconstructor._operand_expression(
                     semantics, instruction.operand
                 )
-                literal_statements, operand_expr = self._reconstructor._translate_literal(
+                literal_statements, value = self._reconstructor._translate_literal(
                     instruction,
                     semantics,
                     self,
                     operand_expr=operand_expr,
                 )
-                self._literal_tracker.observe(instruction.offset, operand_expr)
-                queued = self._string_collector.enqueue(
-                    instruction.offset, literal_statements, operand_expr
-                )
-                statements.extend(queued)
+                self._literal_tracker.observe(instruction.offset, value.expression)
+                self._string_collector.enqueue(instruction.offset, value)
+                statements.extend(literal_statements)
                 continue
             else:
                 self._literal_tracker.break_sequence()
-            statements.extend(self._string_collector.flush())
+            self._string_collector.flush()
             if semantics.has_tag("comparison"):
                 statements.extend(
                     self._reconstructor._translate_comparison(instruction, semantics, self)
@@ -425,7 +743,7 @@ class BlockTranslator:
             statements.extend(
                 self._reconstructor._translate_generic(instruction, semantics, self)
             )
-        statements.extend(self._string_collector.finalize())
+        self._string_collector.finalize()
         self._literal_tracker.break_sequence()
         if terminator is None:
             target = block.successors[0] if block.successors else fallthrough
@@ -589,6 +907,10 @@ class HighLevelReconstructor:
         )
         base_name = self._derive_function_name(program, literal_runs)
         function_name = self._unique_function_name(base_name)
+        helper_usage: Dict[str, Dict[str, int]] = {"function": {}, "method": {}}
+        for (name, kind), count in translator.helper_usage_counter.items():
+            bucket = helper_usage.setdefault(kind, {})
+            bucket[name] = count
         metadata = FunctionMetadata(
             block_count=len(blocks),
             instruction_count=translator.instruction_total,
@@ -599,6 +921,14 @@ class HighLevelReconstructor:
             literal_runs=tuple(literal_runs),
             literal_stats=stats,
             literal_report=report,
+            value_comments=list(translator.value_comment_log),
+            instruction_trace=dict(translator.trace_map),
+            stack_events=translator.stack.events(),
+            helper_usage=helper_usage,
+            stack_depth_min=translator.stack.min_depth,
+            stack_depth_max=translator.stack.max_depth,
+            stack_depth_final=translator.stack.depth,
+            stack_underflows=translator.stack.underflow_events,
         )
         return HighLevelFunction(name=function_name, body=body, metadata=metadata)
 
@@ -639,12 +969,14 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
         *,
         operand_expr: Optional[LuaExpression] = None,
-    ) -> Tuple[List[LuaStatement], LuaExpression]:
+    ) -> Tuple[List[LuaStatement], StackValue]:
         operand = operand_expr or self._operand_expression(semantics, instruction.operand)
-        statements, _ = translator.stack.push_literal(operand)
+        statements, value = translator.stack.push_literal(
+            operand, origin=instruction.offset
+        )
         translator.literal_count += 1
-        decorated = self._decorate_with_comment(statements, semantics)
-        return decorated, operand
+        decorated = self._decorate_with_comment(statements, semantics, value=value)
+        return decorated, value
 
     def _translate_comparison(
         self,
@@ -652,11 +984,21 @@ class HighLevelReconstructor:
         semantics: InstructionSemantics,
         translator: BlockTranslator,
     ) -> List[LuaStatement]:
-        lhs, rhs = translator.stack.pop_pair()
+        lhs_value, rhs_value = translator.stack.pop_pair()
         operator = semantics.comparison_operator or "=="
-        expression = BinaryExpr(lhs, operator, rhs)
-        statements, _ = translator.stack.push_expression(expression, prefix="cmp", make_local=True)
-        return self._decorate_with_comment(statements, semantics)
+        expression = BinaryExpr(lhs_value.expression, operator, rhs_value.expression)
+        statements, value = translator.stack.push_expression(
+            expression, prefix="cmp", make_local=True, origin=instruction.offset
+        )
+        prefix_comments = self._value_comment_lines(
+            [lhs_value, rhs_value],
+            prefix="cmp",
+            collector=translator.value_comment_log,
+            trace_map=translator.trace_map,
+        )
+        return self._decorate_with_comment(
+            statements, semantics, value=value, prefix_comments=prefix_comments
+        )
 
     def _translate_branch(
         self,
@@ -666,13 +1008,23 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
         fallthrough: Optional[int],
     ) -> BranchTerminator:
-        condition = translator.stack.pop_single()
+        condition_value = translator.stack.pop_single()
+        condition = condition_value.expression
         # Determine targets based on IR metadata.
         true_target, false_target = self._select_branch_targets(
             block_start, translator, fallthrough
         )
         translator.branch_count += 1
         comment = self._comment_formatter.format_inline(semantics.summary or "")
+        condition_comments = self._value_comment_lines(
+            [condition_value],
+            prefix="cond",
+            collector=translator.value_comment_log,
+            trace_map=translator.trace_map,
+        )
+        if condition_comments:
+            suffix = " | ".join(condition_comments)
+            comment = f"{comment} | {suffix}" if comment else suffix
         return BranchTerminator(
             condition=condition,
             true_target=true_target,
@@ -689,9 +1041,19 @@ class HighLevelReconstructor:
         semantics: InstructionSemantics,
         translator: BlockTranslator,
     ) -> ReturnTerminator:
-        values = translator.stack.flush()
+        stack_values = translator.stack.flush()
         comment = self._comment_formatter.format_inline(semantics.summary or "")
-        return ReturnTerminator(values=values, comment=comment)
+        value_comments = self._value_comment_lines(
+            stack_values,
+            prefix="ret",
+            collector=translator.value_comment_log,
+            trace_map=translator.trace_map,
+        )
+        if value_comments:
+            suffix = " | ".join(value_comments)
+            comment = f"{comment} | {suffix}" if comment else suffix
+        expressions = [value.expression for value in stack_values]
+        return ReturnTerminator(values=expressions, comment=comment)
 
     def _translate_structure(
         self,
@@ -700,12 +1062,19 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
     ) -> List[LuaStatement]:
         inputs, outputs = estimate_stack_io(semantics)
-        args = translator.stack.pop_many(inputs)
+        arg_values = translator.stack.pop_many(inputs)
+        call_args = [value.expression for value in arg_values]
         if semantics.uses_operand:
-            args.append(self._operand_expression(semantics, instruction.operand))
+            call_args.append(self._operand_expression(semantics, instruction.operand))
+        prefix_comments = self._value_comment_lines(
+            arg_values,
+            prefix="arg",
+            collector=translator.value_comment_log,
+            trace_map=translator.trace_map,
+        )
         method = _snake_to_camel(semantics.mnemonic)
         target = NameExpr(semantics.struct_context or "struct")
-        call_expr = MethodCallExpr(target, method, args)
+        call_expr = MethodCallExpr(target, method, call_args)
         signature = MethodSignature(
             name=semantics.mnemonic,
             summary=semantics.summary or "",
@@ -717,11 +1086,21 @@ class HighLevelReconstructor:
         )
         self._helper_registry.register_method(signature)
         translator.helper_calls += 1
+        translator.helper_usage_counter[(semantics.mnemonic, "method")] += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs, prefix="struct")
+            statements, values = translator.stack.push_call_results(
+                call_expr, outputs, prefix="struct", origin=instruction.offset
+            )
+            summary_text = semantics.summary or ""
+            summary_lines = self._format_summary_lines(summary_text) if summary_text else []
+            if summary_lines:
+                for value in values:
+                    value.add_comments(summary_lines)
         else:
             statements = [CallStatement(call_expr)]
-        return self._decorate_with_comment(statements, semantics)
+        return self._decorate_with_comment(
+            statements, semantics, prefix_comments=prefix_comments
+        )
 
     def _translate_call(
         self,
@@ -730,10 +1109,17 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
     ) -> List[LuaStatement]:
         inputs, outputs = estimate_stack_io(semantics)
-        args = translator.stack.pop_many(inputs)
+        arg_values = translator.stack.pop_many(inputs)
+        call_args = [value.expression for value in arg_values]
         if semantics.uses_operand:
-            args.append(self._operand_expression(semantics, instruction.operand))
-        call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
+            call_args.append(self._operand_expression(semantics, instruction.operand))
+        prefix_comments = self._value_comment_lines(
+            arg_values,
+            prefix="arg",
+            collector=translator.value_comment_log,
+            trace_map=translator.trace_map,
+        )
+        call_expr = CallExpr(NameExpr(semantics.mnemonic), call_args)
         signature = HelperSignature(
             name=semantics.mnemonic,
             summary=semantics.summary or "",
@@ -743,11 +1129,25 @@ class HighLevelReconstructor:
         )
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
+        translator.helper_usage_counter[(semantics.mnemonic, "function")] += 1
         if outputs <= 0:
             statements = [CallStatement(call_expr)]
         else:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
-        return self._decorate_with_comment(statements, semantics)
+            statements, values = translator.stack.push_call_results(
+                call_expr, outputs, origin=instruction.offset
+            )
+            summary_text = semantics.summary or ""
+            summary_lines = self._format_summary_lines(summary_text) if summary_text else []
+            if summary_lines:
+                for value in values:
+                    value.add_comments(summary_lines)
+            value = values[0] if len(values) == 1 else None
+            return self._decorate_with_comment(
+                statements, semantics, value=value, prefix_comments=prefix_comments
+            )
+        return self._decorate_with_comment(
+            statements, semantics, prefix_comments=prefix_comments
+        )
 
     def _translate_generic(
         self,
@@ -756,10 +1156,17 @@ class HighLevelReconstructor:
         translator: BlockTranslator,
     ) -> List[LuaStatement]:
         inputs, outputs = estimate_stack_io(semantics)
-        args = translator.stack.pop_many(inputs)
+        arg_values = translator.stack.pop_many(inputs)
+        call_args = [value.expression for value in arg_values]
         if semantics.uses_operand:
-            args.append(self._operand_expression(semantics, instruction.operand))
-        call_expr = CallExpr(NameExpr(semantics.mnemonic), args)
+            call_args.append(self._operand_expression(semantics, instruction.operand))
+        prefix_comments = self._value_comment_lines(
+            arg_values,
+            prefix="arg",
+            collector=translator.value_comment_log,
+            trace_map=translator.trace_map,
+        )
+        call_expr = CallExpr(NameExpr(semantics.mnemonic), call_args)
         signature = HelperSignature(
             name=semantics.mnemonic,
             summary=semantics.summary or "",
@@ -769,11 +1176,24 @@ class HighLevelReconstructor:
         )
         self._helper_registry.register_function(signature)
         translator.helper_calls += 1
+        translator.helper_usage_counter[(semantics.mnemonic, "function")] += 1
         if outputs > 0:
-            statements, _ = translator.stack.push_call_results(call_expr, outputs)
-        else:
-            statements = [CallStatement(call_expr)]
-        return self._decorate_with_comment(statements, semantics)
+            statements, values = translator.stack.push_call_results(
+                call_expr, outputs, origin=instruction.offset
+            )
+            summary_text = semantics.summary or ""
+            summary_lines = self._format_summary_lines(summary_text) if summary_text else []
+            if summary_lines:
+                for value in values:
+                    value.add_comments(summary_lines)
+            value = values[0] if len(values) == 1 else None
+            return self._decorate_with_comment(
+                statements, semantics, value=value, prefix_comments=prefix_comments
+            )
+        statements = [CallStatement(call_expr)]
+        return self._decorate_with_comment(
+            statements, semantics, prefix_comments=prefix_comments
+        )
 
     def _select_branch_targets(
         self,
@@ -808,16 +1228,70 @@ class HighLevelReconstructor:
 
     # ------------------------------------------------------------------
     def _decorate_with_comment(
-        self, statements: List[LuaStatement], semantics: InstructionSemantics
+        self,
+        statements: List[LuaStatement],
+        semantics: InstructionSemantics,
+        *,
+        value: Optional[StackValue] = None,
+        prefix_comments: Sequence[str] = (),
     ) -> List[LuaStatement]:
         summary = semantics.summary or ""
-        if not self._should_emit_comment(summary):
+        comment_lines: List[str] = list(prefix_comments)
+        formatted_summary: List[str] = []
+        if summary:
+            formatted_summary = self._format_summary_lines(summary)
+            if value is not None:
+                value.add_comments(formatted_summary)
+            if self._should_emit_comment(summary):
+                comment_lines = formatted_summary + comment_lines
+        else:
+            self._last_summary = None
+        if not comment_lines:
             return statements
-        comment = self._comment_formatter.format_inline(summary)
-        if not comment:
-            wrapped = self._comment_formatter.wrap(summary)
-            return [CommentStatement(line) for line in wrapped] + statements
-        return [CommentStatement(comment)] + statements
+        if not statements:
+            if value is not None and formatted_summary and not prefix_comments:
+                return statements
+            return [CommentStatement(line) for line in comment_lines] + statements
+        first, *rest = statements
+        commented = CommentedStatement(comment_lines, first)
+        return [commented] + rest
+
+    def _format_summary_lines(self, summary: str) -> List[str]:
+        inline = self._comment_formatter.format_inline(summary)
+        if inline:
+            return [inline]
+        return self._comment_formatter.wrap(summary)
+
+    def _value_comment_lines(
+        self,
+        values: Sequence[StackValue],
+        *,
+        prefix: str,
+        collector: Optional[List[Tuple[str, Optional[int], str]]] = None,
+        trace_map: Optional[Dict[int, InstructionTraceInfo]] = None,
+    ) -> List[str]:
+        lines: List[str] = []
+        for index, value in enumerate(values, 1):
+            comments = value.take_comments()
+            if not comments:
+                continue
+            suffix = f" @0x{value.origin:06X}" if value.origin is not None else ""
+            label = f"{prefix}{index}{suffix}"
+            for comment in comments:
+                lines.append(f"{label}: {comment}")
+                if collector is not None:
+                    collector.append((f"{prefix}{index}", value.origin, comment))
+                if trace_map is not None and value.origin is not None:
+                    info = trace_map.get(value.origin)
+                    if info is None:
+                        info = InstructionTraceInfo(
+                            offset=value.origin,
+                            mnemonic="unknown",
+                            summary="",
+                        )
+                        trace_map[value.origin] = info
+                    info.add_usage(f"{prefix}{index}", comment)
+        return lines
 
     def _should_emit_comment(self, summary: str) -> bool:
         if not summary:

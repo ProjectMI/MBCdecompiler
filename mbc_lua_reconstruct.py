@@ -17,6 +17,7 @@ from mbcdisasm import (
     Segment,
     SegmentClassifier,
 )
+from mbcdisasm import analysis_report
 from mbcdisasm.data_segments import render_data_summaries, summarise_data_segments
 from mbcdisasm.highlevel import HighLevelReconstructor, HighLevelFunction
 from mbcdisasm.literal_sequences import build_literal_run_report, literal_report_to_dict
@@ -162,6 +163,52 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Write literal run statistics to the specified JSON file",
     )
+    parser.add_argument(
+        "--analysis-text",
+        type=Path,
+        default=None,
+        help="Write a human readable reconstruction analysis report",
+    )
+    parser.add_argument(
+        "--analysis-json",
+        type=Path,
+        default=None,
+        help="Write a machine readable reconstruction analysis report",
+    )
+    parser.add_argument(
+        "--analysis-markdown",
+        type=Path,
+        default=None,
+        help="Write a Markdown reconstruction analysis report",
+    )
+    parser.add_argument(
+        "--analysis-csv",
+        type=Path,
+        default=None,
+        help="Write a CSV reconstruction analysis report",
+    )
+    parser.add_argument(
+        "--analysis-helper-csv",
+        type=Path,
+        default=None,
+        help="Write a CSV helper usage summary",
+    )
+    parser.add_argument(
+        "--analysis-summary",
+        action="store_true",
+        help="Print a module-level summary to stdout",
+    )
+    parser.add_argument(
+        "--analysis-warning-report",
+        type=Path,
+        default=None,
+        help="Write a text report containing only warning-carrying functions",
+    )
+    parser.add_argument(
+        "--analysis-warning-stdout",
+        action="store_true",
+        help="Print the warning report to stdout",
+    )
     return parser.parse_args()
 
 
@@ -210,6 +257,7 @@ def main() -> None:
         functions.append(reconstructor.from_ir(program))
 
     module_text = reconstructor.render(functions)
+    analyses = analysis_report.build_analysis(functions)
 
     if args.literal_report_json:
         all_runs = [run for func in functions for run in func.metadata.literal_runs]
@@ -217,6 +265,28 @@ def main() -> None:
         payload = literal_report_to_dict(report)
         args.literal_report_json.parent.mkdir(parents=True, exist_ok=True)
         args.literal_report_json.write_text(json.dumps(payload, indent=2), "utf-8")
+    if args.analysis_text:
+        args.analysis_text.parent.mkdir(parents=True, exist_ok=True)
+        analysis_report.write_text_report(analyses, str(args.analysis_text))
+    if args.analysis_json:
+        args.analysis_json.parent.mkdir(parents=True, exist_ok=True)
+        analysis_report.write_json_report(analyses, str(args.analysis_json))
+    if args.analysis_markdown:
+        args.analysis_markdown.parent.mkdir(parents=True, exist_ok=True)
+        analysis_report.write_markdown_report(analyses, str(args.analysis_markdown))
+    if args.analysis_csv:
+        args.analysis_csv.parent.mkdir(parents=True, exist_ok=True)
+        analysis_report.write_csv_report(analyses, str(args.analysis_csv))
+    if args.analysis_helper_csv:
+        args.analysis_helper_csv.parent.mkdir(parents=True, exist_ok=True)
+        analysis_report.write_helper_usage_csv(analyses, str(args.analysis_helper_csv))
+    if args.analysis_summary:
+        print(analysis_report.render_module_summary_text(analyses))
+    if args.analysis_warning_report:
+        args.analysis_warning_report.parent.mkdir(parents=True, exist_ok=True)
+        analysis_report.write_warning_report(analyses, str(args.analysis_warning_report))
+    if args.analysis_warning_stdout:
+        print(analysis_report.render_warning_report(analyses))
 
     data_summaries = summarise_data_segments(
         container.segments(),
