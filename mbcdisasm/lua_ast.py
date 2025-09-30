@@ -154,6 +154,19 @@ class CommentStatement(LuaStatement):
 
 
 @dataclass
+class CommentedStatement(LuaStatement):
+    """Wrap another statement with a leading comment block."""
+
+    comments: Sequence[str]
+    inner: LuaStatement
+
+    def emit(self, writer: LuaWriter) -> None:
+        for comment in self.comments:
+            writer.write_comment(comment)
+        self.inner.emit(writer)
+
+
+@dataclass
 class BlankLine(LuaStatement):
     def emit(self, writer: LuaWriter) -> None:  # pragma: no cover - trivial
         writer.write_line("")
