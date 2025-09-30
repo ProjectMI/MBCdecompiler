@@ -235,6 +235,154 @@ class LiteralRunWithMarkersSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class MarkerPairWithHeaderSignature(SignatureRule):
+    """Detect paired literal markers that introduce a fixed header sequence."""
+
+    name = "marker_pair_with_header"
+    category = "literal"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        pair_idx = next(
+            (
+                idx
+                for idx in range(len(profiles) - 1)
+                if is_literal_marker(profiles[idx]) and is_literal_marker(profiles[idx + 1])
+            ),
+            None,
+        )
+        if pair_idx is None:
+            return None
+
+        header_idx = pair_idx + 2
+        if header_idx >= len(profiles):
+            return None
+        if not profiles[header_idx].label.startswith("41:B4"):
+            return None
+
+        if header_idx + 1 >= len(profiles):
+            return None
+        if not profiles[header_idx + 1].label.startswith("08:"):
+            return None
+
+        notes = (
+            f"pair_idx={pair_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = self.base_confidence
+        if stack.change >= 0:
+            confidence += 0.04
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class AsciiPrologMarkerComboSignature(SignatureRule):
+    """Recognise ASCII literals wrapped by a ``05:00`` prolog and marker pair."""
+
+    name = "ascii_prolog_marker_combo"
+    category = "literal"
+    base_confidence = 0.59
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 5:
+            return None
+
+        if not profiles[0].label.startswith("05:"):
+            return None
+
+        ascii_idx = next(
+            (
+                idx
+                for idx, profile in enumerate(profiles[1:], start=1)
+                if profile.kind is InstructionKind.ASCII_CHUNK
+            ),
+            None,
+        )
+        if ascii_idx is None:
+            return None
+
+        helper_idx = next(
+            (
+                idx
+                for idx in range(ascii_idx + 1, len(profiles))
+                if profiles[idx].label.startswith("10:0F")
+            ),
+            None,
+        )
+        if helper_idx is None:
+            return None
+
+        marker_idx = next(
+            (
+                idx
+                for idx in range(helper_idx + 1, len(profiles) - 1)
+                if is_literal_marker(profiles[idx]) and is_literal_marker(profiles[idx + 1])
+            ),
+            None,
+        )
+        if marker_idx is None:
+            return None
+
+        notes = (
+            f"ascii_idx={ascii_idx}",
+            f"marker_idx={marker_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.83, self.base_confidence + 0.04)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class AsciiWrapperEf48Signature(SignatureRule):
+    """Match ASCII payloads wrapped by ``EF:28`` and ``48:00`` sentinels."""
+
+    name = "ascii_wrapper_ef48"
+    category = "literal"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        labels = [profile.label for profile in profiles]
+        try:
+            start_idx = next(idx for idx, label in enumerate(labels) if label.startswith("EF:28"))
+        except StopIteration:
+            return None
+
+        try:
+            end_idx = next(
+                idx for idx in range(start_idx + 1, len(labels)) if labels[idx].startswith("48:00")
+            )
+        except StopIteration:
+            return None
+
+        if end_idx <= start_idx + 1:
+            return None
+
+        ascii_count = sum(
+            1 for profile in profiles[start_idx + 1 : end_idx] if profile.kind is InstructionKind.ASCII_CHUNK
+        )
+        if ascii_count == 0:
+            return None
+
+        notes = (
+            f"start_idx={start_idx}",
+            f"end_idx={end_idx}",
+            f"ascii_count={ascii_count}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.84, self.base_confidence + 0.05 * ascii_count)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class MarkerRunSignature(SignatureRule):
     """Detect clusters of literal marker instructions."""
 
@@ -359,6 +507,113 @@ class AsciiTailcallPatternSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class AsciiIndirectTailcallSignature(SignatureRule):
+    """Match tailcalls that resolve through indirect markers and ASCII IDs."""
+
+    name = "ascii_indirect_tailcall"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 6:
+            return None
+
+        first_label = profiles[0].label
+        if not (is_literal_marker(profiles[0]) or first_label.startswith(("00:38", "10:38"))):
+            return None
+
+        if not is_tailcall(profiles[1]):
+            return None
+
+        labels = [profile.label for profile in profiles]
+
+        marker_4b_idx = next(
+            (idx for idx in range(2, len(profiles)) if labels[idx].startswith("4B:")),
+            None,
+        )
+        if marker_4b_idx is None:
+            return None
+
+        marker_69_idx = next(
+            (idx for idx in range(marker_4b_idx + 1, len(profiles)) if labels[idx].startswith("69:")),
+            None,
+        )
+        if marker_69_idx is None:
+            return None
+
+        literal_idx = next(
+            (
+                idx
+                for idx in range(marker_69_idx + 1, len(profiles))
+                if is_literal_like(profiles[idx])
+            ),
+            None,
+        )
+        if literal_idx is None:
+            return None
+
+        ascii_idx = next(
+            (
+                idx
+                for idx in range(literal_idx + 1, len(profiles))
+                if profiles[idx].kind is InstructionKind.ASCII_CHUNK
+            ),
+            None,
+        )
+        if ascii_idx is None:
+            return None
+
+        notes = (
+            f"tail_idx=1",
+            f"ascii_idx={ascii_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.86, self.base_confidence + 0.05)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class TailcallPostJumpSignature(SignatureRule):
+    """Recognise tailcalls that are immediately preceded by a jump."""
+
+    name = "tailcall_post_jump"
+    category = "call"
+    base_confidence = 0.58
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        first = profiles[0]
+        if first.kind not in {InstructionKind.BRANCH, InstructionKind.CONTROL} and not first.label.startswith("22:"):
+            return None
+
+        tail_idx = next((idx for idx, profile in enumerate(profiles[1:], start=1) if is_tailcall(profile)), None)
+        if tail_idx is None:
+            return None
+
+        marker_idx = next(
+            (idx for idx in range(tail_idx + 1, len(profiles)) if profiles[idx].label.startswith("69:")),
+            None,
+        )
+        if marker_idx is None:
+            return None
+
+        notes = (
+            f"jump_idx=0",
+            f"tail_idx={tail_idx}",
+            f"marker_idx={marker_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = self.base_confidence
+        if stack.change <= 0:
+            confidence += 0.04
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class TailcallReturnComboSignature(SignatureRule):
     """Detect tailcalls that immediately collapse into a return."""
 
@@ -394,6 +649,78 @@ class TailcallReturnComboSignature(SignatureRule):
         notes = (
             f"tail_idx={tail_idx}",
             f"return_idx={return_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = self.base_confidence
+        if stack.change <= 0:
+            confidence += 0.05
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class TailcallReturnIndirectSignature(SignatureRule):
+    """Detect tailcalls that return through helper + indirect cleanup."""
+
+    name = "tailcall_return_indirect"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 6:
+            return None
+
+        if not profiles[0].label.startswith("4C:"):
+            return None
+
+        tail_idx = next((idx for idx, profile in enumerate(profiles) if is_tailcall(profile)), None)
+        if tail_idx is None:
+            return None
+
+        return_idx = next(
+            (
+                idx
+                for idx in range(tail_idx + 1, len(profiles))
+                if profiles[idx].kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
+            ),
+            None,
+        )
+        if return_idx is None:
+            return None
+
+        literal_idx = next(
+            (
+                idx
+                for idx in range(return_idx + 1, len(profiles))
+                if is_literal_like(profiles[idx])
+            ),
+            None,
+        )
+        if literal_idx is None:
+            return None
+
+        helper_idx = next(
+            (
+                idx
+                for idx in range(literal_idx + 1, len(profiles))
+                if is_call_helper(profiles[idx]) and profiles[idx].label.startswith("10:")
+            ),
+            None,
+        )
+        if helper_idx is None:
+            return None
+
+        indirect_idx = next(
+            (idx for idx in range(helper_idx + 1, len(profiles)) if profiles[idx].label.startswith("69:")),
+            None,
+        )
+        if indirect_idx is None:
+            return None
+
+        notes = (
+            f"tail_idx={tail_idx}",
+            f"return_idx={return_idx}",
+            f"indirect_idx={indirect_idx}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = self.base_confidence
@@ -471,6 +798,58 @@ class FanoutTeardownSignature(SignatureRule):
         confidence = self.base_confidence
         if stack.change < 0:
             confidence += 0.05
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class IndirectCallDualLiteralSignature(SignatureRule):
+    """Detect indirect call setups that use two literal pushes with F1/10 markers."""
+
+    name = "indirect_call_dual_literal"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 6:
+            return None
+
+        labels = [profile.label for profile in profiles]
+        if "10:38" not in labels:
+            return None
+
+        literal_indices = [idx for idx, profile in enumerate(profiles) if is_literal_like(profile)]
+        if len(literal_indices) < 2:
+            return None
+
+        first_push = literal_indices[0]
+        second_push = next((idx for idx in literal_indices[1:] if idx > first_push), None)
+        if second_push is None:
+            return None
+
+        f1_idx = next(
+            (idx for idx in range(first_push + 1, second_push) if labels[idx] == "F1:3D"),
+            None,
+        )
+        if f1_idx is None:
+            return None
+
+        helper_idx = next(
+            (idx for idx in range(f1_idx + 1, second_push) if labels[idx] == "10:48"),
+            None,
+        )
+        if helper_idx is None:
+            return None
+
+        if not any(label.startswith("69:") for label in labels[second_push + 1 :]):
+            return None
+
+        notes = (
+            f"first_push={first_push}",
+            f"second_push={second_push}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.88, self.base_confidence + 0.04 * (second_push - first_push))
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
@@ -592,12 +971,19 @@ class SignatureDetector:
             HeaderAsciiCtrlSeqSignature(),
             TableStoreSignature(),
             IndirectFetchSignature(),
+            MarkerPairWithHeaderSignature(),
+            AsciiPrologMarkerComboSignature(),
+            AsciiWrapperEf48Signature(),
             LiteralRunWithMarkersSignature(),
             LiteralReduceChainExSignature(),
             AsciiTailcallPatternSignature(),
+            AsciiIndirectTailcallSignature(),
+            TailcallPostJumpSignature(),
             TailcallReturnComboSignature(),
+            TailcallReturnIndirectSignature(),
             CallprepAsciiDispatchSignature(),
             FanoutTeardownSignature(),
+            IndirectCallDualLiteralSignature(),
             IndirectCallExSignature(),
             IndirectReturnExSignature(),
             LiteralRunSignature(),
