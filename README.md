@@ -2,46 +2,58 @@
 
 This repository provides a research-oriented toolkit for working with Sphere `.mbc` script containers and their companion `.adb` index files. The goal is to offer an extendable pipeline that supports automated opcode discovery, iterative knowledge accumulation, and human-facing disassembly listings.
 
-## Project layout
-
-- `mbcdisasm/` &mdash; Python package containing the core modules.
-  - `adb.py` parses the `.adb` segment index.
-  - `mbc.py` loads the `.mbc` container and classifies segments.
-  - `instruction.py` defines the raw instruction representation.
-  - `analysis.py` implements the statistical analyzer used during opcode research.
-  - `knowledge.py` maintains the JSON knowledge base for opcode/mode pairs.
-  - `disassembler.py` renders annotated disassembly listings using the knowledge base.
-  - `auto_analyze.py` runs the analyzer across multiple binaries, merging the findings into the knowledge base.
-  - `type_summary_cli.py` exposes a lightweight reporting CLI.
-- `mbc_disasm.py` &mdash; main CLI entry point that ties the analyzer and disassembler together.
-- `knowledge/` &mdash; persisted knowledge base files (created on demand).
-- `tests/` &mdash; sanity tests that exercise the pipeline on bundled fixtures.
-
-All components only depend on the Python standard library.
-
 ## Usage
 
 Invoke the main tool by pointing it at the `.adb` index and matching `.mbc` container:
 
 ```bash
-python mbc_disasm.py <adb> <mbc>
+python mbc_lua_reconstruct.py <adb> <mbc>
 ```
 
 Key options:
 
-- `--segment <id ...>` limits the work to selected segment indices.
-- `--max-instr <count>` truncates each segment disassembly after the specified number of instructions.
-- `--opcode-limit <count>` caps the length of the opcode coverage table shown on stdout.
-- `--disasm-out <path>` overrides the default `<mbc name>.disasm.txt` output path.
-- `--analysis-out <path>` writes a JSON summary of the current run.
-- `--knowledge-base <path>` points to the opcode knowledge base JSON document (default `knowledge/opcode_profiles.json`).
-- `--update-knowledge` merges the observed statistics back into the knowledge base and
+- `- `--segment <id ...>` limits the work to selected segment indices.
+- `- `--max-instr <count>` truncates each segment disassembly after the specified number of instructions.
+- `- `--opcode-limit <count>` caps the length of the opcode coverage table shown on stdout.
+- `- `--disasm-out <path>` overrides the default `<mbc name>.disasm.txt` output path.
+- `- `--analysis-out <path>` writes a JSON summary of the current run.
+- `- `--knowledge-base <path>` points to the opcode knowledge base JSON document (default `knowledge/opcode_profiles.json`).
+- `- `--update-knowledge` merges the observed statistics back into the knowledge base and
   automatically refreshes stack delta annotations when the new samples are
   confident.
 
-The tool prints a concise CLI report (segment classifications, detected issues, opcode coverage) and stores the full instruction listing to a file so the console output stays readable.
-
-Runs also emit a "knowledge confidence" table that compares each observed opcode/mode pair with the accumulated statistics from the knowledge base, highlighting stable interpretations versus newly discovered conflicts.
+- `--segment SEGMENTS 
+- `--max-instr MAX_INSTR 
+- `--knowledge-base KNOWLEDGE_BASE
+- `--output OUTPUT 
+- `--keep-duplicate-comments
+- `--inline-comment-width INLINE_COMMENT_WIDTH 
+- `--no-stub-metadata 
+- `--no-enum-metadata
+- `--no-module-summary 
+- `--no-literal-report 
+- `--min-string-length MIN_STRING_LENGTH
+- `--data-hex-bytes DATA_HEX_BYTES 
+- `--data-hex-width DATA_HEX_WIDTH 
+- `--no-data-hex
+- `--data-histogram DATA_HISTOGRAM 
+- `--data-run-threshold DATA_RUN_THRESHOLD
+- `--data-max-runs DATA_MAX_RUNS 
+- `--string-table
+- `--string-table-min-occurrences STRING_TABLE_MIN_OCCURRENCES 
+- `--data-stats
+- `--emit-data-table 
+- `--data-table-name DATA_TABLE_NAME 
+- `--data-table-return
+- `--literal-report-json LITERAL_REPORT_JSON 
+- `--analysis-text ANALYSIS_TEXT
+- `--analysis-json ANALYSIS_JSON 
+- `--analysis-markdown ANALYSIS_MARKDOWN
+- `--analysis-csv ANALYSIS_CSV 
+- `--analysis-helper-csv ANALYSIS_HELPER_CSV
+- `--analysis-summary 
+- `--analysis-warning-report ANALYSIS_WARNING_REPORT
+- `--analysis-warning-stdout
 
 ### Quick summaries
 
@@ -85,13 +97,6 @@ the operand hint so you can gauge how reliable the classification is:
 
 Manual annotations are merged on load and persisted when the knowledge base is
 saved, making it easy to iterate on human-friendly mnemonics.
-
-### JSON summaries
-
-`--analysis-out` reports now include an `opcode_mode_matrix` section that lists
-the set of mode values observed for every opcode.  This compact view highlights
-how widely an opcode is reused across modes without having to inspect every
-opcode/mode histogram individually.
 
 ## Tests
 
