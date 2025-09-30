@@ -1,106 +1,26 @@
 # Sphere MBC Disassembler
 
-This repository provides a research-oriented toolkit for working with Sphere `.mbc` script containers and their companion `.adb` index files. The goal is to offer an extendable pipeline that supports automated opcode discovery, iterative knowledge accumulation, and human-facing disassembly listings.
+This repository now focuses on a single task: producing annotated disassembly listings for Sphere `.mbc` script containers.  The command-line interface reads a container plus its `.adb` index file and emits a plain text listing with mnemonics and stack hints sourced from `knowledge/manual_annotations.json`.
 
 ## Usage
 
-Invoke the main tool by pointing it at the `.adb` index and matching `.mbc` container:
-
-```bash
-python mbc_lua_reconstruct.py <adb> <mbc>
+```
+python mbc_disasm.py <adb> <mbc> [--segment INDEX ...] [--max-instr COUNT] [--disasm-out PATH]
 ```
 
-Key options:
+The tool loads opcode metadata from `knowledge/opcode_profiles.json`.  Manual overrides are merged automatically from `knowledge/manual_annotations.json` and drive the mnemonic and stack effect substitutions in the generated listing.
 
-- --segment SEGMENTS 
-- --max-instr MAX_INSTR 
-- --knowledge-base KNOWLEDGE_BASE
-- --output OUTPUT 
-- --keep-duplicate-comments
-- --inline-comment-width INLINE_COMMENT_WIDTH 
-- --no-stub-metadata 
-- --no-enum-metadata
-- --no-module-summary 
-- --no-literal-report 
-- --min-string-length MIN_STRING_LENGTH
-- --data-hex-bytes DATA_HEX_BYTES 
-- --data-hex-width DATA_HEX_WIDTH 
-- --no-data-hex
-- --data-histogram DATA_HISTOGRAM 
-- --data-run-threshold DATA_RUN_THRESHOLD
-- --data-max-runs DATA_MAX_RUNS 
-- --string-table
-- --string-table-min-occurrences STRING_TABLE_MIN_OCCURRENCES 
-- --data-stats
-- --emit-data-table 
-- --data-table-name DATA_TABLE_NAME 
-- --data-table-return
-- --literal-report-json LITERAL_REPORT_JSON 
-- --analysis-text ANALYSIS_TEXT
-- --analysis-json ANALYSIS_JSON 
-- --analysis-markdown ANALYSIS_MARKDOWN
-- --analysis-csv ANALYSIS_CSV 
-- --analysis-helper-csv ANALYSIS_HELPER_CSV
-- --analysis-summary 
-- --analysis-warning-report ANALYSIS_WARNING_REPORT
-- --analysis-warning-stdout
+- `--segment` limits processing to the selected segment indices.
+- `--max-instr` truncates each segment after the specified number of instructions.
+- `--disasm-out` overrides the default `<mbc>.disasm.txt` output path.
+- `--knowledge-base` points to an alternate knowledge database location.
 
-### Quick summaries
-
-To inspect the inferred segment classifications and opcode coverage without generating a full disassembly:
-
-```bash
-python -m mbcdisasm.type_summary_cli <adb> <mbc>
-```
-
-### Batch analysis
-
-Aggregate opcode statistics from an entire directory and evolve the knowledge base automatically:
-
-```bash
-python -m mbcdisasm.auto_analyze mbc/
-```
-
-Each processed pair contributes its opcode/mode histograms to the knowledge base, allowing the disassembler to attach better mnemonics and stack hints over time.  Newly
-learned stack behaviours are echoed to the console so operators can audit the
-automatic deductions.
-
-### Knowledge annotations
-
-The disassembler now renders richer inline comments that summarise the inferred
-stack effect, likely control-flow role and dominant operand class for each
-instruction.  These hints are derived from the opcode statistics stored in the
-knowledge base and can be refined manually by editing
-`knowledge/manual_annotations.json`.  Manual entries are organised into
-semantic categories with per-opcode overrides:
-
-```json
-{
-  "push_literal": {
-    "control_flow": "fallthrough",
-    "stack_delta": 1,
-    "summary": "Literal push helpers",
-    "opcodes": ["29:10"]
-  },
-  "_overrides": {
-    "29:10": {
-      "name": "call_indirect",
-      "control_flow": "call",
-      "summary": "invoke helper routine by table index"
-    }
-  }
-}
-```
-
-Manual annotations are merged on load and persisted when the knowledge base is
-saved, making it easy to iterate on human-friendly mnemonics.
+The CLI prints the final output path and writes the listing to disk.
 
 ## Tests
 
-Run the tests as
+Run the test suite with:
 
-```bash
-pytest -s tests/test_reports.py
-pytest -s tests/test_stack_gap_inventory.py
-pytest -s tests/test_opcode_profiles.py 
+```
+pytest
 ```
