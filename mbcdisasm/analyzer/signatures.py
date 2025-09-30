@@ -280,6 +280,39 @@ class LiteralRunWithMarkersSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class ReduceAsciiPrologSignature(SignatureRule):
+    """Recognise the ``reduce`` + ``00:4F`` marker that precedes ASCII payloads."""
+
+    name = "reduce_ascii_prolog"
+    category = "literal"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 3:
+            return None
+
+        first, second = profiles[0], profiles[1]
+        if first.kind is not InstructionKind.REDUCE:
+            return None
+        if second.label != "00:4F":
+            return None
+
+        ascii_after = sum(
+            1 for profile in profiles[2:] if profile.kind is InstructionKind.ASCII_CHUNK
+        )
+        if ascii_after == 0:
+            return None
+
+        notes = (
+            f"ascii_after={ascii_after}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.88, self.base_confidence + 0.05 * min(ascii_after, 3))
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class MarkerPairWithHeaderSignature(SignatureRule):
     """Detect paired literal markers that introduce a fixed header sequence."""
 
@@ -479,6 +512,48 @@ class AsciiReduceMarkerSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, min(0.87, confidence), notes)
 
 
+class MarkerFenceReduceSignature(SignatureRule):
+    """Recognise literal marker fences around ``00:69`` and reducers."""
+
+    name = "marker_fence_reduce"
+    category = "literal"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 6:
+            return None
+
+        labels = [profile.label for profile in profiles]
+        operands = [profile.operand for profile in profiles]
+
+        if labels[0] != "3D:30" or operands[0] != 0x3069:
+            return None
+        if labels[1] != "01:90":
+            return None
+        if labels[2] != "5E:29" or operands[2] != 0x2910:
+            return None
+        if labels[3] != "ED:4D" or operands[3] != 0x4D0E:
+            return None
+        if labels[4] != "00:69" or operands[4] != 0x0190:
+            return None
+
+        reduce_idx = next(
+            (idx for idx in range(5, len(profiles)) if profiles[idx].opcode == 0x04),
+            None,
+        )
+        if reduce_idx is None:
+            return None
+
+        notes = (
+            f"reduce_idx={reduce_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.87, self.base_confidence + 0.04 * (len(profiles) - reduce_idx))
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class LiteralZeroInitSignature(SignatureRule):
     """Identify literal loaders wrapped around a ``DE:ED`` zero initialiser."""
 
@@ -536,6 +611,40 @@ class MarkerRunSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, self.base_confidence, notes)
 
 
+class ModeSweepSignature(SignatureRule):
+    """Detect uniform mode sweeps used for register initialisation."""
+
+    name = "mode_sweep_block"
+    category = "setup"
+    base_confidence = 0.59
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        modes = {profile.mode for profile in profiles}
+        if len(modes) != 1:
+            return None
+
+        (mode,) = modes
+        if mode not in {0x4E, 0x4F}:
+            return None
+
+        distinct_opcodes = {profile.opcode for profile in profiles}
+        if len(distinct_opcodes) < 3:
+            return None
+
+        notes = (
+            f"mode=0x{mode:02X}",
+            f"unique_opcodes={len(distinct_opcodes)}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.85, self.base_confidence + 0.04 * (len(profiles) - 3))
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class LiteralReduceChainExSignature(SignatureRule):
     """Recognise literal chains punctuated by reduction helpers."""
 
@@ -570,6 +679,29 @@ class LiteralReduceChainExSignature(SignatureRule):
             0.88,
             self.base_confidence + 0.05 * min(reduce_count, 3) + 0.03 * (density - 0.55),
         )
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class StackLiftPairSignature(SignatureRule):
+    """Detect the ``00:30`` → ``00:48`` stack lift micro pattern."""
+
+    name = "stack_lift_pair"
+    category = "literal"
+    base_confidence = 0.55
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 2:
+            return None
+        if profiles[0].label != "00:30" or profiles[1].label != "00:48":
+            return None
+
+        notes = (
+            "stack_lift_pair",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.8, self.base_confidence + 0.03)
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
@@ -650,6 +782,44 @@ class TailcallAsciiWrapperSignature(SignatureRule):
         if literal_prefix:
             confidence += min(0.03, 0.01 * literal_prefix)
         return SignatureMatch(self.name, self.category, min(0.88, confidence), notes)
+
+
+class JumpAsciiTailcallSignature(SignatureRule):
+    """Recognise ``jump`` → ASCII → ``tailcall`` → ASCII chains."""
+
+    name = "jump_ascii_tailcall"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        first = profiles[0]
+        if first.kind not in {InstructionKind.BRANCH, InstructionKind.CONTROL} and not first.label.startswith("22:"):
+            return None
+
+        if profiles[1].kind is not InstructionKind.ASCII_CHUNK:
+            return None
+
+        if not is_tailcall(profiles[2]):
+            return None
+
+        ascii_tail = sum(
+            1 for profile in profiles[3:] if profile.kind is InstructionKind.ASCII_CHUNK
+        )
+        if ascii_tail == 0:
+            return None
+
+        notes = (
+            "jump_idx=0",
+            f"ascii_tail={ascii_tail}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.87, self.base_confidence + 0.05 * min(ascii_tail, 2))
+        return SignatureMatch(self.name, self.category, confidence, notes)
 
 
 class AsciiTailcallPatternSignature(SignatureRule):
@@ -911,6 +1081,36 @@ class TailcallReturnIndirectSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class ReturnModeRibbonSignature(SignatureRule):
+    """Recognise return sequences that stay within ``mode=0x5B``."""
+
+    name = "return_mode_ribbon"
+    category = "return"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        labels = [profile.label for profile in profiles]
+        if labels[:3] != ["27:5B", "2A:5B", "30:5B"]:
+            return None
+
+        tail = profiles[3:]
+        if not tail or any(profile.mode != 0x5B for profile in tail):
+            return None
+
+        notes = (
+            "mode=0x5B",
+            f"tail_span={len(tail)}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.88, self.base_confidence + 0.05 * len(tail))
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class ReturnStackMarkerSignature(SignatureRule):
     """Recognise return chains guarded by ``5E:29`` / ``F0:4B`` markers."""
 
@@ -985,6 +1185,97 @@ class ReturnBdCapsuleSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, min(0.88, confidence), notes)
 
 
+class PoisonReturnPrologSignature(SignatureRule):
+    """Detect the ``FA:FF``/``41:DD``/``00:09`` prolog before returns."""
+
+    name = "poison_return_prolog"
+    category = "return"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 4:
+            return None
+
+        required = ["FA:FF", "41:DD", "00:09", "30:29"]
+        labels = [profile.label for profile in profiles[:4]]
+        if labels != required:
+            return None
+
+        notes = (
+            "poison_capsule",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.86, self.base_confidence + 0.05)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class ReturnAsciiEpilogueSignature(SignatureRule):
+    """Detect return tails that inject ASCII chunks before the follow-up push."""
+
+    name = "return_ascii_epilogue"
+    category = "return"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 6:
+            return None
+
+        if profiles[0].opcode != 0x04:
+            return None
+        if not is_call_helper(profiles[1]):
+            return None
+        if profiles[2].label != "77:00":
+            return None
+        if profiles[3].label != "01:84":
+            return None
+        if profiles[4].kind is not InstructionKind.ASCII_CHUNK:
+            return None
+        if profiles[5].kind not in {InstructionKind.LITERAL, InstructionKind.PUSH}:
+            return None
+
+        notes = (
+            "ascii_tail",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.86, self.base_confidence + 0.04)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class B4SlotReturnSignature(SignatureRule):
+    """Recognise ``20:00`` → ``01:B4`` slot prep followed by a guarded return."""
+
+    name = "b4_slot_return"
+    category = "return"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 6:
+            return None
+
+        labels = [profile.label for profile in profiles[:6]]
+        if labels[0] != "20:00" or labels[1] != "01:B4" or labels[2] != "00:69":
+            return None
+        if not labels[3].startswith("27:"):
+            return None
+        if labels[4] != "02:66":
+            return None
+        if profiles[5].kind is not InstructionKind.RETURN:
+            return None
+
+        notes = (
+            "b4_slot_sequence",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.87, self.base_confidence + 0.04)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class CallprepAsciiDispatchSignature(SignatureRule):
     """Recognise call helpers that dispatch via ASCII payloads."""
 
@@ -1017,6 +1308,43 @@ class CallprepAsciiDispatchSignature(SignatureRule):
             f"stackΔ={stack.change:+d}",
         )
         confidence = min(0.86, self.base_confidence + 0.05 * anchor_hits)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class FanoutTeardownExtendedSignature(SignatureRule):
+    """Match the extended fanout teardown guarded by ``1A:21``."""
+
+    name = "fanout_teardown_ext"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 7:
+            return None
+
+        labels = [profile.label for profile in profiles]
+        if labels[0] != "1A:21":
+            return None
+        if labels[1] != "04:00":
+            return None
+        if profiles[2].opcode != 0x66:
+            return None
+        if labels[3] != "01:69":
+            return None
+        if not labels[4].startswith("27:"):
+            return None
+        if labels[5] != "04:66":
+            return None
+        if not is_call_helper(profiles[6]):
+            return None
+
+        notes = (
+            "fanout_teardown_ext",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.87, self.base_confidence + 0.04)
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
@@ -1264,27 +1592,37 @@ class SignatureDetector:
     @staticmethod
     def _default_rules() -> Tuple[SignatureRule, ...]:
         return (
+            ReduceAsciiPrologSignature(),
             AsciiRunSignature(),
             HeaderAsciiCtrlSeqSignature(),
             ScriptHeaderPrologSignature(),
+            ModeSweepSignature(),
             TableStoreSignature(),
             IndirectFetchSignature(),
             MarkerPairWithHeaderSignature(),
             AsciiPrologMarkerComboSignature(),
             AsciiWrapperEf48Signature(),
             AsciiReduceMarkerSignature(),
+            MarkerFenceReduceSignature(),
             LiteralZeroInitSignature(),
             LiteralRunWithMarkersSignature(),
             LiteralReduceChainExSignature(),
+            StackLiftPairSignature(),
             AsciiTailcallPatternSignature(),
             TailcallAsciiWrapperSignature(),
+            JumpAsciiTailcallSignature(),
             AsciiIndirectTailcallSignature(),
             TailcallPostJumpSignature(),
             TailcallReturnComboSignature(),
             TailcallReturnIndirectSignature(),
+            ReturnModeRibbonSignature(),
             ReturnStackMarkerSignature(),
             ReturnBdCapsuleSignature(),
+            PoisonReturnPrologSignature(),
+            ReturnAsciiEpilogueSignature(),
+            B4SlotReturnSignature(),
             CallprepAsciiDispatchSignature(),
+            FanoutTeardownExtendedSignature(),
             FanoutTeardownSignature(),
             DoubleTailcallBranchSignature(),
             IndirectCallDualLiteralSignature(),
