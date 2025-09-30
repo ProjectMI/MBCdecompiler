@@ -1,0 +1,330 @@
+{
+  "branch_eq": {
+    "control_flow": "branch",
+    "summary": "Условный переход по =",
+    "opcodes": [
+      "17:00"
+    ]
+  },
+  "branch_lt": {
+    "control_flow": "branch",
+    "summary": "Условный переход по <",
+    "opcodes": [
+      "18:00"
+    ]
+  },
+  "branch_le": {
+    "control_flow": "branch",
+    "summary": "Условный переход по <=",
+    "opcodes": [
+      "19:00"
+    ]
+  },
+  "test_branch": {
+    "control_flow": "branch",
+    "summary": "Проверка значения на истинность и ветвление",
+    "opcodes": [
+      "1A:00"
+    ]
+  },
+  "testset_branch": {
+    "control_flow": "branch",
+    "summary": "Ветвление в стиле Lua TESTSET",
+    "opcodes": [
+      "1B:00"
+    ]
+  },
+  "tforloop_iter": {
+    "control_flow": "branch",
+    "summary": "TFORLOOP итератор",
+    "opcodes": [
+      "21:00"
+    ]
+  },
+  "jump_relative": {
+    "control_flow": "jump",
+    "summary": "Безусловный переход по относительному смещению",
+    "opcodes": [
+      "16:00"
+    ]
+  },
+  "call_helpers": {
+    "control_flow": "call",
+    "summary": "Все вспомогательные инструкции подготовки и возврата вызовов",
+    "opcodes": [
+      "10:00",
+      "10:01",
+      "10:02",
+      "10:04",
+      "10:AC"
+    ]
+  },
+  "call_dispatch": {
+    "control_flow": "call",
+    "summary": "Основной вызов функции",
+    "opcodes": [
+      "1C:00"
+    ]
+  },
+  "tailcall_dispatch": {
+    "control_flow": "call",
+    "summary": "Хвостовой вызов",
+    "opcodes": [
+      "1D:00"
+    ]
+  },
+  "return_values": {
+    "control_flow": "return",
+    "summary": "Инструкция возврата",
+    "opcodes": [
+      "1E:00"
+    ]
+  },
+  "terminator": {
+    "control_flow": "stop",
+    "summary": "Терминаторы выполнения, включая FF:00, FF:FF и их варианты",
+    "opcodes": [
+      "FF:00",
+      "FF:30",
+      "FF:69"
+    ]
+  },
+  "push_literal": {
+    "control_flow": "fallthrough",
+    "summary": "Все формы загрузки литералов (малые, средние, широкие, парные, followup). Семантика одинакова — помещение литерала(ов) на стек",
+    "opcodes": [
+      "00:00",
+      "00:01",
+      "00:02",
+      "00:03",
+      "00:04",
+      "00:29",
+      "00:2C"
+    ]
+  },
+  "inline_ascii_chunk": {
+    "control_flow": "fallthrough",
+    "summary": "Все инструкции вида inline_ascii_chunk_XXXX, представляющие собой закодированные ASCII-данные без изменения стека и управления",
+    "opcodes": [
+      "00:3C",
+      "00:41",
+      "00:53",
+      "00:63",
+      "1F:00",
+      "47:65",
+      "72:65",
+      "73:00",
+      "73:65",
+      "7C:7C",
+      "ED:DE"
+    ]
+  },
+  "literal_marker": {
+    "control_flow": "fallthrough",
+    "summary": "Все ресурсные и структурные маркеры. Используются как описательные элементы, не изменяют выполнение",
+    "opcodes": [
+      "00:26",
+      "00:28",
+      "00:31",
+      "00:3E",
+      "00:3D",
+      "00:5E",
+      "00:64",
+      "00:65",
+      "00:66",
+      "00:72",
+      "00:ED",
+      "00:F0",
+      "07:00",
+      "09:00",
+      "0A:00",
+      "0E:00",
+      "12:00",
+      "14:00",
+      "15:00",
+      "26:00",
+      "28:00",
+      "2B:00",
+      "30:00",
+      "32:00",
+      "35:00",
+      "3B:00",
+      "40:00",
+      "42:00",
+      "43:00",
+      "45:00",
+      "47:00",
+      "66:00",
+      "71:00",
+      "75:00",
+      "79:00",
+      "7A:00",
+      "7B:00",
+      "7D:00",
+      "7F:00",
+      "81:00",
+      "82:00",
+      "86:00",
+      "89:00",
+      "8A:00",
+      "8B:00",
+      "96:00",
+      "97:00",
+      "99:00",
+      "9A:00",
+      "9E:00",
+      "9F:00",
+      "A0:00",
+      "A1:00",
+      "A2:00",
+      "A3:00",
+      "A5:00",
+      "A6:00",
+      "A8:00",
+      "A9:00",
+      "AB:00",
+      "AD:00",
+      "AE:00",
+      "AF:00",
+      "B0:00",
+      "B1:00",
+      "B2:00",
+      "B3:00",
+      "B7:00",
+      "B9:00",
+      "BA:00",
+      "BB:00",
+      "BC:00",
+      "BE:00",
+      "BF:00",
+      "C1:00",
+      "C2:00",
+      "C3:00",
+      "C5:00",
+      "C6:00",
+      "C7:00",
+      "C9:00",
+      "CA:00",
+      "CB:00",
+      "CD:00",
+      "CE:00",
+      "CF:00",
+      "D0:00",
+      "D1:00",
+      "D2:00",
+      "D3:00",
+      "D4:00",
+      "D5:00",
+      "D6:00",
+      "D7:00",
+      "D9:00",
+      "DA:00",
+      "DB:00",
+      "DC:00",
+      "DF:00",
+      "E1:00",
+      "E0:00",
+      "E2:00",
+      "E3:00",
+      "E4:00",
+      "E5:00",
+      "E7:00",
+      "E9:00",
+      "EA:00",
+      "EB:00",
+      "EC:00",
+      "ED:00",
+      "EE:00",
+      "EF:00",
+      "F1:00",
+      "F2:00",
+      "F3:00",
+      "F4:00",
+      "F5:00",
+      "F6:00",
+      "F7:00",
+      "F8:00",
+      "F9:00",
+      "FA:00",
+      "FC:00",
+      "FD:00",
+      "FE:00",
+      "FF:3D",
+      "FF:FF"
+    ]
+  },
+  "fanout": {
+    "control_flow": "fallthrough",
+    "summary": "Инструкции дублирования значений на стеке (fanout_passthrough, fanout_single_a/b, fanout_pair и т.д.)",
+    "opcodes": [
+      "66:14",
+      "66:15",
+      "66:27",
+      "66:43",
+      "66:6F"
+    ]
+  },
+  "indirect_access": {
+    "control_flow": "fallthrough",
+    "summary": "Все формы indirect_fetch_slot / indirect_store_slot и их варианты. Семантика одна — косвенные загрузки и записи",
+    "opcodes": [
+      "69:01",
+      "69:10",
+      "69:11",
+      "69:20",
+      "69:6E"
+    ]
+  },
+  "reduce_pair": {
+    "control_flow": "fallthrough",
+    "summary": "Базовый редуктор",
+    "opcodes": [
+      "04:00"
+    ]
+  },
+  "reduce_quad": {
+    "control_flow": "fallthrough",
+    "summary": "Расширенный редуктор на четыре операнда",
+    "opcodes": [
+      "04:F0"
+    ]
+  },
+  "reduce_passthrough": {
+    "control_flow": "fallthrough",
+    "summary": "Форма редукции без изменения стека",
+    "opcodes": [
+      "04:66"
+    ]
+  },
+  "stack_teardown_1": {
+    "control_flow": "fallthrough",
+    "summary": "Очистка одного элемента стека",
+    "opcodes": [
+      "01:EC"
+    ]
+  },
+  "stack_teardown_3": {
+    "control_flow": "fallthrough",
+    "summary": "Очистка трёх элементов стека",
+    "opcodes": [
+      "01:F1"
+    ]
+  },
+  "stack_teardown_4": {
+    "control_flow": "fallthrough",
+    "summary": "Очистка четырёх элементов стека",
+    "opcodes": [
+      "01:F0"
+    ]
+  },
+  "stack_teardown_5": {
+    "control_flow": "fallthrough",
+    "summary": "Очистка пяти элементов стека",
+    "opcodes": [
+      "01:00"
+    ]
+  },
+  "unclassified": {
+    "opcodes": []
+  }
+}
