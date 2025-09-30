@@ -36,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--knowledge-base",
         type=Path,
-        default=Path("knowledge/opcode_profiles.json"),
-        help="Location of the opcode knowledge base database",
+        default=Path("knowledge/manual_annotations.json"),
+        help="Location of the manual opcode annotation file",
     )
     return parser.parse_args()
 
