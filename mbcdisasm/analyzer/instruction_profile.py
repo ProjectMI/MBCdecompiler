@@ -24,6 +24,7 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
+from .data_signatures import DATA_CLASSIFIER
 
 
 class InstructionKind(Enum):
@@ -142,6 +143,8 @@ class InstructionProfile:
         """Create a profile for ``word`` using ``knowledge`` annotations."""
 
         info = knowledge.lookup(word.label())
+        if info is None:
+            info = DATA_CLASSIFIER.classify(word)
         mnemonic = info.mnemonic if info else f"op_{word.opcode:02X}_{word.mode:02X}"
         summary = info.summary if info else None
         category = info.category if info else None
@@ -230,10 +233,10 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
 
     if info.category:
         category = info.category.lower()
-        if "literal" in category:
-            return InstructionKind.LITERAL
         if "ascii" in category:
             return InstructionKind.ASCII_CHUNK
+        if "literal" in category:
+            return InstructionKind.LITERAL
         if "push" in category:
             return InstructionKind.PUSH
         if "reduce" in category or "fold" in category:

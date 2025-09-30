@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, filter_profiles
+from .string_classifier import GLOBAL_STRING_CLASSIFIER
 from .stack import StackSummary
 
 
@@ -97,6 +98,7 @@ class HeuristicEngine:
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
         features.extend(self._context_features(previous, following))
+        features.extend(self._data_features(profiles))
 
         confidence = sum(feature.score for feature in features)
         confidence = max(0.0, min(1.0, confidence))
@@ -245,4 +247,51 @@ class HeuristicEngine:
             features.append(LocalFeature(name="pre_control", score=0.05, evidence=(previous.label,)))
         if following and following.is_control():
             features.append(LocalFeature(name="post_control", score=0.05, evidence=(following.label,)))
+        return features
+
+    def _data_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        """Detect synthetic data runs emitted by :mod:`data_signatures`."""
+
+        features: List[LocalFeature] = []
+        if not profiles:
+            return features
+
+        synthetic = [profile for profile in profiles if profile.traits.get("synthetic")]
+        if not synthetic:
+            return features
+
+        ascii_profiles = [profile for profile in synthetic if profile.traits.get("detector") == "ascii_chunk"]
+        if len(ascii_profiles) >= 2:
+            evidence = tuple(profile.traits.get("ascii_text", "?") for profile in ascii_profiles[:3])
+            features.append(LocalFeature(name="ascii_stream", score=0.2, evidence=evidence))
+
+            categories = [
+                GLOBAL_STRING_CLASSIFIER.classify(str(profile.traits.get("ascii_text", "")))
+                for profile in ascii_profiles
+                if profile.traits.get("ascii_text")
+            ]
+            if categories:
+                dominant = max(categories, key=lambda item: item.weight)
+                features.append(
+                    LocalFeature(
+                        name=f"ascii_{dominant.category}",
+                        score=min(0.25, dominant.weight),
+                        evidence=dominant.tags[:3],
+                    )
+                )
+
+        markers = [profile for profile in synthetic if profile.traits.get("detector") in {"repeat8", "repeat16", "char_marker"}]
+        if markers:
+            evidence = tuple(profile.traits.get("detector", "?") for profile in markers[:3])
+            features.append(LocalFeature(name="data_marker", score=0.15, evidence=evidence))
+
+        literal_opcode = [profile for profile in synthetic if profile.traits.get("detector") == "literal_opcode00"]
+        if len(literal_opcode) >= len(profiles) // 2:
+            modes = {profile.traits.get("mode") for profile in literal_opcode}
+            evidence = tuple(f"mode={mode:02X}" for mode in sorted(mode for mode in modes if isinstance(mode, int))[:3])
+            features.append(LocalFeature(name="literal_opcode00_run", score=0.2, evidence=evidence))
+
+        if len(synthetic) == len(profiles):
+            features.append(LocalFeature(name="synthetic_block", score=0.1))
+
         return features
