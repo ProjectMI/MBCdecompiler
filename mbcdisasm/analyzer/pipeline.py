@@ -20,6 +20,7 @@ from .signatures import SignatureDetector
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
+from .block_features import BlockFeatures
 
 
 @dataclass
@@ -106,6 +107,7 @@ class PipelineAnalyzer:
             stack_summary = StackTracker().process_block(block_profiles)
             previous = profiles[idx - 1] if idx > 0 else None
             following = profiles[idx + span] if idx + span < total else None
+            block_features = BlockFeatures.from_profiles(block_profiles)
             heuristic_report = self.heuristics.analyse(
                 block_profiles,
                 stack_summary,
@@ -114,6 +116,7 @@ class PipelineAnalyzer:
             )
             category, confidence, notes = self._classify_block(
                 block_profiles,
+                block_features,
                 stack_summary,
                 best_match,
                 heuristic_report,
@@ -127,6 +130,7 @@ class PipelineAnalyzer:
     def _classify_block(
         self,
         profiles: Sequence[InstructionProfile],
+        features: BlockFeatures,
         stack: StackSummary,
         match: Optional[PatternMatch],
         heuristics: HeuristicReport,
@@ -151,49 +155,85 @@ class PipelineAnalyzer:
             return signature.category, confidence, notes
 
         dominant = dominant_kind(profiles)
-        category = "unknown"
+        feature_map = heuristics.feature_map()
+        notes.extend(features.summarise())
+
+        category = "literal"
         confidence = self.settings.min_confidence
 
-        if dominant in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
-            category = "literal"
-            confidence = 0.55
-        elif dominant in {InstructionKind.REDUCE, InstructionKind.ARITHMETIC}:
-            category = "compute"
-            confidence = 0.5
-        elif dominant in {InstructionKind.STACK_TEARDOWN, InstructionKind.RETURN, InstructionKind.TERMINATOR}:
-            category = "return"
-            confidence = 0.6
-        elif dominant in {InstructionKind.CALL, InstructionKind.TAILCALL}:
-            category = "call"
-            confidence = 0.6
-        elif dominant is InstructionKind.TEST:
-            category = "test"
-            confidence = 0.5
-        elif dominant in {InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP}:
-            category = "indirect"
-            confidence = 0.5
+        literal_ratio = features.literal_ratio()
+        call_ratio = features.call_ratio()
+        return_ratio = features.return_ratio()
+        branch_ratio = features.branch_ratio()
+        compute_ratio = features.compute_ratio()
+        indirect_ratio = features.indirect_ratio()
 
-        feature_map = heuristics.feature_map()
-
-        if "indirect_pattern" in feature_map:
-            category = "indirect"
-            confidence = max(confidence, 0.6)
-
+        call_score = call_ratio
         if "call_helper" in feature_map:
-            category = "call"
-            confidence = max(confidence, 0.65)
+            call_score += feature_map["call_helper"].score
 
-        if "return_sequence" in feature_map or "stack_teardown" in feature_map:
-            category = "return"
-            confidence = max(confidence, 0.6)
+        has_explicit_call = features.call_like > 0 or dominant in {
+            InstructionKind.CALL,
+            InstructionKind.TAILCALL,
+        }
+        call_signal = has_explicit_call or (
+            call_score >= 0.35 and (literal_ratio < 0.45 or stack.change <= 0)
+        )
+
+        if call_signal:
+            category = "call"
+            confidence = max(confidence, min(1.0, 0.45 + call_score * 0.4 + heuristics.confidence * 0.2))
+        else:
+            return_score = return_ratio
+            if "return_sequence" in feature_map:
+                return_score += feature_map["return_sequence"].score
+            if "stack_teardown" in feature_map:
+                return_score += feature_map["stack_teardown"].score
+            if return_score >= 0.2 or dominant in {
+                InstructionKind.RETURN,
+                InstructionKind.TERMINATOR,
+                InstructionKind.STACK_TEARDOWN,
+            }:
+                category = "return"
+                confidence = max(confidence, min(1.0, 0.45 + return_score * 0.35 + heuristics.confidence * 0.2))
+            else:
+                if branch_ratio >= 0.2 or dominant is InstructionKind.TEST:
+                    category = "test"
+                    confidence = max(confidence, min(1.0, 0.4 + branch_ratio * 0.3 + heuristics.confidence * 0.1))
+                elif indirect_ratio >= 0.2 or "indirect_pattern" in feature_map:
+                    indirect_score = indirect_ratio
+                    if "indirect_pattern" in feature_map:
+                        indirect_score += feature_map["indirect_pattern"].score
+                    category = "indirect"
+                    confidence = max(confidence, min(1.0, 0.45 + indirect_score * 0.35 + heuristics.confidence * 0.1))
+                elif compute_ratio >= 0.25 or dominant in {
+                    InstructionKind.ARITHMETIC,
+                    InstructionKind.REDUCE,
+                }:
+                    category = "compute"
+                    confidence = max(confidence, min(1.0, 0.4 + compute_ratio * 0.4 + heuristics.confidence * 0.1))
+                else:
+                    literal_score = literal_ratio
+                    if dominant in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+                        literal_score = max(literal_score, 0.45)
+                    if literal_score < 0.2 and features.meta_like > features.literal_like and stack.change < 0:
+                        category = "compute"
+                        confidence = max(confidence, 0.4 + features.meta_ratio() * 0.3)
+                    else:
+                        category = "literal"
+                        confidence = max(confidence, min(1.0, 0.45 + literal_score * 0.4 + heuristics.confidence * 0.1))
 
         if stack.change > 0 and category == "compute":
             notes.append("positive stack change in compute block")
         if stack.change < 0 and category == "literal":
             notes.append("literal block reduced stack")
+
         if stack.uncertain:
             confidence *= 0.85
             notes.append("uncertain stack delta")
+
+        confidence = max(confidence, self.settings.min_confidence)
+        confidence = min(1.0, confidence)
         return category, confidence, notes
 
     def _generate_warnings(self, blocks: Sequence[PipelineBlock]) -> List[str]:

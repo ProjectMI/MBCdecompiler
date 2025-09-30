@@ -2,6 +2,7 @@ from pathlib import Path
 
 from mbcdisasm import KnowledgeBase, MbcContainer
 from mbcdisasm.analyzer import PipelineAnalyzer
+from mbcdisasm.analyzer.instruction_profile import InstructionKind
 from mbcdisasm.instruction import read_instructions
 
 
@@ -24,3 +25,16 @@ def test_char_script_recognition_ratio():
     assert total_blocks > 0
     ratio = recognised / total_blocks
     assert ratio >= 0.5
+
+
+def test_char_has_no_unknown_blocks():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    analyzer = PipelineAnalyzer(knowledge)
+    container = MbcContainer.load(Path("mbc/_char.mbc"), Path("mbc/_char.adb"))
+
+    for segment in container.segments():
+        instructions, _ = read_instructions(segment.data, segment.start)
+        report = analyzer.analyse_segment(instructions)
+        for block in report.blocks:
+            assert block.category != "unknown", f"Block {block.start_offset:08X} classified as unknown"
+            assert block.kind is not InstructionKind.UNKNOWN, f"Block {block.start_offset:08X} has unknown kind"

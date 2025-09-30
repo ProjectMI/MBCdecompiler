@@ -36,6 +36,38 @@ ASCII_HEURISTIC_SUMMARY = (
     "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
 )
 
+# Families of opcodes that can be classified purely from the opcode value.  The
+# manual annotation database does not yet cover the hundreds of helper opcodes
+# present in ``_char`` so the fallback classifier relies on these sets to assign
+# sensible :class:`InstructionKind` values.
+CALL_OPCODE_FAMILY = {
+    0x10,
+    0x11,
+    0x12,
+    0x13,
+    0x16,
+    0x17,
+    0x18,
+    0x19,
+    0x28,
+    0x4B,
+    0x84,
+    0x88,
+    0x8C,
+    0xA4,
+    0xA8,
+    0xAC,
+    0xB4,
+    0xB8,
+    0xBC,
+    0xF0,
+    0xF1,
+}
+
+INDIRECT_OPCODE_FAMILY = {0x69}
+
+TABLE_LOOKUP_OPCODE_FAMILY = {0x75}
+
 
 class InstructionKind(Enum):
     """High level classification of an opcode.
@@ -323,8 +355,17 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x22, 0x23, 0x24, 0x25, 0x26, 0x27}:
         return InstructionKind.BRANCH
 
-    if opcode in {0x16}:
+    if opcode in CALL_OPCODE_FAMILY:
         return InstructionKind.CALL
+
+    if opcode in INDIRECT_OPCODE_FAMILY:
+        return InstructionKind.INDIRECT
+
+    if opcode in TABLE_LOOKUP_OPCODE_FAMILY:
+        return InstructionKind.TABLE_LOOKUP
+
+    if opcode == 0xFF:
+        return InstructionKind.TERMINATOR
 
     if opcode in {0x41, 0x47, 0x90, 0xDC, 0xF4}:
         return InstructionKind.ASCII_CHUNK
@@ -341,7 +382,7 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x05, 0x06, 0x07, 0x08}:
         return InstructionKind.ARITHMETIC
 
-    return InstructionKind.UNKNOWN
+    return InstructionKind.META
 
 
 def resolve_opcode_info(
@@ -386,12 +427,21 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     if all(byte == 0 for byte in raw):
         return False
     printable = 0
-    for byte in raw:
-        if byte in ASCII_ALLOWED:
-            if 0x20 <= byte <= 0x7E:
-                printable += 1
+    zero_seen = False
+    for index, byte in enumerate(raw):
+        if byte == 0:
+            if not zero_seen:
+                # Allow trailing NUL terminators but reject embedded zeros.
+                if any(value != 0 for value in raw[index + 1 :]):
+                    return False
+            zero_seen = True
             continue
-        return False
+        if zero_seen:
+            return False
+        if byte not in ASCII_ALLOWED:
+            return False
+        if 0x20 <= byte <= 0x7E:
+            printable += 1
     return printable > 0
 
 
@@ -434,13 +484,57 @@ def summarise_profiles(profiles: Sequence[InstructionProfile]) -> Mapping[Instru
     return histogram
 
 
+# When multiple kinds tie for dominance we prefer the ones earlier in this
+# ordering.  The priority list favours call/return/branch classifications before
+# literal and compute categories which mirrors how the pipeline is typically
+# consumed: recovering the control structure takes precedence over the literal
+# payload.
+DOMINANT_PRIORITY = [
+    InstructionKind.CALL,
+    InstructionKind.TAILCALL,
+    InstructionKind.RETURN,
+    InstructionKind.TERMINATOR,
+    InstructionKind.BRANCH,
+    InstructionKind.TEST,
+    InstructionKind.INDIRECT,
+    InstructionKind.TABLE_LOOKUP,
+    InstructionKind.LITERAL,
+    InstructionKind.ASCII_CHUNK,
+    InstructionKind.PUSH,
+    InstructionKind.REDUCE,
+    InstructionKind.ARITHMETIC,
+    InstructionKind.LOGICAL,
+    InstructionKind.BITWISE,
+    InstructionKind.STACK_TEARDOWN,
+    InstructionKind.STACK_COPY,
+    InstructionKind.META,
+]
+
+
 def dominant_kind(profiles: Sequence[InstructionProfile]) -> InstructionKind:
     """Return the most common instruction kind in ``profiles``."""
 
     histogram = summarise_profiles(profiles)
     if not histogram:
         return InstructionKind.UNKNOWN
-    return max(histogram.items(), key=lambda item: item[1])[0]
+
+    if InstructionKind.UNKNOWN in histogram and len(histogram) > 1:
+        histogram = {
+            kind: count
+            for kind, count in histogram.items()
+            if kind is not InstructionKind.UNKNOWN
+        }
+
+    if not histogram:
+        return InstructionKind.UNKNOWN
+
+    priority = {kind: idx for idx, kind in enumerate(DOMINANT_PRIORITY)}
+
+    def score(item: Tuple[InstructionKind, int]) -> Tuple[int, int]:
+        kind, count = item
+        return (count, -priority.get(kind, len(priority)))
+
+    return max(histogram.items(), key=score)[0]
 
 
 def filter_profiles(
