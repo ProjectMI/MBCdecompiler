@@ -6,7 +6,7 @@ import re
 
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .ir import IRBlock, IRInstruction, IRProgram
 from .knowledge import KnowledgeBase
@@ -42,6 +42,7 @@ from .lua_formatter import (
     LuaRenderOptions,
     LuaWriter,
     MethodSignature,
+    render_lua_value,
     join_sections,
 )
 from .manual_semantics import InstructionSemantics
@@ -64,6 +65,7 @@ class HighLevelStack:
         self._values: List[LuaExpression] = []
         self._counter = 0
         self.warnings: List[str] = []
+        self.placeholders: List[str] = []
 
     def new_symbol(self, prefix: str = "value") -> str:
         name = f"{prefix}_{self._counter}"
@@ -122,6 +124,7 @@ class HighLevelStack:
         self.warnings.append(
             f"underflow generated placeholder {placeholder.name}"
         )
+        self.placeholders.append(placeholder.name)
         return placeholder
 
     def pop_many(self, count: int) -> List[LuaExpression]:
@@ -206,6 +209,9 @@ class FunctionMetadata:
     literal_runs: Sequence[LiteralRun] = field(default_factory=tuple)
     literal_stats: Optional[LiteralStatistics] = None
     literal_report: Optional[LiteralRunReport] = None
+    placeholders: Sequence[str] = field(default_factory=tuple)
+    mnemonic_counts: Dict[str, int] = field(default_factory=dict)
+    tag_counts: Dict[str, int] = field(default_factory=dict)
 
     def summary_lines(self) -> List[str]:
         lines = ["function summary:"]
@@ -214,6 +220,8 @@ class FunctionMetadata:
         lines.append(f"- literal instructions: {self.literal_count}")
         lines.append(f"- helper invocations: {self.helper_calls}")
         lines.append(f"- branches: {self.branch_count}")
+        if self.placeholders:
+            lines.append(f"- placeholder values: {len(self.placeholders)}")
         string_runs = [run for run in self.literal_runs if run.kind == "string"]
         if string_runs:
             lines.append(f"- string literal sequences: {len(string_runs)}")
@@ -229,6 +237,11 @@ class FunctionMetadata:
 
     def warning_lines(self) -> List[str]:
         return [f"- {warning}" for warning in self.warnings]
+
+    def placeholder_names(self) -> List[str]:
+        if not self.placeholders:
+            return []
+        return sorted(dict.fromkeys(self.placeholders))
 
     def literal_run_lines(
         self, *, limit: int = 8, preview: int = 72
@@ -261,6 +274,67 @@ class FunctionMetadata:
         blocks = self.literal_report.block_lines(limit=block_limit)
         return summary + blocks
 
+    # ------------------------------------------------------------------
+    def _top_items(
+        self, data: Dict[str, int], *, limit: int
+    ) -> List[Tuple[str, int, float]]:
+        if not data:
+            return []
+        total = max(sum(data.values()), 1)
+        items = sorted(data.items(), key=lambda item: (-item[1], item[0]))
+        result: List[Tuple[str, int, float]] = []
+        for name, count in items[:limit]:
+            percentage = round((count / total) * 100, 1)
+            result.append((name, count, percentage))
+        return result
+
+    def mnemonic_summary(self, limit: int = 6) -> List[Tuple[str, int, float]]:
+        return self._top_items(self.mnemonic_counts, limit=limit)
+
+    def tag_summary(self, limit: int = 6) -> List[Tuple[str, int, float]]:
+        return self._top_items(self.tag_counts, limit=limit)
+
+    def instruction_profile_lines(self, limit: int = 6) -> List[str]:
+        top = self.mnemonic_summary(limit=limit)
+        if not top:
+            return []
+        lines = ["instruction profile (top mnemonics):"]
+        for name, count, percentage in top:
+            lines.append(f"- {name}: {count} ({percentage:.1f}% of instructions)")
+        return lines
+
+    def tag_profile_lines(self, limit: int = 6) -> List[str]:
+        top = self.tag_summary(limit=limit)
+        if not top:
+            return []
+        lines = ["instruction tags (top categories):"]
+        for name, count, percentage in top:
+            lines.append(f"- {name}: {count} ({percentage:.1f}% of instructions)")
+        return lines
+
+    def density_stats(self) -> Dict[str, float]:
+        if self.instruction_count <= 0:
+            return {}
+        base = max(self.instruction_count, 1)
+        stats: Dict[str, float] = {}
+        if self.literal_count:
+            stats["literal"] = round((self.literal_count / base) * 100, 2)
+        if self.helper_calls:
+            stats["helper"] = round((self.helper_calls / base) * 100, 2)
+        if self.branch_count:
+            stats["branch"] = round((self.branch_count / base) * 100, 2)
+        return stats
+
+    def density_lines(self) -> List[str]:
+        stats = self.density_stats()
+        if not stats:
+            return []
+        order = sorted(stats.items(), key=lambda item: (-item[1], item[0]))
+        lines = ["instruction density:"]
+        for name, percentage in order:
+            lines.append(f"- {name}: {percentage:.2f}% of instructions")
+        return lines
+
 
 @dataclass
 class HighLevelFunction:
@@ -269,12 +343,25 @@ class HighLevelFunction:
     name: str
     body: BlockStatement
     metadata: FunctionMetadata
+    segment_index: int
 
     def render(self) -> str:
         writer = LuaWriter()
         summary = self.metadata.summary_lines()
         if summary:
             writer.write_comment_block(summary)
+            writer.write_line("")
+        profile_lines = self.metadata.instruction_profile_lines()
+        if profile_lines:
+            writer.write_comment_block(profile_lines)
+            writer.write_line("")
+        tag_lines = self.metadata.tag_profile_lines()
+        if tag_lines:
+            writer.write_comment_block(tag_lines)
+            writer.write_line("")
+        density_lines = self.metadata.density_lines()
+        if density_lines:
+            writer.write_comment_block(density_lines)
             writer.write_line("")
         literal_lines = self.metadata.literal_run_lines()
         if literal_lines:
@@ -295,9 +382,688 @@ class HighLevelFunction:
             writer.write_line("")
         writer.write_line(f"function {self.name}()")
         with writer.indented():
+            placeholders = self.metadata.placeholder_names()
+            if placeholders:
+                writer.write_comment(
+                    "placeholder locals inserted for stack underflow warnings"
+                )
+                for name in placeholders:
+                    writer.write_line(f"local {name}")
+                writer.ensure_blank_line()
             self.body.emit(writer)
         writer.write_line("end")
         return writer.render()
+
+
+@dataclass
+class FunctionMetadataEntry:
+    """Snapshot of the metadata that feeds the module level summary."""
+
+    name: str
+    segment_index: int
+    blocks: int
+    instructions: int
+    helper_calls: int
+    branches: int
+    literal_instructions: int
+    literal_runs: Sequence[LiteralRun]
+    literal_kind_counts: Dict[str, int]
+    warnings: List[str]
+    placeholders: List[str]
+    literal_report_blocks: int = 0
+    top_tokens: List[Tuple[str, int]] = field(default_factory=list)
+    top_numbers: List[Tuple[int, int]] = field(default_factory=list)
+    longest_runs: List[str] = field(default_factory=list)
+    mnemonics: List[Dict[str, object]] = field(default_factory=list)
+    tags: List[Dict[str, object]] = field(default_factory=list)
+    density: Dict[str, float] = field(default_factory=dict)
+
+    def literal_run_count(self) -> int:
+        return len(self.literal_runs)
+
+    def string_run_count(self) -> int:
+        return self.literal_kind_counts.get("string", 0)
+
+    def numeric_run_count(self) -> int:
+        return self.literal_kind_counts.get("number", 0)
+
+    def warning_count(self) -> int:
+        return len(self.warnings)
+
+    def placeholder_count(self) -> int:
+        return len(self.placeholders)
+
+    def to_table(self) -> Dict[str, object]:
+        data: Dict[str, object] = {
+            "name": self.name,
+            "segment": self.segment_index,
+            "blocks": self.blocks,
+            "instructions": self.instructions,
+            "helpers": self.helper_calls,
+            "branches": self.branches,
+            "literal_instructions": self.literal_instructions,
+            "literal_runs": self.literal_run_count(),
+        }
+        if self.literal_kind_counts:
+            data["literal_kinds"] = dict(sorted(self.literal_kind_counts.items()))
+        if self.literal_report_blocks:
+            data["literal_report_blocks"] = self.literal_report_blocks
+        if self.top_tokens:
+            data["top_tokens"] = [list(item) for item in self.top_tokens]
+        if self.top_numbers:
+            data["top_numbers"] = [list(item) for item in self.top_numbers]
+        if self.longest_runs:
+            data["longest_runs"] = list(self.longest_runs)
+        if self.warnings:
+            data["warnings"] = list(self.warnings)
+        if self.placeholders:
+            data["placeholders"] = list(self.placeholders)
+        if self.mnemonics:
+            data["mnemonics"] = [dict(item) for item in self.mnemonics]
+        if self.tags:
+            data["tags"] = [dict(item) for item in self.tags]
+        if self.density:
+            data["density"] = dict(self.density)
+        return data
+
+
+@dataclass
+class ModuleMetadataSnapshot:
+    """Aggregated view of module level metadata and helper information."""
+
+    summary: Dict[str, Any]
+    functions: List[FunctionMetadataEntry]
+    helper_info: Dict[str, Any]
+    enum_info: List[Dict[str, Any]]
+    name_index: Dict[str, int] = field(default_factory=dict)
+    warning_map: Dict[str, List[str]] = field(default_factory=dict)
+    placeholder_map: Dict[str, List[str]] = field(default_factory=dict)
+    literal_preview_map: Dict[str, List[str]] = field(default_factory=dict)
+    helper_function_map: Dict[str, Any] = field(default_factory=dict)
+    struct_method_map: Dict[str, Any] = field(default_factory=dict)
+    mnemonic_map: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
+    tag_map: Dict[str, List[Dict[str, object]]] = field(default_factory=dict)
+    module_mnemonics: List[Dict[str, object]] = field(default_factory=list)
+    module_tags: List[Dict[str, object]] = field(default_factory=list)
+    density_map: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    def summary_lines(self) -> List[str]:
+        lines = ["module summary:"]
+        lines.append(f"- functions: {self.summary.get('functions', 0)}")
+        lines.append(f"- helper functions: {self.summary.get('helper_functions', 0)}")
+        lines.append(f"- struct helpers: {self.summary.get('struct_helpers', 0)}")
+        lines.append(
+            f"- literal instructions: {self.summary.get('literal_instructions', 0)}"
+        )
+        lines.append(
+            f"- branch instructions: {self.summary.get('branch_instructions', 0)}"
+        )
+        enum_info = self.summary.get("enum_namespaces")
+        if isinstance(enum_info, dict):
+            lines.append(
+                "- enum namespaces: "
+                f"{enum_info.get('count', 0)} "
+                f"({enum_info.get('values', 0)} values)"
+            )
+        lines.append(f"- stack warnings: {self.summary.get('stack_warnings', 0)}")
+        placeholder_total = self.summary.get("placeholder_values")
+        if placeholder_total:
+            lines.append(f"- placeholder values: {placeholder_total}")
+        string_total = self.summary.get("string_literal_sequences")
+        if string_total:
+            lines.append(f"- string literal sequences: {string_total}")
+        numeric_total = self.summary.get("numeric_literal_runs")
+        if numeric_total:
+            lines.append(f"- numeric literal runs: {numeric_total}")
+        literal_report = self.summary.get("literal_report")
+        if isinstance(literal_report, dict):
+            blocks = literal_report.get("blocks")
+            if blocks:
+                lines.append(f"- literal run blocks: {blocks}")
+            tokens = literal_report.get("top_tokens") or []
+            if tokens:
+                token_line = ", ".join(f"{token}:{count}" for token, count in tokens)
+                lines.append(f"- literal tokens: {token_line}")
+            numbers = literal_report.get("top_numbers") or []
+            if numbers:
+                number_line = ", ".join(f"{value}:{count}" for value, count in numbers)
+                lines.append(f"- literal numbers: {number_line}")
+            previews = literal_report.get("longest_runs") or []
+            if previews:
+                lines.append("- notable literal runs: " + "; ".join(previews[:2]))
+        mnemonic_info = self.summary.get("mnemonics")
+        if isinstance(mnemonic_info, dict):
+            unique = mnemonic_info.get("unique", 0)
+            lines.append(f"- instruction mnemonics: {unique} unique")
+            top = mnemonic_info.get("top") or []
+            if top:
+                preview = ", ".join(
+                    f"{item['name']}:{item['count']}" for item in top[:4]
+                )
+                lines.append(f"- top mnemonics: {preview}")
+        tag_info = self.summary.get("tags")
+        if isinstance(tag_info, dict):
+            unique_tags = tag_info.get("unique", 0)
+            lines.append(f"- instruction tags: {unique_tags} categories")
+            tag_preview = tag_info.get("top") or []
+            if tag_preview:
+                preview = ", ".join(
+                    f"{item['name']}:{item['count']}" for item in tag_preview[:4]
+                )
+                lines.append(f"- top tags: {preview}")
+        density_info = self.summary.get("density")
+        if isinstance(density_info, dict) and density_info:
+            density_line = ", ".join(
+                f"{name}={value:.2f}%" for name, value in sorted(density_info.items())
+            )
+            lines.append(f"- instruction density: {density_line}")
+        return lines
+
+    def has_table(self) -> bool:
+        return bool(
+            self.functions
+            or self.helper_info
+            or self.enum_info
+            or self.module_mnemonics
+            or self.module_tags
+            or self.mnemonic_map
+            or self.tag_map
+            or self.density_map
+        )
+
+    def to_table(self) -> Dict[str, object]:
+        payload: Dict[str, object] = {"summary": self.summary}
+        if self.functions:
+            payload["functions"] = [entry.to_table() for entry in self.functions]
+        if self.helper_info:
+            payload["helpers"] = self.helper_info
+        if self.enum_info:
+            payload["enums"] = self.enum_info
+        if self.module_mnemonics:
+            payload["mnemonics"] = [dict(item) for item in self.module_mnemonics]
+        if self.module_tags:
+            payload["tags"] = [dict(item) for item in self.module_tags]
+        if self.density_map:
+            payload["density_map"] = {
+                name: dict(values) for name, values in sorted(self.density_map.items())
+            }
+        return payload
+
+    def render_table(self, writer: LuaWriter) -> None:
+        if not self.has_table():
+            return
+        writer.write_comment("module metadata tables (auto-generated)")
+        table_lines = render_lua_value(self.to_table()).splitlines()
+        if not table_lines:
+            return
+        writer.write_line(f"local __module_metadata = {table_lines[0]}")
+        for line in table_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        index_lines = render_lua_value(self.name_index or {}).splitlines()
+        writer.write_line(f"local __metadata_index = {index_lines[0]}")
+        for line in index_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        warning_lines = render_lua_value(self.warning_map or {}).splitlines()
+        writer.write_line(f"local __metadata_warnings = {warning_lines[0]}")
+        for line in warning_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        placeholder_lines = render_lua_value(self.placeholder_map or {}).splitlines()
+        writer.write_line(f"local __metadata_placeholders = {placeholder_lines[0]}")
+        for line in placeholder_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        literal_lines = render_lua_value(self.literal_preview_map or {}).splitlines()
+        writer.write_line(f"local __metadata_literal_runs = {literal_lines[0]}")
+        for line in literal_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        mnemonic_lines = render_lua_value(self.mnemonic_map or {}).splitlines()
+        writer.write_line(f"local __metadata_mnemonics = {mnemonic_lines[0]}")
+        for line in mnemonic_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        tag_lines = render_lua_value(self.tag_map or {}).splitlines()
+        writer.write_line(f"local __metadata_tags = {tag_lines[0]}")
+        for line in tag_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        module_mnemonics = render_lua_value(self.module_mnemonics or {}).splitlines()
+        writer.write_line(f"local __module_mnemonics = {module_mnemonics[0]}")
+        for line in module_mnemonics[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        module_tags = render_lua_value(self.module_tags or {}).splitlines()
+        writer.write_line(f"local __module_tags = {module_tags[0]}")
+        for line in module_tags[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        density_lines = render_lua_value(self.density_map or {}).splitlines()
+        writer.write_line(f"local __metadata_density = {density_lines[0]}")
+        for line in density_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+
+        writer.write_comment("metadata query helpers")
+        writer.write_line("local function module_metadata()")
+        with writer.indented():
+            writer.write_line("return __module_metadata")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_metadata(name)")
+        with writer.indented():
+            writer.write_line("local index = __metadata_index[name]")
+            writer.write_line("if not index then")
+            with writer.indented():
+                writer.write_line("return nil")
+            writer.write_line("end")
+            writer.write_line("return __module_metadata.functions[index]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_warnings(name)")
+        with writer.indented():
+            writer.write_line("return __metadata_warnings[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_placeholders(name)")
+        with writer.indented():
+            writer.write_line("return __metadata_placeholders[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_literal_runs(name)")
+        with writer.indented():
+            writer.write_line("return __metadata_literal_runs[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_mnemonics(name)")
+        with writer.indented():
+            writer.write_line("return __metadata_mnemonics[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_tags(name)")
+        with writer.indented():
+            writer.write_line("return __metadata_tags[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function module_mnemonics()")
+        with writer.indented():
+            writer.write_line("return __module_mnemonics")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function module_tags()")
+        with writer.indented():
+            writer.write_line("return __module_tags")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function function_density(name)")
+        with writer.indented():
+            writer.write_line("return __metadata_density[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function module_density()")
+        with writer.indented():
+            writer.write_line("local summary = __module_metadata.summary")
+            writer.write_line("if not summary then")
+            with writer.indented():
+                writer.write_line("return nil")
+            writer.write_line("end")
+            writer.write_line("return summary.density")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_comment("helper signature tables (auto-generated)")
+        helper_lines = render_lua_value(self.helper_function_map or {}).splitlines()
+        writer.write_line(f"local __helper_functions = {helper_lines[0]}")
+        for line in helper_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+        struct_lines = render_lua_value(self.struct_method_map or {}).splitlines()
+        writer.write_line(f"local __struct_helpers = {struct_lines[0]}")
+        for line in struct_lines[1:]:
+            writer.write_line(line)
+        writer.ensure_blank_line()
+        writer.write_line("local function helper_metadata(name)")
+        with writer.indented():
+            writer.write_line("return __helper_functions[name]")
+        writer.write_line("end")
+        writer.ensure_blank_line()
+        writer.write_line("local function struct_helper_metadata(struct, method)")
+        with writer.indented():
+            writer.write_line("local bucket = __struct_helpers[struct]")
+            writer.write_line("if not bucket then")
+            with writer.indented():
+                writer.write_line("return nil")
+            writer.write_line("end")
+            writer.write_line("return bucket[method]")
+        writer.write_line("end")
+
+
+class ModuleMetadataBuilder:
+    """Construct structured metadata for the reconstructed module."""
+
+    def __init__(
+        self,
+        functions: Sequence[HighLevelFunction],
+        *,
+        helper_registry: HelperRegistry,
+        enum_registry: EnumRegistry,
+        options: LuaRenderOptions,
+    ) -> None:
+        self._functions = functions
+        self._helper_registry = helper_registry
+        self._enum_registry = enum_registry
+        self._options = options
+
+    def build(self) -> ModuleMetadataSnapshot:
+        function_entries = [self._build_function_entry(func) for func in self._functions]
+        name_index = {entry.name: idx + 1 for idx, entry in enumerate(function_entries)}
+        warning_map = {
+            entry.name: list(entry.warnings)
+            for entry in function_entries
+            if entry.warnings
+        }
+        placeholder_map = {
+            entry.name: list(entry.placeholders)
+            for entry in function_entries
+            if entry.placeholders
+        }
+        literal_preview_map = {
+            entry.name: list(entry.longest_runs)
+            for entry in function_entries
+            if entry.longest_runs
+        }
+        mnemonic_map = {
+            entry.name: [dict(item) for item in entry.mnemonics]
+            for entry in function_entries
+            if entry.mnemonics
+        }
+        tag_map = {
+            entry.name: [dict(item) for item in entry.tags]
+            for entry in function_entries
+            if entry.tags
+        }
+        density_map = {
+            entry.name: dict(entry.density)
+            for entry in function_entries
+            if entry.density
+        }
+        mnemonic_counter: Counter[str] = Counter()
+        tag_counter: Counter[str] = Counter()
+        for entry in function_entries:
+            for item in entry.mnemonics:
+                mnemonic_counter[item["name"]] += int(item["count"])
+            for item in entry.tags:
+                tag_counter[item["name"]] += int(item["count"])
+        summary = self._build_summary(function_entries, mnemonic_counter, tag_counter)
+        total_instructions = sum(entry.instructions for entry in function_entries)
+        module_mnemonics = self._profile_from_counter(
+            mnemonic_counter, total_instructions, limit=64
+        )
+        module_tags = self._profile_from_counter(
+            tag_counter, total_instructions, limit=64
+        )
+        helper_info, helper_function_map, struct_method_map = self._build_helper_info()
+        enum_info = self._build_enum_info()
+        return ModuleMetadataSnapshot(
+            summary=summary,
+            functions=function_entries,
+            helper_info=helper_info,
+            enum_info=enum_info,
+            name_index=name_index,
+            warning_map=warning_map,
+            placeholder_map=placeholder_map,
+            literal_preview_map=literal_preview_map,
+            helper_function_map=helper_function_map,
+            struct_method_map=struct_method_map,
+            mnemonic_map=mnemonic_map,
+            tag_map=tag_map,
+            module_mnemonics=module_mnemonics,
+            module_tags=module_tags,
+            density_map=density_map,
+        )
+
+    def _build_function_entry(self, function: HighLevelFunction) -> FunctionMetadataEntry:
+        metadata = function.metadata
+        kind_counts = (
+            dict(metadata.literal_stats.kind_counts)
+            if metadata.literal_stats
+            else {}
+        )
+        report_blocks = 0
+        top_tokens: List[Tuple[str, int]] = []
+        top_numbers: List[Tuple[int, int]] = []
+        longest_runs: List[str] = []
+        if metadata.literal_report:
+            report_blocks = len(metadata.literal_report.block_summaries)
+            top_tokens = metadata.literal_report.top_tokens(limit=5)
+            top_numbers = metadata.literal_report.top_numbers(limit=5)
+            longest_runs = metadata.literal_report.longest_previews(limit=5)
+        mnemonic_profile = self._profile_from_counts(
+            metadata.mnemonic_counts,
+            metadata.instruction_count,
+        )
+        tag_profile = self._profile_from_counts(
+            metadata.tag_counts,
+            metadata.instruction_count,
+        )
+        density = metadata.density_stats()
+        return FunctionMetadataEntry(
+            name=function.name,
+            segment_index=function.segment_index,
+            blocks=metadata.block_count,
+            instructions=metadata.instruction_count,
+            helper_calls=metadata.helper_calls,
+            branches=metadata.branch_count,
+            literal_instructions=metadata.literal_count,
+            literal_runs=tuple(metadata.literal_runs),
+            literal_kind_counts=kind_counts,
+            warnings=list(metadata.warnings),
+            placeholders=metadata.placeholder_names(),
+            literal_report_blocks=report_blocks,
+            top_tokens=top_tokens,
+            top_numbers=top_numbers,
+            longest_runs=longest_runs,
+            mnemonics=mnemonic_profile,
+            tags=tag_profile,
+            density=density,
+        )
+
+    def _build_summary(
+        self,
+        entries: Sequence[FunctionMetadataEntry],
+        mnemonic_counter: Counter[str],
+        tag_counter: Counter[str],
+    ) -> Dict[str, Any]:
+        summary: Dict[str, Any] = {
+            "functions": len(entries),
+            "helper_functions": self._helper_registry.function_count(),
+            "struct_helpers": self._helper_registry.method_count(),
+            "literal_instructions": sum(
+                entry.literal_instructions for entry in entries
+            ),
+            "branch_instructions": sum(entry.branches for entry in entries),
+            "stack_warnings": sum(entry.warning_count() for entry in entries),
+        }
+        placeholder_total = sum(entry.placeholder_count() for entry in entries)
+        if placeholder_total:
+            summary["placeholder_values"] = placeholder_total
+        if not self._enum_registry.is_empty():
+            summary["enum_namespaces"] = {
+                "count": self._enum_registry.namespace_count(),
+                "values": self._enum_registry.total_values(),
+            }
+        string_total = sum(entry.string_run_count() for entry in entries)
+        if string_total:
+            summary["string_literal_sequences"] = string_total
+        numeric_total = sum(entry.numeric_run_count() for entry in entries)
+        if numeric_total:
+            summary["numeric_literal_runs"] = numeric_total
+        if self._options.emit_literal_report:
+            aggregated: List[LiteralRun] = []
+            for entry in entries:
+                aggregated.extend(entry.literal_runs)
+            if aggregated:
+                report = build_literal_run_report(aggregated)
+                summary["literal_report"] = {
+                    "blocks": len(report.block_summaries),
+                    "top_tokens": report.top_tokens(limit=5),
+                    "top_numbers": report.top_numbers(limit=5),
+                    "longest_runs": report.longest_previews(limit=5),
+                }
+        total_instructions = sum(entry.instructions for entry in entries)
+        if mnemonic_counter:
+            summary["mnemonics"] = {
+                "unique": len(mnemonic_counter),
+                "top": self._profile_from_counter(
+                    mnemonic_counter, total_instructions, limit=8
+                ),
+            }
+        if tag_counter:
+            summary["tags"] = {
+                "unique": len(tag_counter),
+                "top": self._profile_from_counter(
+                    tag_counter, total_instructions, limit=8
+                ),
+            }
+        density_summary = self._density_summary(entries)
+        if density_summary:
+            summary["density"] = density_summary
+        return summary
+
+    def _build_helper_info(self) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        counts = {
+            "functions": self._helper_registry.function_count(),
+            "methods": self._helper_registry.method_count(),
+            "structs": self._helper_registry.struct_count(),
+        }
+        functions: List[Dict[str, Any]] = []
+        function_map: Dict[str, Any] = {}
+        for signature in self._helper_registry.iter_functions():
+            functions.append(
+                {
+                    "name": signature.name,
+                    "inputs": signature.inputs,
+                    "outputs": signature.outputs,
+                    "uses_operand": signature.uses_operand,
+                    "summary": signature.summary,
+                }
+            )
+            function_map[signature.name] = {
+                "inputs": signature.inputs,
+                "outputs": signature.outputs,
+                "uses_operand": signature.uses_operand,
+                "summary": signature.summary,
+            }
+        methods: Dict[str, List[Dict[str, Any]]] = {}
+        struct_map: Dict[str, Any] = {}
+        for struct_name, signatures in self._helper_registry.iter_methods():
+            entries: List[Dict[str, Any]] = []
+            detail: Dict[str, Any] = {}
+            for signature in signatures:
+                entries.append(
+                    {
+                        "name": signature.name,
+                        "method": signature.method,
+                        "inputs": signature.inputs,
+                        "outputs": signature.outputs,
+                        "uses_operand": signature.uses_operand,
+                        "summary": signature.summary,
+                    }
+                )
+                detail[signature.method] = {
+                    "name": signature.name,
+                    "inputs": signature.inputs,
+                    "outputs": signature.outputs,
+                    "uses_operand": signature.uses_operand,
+                    "summary": signature.summary,
+                }
+            methods[struct_name] = entries
+            struct_map[struct_name] = detail
+        payload: Dict[str, Any] = {"counts": counts}
+        if functions:
+            payload["functions"] = functions
+        if methods:
+            payload["methods"] = methods
+        return payload, function_map, struct_map
+
+    def _build_enum_info(self) -> List[Dict[str, Any]]:
+        namespaces: List[Dict[str, Any]] = []
+        for namespace in self._enum_registry.iter_namespaces():
+            entry: Dict[str, Any] = {"name": namespace.name}
+            if namespace.description:
+                entry["description"] = namespace.description
+            values = [
+                {"value": value, "label": label}
+                for value, label in sorted(namespace.values.items())
+            ]
+            entry["values"] = values
+            namespaces.append(entry)
+        return namespaces
+
+    @staticmethod
+    def _profile_from_counter(
+        counter: Counter[str],
+        total: int,
+        *,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, object]]:
+        if not counter:
+            return []
+        safe_total = max(total, 1)
+        items = counter.most_common()
+        if limit is not None:
+            items = items[:limit]
+        profile: List[Dict[str, object]] = []
+        for name, count in items:
+            percentage = round((count / safe_total) * 100, 2)
+            profile.append({
+                "name": name,
+                "count": count,
+                "percentage": percentage,
+            })
+        return profile
+
+    @staticmethod
+    def _profile_from_counts(
+        counts: Dict[str, int],
+        total: int,
+        *,
+        limit: Optional[int] = None,
+    ) -> List[Dict[str, object]]:
+        if not counts:
+            return []
+        counter: Counter[str] = Counter(counts)
+        return ModuleMetadataBuilder._profile_from_counter(
+            counter, total, limit=limit
+        )
+
+    @staticmethod
+    def _density_summary(
+        entries: Sequence[FunctionMetadataEntry],
+    ) -> Dict[str, float]:
+        total_instructions = sum(entry.instructions for entry in entries)
+        if total_instructions <= 0:
+            return {}
+        safe_total = float(total_instructions)
+        literal = sum(entry.literal_instructions for entry in entries)
+        helpers = sum(entry.helper_calls for entry in entries)
+        branches = sum(entry.branches for entry in entries)
+        result = {
+            "literal": round((literal / safe_total) * 100, 2) if literal else 0.0,
+            "helper": round((helpers / safe_total) * 100, 2) if helpers else 0.0,
+            "branch": round((branches / safe_total) * 100, 2) if branches else 0.0,
+        }
+        return {name: value for name, value in result.items() if value > 0}
 
 
 @dataclass
@@ -350,6 +1116,8 @@ class BlockTranslator:
         self.helper_calls = 0
         self.branch_count = 0
         self.instruction_total = 0
+        self.mnemonic_counts: Counter[str] = Counter()
+        self.tag_counts: Counter[str] = Counter()
 
     def translate(self) -> Dict[int, BlockInfo]:
         blocks: Dict[int, BlockInfo] = {}
@@ -372,6 +1140,9 @@ class BlockTranslator:
             semantics = instruction.semantics
             self._reconstructor._register_enums(semantics)
             is_last = index == len(block.instructions) - 1
+            self.mnemonic_counts[semantics.mnemonic] += 1
+            for tag in semantics.tags:
+                self.tag_counts[tag] += 1
             if semantics.has_tag("literal"):
                 operand_expr = self._reconstructor._operand_expression(
                     semantics, instruction.operand
@@ -599,16 +1370,34 @@ class HighLevelReconstructor:
             literal_runs=tuple(literal_runs),
             literal_stats=stats,
             literal_report=report,
+            placeholders=tuple(translator.stack.placeholders),
+            mnemonic_counts=dict(translator.mnemonic_counts),
+            tag_counts=dict(translator.tag_counts),
         )
-        return HighLevelFunction(name=function_name, body=body, metadata=metadata)
+        return HighLevelFunction(
+            name=function_name,
+            body=body,
+            metadata=metadata,
+            segment_index=program.segment_index,
+        )
 
     # ------------------------------------------------------------------
     def render(self, functions: Sequence[HighLevelFunction]) -> str:
         sections: List[str] = []
+        metadata_snapshot = ModuleMetadataBuilder(
+            functions,
+            helper_registry=self._helper_registry,
+            enum_registry=self._enum_registry,
+            options=self.options,
+        ).build()
         if self.options.emit_module_summary:
             summary_writer = LuaWriter()
-            summary_writer.write_comment_block(self._module_summary_lines(functions))
+            summary_writer.write_comment_block(metadata_snapshot.summary_lines())
             sections.append(summary_writer.render())
+        if metadata_snapshot.has_table():
+            metadata_writer = LuaWriter()
+            metadata_snapshot.render_table(metadata_writer)
+            sections.append(metadata_writer.render())
         if not self._enum_registry.is_empty():
             writer = LuaWriter()
             self._enum_registry.render(writer, options=self.options)
@@ -827,61 +1616,6 @@ class HighLevelReconstructor:
             return False
         self._last_summary = summary
         return True
-
-    def _module_summary_lines(
-        self, functions: Sequence[HighLevelFunction]
-    ) -> List[str]:
-        lines = ["module summary:"]
-        lines.append(f"- functions: {len(functions)}")
-        helper_functions = self._helper_registry.function_count()
-        helper_methods = self._helper_registry.method_count()
-        lines.append(f"- helper functions: {helper_functions}")
-        lines.append(f"- struct helpers: {helper_methods}")
-        literal_total = sum(func.metadata.literal_count for func in functions)
-        lines.append(f"- literal instructions: {literal_total}")
-        branch_total = sum(func.metadata.branch_count for func in functions)
-        lines.append(f"- branch instructions: {branch_total}")
-        if not self._enum_registry.is_empty():
-            lines.append(
-                "- enum namespaces: "
-                f"{self._enum_registry.namespace_count()} "
-                f"({self._enum_registry.total_values()} values)"
-            )
-        warnings = sum(len(func.metadata.warnings) for func in functions)
-        lines.append(f"- stack warnings: {warnings}")
-        string_total = sum(
-            sum(1 for run in func.metadata.literal_runs if run.kind == "string")
-            for func in functions
-        )
-        if string_total:
-            lines.append(f"- string literal sequences: {string_total}")
-        numeric_total = sum(
-            sum(1 for run in func.metadata.literal_runs if run.kind == "number")
-            for func in functions
-        )
-        if numeric_total:
-            lines.append(f"- numeric literal runs: {numeric_total}")
-        if self.options.emit_literal_report:
-            all_runs: List[LiteralRun] = []
-            for func in functions:
-                all_runs.extend(func.metadata.literal_runs)
-            if all_runs:
-                report = build_literal_run_report(all_runs)
-                lines.append(f"- literal run blocks: {len(report.block_summaries)}")
-                tokens = report.top_tokens(limit=3)
-                if tokens:
-                    token_line = ", ".join(f"{token}:{count}" for token, count in tokens)
-                    lines.append(f"- literal tokens: {token_line}")
-                numbers = report.top_numbers(limit=3)
-                if numbers:
-                    number_line = ", ".join(f"{value}:{count}" for value, count in numbers)
-                    lines.append(f"- literal numbers: {number_line}")
-                previews = report.longest_previews(limit=2)
-                if previews:
-                    lines.append(
-                        "- notable literal runs: " + "; ".join(previews)
-                    )
-        return lines
 
     def _derive_function_name(
         self,

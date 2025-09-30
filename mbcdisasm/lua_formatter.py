@@ -12,6 +12,13 @@ The design is intentionally opinionated: we favour stable output over raw
 performance so that subsequent manual clean-up is predictable.  The helper
 registry is similarly focused on human readable stubs that document the known
 behaviour of VM helpers without trying to perfectly emulate Sphere's runtime.
+
+Recent iterations expanded the formatter with generic Lua table rendering
+utilities.  The high level reconstructor now emits structured metadata tables
+alongside the human readable comments so downstream tooling can inspect the
+same information without re-parsing natural language descriptions.  Keeping the
+table formatting logic here ensures a single, well tested implementation can be
+reused by other components.
 """
 
 from __future__ import annotations
@@ -19,6 +26,11 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+import re
+from collections.abc import Mapping
+
+from .lua_literals import escape_lua_string
 
 
 class LuaWriter:
@@ -258,6 +270,15 @@ class HelperRegistry:
             return
         bucket[signature.method] = signature
 
+    def iter_functions(self) -> Iterable[HelperSignature]:
+        for name in sorted(self._functions):
+            yield self._functions[name]
+
+    def iter_methods(self) -> Iterable[Tuple[str, List[MethodSignature]]]:
+        for struct in sorted(self._methods):
+            methods = self._methods[struct]
+            yield struct, [methods[name] for name in sorted(methods)]
+
     # ------------------------------------------------------------------
     # rendering helpers
     # ------------------------------------------------------------------
@@ -269,10 +290,11 @@ class HelperRegistry:
         options: Optional[LuaRenderOptions] = None,
     ) -> None:
         opts = options or LuaRenderOptions()
-        for struct_name, methods in sorted(self._methods.items()):
+        for struct_name, methods in self.iter_methods():
             writer.write_line(f"local {struct_name} = {{}}")
             writer.ensure_blank_line()
-            for method_name, signature in sorted(methods.items()):
+            for signature in methods:
+                method_name = signature.method
                 params = signature.parameters()
                 param_list = ", ".join(params)
                 writer.write_line(
@@ -290,7 +312,8 @@ class HelperRegistry:
                 writer.write_line("end")
                 writer.ensure_blank_line()
 
-        for name, signature in sorted(self._functions.items()):
+        for signature in self.iter_functions():
+            name = signature.name
             params = signature.parameters()
             param_list = ", ".join(params)
             writer.write_line(f"local function {name}({param_list})")
@@ -359,6 +382,10 @@ class EnumRegistry:
     def total_values(self) -> int:
         return sum(len(namespace.values) for namespace in self._namespaces.values())
 
+    def iter_namespaces(self) -> Iterable[EnumNamespace]:
+        for name in sorted(self._namespaces):
+            yield self._namespaces[name]
+
     def render(
         self,
         writer: LuaWriter,
@@ -366,7 +393,7 @@ class EnumRegistry:
         options: Optional[LuaRenderOptions] = None,
     ) -> None:
         opts = options or LuaRenderOptions()
-        for namespace in sorted(self._namespaces.values(), key=lambda item: item.name):
+        for namespace in self.iter_namespaces():
             if opts.emit_enum_metadata:
                 meta = [f"enum {namespace.name}: {len(namespace.values)} entries"]
                 if namespace.description:
@@ -400,4 +427,106 @@ def join_sections(sections: Iterable[str]) -> str:
 
     cleaned = [section.rstrip() for section in sections if section.strip()]
     return "\n\n".join(cleaned) + ("\n" if cleaned else "")
+
+
+_LUA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _format_table_key(key: object) -> str:
+    """Return a Lua table key representation for ``key``."""
+
+    if isinstance(key, str) and _LUA_IDENTIFIER_PATTERN.match(key):
+        return key
+    if isinstance(key, bool):
+        return "[true]" if key else "[false]"
+    if isinstance(key, (int, float)):
+        # Integers and floats can be emitted directly inside brackets.
+        if isinstance(key, bool):  # ``bool`` is a subclass of ``int``.
+            return "[true]" if key else "[false]"
+        return f"[{key}]"
+    return f"[{escape_lua_string(str(key))}]"
+
+
+def _format_scalar(value: object) -> str:
+    """Format scalar ``value`` for inclusion in a Lua table."""
+
+    if value is None:
+        return "nil"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{value}"
+    if isinstance(value, str):
+        return escape_lua_string(value)
+    return escape_lua_string(str(value))
+
+
+def _table_sort_key(item: object) -> Tuple[int, object]:
+    """Provide a deterministic sort key for Lua table entries."""
+
+    if isinstance(item, str):
+        return (0, item)
+    if isinstance(item, bool):
+        return (1, int(item))
+    if isinstance(item, (int, float)):
+        return (2, item)
+    return (3, str(item))
+
+
+def _render_lua_lines(value: object, indent: str, level: int) -> List[str]:
+    """Return a list of lines representing ``value`` as Lua source."""
+
+    prefix = indent * level
+    if isinstance(value, Mapping):
+        if not value:
+            return [f"{prefix}{{}}"]
+        lines: List[str] = [f"{prefix}{{"]
+        for key, entry in sorted(value.items(), key=lambda item: _table_sort_key(item[0])):
+            nested = _render_lua_lines(entry, indent, level + 1)
+            key_repr = _format_table_key(key)
+            if len(nested) == 1:
+                lines.append(
+                    f"{indent * (level + 1)}{key_repr} = {nested[0].lstrip()},"
+                )
+            else:
+                first = nested[0].lstrip()
+                lines.append(f"{indent * (level + 1)}{key_repr} = {first}")
+                if len(nested) > 2:
+                    lines.extend(nested[1:-1])
+                lines.append(f"{nested[-1]},")
+        lines.append(f"{prefix}}}")
+        return lines
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return [f"{prefix}{{}}"]
+        lines = [f"{prefix}{{"]
+        for entry in value:
+            nested = _render_lua_lines(entry, indent, level + 1)
+            if len(nested) == 1:
+                lines.append(f"{nested[0]},")
+            else:
+                if len(nested) > 1:
+                    lines.extend(nested[:-1])
+                lines.append(f"{nested[-1]},")
+        lines.append(f"{prefix}}}")
+        return lines
+    return [f"{prefix}{_format_scalar(value)}"]
+
+
+def render_lua_value(value: object, *, indent: str = "  ") -> str:
+    """Render ``value`` as a formatted Lua literal.
+
+    The renderer supports nested dictionaries and sequences, emitting stable
+    output suitable for inclusion in generated Lua sources.  Scalars are
+    formatted using Lua syntax (``true``/``false``, ``nil`` and quoted strings).
+    """
+
+    lines = _render_lua_lines(value, indent, 0)
+    return "\n".join(lines)
+
+
+def render_lua_table(mapping: Mapping[str, object], *, indent: str = "  ") -> str:
+    """Specialised helper that renders mapping objects as Lua tables."""
+
+    return render_lua_value(mapping, indent=indent)
 

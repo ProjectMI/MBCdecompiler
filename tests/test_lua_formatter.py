@@ -182,6 +182,7 @@ def test_highlevel_function_summary_and_warnings() -> None:
         name="segment_001",
         body=wrap_block([ReturnStatement()]),
         metadata=metadata,
+        segment_index=1,
     )
     rendered = function.render().splitlines()
     assert rendered[0] == "-- function summary:"
@@ -193,6 +194,30 @@ def test_highlevel_function_summary_and_warnings() -> None:
     assert "-- stack reconstruction warnings:" in rendered
     assert "-- - stack underflow" in rendered
     assert "function segment_001()" in rendered
+
+
+def test_highlevel_function_instruction_profile_rendered() -> None:
+    metadata = FunctionMetadata(
+        block_count=1,
+        instruction_count=5,
+        literal_count=2,
+        helper_calls=1,
+        branch_count=1,
+        mnemonic_counts={"load": 3, "store": 1, "branch": 1},
+        tag_counts={"literal": 2, "control": 1},
+    )
+    function = HighLevelFunction(
+        name="segment_profile",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata,
+        segment_index=8,
+    )
+    rendered = function.render().splitlines()
+    assert any("instruction profile (top mnemonics)" in line for line in rendered)
+    assert any("load: 3" in line for line in rendered)
+    assert any("instruction tags (top categories)" in line for line in rendered)
+    assert any("literal: 2" in line for line in rendered)
+    assert any("instruction density:" in line for line in rendered)
 
 
 def test_highlevel_function_string_metadata_block() -> None:
@@ -223,6 +248,7 @@ def test_highlevel_function_string_metadata_block() -> None:
         name="segment_demo",
         body=wrap_block([ReturnStatement()]),
         metadata=metadata,
+        segment_index=2,
     )
     rendered = function.render().splitlines()
     assert "-- function summary:" in rendered
@@ -230,6 +256,24 @@ def test_highlevel_function_string_metadata_block() -> None:
     assert "-- literal runs:" in rendered
     assert '-- - 0x001234 kind=string count=2: "demo string"' in rendered
     assert any("literal statistics" in line for line in rendered)
+
+
+def test_placeholder_locals_rendered() -> None:
+    metadata = FunctionMetadata(
+        block_count=1,
+        instruction_count=1,
+        placeholders=("stack_0", "stack_1"),
+    )
+    function = HighLevelFunction(
+        name="segment_placeholder",
+        body=wrap_block([ReturnStatement()]),
+        metadata=metadata,
+        segment_index=6,
+    )
+    rendered = function.render().splitlines()
+    assert any("placeholder locals inserted" in line for line in rendered)
+    assert any(line.strip() == "local stack_0" for line in rendered)
+    assert any(line.strip() == "local stack_1" for line in rendered)
 
 
 def test_module_summary_toggle(tmp_path: Path) -> None:
@@ -241,6 +285,7 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
         name="segment_010",
         body=wrap_block([ReturnStatement()]),
         metadata=metadata,
+        segment_index=3,
     )
     reconstructor._helper_registry.register_function(
         HelperSignature(
@@ -261,6 +306,32 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     assert "- branch instructions: 0" in output
     assert "- enum namespaces: 1 (1 values)" in output
     assert "- stack warnings: 0" in output
+    assert "module metadata table" in output
+    assert "local __module_metadata = {" in output
+    assert "module_metadata()" in output
+    assert "local __metadata_index = {" in output
+    assert "local __metadata_warnings = {" in output
+    assert "local __metadata_placeholders = {" in output
+    assert "local __metadata_literal_runs = {" in output
+    assert "local __metadata_mnemonics = {" in output
+    assert "local __metadata_tags = {" in output
+    assert "local __module_mnemonics = {" in output
+    assert "local __module_tags = {" in output
+    assert "local __metadata_density = {" in output
+    assert "local function function_metadata(" in output
+    assert "local function function_warnings(" in output
+    assert "local function function_placeholders(" in output
+    assert "local function function_literal_runs(" in output
+    assert "local function function_mnemonics(" in output
+    assert "local function function_tags(" in output
+    assert "local function module_mnemonics(" in output
+    assert "local function module_tags(" in output
+    assert "local function function_density(" in output
+    assert "local function module_density(" in output
+    assert "local __helper_functions = {" in output
+    assert "local __struct_helpers = {" in output
+    assert "local function helper_metadata(" in output
+    assert "local function struct_helper_metadata(" in output
 
     no_summary = HighLevelReconstructor(
         knowledge,
@@ -277,13 +348,23 @@ def test_module_summary_toggle(tmp_path: Path) -> None:
     )
     result = no_summary.render([function])
     assert "module summary" not in result
+    assert "module metadata table" in result
+    assert "local __metadata_index" in result
 
 
 def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
     knowledge = KnowledgeBase.load(tmp_path / "kb_multi.json")
     reconstructor = HighLevelReconstructor(knowledge)
 
-    metadata_a = FunctionMetadata(block_count=1, instruction_count=2, literal_count=1, helper_calls=0, branch_count=1)
+    metadata_a = FunctionMetadata(
+        block_count=1,
+        instruction_count=2,
+        literal_count=1,
+        helper_calls=0,
+        branch_count=1,
+        mnemonic_counts={"load": 1, "branch": 1},
+        tag_counts={"literal": 1, "control": 1},
+    )
     metadata_b = FunctionMetadata(
         block_count=2,
         instruction_count=3,
@@ -291,16 +372,21 @@ def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
         helper_calls=1,
         branch_count=0,
         warnings=["placeholder"],
+        placeholders=("stack_0",),
+        mnemonic_counts={"store": 2, "load": 1},
+        tag_counts={"literal": 2, "call": 1},
     )
     fn_a = HighLevelFunction(
         name="segment_a",
         body=wrap_block([ReturnStatement()]),
         metadata=metadata_a,
+        segment_index=4,
     )
     fn_b = HighLevelFunction(
         name="segment_b",
         body=wrap_block([ReturnStatement()]),
         metadata=metadata_b,
+        segment_index=5,
     )
 
     reconstructor._helper_registry.register_function(
@@ -333,6 +419,20 @@ def test_module_summary_with_multiple_functions(tmp_path: Path) -> None:
     assert "- literal instructions: 3" in rendered
     assert "- branch instructions: 1" in rendered
     assert "- stack warnings: 1" in rendered
+    assert "- placeholder values: 1" in rendered
+    assert "- instruction mnemonics:" in rendered
+    assert "- top mnemonics:" in rendered
+    assert "- instruction tags:" in rendered
+    assert "- top tags:" in rendered
+    assert "- instruction density:" in rendered
+    assert "module metadata table" in rendered
+    assert "density_map = {" in rendered
+    assert "placeholders = {" in rendered
+    assert '"stack_0"' in rendered
+    assert "__metadata_warnings" in rendered
+    assert '"placeholder"' in rendered
+    assert "__helper_functions" in rendered
+    assert "reduce_pair" in rendered
 
 
 def test_comment_deduplication(tmp_path: Path) -> None:
