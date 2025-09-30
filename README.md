@@ -36,7 +36,10 @@ return/terminator combinations.  The analyser combines deterministic stack
 tracking with small local opcode templates and the surrounding control-flow
 context.  Each recognised pipeline block records its stack delta, dominant
 instruction kind and confidence score, providing a solid foundation for higher
-level decompilation or refactoring tools.
+level decompilation or refactoring tools.  The command-line disassembler embeds
+these results directly in the emitted listing: each segment starts with a
+pipeline summary and every block is documented with stack ranges, detected
+patterns and heuristic notes before the corresponding instructions.
 
 ## Tests
 

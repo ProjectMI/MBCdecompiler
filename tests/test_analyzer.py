@@ -1,3 +1,4 @@
+from mbcdisasm import Disassembler, Segment, SegmentDescriptor
 from mbcdisasm.analyzer import PipelineAnalyzer
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
@@ -6,6 +7,11 @@ from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
 def make_word(offset: int, opcode: int, mode: int = 0, operand: int = 0) -> InstructionWord:
     raw = (opcode << 24) | (mode << 16) | (operand & 0xFFFF)
     return InstructionWord(offset, raw)
+
+
+def encode_word(opcode: int, mode: int = 0, operand: int = 0) -> bytes:
+    raw = (opcode << 24) | (mode << 16) | (operand & 0xFFFF)
+    return raw.to_bytes(4, "big")
 
 
 def build_knowledge() -> KnowledgeBase:
@@ -76,3 +82,34 @@ def test_return_pipeline_detection():
     categories = [block.category for block in report.blocks]
     assert "return" in categories
     assert report.total_stack_change() <= 0
+
+
+class _DummyContainer:
+    def __init__(self, segment: Segment) -> None:
+        self._segment = segment
+
+    def segments(self):
+        return (self._segment,)
+
+
+def test_listing_embeds_pipeline_blocks():
+    knowledge = build_knowledge()
+    disassembler = Disassembler(knowledge)
+
+    segment_bytes = b"".join(
+        [
+            encode_word(0x10),
+            encode_word(0x11),
+            encode_word(0x12),
+        ]
+    )
+    descriptor = SegmentDescriptor(index=0, start=0, end=len(segment_bytes))
+    segment = Segment(descriptor, segment_bytes)
+    container = _DummyContainer(segment)
+
+    listing = disassembler.generate_listing(container)
+
+    assert "; pipeline stats:" in listing
+    assert "; pipeline block 1:" in listing
+    assert "category=literal" in listing
+    assert "literal" in listing  # mnemonic still present
