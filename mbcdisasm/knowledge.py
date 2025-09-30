@@ -4,17 +4,82 @@ from __future__ import annotations
 
 import json
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 @dataclass(frozen=True)
 class OpcodeInfo:
-    """Human-friendly annotation for a single opcode/mode combination."""
+    """Human-friendly annotation for a single opcode/mode combination.
+
+    The historical tooling only tracked a mnemonic string and an optional
+    summary.  The upcoming pipeline analyser requires richer metadata so the
+    structure has been expanded to accommodate additional fields commonly found
+    in the manual annotation database.  All fields are optional and default to
+    ``None`` or an empty mapping which keeps the public surface backwards
+    compatible for callers that only rely on the mnemonic.
+    """
 
     mnemonic: str
     summary: Optional[str] = None
+    control_flow: Optional[str] = None
+    category: Optional[str] = None
+    stack_delta: Optional[int] = None
+    stack_push: Optional[int] = None
+    stack_pop: Optional[int] = None
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def stack_effect(self) -> Optional[int]:
+        """Return the signed stack delta if it is explicitly defined."""
+
+        if self.stack_delta is not None:
+            return self.stack_delta
+        if self.stack_push is not None or self.stack_pop is not None:
+            pushed = self.stack_push or 0
+            popped = self.stack_pop or 0
+            return pushed - popped
+        return None
+
+    @classmethod
+    def from_json(cls, mnemonic: str, entry: Mapping[str, Any]) -> "OpcodeInfo":
+        """Create an :class:`OpcodeInfo` instance from a JSON entry."""
+
+        summary = entry.get("summary")
+        control_flow = entry.get("control_flow")
+        category = entry.get("category")
+
+        stack_delta = entry.get("stack_delta")
+        stack_push = entry.get("stack_push")
+        stack_pop = entry.get("stack_pop")
+
+        attributes: Dict[str, Any] = {
+            key: value
+            for key, value in entry.items()
+            if key
+            not in {
+                "name",
+                "mnemonic",
+                "summary",
+                "control_flow",
+                "category",
+                "opcodes",
+                "stack_delta",
+                "stack_push",
+                "stack_pop",
+            }
+        }
+
+        return cls(
+            mnemonic=mnemonic,
+            summary=summary,
+            control_flow=control_flow,
+            category=category,
+            stack_delta=stack_delta,
+            stack_push=stack_push,
+            stack_pop=stack_pop,
+            attributes=attributes,
+        )
 
 
 class KnowledgeBase:
@@ -42,13 +107,13 @@ class KnowledgeBase:
                 if not isinstance(entry, Mapping):
                     continue
                 mnemonic = str(entry.get("name") or key)
-                summary = entry.get("summary")
+                info = OpcodeInfo.from_json(mnemonic, entry)
                 for label in entry.get("opcodes", []):
                     if not isinstance(label, str):
                         continue
                     normalized = _normalize_label(label)
                     if normalized is not None:
-                        annotations[normalized] = OpcodeInfo(mnemonic=mnemonic, summary=summary)
+                        annotations[normalized] = info
 
         return cls(annotations)
 
