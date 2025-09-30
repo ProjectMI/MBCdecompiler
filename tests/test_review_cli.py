@@ -80,10 +80,11 @@ class ReviewCliTest(unittest.TestCase):
 
         self.assertIn("BB:20", summary["updated_keys"])
         manual = json.loads(manual_path.read_text("utf-8"))
-        self.assertEqual(manual["BB:20"]["control_flow"], "call")
-        self.assertEqual(manual["BB:20"]["flow_target"], "relative")
-        self.assertEqual(manual["BB:20"]["stack_delta"], 1)
-        self.assertEqual(manual["BB:20"]["notes"], "verified")
+        overrides = manual["_overrides"]
+        self.assertEqual(overrides["BB:20"]["control_flow"], "call")
+        self.assertEqual(overrides["BB:20"]["flow_target"], "relative")
+        self.assertEqual(overrides["BB:20"]["stack_delta"], 1)
+        self.assertEqual(overrides["BB:20"]["notes"], "verified")
 
         reloaded = KnowledgeBase.load(self.knowledge_path)
         tasks = [task for task in reloaded.pending_review_tasks() if task.key == "BB:20"]

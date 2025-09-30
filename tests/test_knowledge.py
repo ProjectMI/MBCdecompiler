@@ -46,7 +46,20 @@ def test_manual_annotations_are_loaded(tmp_path):
     kb_path = tmp_path / "kb.json"
     manual_path = tmp_path / "manual_annotations.json"
     manual_path.write_text(
-        json.dumps({"01:02": {"name": "custom", "summary": "manual override"}}),
+        json.dumps(
+            {
+                "push_literal": {
+                    "control_flow": "fallthrough",
+                    "stack_delta": 1,
+                    "summary": "Literal push",
+                    "opcodes": ["01:02"],
+                },
+                "_overrides": {
+                    "01:02": {"name": "custom", "summary": "manual override"}
+                },
+            },
+            sort_keys=True,
+        ),
         "utf-8",
     )
 
@@ -121,14 +134,23 @@ def test_merge_profiles_infers_manual_annotations(tmp_path):
     manual_path.write_text(
         json.dumps(
             {
-                "AA:00": {
-                    "name": "manual_literal",
-                    "summary": "Push literal value",
-                    "stack_delta": 1,
-                    "operand_hint": "small",
+                "push_literal": {
                     "control_flow": "fallthrough",
-                }
-            }
+                    "stack_delta": 1,
+                    "summary": "Literal push",
+                    "opcodes": ["AA:00"],
+                },
+                "_overrides": {
+                    "AA:00": {
+                        "name": "manual_literal",
+                        "summary": "Push literal value",
+                        "stack_delta": 1,
+                        "operand_hint": "small",
+                        "control_flow": "fallthrough",
+                    }
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )
@@ -164,14 +186,23 @@ def test_manual_inference_handles_unknown_stack(tmp_path):
     manual_path.write_text(
         json.dumps(
             {
-                "AA:00": {
-                    "name": "manual_literal",
-                    "summary": "Push literal value",
-                    "stack_delta": 1,
-                    "operand_hint": "small",
+                "push_literal": {
                     "control_flow": "fallthrough",
-                }
-            }
+                    "stack_delta": 1,
+                    "summary": "Literal push",
+                    "opcodes": ["AA:00"],
+                },
+                "_overrides": {
+                    "AA:00": {
+                        "name": "manual_literal",
+                        "summary": "Push literal value",
+                        "stack_delta": 1,
+                        "operand_hint": "small",
+                        "control_flow": "fallthrough",
+                    }
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )
@@ -204,12 +235,21 @@ def test_missing_operand_hint_not_queued_for_review(tmp_path):
     manual_path.write_text(
         json.dumps(
             {
-                "CC:00": {
-                    "name": "manual_cc",
-                    "summary": "Manual without operand hint",
+                "manual_group": {
+                    "control_flow": "fallthrough",
                     "stack_delta": 1,
-                }
-            }
+                    "summary": "Manual group",
+                    "opcodes": ["CC:00"],
+                },
+                "_overrides": {
+                    "CC:00": {
+                        "name": "manual_cc",
+                        "summary": "Manual without operand hint",
+                        "stack_delta": 1,
+                    }
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )

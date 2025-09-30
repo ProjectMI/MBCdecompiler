@@ -1228,9 +1228,62 @@ class KnowledgeBase:
                 f"manual annotations file {manual_path} must contain an object"
             )
 
-        for key, payload in manual_data.items():
+        category_entries: Dict[str, Dict[str, object]] = {}
+        overrides_raw = manual_data.get("_overrides")
+        overrides: Dict[str, Dict[str, object]] = {}
+        if isinstance(overrides_raw, Mapping):
+            for key, payload in overrides_raw.items():
+                if not isinstance(payload, Mapping):
+                    continue
+                overrides[str(key)] = {
+                    str(field): value for field, value in payload.items()
+                }
+
+        for category, payload in manual_data.items():
+            if category == "unclassified" or category.startswith("_"):
+                continue
             if not isinstance(payload, Mapping):
                 continue
+            opcodes = payload.get("opcodes")
+            if not isinstance(opcodes, Sequence):
+                continue
+
+            base_entry: Dict[str, object] = {"category": str(category)}
+            summary = payload.get("summary")
+            if summary is not None:
+                base_entry["summary"] = str(summary)
+            control_flow = payload.get("control_flow")
+            if control_flow is not None:
+                base_entry["control_flow"] = str(control_flow)
+            if "stack_delta" in payload:
+                try:
+                    base_entry["stack_delta"] = float(payload["stack_delta"])
+                except (TypeError, ValueError):
+                    pass
+
+            for opcode in opcodes:
+                key_str = str(opcode)
+                entry = dict(base_entry)
+                entry.setdefault(
+                    "name", f"{category}_{key_str.replace(':', '_')}"
+                )
+                category_entries[key_str] = entry
+
+        manual_entries: Dict[str, Dict[str, object]] = {
+            key: dict(value) for key, value in category_entries.items()
+        }
+
+        for key, payload in overrides.items():
+            entry = manual_entries.get(key)
+            if entry is None:
+                entry = {
+                    "category": "manual_override",
+                    "name": f"manual_override_{key.replace(':', '_')}",
+                }
+                manual_entries[key] = entry
+            entry.update(payload)
+
+        for key, payload in manual_entries.items():
             key_str = str(key)
             normalized = {str(field): value for field, value in payload.items()}
             self._manual_reference[key_str] = normalized

@@ -61,33 +61,60 @@ def test_highlevel_reconstruction_generates_control_flow(tmp_path: Path) -> None
     manual_path.write_text(
         json.dumps(
             {
-                "01:00": {
-                    "name": "push_literal_small",
-                    "summary": "Load an enum state",
+                "literal_ops": {
+                    "control_flow": "fallthrough",
                     "stack_delta": 1,
-                    "tags": ["literal"],
-                    "enum_values": {"0": "IDLE", "1": "RUN"},
-                    "enum_namespace": "State",
+                    "summary": "Literal operations",
+                    "opcodes": ["01:00"],
                 },
-                "02:00": {
-                    "name": "compare_equal",
-                    "summary": "Check equality",
+                "compare_ops": {
+                    "control_flow": "fallthrough",
                     "stack_delta": -1,
-                    "tags": ["comparison"],
+                    "summary": "Comparison operations",
+                    "opcodes": ["02:00"],
                 },
-                "03:00": {
-                    "name": "branch_if_true",
-                    "summary": "Branch when true",
-                    "stack_delta": -1,
+                "branch_ops": {
                     "control_flow": "branch",
-                },
-                "04:00": {
-                    "name": "return_value",
-                    "summary": "Return top value",
                     "stack_delta": -1,
-                    "control_flow": "return",
+                    "summary": "Branch helpers",
+                    "opcodes": ["03:00"],
                 },
-            }
+                "return_ops": {
+                    "control_flow": "return",
+                    "stack_delta": -1,
+                    "summary": "Return helpers",
+                    "opcodes": ["04:00"],
+                },
+                "_overrides": {
+                    "01:00": {
+                        "name": "push_literal_small",
+                        "summary": "Load an enum state",
+                        "stack_delta": 1,
+                        "tags": ["literal"],
+                        "enum_values": {"0": "IDLE", "1": "RUN"},
+                        "enum_namespace": "State",
+                    },
+                    "02:00": {
+                        "name": "compare_equal",
+                        "summary": "Check equality",
+                        "stack_delta": -1,
+                        "tags": ["comparison"],
+                    },
+                    "03:00": {
+                        "name": "branch_if_true",
+                        "summary": "Branch when true",
+                        "stack_delta": -1,
+                        "control_flow": "branch",
+                    },
+                    "04:00": {
+                        "name": "return_value",
+                        "summary": "Return top value",
+                        "stack_delta": -1,
+                        "control_flow": "return",
+                    },
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )
@@ -146,19 +173,34 @@ def test_string_literal_sequences_annotated(tmp_path: Path) -> None:
     manual_path.write_text(
         json.dumps(
             {
-                "01:00": {
-                    "name": "push_literal_small",
-                    "summary": "Push literal chunk",
+                "literal_ops": {
+                    "control_flow": "fallthrough",
                     "stack_delta": 1,
-                    "tags": ["literal"],
+                    "summary": "Literal operations",
+                    "opcodes": ["01:00"],
                 },
-                "02:00": {
-                    "name": "return_top",
-                    "summary": "Return top value",
-                    "stack_delta": -1,
+                "return_ops": {
                     "control_flow": "return",
+                    "stack_delta": -1,
+                    "summary": "Return helpers",
+                    "opcodes": ["02:00"],
                 },
-            }
+                "_overrides": {
+                    "01:00": {
+                        "name": "push_literal_small",
+                        "summary": "Push literal chunk",
+                        "stack_delta": 1,
+                        "tags": ["literal"],
+                    },
+                    "02:00": {
+                        "name": "return_top",
+                        "summary": "Return top value",
+                        "stack_delta": -1,
+                        "control_flow": "return",
+                    },
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )
@@ -192,19 +234,34 @@ def test_string_sequences_drive_function_naming(tmp_path: Path) -> None:
     manual_path.write_text(
         json.dumps(
             {
-                "01:00": {
-                    "name": "push_literal_small",
-                    "summary": "Push literal chunk",
+                "literal_ops": {
+                    "control_flow": "fallthrough",
                     "stack_delta": 1,
-                    "tags": ["literal"],
+                    "summary": "Literal operations",
+                    "opcodes": ["01:00"],
                 },
-                "02:00": {
-                    "name": "return_top",
-                    "summary": "Return top value",
-                    "stack_delta": -1,
+                "return_ops": {
                     "control_flow": "return",
+                    "stack_delta": -1,
+                    "summary": "Return helpers",
+                    "opcodes": ["02:00"],
                 },
-            }
+                "_overrides": {
+                    "01:00": {
+                        "name": "push_literal_small",
+                        "summary": "Push literal chunk",
+                        "stack_delta": 1,
+                        "tags": ["literal"],
+                    },
+                    "02:00": {
+                        "name": "return_top",
+                        "summary": "Return top value",
+                        "stack_delta": -1,
+                        "control_flow": "return",
+                    },
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )
@@ -249,19 +306,34 @@ def test_literal_report_toggle(tmp_path: Path) -> None:
     manual_path.write_text(
         json.dumps(
             {
-                "01:00": {
-                    "name": "push_literal_small",
-                    "summary": "Push literal chunk",
+                "literal_ops": {
+                    "control_flow": "fallthrough",
                     "stack_delta": 1,
-                    "tags": ["literal"],
+                    "summary": "Literal operations",
+                    "opcodes": ["01:00"],
                 },
-                "02:00": {
-                    "name": "return_top",
-                    "summary": "Return top value",
-                    "stack_delta": -1,
+                "return_ops": {
                     "control_flow": "return",
+                    "stack_delta": -1,
+                    "summary": "Return helpers",
+                    "opcodes": ["02:00"],
                 },
-            }
+                "_overrides": {
+                    "01:00": {
+                        "name": "push_literal_small",
+                        "summary": "Push literal chunk",
+                        "stack_delta": 1,
+                        "tags": ["literal"],
+                    },
+                    "02:00": {
+                        "name": "return_top",
+                        "summary": "Return top value",
+                        "stack_delta": -1,
+                        "control_flow": "return",
+                    },
+                },
+            },
+            sort_keys=True,
         ),
         "utf-8",
     )
