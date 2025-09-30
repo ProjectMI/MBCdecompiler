@@ -37,6 +37,19 @@ ASCII_HEURISTIC_SUMMARY = (
 )
 
 
+def _kind_from_sequences(
+    text: Optional[str],
+    sequences: Tuple[Tuple[InstructionKind, Tuple[str, ...]], ...],
+) -> Optional[InstructionKind]:
+    if not text:
+        return None
+    lower = text.lower()
+    for kind, tokens in sequences:
+        if any(token in lower for token in tokens):
+            return kind
+    return None
+
+
 class InstructionKind(Enum):
     """High level classification of an opcode.
 
@@ -67,6 +80,107 @@ class InstructionKind(Enum):
     BITWISE = auto()
     META = auto()
     UNKNOWN = auto()
+
+
+_CONTROL_KEYWORDS: Tuple[Tuple[InstructionKind, Tuple[str, ...]], ...] = (
+    (InstructionKind.RETURN, ("return", "возврат")),
+    (
+        InstructionKind.TERMINATOR,
+        ("terminator", "halt", "stop", "останов", "конец"),
+    ),
+    (InstructionKind.TAILCALL, ("tailcall", "хвост")),
+    (InstructionKind.CALL, ("call", "вызов")),
+    (InstructionKind.BRANCH, ("branch", "jump", "ветвл", "переход")),
+    (InstructionKind.CONTROL, ("control", "управ")),
+)
+
+_CATEGORY_KEYWORDS: Tuple[Tuple[InstructionKind, Tuple[str, ...]], ...] = (
+    (InstructionKind.ASCII_CHUNK, ("ascii", "строк", "символ")),
+    (InstructionKind.LITERAL, ("literal", "const", "литерал", "констант")),
+    (InstructionKind.PUSH, ("push", "загруз", "помещ", "стек")),
+    (InstructionKind.REDUCE, ("reduce", "fold", "редук", "свёрт", "сверт")),
+    (
+        InstructionKind.STACK_TEARDOWN,
+        ("teardown", "pop", "drop", "clear", "очист", "сброс", "удал"),
+    ),
+    (InstructionKind.STACK_COPY, ("copy", "duplicate", "dup", "дубл", "копир")),
+    (InstructionKind.TEST, ("test", "услов", "провер")),
+    (InstructionKind.INDIRECT, ("indirect", "косвен", "lookup", "fetch")),
+    (InstructionKind.TABLE_LOOKUP, ("table", "слот", "индекс", "таблиц")),
+    (InstructionKind.TAILCALL, ("tailcall", "хвост")),
+    (InstructionKind.RETURN, ("return", "возврат")),
+    (
+        InstructionKind.TERMINATOR,
+        ("terminator", "halt", "stop", "останов", "конец"),
+    ),
+    (InstructionKind.META, ("helper", "вспомог", "meta")),
+)
+
+_TEXT_KEYWORDS: Tuple[Tuple[InstructionKind, Tuple[str, ...]], ...] = (
+    (InstructionKind.ASCII_CHUNK, ("ascii", "строк", "символ", "текст")),
+    (InstructionKind.LITERAL, ("literal", "const", "литерал", "констант")),
+    (InstructionKind.PUSH, ("push", "загруз", "помест", "стек")),
+    (InstructionKind.REDUCE, ("reduce", "fold", "редук", "свёрт", "сверт")),
+    (InstructionKind.TEST, ("test", "ветвл", "услов", "провер")),
+    (
+        InstructionKind.STACK_TEARDOWN,
+        ("teardown", "pop", "drop", "clear", "очист", "сброс", "удал", "снять"),
+    ),
+    (InstructionKind.STACK_COPY, ("duplicate", "copy", "dup", "дубл", "копир")),
+    (
+        InstructionKind.INDIRECT,
+        ("indirect", "косвен", "lookup", "fetch", "индекс", "слот"),
+    ),
+    (InstructionKind.TABLE_LOOKUP, ("table", "таблиц", "слот")),
+    (InstructionKind.TAILCALL, ("tailcall", "хвост")),
+    (InstructionKind.RETURN, ("return", "возврат")),
+    (
+        InstructionKind.TERMINATOR,
+        ("terminator", "halt", "stop", "останов", "конец"),
+    ),
+    (InstructionKind.CALL, ("call", "вызов")),
+    (InstructionKind.ARITHMETIC, ("arith", "math", "арифм", "вычис")),
+    (InstructionKind.LOGICAL, ("logic", "boolean", "логич")),
+    (InstructionKind.BITWISE, ("bit", "бит", "побит")),
+    (InstructionKind.META, ("helper", "service", "meta", "вспомог")),
+)
+
+
+_OPCODE_KIND_GUESSES = {
+    0x20: InstructionKind.META,
+    0x21: InstructionKind.BRANCH,
+    0x28: InstructionKind.META,
+    0x2C: InstructionKind.PUSH,
+    0x3C: InstructionKind.META,
+    0x3D: InstructionKind.META,
+    0x3E: InstructionKind.META,
+    0x4A: InstructionKind.META,
+    0x4B: InstructionKind.META,
+    0x4F: InstructionKind.META,
+    0x52: InstructionKind.META,
+    0x5B: InstructionKind.META,
+    0x61: InstructionKind.META,
+    0x63: InstructionKind.META,
+    0x64: InstructionKind.META,
+    0x66: InstructionKind.ASCII_CHUNK,
+    0x67: InstructionKind.LITERAL,
+    0x6A: InstructionKind.META,
+    0x6C: InstructionKind.META,
+    0x6E: InstructionKind.META,
+    0x72: InstructionKind.META,
+    0x75: InstructionKind.BRANCH,
+    0x84: InstructionKind.META,
+    0x88: InstructionKind.META,
+    0x8C: InstructionKind.META,
+    0x90: InstructionKind.ASCII_CHUNK,
+    0xAC: InstructionKind.META,
+    0xBC: InstructionKind.META,
+    0xC0: InstructionKind.META,
+    0xC4: InstructionKind.META,
+    0xDE: InstructionKind.TERMINATOR,
+    0xF0: InstructionKind.META,
+    0xF1: InstructionKind.META,
+}
 
 
 @dataclass(frozen=True)
@@ -233,44 +347,14 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
         return guess_kind_from_opcode(word)
 
     if info.control_flow:
-        control = info.control_flow.lower()
-        if "return" in control:
-            return InstructionKind.RETURN
-        if "terminator" in control or "halt" in control:
-            return InstructionKind.TERMINATOR
-        if "branch" in control or "jump" in control:
-            return InstructionKind.BRANCH
-        if "call" in control:
-            if "tail" in (info.category or ""):
-                return InstructionKind.TAILCALL
-            return InstructionKind.CALL
-        if "control" in control:
-            return InstructionKind.CONTROL
+        kind = _kind_from_sequences(info.control_flow, _CONTROL_KEYWORDS)
+        if kind is not None:
+            return kind
 
     if info.category:
-        category = info.category.lower()
-        if "ascii" in category:
-            return InstructionKind.ASCII_CHUNK
-        if "literal" in category:
-            return InstructionKind.LITERAL
-        if "push" in category:
-            return InstructionKind.PUSH
-        if "reduce" in category or "fold" in category:
-            return InstructionKind.REDUCE
-        if "teardown" in category or "pop" in category:
-            return InstructionKind.STACK_TEARDOWN
-        if "copy" in category or "dup" in category:
-            return InstructionKind.STACK_COPY
-        if "test" in category:
-            return InstructionKind.TEST
-        if "indirect" in category or "table" in category:
-            return InstructionKind.INDIRECT
-        if "tailcall" in category:
-            return InstructionKind.TAILCALL
-        if "return" in category:
-            return InstructionKind.RETURN
-        if "terminator" in category:
-            return InstructionKind.TERMINATOR
+        kind = _kind_from_sequences(info.category, _CATEGORY_KEYWORDS)
+        if kind is not None:
+            return kind
 
     mnemonic = (info.mnemonic or "").lower()
     summary = (info.summary or "").lower()
@@ -278,28 +362,9 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
     for source in (mnemonic, summary):
         if not source:
             continue
-        if "literal" in source or "const" in source:
-            return InstructionKind.LITERAL
-        if "push" in source and "stack" in source:
-            return InstructionKind.PUSH
-        if "reduce" in source or "fold" in source:
-            return InstructionKind.REDUCE
-        if "test" in source and "branch" in source:
-            return InstructionKind.TEST
-        if "stack" in source and ("clear" in source or "teardown" in source or "drop" in source):
-            return InstructionKind.STACK_TEARDOWN
-        if "duplicate" in source or "copy" in source:
-            return InstructionKind.STACK_COPY
-        if "table" in source or "index" in source:
-            return InstructionKind.TABLE_LOOKUP
-        if "arith" in source or "math" in source:
-            return InstructionKind.ARITHMETIC
-        if "logic" in source or "boolean" in source:
-            return InstructionKind.LOGICAL
-        if "bit" in source:
-            return InstructionKind.BITWISE
-        if "meta" in source or "helper" in source:
-            return InstructionKind.META
+        kind = _kind_from_sequences(source, _TEXT_KEYWORDS)
+        if kind is not None:
+            return kind
 
     if looks_like_ascii_chunk(word):
         return InstructionKind.ASCII_CHUNK
@@ -311,6 +376,10 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
 
     opcode = word.opcode
     mode = word.mode
+
+    mapped = _OPCODE_KIND_GUESSES.get(opcode)
+    if mapped is not None:
+        return mapped
 
     if opcode == 0x00:
         return InstructionKind.LITERAL
@@ -341,7 +410,7 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x05, 0x06, 0x07, 0x08}:
         return InstructionKind.ARITHMETIC
 
-    return InstructionKind.UNKNOWN
+    return InstructionKind.META
 
 
 def resolve_opcode_info(

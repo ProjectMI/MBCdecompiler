@@ -172,6 +172,9 @@ class PipelineAnalyzer:
         elif dominant in {InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP}:
             category = "indirect"
             confidence = 0.5
+        elif dominant is InstructionKind.META:
+            category = "compute"
+            confidence = 0.45
 
         feature_map = heuristics.feature_map()
 
@@ -182,6 +185,10 @@ class PipelineAnalyzer:
         if "call_helper" in feature_map:
             category = "call"
             confidence = max(confidence, 0.65)
+
+        if "literal_chain" in feature_map and category in {"unknown", "compute"}:
+            category = "literal"
+            confidence = max(confidence, 0.5)
 
         if "return_sequence" in feature_map or "stack_teardown" in feature_map:
             category = "return"

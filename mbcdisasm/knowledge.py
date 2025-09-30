@@ -6,7 +6,7 @@ import json
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -169,10 +169,11 @@ class KnowledgeBase:
         if info is not None:
             return info
 
-        opcode = _extract_opcode(canonical)
-        if opcode is None:
-            return None
-        return self._wildcards.get(opcode)
+        for opcode in _extract_opcode_candidates(canonical):
+            info = self._wildcards.get(opcode)
+            if info is not None:
+                return info
+        return None
 
     def lookup_by_name(self, name: str) -> Optional[OpcodeInfo]:
         """Return an annotation by the entry name used in the JSON file."""
@@ -222,25 +223,40 @@ def _normalize_label(label: str) -> Optional[str]:
     return f"{opcode:02X}:{mode:02X}"
 
 
-def _extract_opcode(label: str) -> Optional[int]:
-    """Return the opcode component encoded in ``label``.
+def _extract_opcode_candidates(label: str) -> Tuple[int, ...]:
+    """Return possible opcode values encoded in ``label``.
 
-    The helper accepts labels in the canonical ``"AA:BB"`` form and returns the
-    integer value of the first component.  Invalid tokens yield ``None`` which
-    allows callers to fall back to other lookup strategies without having to
-    repeat the parsing logic.
+    Historical annotation files freely mix decimal and hexadecimal notation
+    (``"105:16"`` versus ``"10:84"``) which makes it ambiguous whether a
+    two-digit token such as ``"10"`` should be interpreted as decimal ``16`` or
+    hexadecimal ``0x10``.  The manual tooling expected the disassembler to try
+    both interpretations.  The previous implementation only attempted the
+    decimal form which meant that legitimate hexadecimal labels emitted by the
+    instruction decoder could not be matched against wildcard entries in the
+    knowledge base.
+
+    The helper therefore returns a tuple containing every plausible opcode
+    candidate.  Callers are expected to try them in order until a match is
+    found.  Duplicates are removed while preserving the original ordering.
     """
 
     if ":" not in label:
-        return None
+        return tuple()
+
     opcode_text, _ = label.split(":", 1)
-    try:
-        opcode = _parse_component(opcode_text)
-    except ValueError:
-        return None
-    if not (0 <= opcode <= 0xFF):
-        return None
-    return opcode
+    tokens: List[int] = []
+
+    for base in (10, 16):
+        try:
+            value = int(opcode_text, base)
+        except ValueError:
+            continue
+        if not (0 <= value <= 0xFF):
+            continue
+        if value not in tokens:
+            tokens.append(value)
+
+    return tuple(tokens)
 
 
 def _parse_wildcard_key(key: str) -> Optional[int]:
