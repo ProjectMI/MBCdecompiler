@@ -70,17 +70,24 @@ automatic deductions.
 The disassembler now renders richer inline comments that summarise the inferred
 stack effect, likely control-flow role and dominant operand class for each
 instruction.  These hints are derived from the opcode statistics stored in the
-knowledge base and can be refined manually by dropping curated entries into
-`knowledge/manual_annotations.json`.  When you provide both `operand_hint` and
-`operand_confidence` the listing will include the confidence percentage next to
-the operand hint so you can gauge how reliable the classification is:
+knowledge base and can be refined manually by editing
+`knowledge/manual_annotations.json`.  Manual entries are organised into
+semantic categories with per-opcode overrides:
 
 ```json
 {
-  "29:10": {
-    "name": "call_indirect",
-    "control_flow": "call",
-    "summary": "invoke helper routine by table index"
+  "push_literal": {
+    "control_flow": "fallthrough",
+    "stack_delta": 1,
+    "summary": "Literal push helpers",
+    "opcodes": ["29:10"]
+  },
+  "_overrides": {
+    "29:10": {
+      "name": "call_indirect",
+      "control_flow": "call",
+      "summary": "invoke helper routine by table index"
+    }
   }
 }
 ```

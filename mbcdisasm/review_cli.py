@@ -170,6 +170,10 @@ def apply_review_package(
     else:
         manual_data = {}
 
+    overrides = manual_data.setdefault("_overrides", {})
+    if not isinstance(overrides, dict):
+        raise ValueError("manual annotations '_overrides' must be a JSON object")
+
     entries = package.get("entries", [])
     if not isinstance(entries, list):
         raise ValueError("package 'entries' must be a list")
@@ -187,9 +191,9 @@ def apply_review_package(
         if not isinstance(decision, Mapping):
             continue
 
-        manual_entry = manual_data.setdefault(key, {})
-        if not isinstance(manual_entry, dict):
-            raise ValueError(f"manual annotations for {key} must be a JSON object")
+        override_entry = overrides.setdefault(key, {})
+        if not isinstance(override_entry, dict):
+            raise ValueError(f"manual annotations override for {key} must be a JSON object")
 
         changes: Dict[str, object] = {}
         for field in decision_fields:
@@ -198,18 +202,18 @@ def apply_review_package(
             value = decision[field]
             if value is None:
                 continue
-            manual_entry[field] = value
+            override_entry[field] = value
             changes[field] = value
 
         operator_notes = entry.get("operator_notes")
         if isinstance(operator_notes, str) and operator_notes:
-            manual_entry["notes"] = operator_notes
+            override_entry["notes"] = operator_notes
             changes["notes"] = operator_notes
 
         if not changes:
             continue
 
-        knowledge.record_annotation(key, **manual_entry)
+        knowledge.record_annotation(key, **override_entry)
         updated_keys.append(key)
         if resolve_tasks:
             resolved += knowledge.resolve_review_task(key)
