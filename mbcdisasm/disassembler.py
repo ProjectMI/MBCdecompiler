@@ -55,58 +55,16 @@ class Disassembler:
 
     def _format_instruction(self, instruction: InstructionWord) -> str:
         key = instruction.label()
-        metadata = self.knowledge.instruction_metadata(key)
+        info = self.knowledge.lookup(key)
 
-        stack_value = metadata.stack_delta
-        stack_confidence = metadata.stack_confidence
-        stack_origin = metadata.stack_source
-
-        stack_detail = "stackΔ="
-        if stack_value is not None:
-            stack_detail += self._format_stack_delta(stack_value)
-            extras = []
-            if stack_origin:
-                extras.append(stack_origin)
-            if stack_confidence is not None:
-                extras.append(f"{stack_confidence * 100:.0f}%")
-            if metadata.stack_samples:
-                extras.append(f"n={metadata.stack_samples}")
-            if extras:
-                stack_detail += f" ({', '.join(extras)})"
-        else:
-            stack_detail += "unknown"
-
-        role = metadata.control_flow or "unknown"
-        if metadata.control_flow and metadata.flow_target:
-            role += f"→{metadata.flow_target}"
-        role_detail = f"role={role}"
-
-        if metadata.operand_hint:
-            operand = metadata.operand_hint
-            if metadata.operand_confidence is not None:
-                operand += f" ({metadata.operand_confidence * 100:.0f}%)"
-            operand_detail = f"operand≈{operand}"
-        else:
-            operand_detail = "operand≈unknown"
-
-        details = [stack_detail, role_detail, operand_detail]
-        if metadata.summary:
-            details.append(metadata.summary)
-
-        comment = " | ".join(details)
+        mnemonic = info.mnemonic if info else f"op_{instruction.opcode:02X}_{instruction.mode:02X}"
+        summary = f" ; {info.summary}" if info and info.summary else ""
 
         return (
             f"{instruction.offset:08X}: {instruction.raw:08X}    "
-            f"{metadata.mnemonic:<24} ; mode={instruction.mode:02X} "
-            f"operand=0x{instruction.operand:04X} | {comment}"
+            f"{mnemonic:<24} op={instruction.opcode:02X} "
+            f"mode={instruction.mode:02X} operand=0x{instruction.operand:04X}{summary}"
         )
-
-    @staticmethod
-    def _format_stack_delta(delta: float) -> str:
-        value = float(delta)
-        if value.is_integer():
-            return f"{value:+.0f}"
-        return f"{value:+.1f}"
 
     def write_listing(
         self,

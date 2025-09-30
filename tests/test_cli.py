@@ -26,19 +26,15 @@ def _write_knowledge(base: Path) -> Path:
             "opcodes": ["01:00"],
             "name": "manual_push",
             "summary": "Manual override for CLI test.",
-            "stack_delta": 2,
         }
     }
     manual_path.write_text(json.dumps(manual_payload, indent=2), "utf-8")
-
-    kb_path = base / "kb.json"
-    kb_path.write_text(json.dumps({"schema": 1, "opcode_modes": {}}), "utf-8")
-    return kb_path
+    return manual_path
 
 
 def test_cli_generates_listing(tmp_path: Path) -> None:
     adb_path, mbc_path = _write_container(tmp_path)
-    kb_path = _write_knowledge(tmp_path)
+    manual_path = _write_knowledge(tmp_path)
     output_path = tmp_path / "out.txt"
 
     result = subprocess.run(
@@ -48,7 +44,7 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
             str(adb_path),
             str(mbc_path),
             "--knowledge-base",
-            str(kb_path),
+            str(manual_path),
             "--disasm-out",
             str(output_path),
         ],
@@ -59,6 +55,6 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
 
     assert output_path.exists()
     listing = output_path.read_text("utf-8")
-    assert "stackΔ=+2" in listing
+    assert "manual_push" in listing
     assert "Manual override for CLI test." in listing
     assert "disassembly written" in result.stdout

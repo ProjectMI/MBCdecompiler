@@ -27,25 +27,20 @@ def _write_knowledge(base: Path) -> Path:
             "opcodes": ["01:00"],
             "name": "manual_push",
             "summary": "Manual override for testing.",
-            "stack_delta": 1,
-            "operand_hint": "literal",
         }
     }
     manual_path.write_text(json.dumps(manual_payload, indent=2), "utf-8")
-
-    kb_path = base / "kb.json"
-    kb_path.write_text(json.dumps({"schema": 1, "opcode_modes": {}}), "utf-8")
-    return kb_path
+    return manual_path
 
 
 def test_listing_includes_manual_annotations(tmp_path: Path) -> None:
     adb_path, mbc_path = _write_container(tmp_path)
-    kb_path = _write_knowledge(tmp_path)
+    manual_path = _write_knowledge(tmp_path)
 
-    knowledge = KnowledgeBase.load(kb_path)
+    knowledge = KnowledgeBase.load(manual_path)
     container = MbcContainer.load(mbc_path, adb_path)
 
     listing = Disassembler(knowledge).generate_listing(container)
 
-    assert "stackΔ=+1" in listing
+    assert "manual_push" in listing
     assert "Manual override for testing." in listing
