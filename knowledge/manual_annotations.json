@@ -352,7 +352,7 @@
     "diapasone": "0x00–0xFF",
     "comment": "TestSet-ветвления всех модов"
   },
-  "FF:*": {
+  "255:*": {
     "category": "terminator",
     "diapasone": "0x00–0xFF",
     "comment": "Терминаторы всех модов; часто встречаются 0x00, 0x30, 0x69"
