@@ -225,17 +225,20 @@ def _normalize_label(label: str) -> Optional[str]:
 def _extract_opcode(label: str) -> Optional[int]:
     """Return the opcode component encoded in ``label``.
 
-    The helper accepts labels in the canonical ``"AA:BB"`` form and returns the
-    integer value of the first component.  Invalid tokens yield ``None`` which
-    allows callers to fall back to other lookup strategies without having to
-    repeat the parsing logic.
+    Runtime lookups operate on canonicalised labels emitted by
+    :meth:`InstructionWord.label`.  Those strings use fixed width hexadecimal
+    components (``"AA:BB"``) regardless of how the opcode was described in the
+    manual annotations.  Relying on :func:`_parse_component` would treat values
+    such as ``"10"`` as decimal numbers which breaks wildcard resolution for
+    opcode ``0x10``.  To avoid this ambiguity the extractor interprets the
+    canonical representation as hexadecimal directly.
     """
 
     if ":" not in label:
         return None
     opcode_text, _ = label.split(":", 1)
     try:
-        opcode = _parse_component(opcode_text)
+        opcode = int(opcode_text, 16)
     except ValueError:
         return None
     if not (0 <= opcode <= 0xFF):

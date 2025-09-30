@@ -30,7 +30,7 @@ from ..knowledge import KnowledgeBase, OpcodeInfo
 # ---------------------------------------------------------------------------
 
 ASCII_ALLOWED = set(range(0x20, 0x7F))
-ASCII_ALLOWED.update({0x09, 0x0A, 0x0D})  # tab/newline characters often occur
+ASCII_ALLOWED.update({0x00, 0x09, 0x0A, 0x0D})  # allow NUL/tab/newline terminators
 
 ASCII_HEURISTIC_SUMMARY = (
     "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
@@ -230,13 +230,16 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
     if info is None:
         if looks_like_ascii_chunk(word):
             return InstructionKind.ASCII_CHUNK
+        literal_kind = heuristic_literal_kind(word)
+        if literal_kind is not None:
+            return literal_kind
         return guess_kind_from_opcode(word)
 
     if info.control_flow:
         control = info.control_flow.lower()
         if "return" in control:
             return InstructionKind.RETURN
-        if "terminator" in control or "halt" in control:
+        if "terminator" in control or "halt" in control or "stop" in control:
             return InstructionKind.TERMINATOR
         if "branch" in control or "jump" in control:
             return InstructionKind.BRANCH
@@ -292,6 +295,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.STACK_COPY
         if "table" in source or "index" in source:
             return InstructionKind.TABLE_LOOKUP
+        if "indirect" in source:
+            return InstructionKind.INDIRECT
         if "arith" in source or "math" in source:
             return InstructionKind.ARITHMETIC
         if "logic" in source or "boolean" in source:
@@ -303,6 +308,9 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
 
     if looks_like_ascii_chunk(word):
         return InstructionKind.ASCII_CHUNK
+    literal_kind = heuristic_literal_kind(word)
+    if literal_kind is not None:
+        return literal_kind
     return guess_kind_from_opcode(word)
 
 
@@ -323,8 +331,11 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x22, 0x23, 0x24, 0x25, 0x26, 0x27}:
         return InstructionKind.BRANCH
 
-    if opcode in {0x16}:
+    if opcode in {0x10, 0x16}:
         return InstructionKind.CALL
+
+    if opcode == 0x69:
+        return InstructionKind.INDIRECT
 
     if opcode in {0x41, 0x47, 0x90, 0xDC, 0xF4}:
         return InstructionKind.ASCII_CHUNK
@@ -341,7 +352,59 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x05, 0x06, 0x07, 0x08}:
         return InstructionKind.ARITHMETIC
 
+    if opcode == 0xFF:
+        return InstructionKind.TERMINATOR
+
     return InstructionKind.UNKNOWN
+
+
+def heuristic_literal_kind(word: InstructionWord) -> Optional[InstructionKind]:
+    """Best-effort literal classifier for raw instruction words."""
+
+    raw = word.raw.to_bytes(4, "big")
+    printable = sum(1 for byte in raw if 0x20 <= byte <= 0x7E)
+    zero_bytes = raw.count(0)
+    high_bytes = sum(1 for byte in raw if byte >= 0x80)
+
+    if printable >= 3 and high_bytes <= 1:
+        return InstructionKind.ASCII_CHUNK
+
+    if printable >= 2 and zero_bytes >= 1 and high_bytes <= 1:
+        return InstructionKind.ASCII_CHUNK
+
+    if zero_bytes >= 3:
+        return InstructionKind.LITERAL
+
+    trailing = raw[2:]
+    if trailing and all(byte in ASCII_ALLOWED or byte == 0xFF for byte in trailing):
+        return InstructionKind.LITERAL
+
+    if zero_bytes >= 2 and high_bytes <= 2:
+        return InstructionKind.LITERAL
+
+    if printable >= 2 and high_bytes <= 2:
+        return InstructionKind.LITERAL
+
+    if printable >= 1 and zero_bytes >= 1 and high_bytes <= 2:
+        return InstructionKind.LITERAL
+
+    opcode_byte = raw[0]
+    if 0x20 <= opcode_byte <= 0x7E and printable + zero_bytes >= 2:
+        if printable >= 2:
+            return InstructionKind.ASCII_CHUNK
+        return InstructionKind.LITERAL
+
+    mode_byte = raw[1]
+    if 0x20 <= mode_byte <= 0x7E and high_bytes <= 3:
+        return InstructionKind.LITERAL
+
+    if 0x20 <= opcode_byte <= 0x7E and high_bytes <= 3:
+        return InstructionKind.LITERAL
+
+    if opcode_byte in {0x11, 0x13, 0xF1}:
+        return InstructionKind.LITERAL
+
+    return None
 
 
 def resolve_opcode_info(
