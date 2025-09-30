@@ -25,6 +25,17 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
 
+# ---------------------------------------------------------------------------
+# Heuristic opcode helpers
+# ---------------------------------------------------------------------------
+
+ASCII_ALLOWED = set(range(0x20, 0x7F))
+ASCII_ALLOWED.update({0x09, 0x0A, 0x0D})  # tab/newline characters often occur
+
+ASCII_HEURISTIC_SUMMARY = (
+    "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
+)
+
 
 class InstructionKind(Enum):
     """High level classification of an opcode.
@@ -141,14 +152,20 @@ class InstructionProfile:
     def from_word(cls, word: InstructionWord, knowledge: KnowledgeBase) -> "InstructionProfile":
         """Create a profile for ``word`` using ``knowledge`` annotations."""
 
-        info = knowledge.lookup(word.label())
+        info, heuristic = resolve_opcode_info(word, knowledge)
         mnemonic = info.mnemonic if info else f"op_{word.opcode:02X}_{word.mode:02X}"
         summary = info.summary if info else None
         category = info.category if info else None
         control_flow = info.control_flow if info else None
         stack_hint = StackEffectHint.from_info(info)
         kind = classify_kind(word, info)
-        traits = info.attributes if info else {}
+        if info and info.attributes:
+            traits: Mapping[str, object] = dict(info.attributes)
+        else:
+            traits = {}
+        if heuristic:
+            traits = dict(traits)
+            traits.setdefault("heuristic", True)
         return cls(
             word=word,
             info=info,
@@ -211,6 +228,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
     """Classify ``word`` using ``info`` heuristics."""
 
     if info is None:
+        if looks_like_ascii_chunk(word):
+            return InstructionKind.ASCII_CHUNK
         return guess_kind_from_opcode(word)
 
     if info.control_flow:
@@ -230,10 +249,10 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
 
     if info.category:
         category = info.category.lower()
-        if "literal" in category:
-            return InstructionKind.LITERAL
         if "ascii" in category:
             return InstructionKind.ASCII_CHUNK
+        if "literal" in category:
+            return InstructionKind.LITERAL
         if "push" in category:
             return InstructionKind.PUSH
         if "reduce" in category or "fold" in category:
@@ -282,6 +301,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
         if "meta" in source or "helper" in source:
             return InstructionKind.META
 
+    if looks_like_ascii_chunk(word):
+        return InstructionKind.ASCII_CHUNK
     return guess_kind_from_opcode(word)
 
 
@@ -290,6 +311,9 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
 
     opcode = word.opcode
     mode = word.mode
+
+    if opcode == 0x00:
+        return InstructionKind.LITERAL
 
     if opcode in {0x29, 0x30}:
         if mode in {0x00, 0x10, 0x30, 0x69}:
@@ -318,6 +342,57 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
         return InstructionKind.ARITHMETIC
 
     return InstructionKind.UNKNOWN
+
+
+def resolve_opcode_info(
+    word: InstructionWord, knowledge: KnowledgeBase
+) -> Tuple[Optional[OpcodeInfo], bool]:
+    """Return the most suitable :class:`OpcodeInfo` for ``word``.
+
+    The helper mirrors :meth:`KnowledgeBase.lookup` but augments the results
+    with lightweight heuristics that recognise frequently occurring instruction
+    families (for example inline ASCII data blocks).  The boolean flag reports
+    whether heuristics were involved which allows callers to highlight the
+    source in diagnostic output.
+    """
+
+    info = knowledge.lookup(word.label())
+    if info is not None:
+        return info, False
+
+    heuristic = heuristic_opcode_info(word)
+    return heuristic, heuristic is not None
+
+
+def heuristic_opcode_info(word: InstructionWord) -> Optional[OpcodeInfo]:
+    """Return a synthetic :class:`OpcodeInfo` inferred from ``word``."""
+
+    if looks_like_ascii_chunk(word):
+        return OpcodeInfo(
+            mnemonic="inline_ascii_chunk",
+            summary=ASCII_HEURISTIC_SUMMARY,
+            control_flow="fallthrough",
+            category="ascii_literal",
+            stack_delta=0,
+            attributes={"source": "heuristic", "kind": "ascii_chunk"},
+        )
+    return None
+
+
+def looks_like_ascii_chunk(word: InstructionWord) -> bool:
+    """Return ``True`` if ``word`` resembles a packed ASCII chunk."""
+
+    raw = word.raw.to_bytes(4, "big")
+    if all(byte == 0 for byte in raw):
+        return False
+    printable = 0
+    for byte in raw:
+        if byte in ASCII_ALLOWED:
+            if 0x20 <= byte <= 0x7E:
+                printable += 1
+            continue
+        return False
+    return printable > 0
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
