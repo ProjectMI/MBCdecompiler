@@ -172,6 +172,9 @@ class PipelineAnalyzer:
         elif dominant in {InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP}:
             category = "indirect"
             confidence = 0.5
+        elif dominant is InstructionKind.META:
+            category = "literal"
+            confidence = 0.45
 
         feature_map = heuristics.feature_map()
 

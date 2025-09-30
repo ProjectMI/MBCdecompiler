@@ -172,7 +172,20 @@ class KnowledgeBase:
         opcode = _extract_opcode(canonical)
         if opcode is None:
             return None
-        return self._wildcards.get(opcode)
+        try:
+            decimal_opcode = _parse_component(canonical.split(":", 1)[0])
+        except ValueError:
+            decimal_opcode = None
+        if decimal_opcode is not None:
+            info = self._wildcards.get(decimal_opcode)
+            if info is not None:
+                return info
+
+        info = self._wildcards.get(opcode)
+        if info is not None:
+            return info
+
+        return None
 
     def lookup_by_name(self, name: str) -> Optional[OpcodeInfo]:
         """Return an annotation by the entry name used in the JSON file."""
@@ -228,16 +241,26 @@ def _extract_opcode(label: str) -> Optional[int]:
     The helper accepts labels in the canonical ``"AA:BB"`` form and returns the
     integer value of the first component.  Invalid tokens yield ``None`` which
     allows callers to fall back to other lookup strategies without having to
-    repeat the parsing logic.
+    repeat the parsing logic.  Canonical labels emitted by
+    :meth:`InstructionWord.label` always use hexadecimal so we fast-path that
+    representation before falling back to the permissive
+    :func:`_parse_component` parser.  This keeps wildcards such as ``"16:*"`` in
+    sync with individual opcode lookups like ``"10:84"``.
     """
 
     if ":" not in label:
         return None
+
     opcode_text, _ = label.split(":", 1)
+
     try:
-        opcode = _parse_component(opcode_text)
+        if len(opcode_text) in {1, 2} and all(ch in string.hexdigits for ch in opcode_text):
+            opcode = int(opcode_text, 16)
+        else:
+            opcode = _parse_component(opcode_text)
     except ValueError:
         return None
+
     if not (0 <= opcode <= 0xFF):
         return None
     return opcode

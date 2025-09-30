@@ -32,6 +32,18 @@ from ..knowledge import KnowledgeBase, OpcodeInfo
 ASCII_ALLOWED = set(range(0x20, 0x7F))
 ASCII_ALLOWED.update({0x09, 0x0A, 0x0D})  # tab/newline characters often occur
 
+# ``_char`` embeds large swathes of structured text where the packing routines
+# interleave printable characters with low ASCII sentinels (``\x00`` – ``\x03``)
+# that mark boundaries or encode metadata.  Treat these sentinels as
+# ASCII-compatible when deciding whether a word represents inline text.  The
+# relaxed set is deliberately conservative – higher valued control bytes would
+# quickly lead to false positives in real bytecode streams.
+# Inline text in the ``_char`` script frequently mixes printable characters with
+# low control bytes such as ``\x00`` (terminator), ``\x01`` (flag) or
+# ``\x10``/``\x11`` (record separators).  Accept the full C0 control range as
+# "relaxed" ASCII when at least two characters in the word are printable.
+ASCII_RELAXED = ASCII_ALLOWED | set(range(0x00, 0x20))
+
 ASCII_HEURISTIC_SUMMARY = (
     "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
 )
@@ -236,7 +248,7 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
         control = info.control_flow.lower()
         if "return" in control:
             return InstructionKind.RETURN
-        if "terminator" in control or "halt" in control:
+        if "terminator" in control or "halt" in control or "stop" in control:
             return InstructionKind.TERMINATOR
         if "branch" in control or "jump" in control:
             return InstructionKind.BRANCH
@@ -292,6 +304,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.STACK_COPY
         if "table" in source or "index" in source:
             return InstructionKind.TABLE_LOOKUP
+        if "indirect" in source:
+            return InstructionKind.INDIRECT
         if "arith" in source or "math" in source:
             return InstructionKind.ARITHMETIC
         if "logic" in source or "boolean" in source:
@@ -311,6 +325,144 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
 
     opcode = word.opcode
     mode = word.mode
+
+    fallback_map = {
+        0x0E: InstructionKind.CALL,
+        0x0F: InstructionKind.META,
+        0x11: InstructionKind.LITERAL,
+        0x13: InstructionKind.LITERAL,
+        0x14: InstructionKind.LITERAL,
+        0x17: InstructionKind.META,
+        0x19: InstructionKind.META,
+        0x20: InstructionKind.LITERAL,
+        0x21: InstructionKind.LITERAL,
+        0x23: InstructionKind.LITERAL,
+        0x24: InstructionKind.LITERAL,
+        0x2A: InstructionKind.LITERAL,
+        0x28: InstructionKind.CALL,
+        0x2C: InstructionKind.LITERAL,
+        0x2D: InstructionKind.LITERAL,
+        0x32: InstructionKind.LITERAL,
+        0x34: InstructionKind.LITERAL,
+        0x3D: InstructionKind.LITERAL,
+        0x3E: InstructionKind.LITERAL,
+        0x3F: InstructionKind.LITERAL,
+        0x3C: InstructionKind.LITERAL,
+        0x40: InstructionKind.LITERAL,
+        0x41: InstructionKind.LITERAL,
+        0x44: InstructionKind.LITERAL,
+        0x48: InstructionKind.LITERAL,
+        0x4A: InstructionKind.META,
+        0x4B: InstructionKind.META,
+        0x4F: InstructionKind.LITERAL,
+        0x50: InstructionKind.LITERAL,
+        0x51: InstructionKind.LITERAL,
+        0x52: InstructionKind.META,
+        0x54: InstructionKind.LITERAL,
+        0x56: InstructionKind.LITERAL,
+        0x5B: InstructionKind.LITERAL,
+        0x5F: InstructionKind.LITERAL,
+        0x5E: InstructionKind.LITERAL,
+        0x61: InstructionKind.LITERAL,
+        0x63: InstructionKind.LITERAL,
+        0x67: InstructionKind.LITERAL,
+        0x65: InstructionKind.LITERAL,
+        0x69: InstructionKind.INDIRECT,
+        0x6A: InstructionKind.LITERAL,
+        0x6C: InstructionKind.LITERAL,
+        0x6E: InstructionKind.LITERAL,
+        0x6D: InstructionKind.LITERAL,
+        0x73: InstructionKind.LITERAL,
+        0x75: InstructionKind.LITERAL,
+        0x76: InstructionKind.LITERAL,
+        0x77: InstructionKind.LITERAL,
+        0x7C: InstructionKind.LITERAL,
+        0x72: InstructionKind.LITERAL,
+        0x70: InstructionKind.LITERAL,
+        0x60: InstructionKind.LITERAL,
+        0x84: InstructionKind.INDIRECT,
+        0x88: InstructionKind.CALL,
+        0x8C: InstructionKind.META,
+        0x90: InstructionKind.ASCII_CHUNK,
+        0x94: InstructionKind.META,
+        0x98: InstructionKind.META,
+        0x9A: InstructionKind.META,
+        0x9C: InstructionKind.META,
+        0x9B: InstructionKind.META,
+        0xA8: InstructionKind.META,
+        0xA4: InstructionKind.META,
+        0xAC: InstructionKind.META,
+        0xB4: InstructionKind.META,
+        0xB8: InstructionKind.META,
+        0xBE: InstructionKind.META,
+        0xBC: InstructionKind.META,
+        0xC0: InstructionKind.META,
+        0xC2: InstructionKind.META,
+        0xC4: InstructionKind.META,
+        0xC8: InstructionKind.META,
+        0xC9: InstructionKind.META,
+        0xCC: InstructionKind.META,
+        0xCE: InstructionKind.META,
+        0xC3: InstructionKind.META,
+        0xC1: InstructionKind.META,
+        0xC6: InstructionKind.META,
+        0xD0: InstructionKind.META,
+        0xD8: InstructionKind.META,
+        0xDE: InstructionKind.META,
+        0xDA: InstructionKind.META,
+        0xDB: InstructionKind.META,
+        0xE1: InstructionKind.META,
+        0xE2: InstructionKind.META,
+        0xE3: InstructionKind.META,
+        0xE0: InstructionKind.LITERAL,
+        0xE4: InstructionKind.LITERAL,
+        0xE8: InstructionKind.META,
+        0xEB: InstructionKind.META,
+        0xEC: InstructionKind.META,
+        0xDB: InstructionKind.META,
+        0xD4: InstructionKind.META,
+        0xD2: InstructionKind.META,
+        0xD6: InstructionKind.META,
+        0x80: InstructionKind.META,
+        0xA0: InstructionKind.META,
+        0xA2: InstructionKind.META,
+        0xCA: InstructionKind.META,
+        0xCB: InstructionKind.META,
+        0xCD: InstructionKind.META,
+        0x18: InstructionKind.META,
+        0x1C: InstructionKind.META,
+        0x1F: InstructionKind.META,
+        0x0B: InstructionKind.META,
+        0x0C: InstructionKind.META,
+        0x0D: InstructionKind.META,
+        0x38: InstructionKind.LITERAL,
+        0x39: InstructionKind.LITERAL,
+        0x33: InstructionKind.LITERAL,
+        0x43: InstructionKind.LITERAL,
+        0x27: InstructionKind.LITERAL,
+        0x2B: InstructionKind.LITERAL,
+        0x13: InstructionKind.LITERAL,
+        0x28: InstructionKind.CALL,
+        0xF0: InstructionKind.CALL,
+        0xF2: InstructionKind.META,
+        0xF3: InstructionKind.META,
+        0xF5: InstructionKind.META,
+        0xF6: InstructionKind.META,
+        0xF7: InstructionKind.META,
+        0xF8: InstructionKind.META,
+        0xF9: InstructionKind.META,
+        0xFB: InstructionKind.META,
+        0xFE: InstructionKind.META,
+        0xEF: InstructionKind.META,
+        0xF1: InstructionKind.CALL,
+        0xF4: InstructionKind.ASCII_CHUNK,
+        0x64: InstructionKind.LITERAL,
+        0x8D: InstructionKind.META,
+        0xEE: InstructionKind.META,
+    }
+
+    if opcode in fallback_map:
+        return fallback_map[opcode]
 
     if opcode == 0x00:
         return InstructionKind.LITERAL
@@ -385,14 +537,31 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     raw = word.raw.to_bytes(4, "big")
     if all(byte == 0 for byte in raw):
         return False
+
     printable = 0
+    relaxed = 0
     for byte in raw:
         if byte in ASCII_ALLOWED:
             if 0x20 <= byte <= 0x7E:
                 printable += 1
+            relaxed += 1
+            continue
+        if byte in ASCII_RELAXED:
+            relaxed += 1
             continue
         return False
-    return printable > 0
+
+    if printable >= 3:
+        return True
+
+    if printable == 2 and relaxed == len(raw):
+        # Many text snippets in ``_char`` encode pairs of characters terminated
+        # by ``\x00`` or ``\x01``.  Accept those combinations as inline ASCII
+        # chunks as long as the remaining bytes are part of the relaxed control
+        # set.
+        return True
+
+    return False
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
