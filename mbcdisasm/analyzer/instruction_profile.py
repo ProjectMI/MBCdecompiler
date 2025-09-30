@@ -37,6 +37,130 @@ ASCII_HEURISTIC_SUMMARY = (
 )
 
 
+# Opcodes frequently observed in literal initialisation pipelines that lack
+# manual annotations.  They behave as structural markers – either carrying ASCII
+# payloads in their bytes or referencing resource identifiers – and do not alter
+# control flow.
+HEURISTIC_LITERAL_OPCODES = {
+    0x0B,
+    0x0C,
+    0x0D,
+    0x0F,
+    0x11,
+    0x13,
+    0x14,
+    0x17,
+    0x18,
+    0x19,
+    0x1C,
+    0x1F,
+    0x20,
+    0x21,
+    0x2C,
+    0x2D,
+    0x31,
+    0x32,
+    0x33,
+    0x34,
+    0x35,
+    0x36,
+    0x37,
+    0x38,
+    0x39,
+    0x3C,
+    0x3D,
+    0x3E,
+    0x3F,
+    0x40,
+    0x41,
+    0x43,
+    0x44,
+    0x45,
+    0x46,
+    0x4A,
+    0x4B,
+    0x4F,
+    0x50,
+    0x52,
+    0x54,
+    0x56,
+    0x5B,
+    0x5E,
+    0x60,
+    0x61,
+    0x63,
+    0x64,
+    0x65,
+    0x66,
+    0x67,
+    0x6C,
+    0x6D,
+    0x6E,
+    0x72,
+    0x73,
+    0x75,
+    0x77,
+    0x80,
+    0x84,
+    0x88,
+    0x8C,
+    0x8D,
+    0x94,
+    0x98,
+    0x9A,
+    0x9B,
+    0x9C,
+    0xA4,
+    0xA8,
+    0xAC,
+    0xB4,
+    0xB8,
+    0xBC,
+    0xBE,
+    0xC1,
+    0xC0,
+    0xC2,
+    0xC3,
+    0xC4,
+    0xC6,
+    0xC8,
+    0xC9,
+    0xCA,
+    0xCB,
+    0xCC,
+    0xD0,
+    0xD4,
+    0xD8,
+    0xDA,
+    0xDB,
+    0xDE,
+    0xE0,
+    0xE1,
+    0xE3,
+    0xE4,
+    0xE8,
+    0xEB,
+    0xEC,
+    0xEF,
+    0xEE,
+    0xF1,
+    0xF6,
+    0xF7,
+    0xF8,
+    0xFB,
+}
+
+# Opcodes that behave like bookkeeping helpers during literal runs.  They are
+# treated as metadata to avoid confusing the analyser with faux control flow.
+HEURISTIC_META_OPCODES = {
+    0x0E,
+    0x28,
+    0xF0,
+}
+
+HEURISTIC_INDIRECT_OPCODES = {0x69}
+
+
 class InstructionKind(Enum):
     """High level classification of an opcode.
 
@@ -236,7 +360,7 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
         control = info.control_flow.lower()
         if "return" in control:
             return InstructionKind.RETURN
-        if "terminator" in control or "halt" in control:
+        if "terminator" in control or "halt" in control or "stop" in control:
             return InstructionKind.TERMINATOR
         if "branch" in control or "jump" in control:
             return InstructionKind.BRANCH
@@ -290,7 +414,7 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.STACK_TEARDOWN
         if "duplicate" in source or "copy" in source:
             return InstructionKind.STACK_COPY
-        if "table" in source or "index" in source:
+        if "table" in source or "index" in source or "indirect" in source:
             return InstructionKind.TABLE_LOOKUP
         if "arith" in source or "math" in source:
             return InstructionKind.ARITHMETIC
@@ -341,6 +465,15 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
     if opcode in {0x05, 0x06, 0x07, 0x08}:
         return InstructionKind.ARITHMETIC
 
+    if opcode in HEURISTIC_LITERAL_OPCODES:
+        return InstructionKind.LITERAL
+
+    if opcode in HEURISTIC_META_OPCODES:
+        return InstructionKind.META
+
+    if opcode in HEURISTIC_INDIRECT_OPCODES:
+        return InstructionKind.INDIRECT
+
     return InstructionKind.UNKNOWN
 
 
@@ -385,14 +518,29 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     raw = word.raw.to_bytes(4, "big")
     if all(byte == 0 for byte in raw):
         return False
+
     printable = 0
+    zeroes = 0
+    anomalies = 0
     for byte in raw:
+        if byte == 0:
+            zeroes += 1
+            continue
         if byte in ASCII_ALLOWED:
             if 0x20 <= byte <= 0x7E:
                 printable += 1
             continue
+        anomalies += 1
+        if anomalies > 1:
+            return False
+
+    if printable == 0:
         return False
-    return printable > 0
+    if zeroes > 2:
+        return False
+    if anomalies and printable < 2:
+        return False
+    return printable >= 2 or (printable == 1 and zeroes >= 1)
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:

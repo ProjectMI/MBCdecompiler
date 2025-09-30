@@ -111,7 +111,10 @@ class KnowledgeBase:
         wildcards: Optional[Mapping[int, OpcodeInfo]] = None,
         by_name: Optional[Mapping[str, OpcodeInfo]] = None,
     ) -> None:
-        self._annotations: Dict[str, OpcodeInfo] = dict(annotations)
+        self._annotations: Dict[str, OpcodeInfo] = {
+            (_normalize_label(label) or label.upper()): info
+            for label, info in annotations.items()
+        }
         self._wildcards: Dict[int, OpcodeInfo] = dict(wildcards or {})
         self._by_name: Dict[str, OpcodeInfo] = dict(by_name or {})
 
@@ -164,7 +167,7 @@ class KnowledgeBase:
     def lookup(self, label: str) -> Optional[OpcodeInfo]:
         """Return manual information for the requested opcode label."""
 
-        canonical = label.upper()
+        canonical = _normalize_label(label) or label.upper()
         info = self._annotations.get(canonical)
         if info is not None:
             return info
@@ -172,7 +175,21 @@ class KnowledgeBase:
         opcode = _extract_opcode(canonical)
         if opcode is None:
             return None
-        return self._wildcards.get(opcode)
+        info = self._wildcards.get(opcode)
+        if info is not None:
+            return info
+
+        token, _, _ = canonical.partition(":")
+        token = token.strip()
+        if len(token) <= 2:
+            try:
+                alt = int(token, 16)
+            except ValueError:
+                alt = None
+            else:
+                if 0 <= alt <= 0xFF and alt != opcode:
+                    return self._wildcards.get(alt)
+        return None
 
     def lookup_by_name(self, name: str) -> Optional[OpcodeInfo]:
         """Return an annotation by the entry name used in the JSON file."""
@@ -213,6 +230,10 @@ def _normalize_label(label: str) -> Optional[str]:
     try:
         opcode = _parse_component(parts[0])
         mode = _parse_component(parts[1])
+        if len(parts[0]) <= 2 and all(ch in string.hexdigits for ch in parts[0]):
+            opcode = int(parts[0], 16)
+        if len(parts[1]) <= 2 and all(ch in string.hexdigits for ch in parts[1]):
+            mode = int(parts[1], 16)
     except ValueError:
         return token.upper()
 
@@ -234,10 +255,15 @@ def _extract_opcode(label: str) -> Optional[int]:
     if ":" not in label:
         return None
     opcode_text, _ = label.split(":", 1)
+    token = opcode_text.strip()
+    if not token:
+        return None
+
     try:
-        opcode = _parse_component(opcode_text)
+        opcode = _parse_component(token)
     except ValueError:
         return None
+
     if not (0 <= opcode <= 0xFF):
         return None
     return opcode
@@ -252,7 +278,11 @@ def _parse_wildcard_key(key: str) -> Optional[int]:
     if mode_text.strip() != "*":
         return None
     try:
-        opcode = _parse_component(opcode_text)
+        text = opcode_text.strip()
+        if len(text) <= 2 and all(ch in string.hexdigits for ch in text):
+            opcode = int(text, 16)
+        else:
+            opcode = _parse_component(text)
     except ValueError:
         return None
     if not (0 <= opcode <= 0xFF):
