@@ -1,5 +1,9 @@
 from mbcdisasm import Disassembler, Segment, SegmentDescriptor
 from mbcdisasm.analyzer import PipelineAnalyzer
+from mbcdisasm.analyzer.instruction_profile import InstructionKind, InstructionProfile
+from mbcdisasm.analyzer.report import PipelineBlock, PipelineReport
+from mbcdisasm.analyzer.stack import StackSummary
+from mbcdisasm.analyzer.stats import CategoryStats, KindStats, PipelineStatistics
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
 
@@ -113,3 +117,54 @@ def test_listing_embeds_pipeline_blocks():
     assert "; pipeline block 1:" in listing
     assert "category=literal" in listing
     assert "literal" in listing  # mnemonic still present
+
+
+def test_listing_summary_counts_unknowns():
+    knowledge = KnowledgeBase({})
+
+    word = InstructionWord(0, 0)
+    profile = InstructionProfile.from_word(word, knowledge)
+    stack = StackSummary(change=0, minimum=0, maximum=0, uncertain=False, events=tuple())
+    block = PipelineBlock(
+        profiles=(profile,),
+        stack=stack,
+        kind=InstructionKind.UNKNOWN,
+        category="unknown",
+        pattern=None,
+        confidence=0.1,
+    )
+    stats = PipelineStatistics(
+        block_count=1,
+        instruction_count=1,
+        total_stack_delta=0,
+        categories={"unknown": CategoryStats(count=1, stack_delta=0, stack_abs=0)},
+        kinds=KindStats(counts={InstructionKind.UNKNOWN: 1}),
+    )
+    report = PipelineReport(blocks=(block,), warnings=("manual warning",), statistics=stats)
+
+    class _SummaryAnalyzer:
+        def __init__(self, result: PipelineReport) -> None:
+            self._result = result
+
+        def analyse_segment(self, instructions):
+            return self._result
+
+    analyzer = _SummaryAnalyzer(report)
+
+    segment_bytes = encode_word(0)
+    descriptor = SegmentDescriptor(index=0, start=0, end=len(segment_bytes))
+    segment = Segment(descriptor, segment_bytes)
+    container = _DummyContainer(segment)
+
+    disassembler = Disassembler(knowledge, analyzer=analyzer)
+    listing = disassembler.generate_listing(container)
+
+    assert "; pipeline block 1:" in listing
+
+    summary = disassembler.summary
+    assert summary is not None
+    assert summary.unknown_kinds == 1
+    assert summary.unknown_categories == 1
+    assert summary.unknown_patterns == 1
+    assert summary.unknown_dominant == 1
+    assert summary.warning_count == 1
