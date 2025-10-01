@@ -62,13 +62,23 @@ def main() -> None:
     container = MbcContainer.load(args.mbc, args.adb)
 
     output_path = args.disasm_out or args.mbc.with_suffix(".disasm.txt")
-    Disassembler(knowledge).write_listing(
+    disassembler = Disassembler(knowledge)
+    summary = disassembler.write_listing(
         container,
         output_path,
         segment_indices=resolve_segments(args),
         max_instructions=args.max_instr,
     )
     print(f"disassembly written to {output_path}")
+    if summary:
+        print(
+            "analysis summary: "
+            f"unknown kind={summary.unknown_kinds} "
+            f"category={summary.unknown_categories} "
+            f"pattern={summary.unknown_patterns} "
+            f"dominant={summary.unknown_dominant} "
+            f"warnings={summary.warning_count}"
+        )
 
 
 if __name__ == "__main__":
