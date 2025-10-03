@@ -31,9 +31,9 @@ class PatternToken:
     def matches(self, event: StackEvent) -> bool:
         """Return ``True`` if ``event`` satisfies this token."""
 
-        if not self.allow_unknown and event.profile.kind is InstructionKind.UNKNOWN:
+        if not self.allow_unknown and event.kind is InstructionKind.UNKNOWN:
             return False
-        if self.kinds and event.profile.kind not in self.kinds:
+        if self.kinds and event.kind not in self.kinds:
             return False
         if event.delta < self.min_delta or event.delta > self.max_delta:
             return False
@@ -77,7 +77,7 @@ class PipelinePattern:
         score = 1.0
         if any(event.uncertain for event in events):
             score *= 0.85
-        if any(event.profile.kind is InstructionKind.UNKNOWN for event in events):
+        if any(event.kind is InstructionKind.UNKNOWN for event in events):
             score *= 0.5
 
         return PatternMatch(pattern=self, events=tuple(events), score=score)
@@ -440,7 +440,12 @@ def indirect_load_pipeline() -> PipelinePattern:
             description="key push",
         ),
         PatternToken(
-            kinds=(InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP),
+            kinds=(
+                InstructionKind.INDIRECT,
+                InstructionKind.INDIRECT_LOAD,
+                InstructionKind.INDIRECT_STORE,
+                InstructionKind.TABLE_LOOKUP,
+            ),
             min_delta=-1,
             max_delta=0,
             description="indirect read",
