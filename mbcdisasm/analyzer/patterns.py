@@ -149,6 +149,7 @@ def default_patterns() -> PatternRegistry:
             indirect_load_pipeline(),
         ]
     )
+    registry.extend(guarded_return_patterns())
     return registry
 
 
@@ -395,3 +396,104 @@ def indirect_load_pipeline() -> PipelinePattern:
         tokens=tokens,
         description="Push base/key then resolve table entry",
     )
+
+
+def guarded_return_patterns() -> Tuple[PipelinePattern, ...]:
+    """Return patterns for guarded returns with optional preludes."""
+
+    guard_token = PatternToken(
+        kinds=(InstructionKind.BRANCH, InstructionKind.TEST),
+        min_delta=-1,
+        max_delta=0,
+        description="guard branch",
+    )
+    payload_token = PatternToken(
+        kinds=(InstructionKind.PUSH, InstructionKind.LITERAL, InstructionKind.STACK_COPY),
+        min_delta=0,
+        max_delta=2,
+        description="guard payload",
+    )
+    return_token = PatternToken(
+        kinds=(InstructionKind.RETURN, InstructionKind.TERMINATOR),
+        min_delta=-4,
+        max_delta=0,
+        description="guarded return",
+    )
+
+    patterns: List[PipelinePattern] = []
+
+    patterns.append(
+        PipelinePattern(
+            name="guarded_return",
+            category="guarded_return",
+            tokens=(guard_token, payload_token, return_token),
+            description="Conditional guard followed by immediate return",
+        )
+    )
+
+    patterns.append(
+        PipelinePattern(
+            name="guarded_return_with_teardown",
+            category="guarded_return",
+            tokens=(
+                PatternToken(
+                    kinds=(InstructionKind.STACK_TEARDOWN,),
+                    min_delta=-4,
+                    max_delta=-1,
+                    description="guard prelude teardown",
+                ),
+                guard_token,
+                payload_token,
+                return_token,
+            ),
+            description="Guarded return preceded by stack teardown",
+        )
+    )
+
+    patterns.append(
+        PipelinePattern(
+            name="guarded_return_with_marker",
+            category="guarded_return",
+            tokens=(
+                PatternToken(
+                    kinds=(InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK),
+                    min_delta=-1,
+                    max_delta=1,
+                    allow_unknown=True,
+                    description="guard prelude literal",
+                ),
+                guard_token,
+                payload_token,
+                return_token,
+            ),
+            description="Guarded return preceded by literal marker",
+        )
+    )
+
+    patterns.append(
+        PipelinePattern(
+            name="guarded_return_with_marker_teardown",
+            category="guarded_return",
+            tokens=(
+                PatternToken(
+                    kinds=(InstructionKind.STACK_TEARDOWN,),
+                    min_delta=-4,
+                    max_delta=-1,
+                    description="guard prelude teardown",
+                ),
+                PatternToken(
+                    kinds=(InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK),
+                    min_delta=-1,
+                    max_delta=1,
+                    allow_unknown=True,
+                    description="guard prelude literal",
+                ),
+                guard_token,
+                payload_token,
+                return_token,
+            ),
+            description="Guarded return with teardown and literal prelude",
+        )
+    )
+
+    return tuple(patterns)

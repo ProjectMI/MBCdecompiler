@@ -29,6 +29,45 @@ def build_knowledge() -> KnowledgeBase:
             category="test",
             stack_delta=-1,
         ),
+        "26:00": OpcodeInfo(
+            mnemonic="guard_test",
+            summary="conditional branch",
+            control_flow="branch",
+            category="test_branch",
+            stack_delta=-1,
+        ),
+        "27:00": OpcodeInfo(
+            mnemonic="guard_testset",
+            summary="conditional branch",
+            control_flow="branch",
+            category="testset_branch",
+            stack_delta=-1,
+        ),
+        "02:66": OpcodeInfo(
+            mnemonic="guard_push",
+            summary="push guard value",
+            category="push",
+            stack_delta=1,
+        ),
+        "30:69": OpcodeInfo(
+            mnemonic="guard_return",
+            summary="return values",
+            control_flow="return",
+            category="return",
+            stack_delta=-1,
+        ),
+        "01:18": OpcodeInfo(
+            mnemonic="guard_teardown",
+            summary="teardown",
+            category="stack_teardown",
+            stack_delta=-2,
+        ),
+        "00:69": OpcodeInfo(
+            mnemonic="guard_marker",
+            summary="marker",
+            category="literal_marker",
+            stack_delta=0,
+        ),
         "20:00": OpcodeInfo(mnemonic="reduce", summary="reduce", category="reduce", stack_delta=-2),
         "21:00": OpcodeInfo(mnemonic="call_helper", summary="call", control_flow="call", category="call"),
         "30:00": OpcodeInfo(
@@ -86,6 +125,43 @@ def test_return_pipeline_detection():
     categories = [block.category for block in report.blocks]
     assert "return" in categories
     assert report.total_stack_change() <= 0
+
+
+def test_guarded_return_detection():
+    analyzer = PipelineAnalyzer(build_knowledge())
+    instructions = [
+        make_word(0, 0x26),
+        make_word(4, 0x02, 0x66),
+        make_word(8, 0x30, 0x69),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    assert len(report.blocks) == 1
+    block = report.blocks[0]
+    assert block.pattern is not None
+    assert block.pattern.pattern.name == "guarded_return"
+    assert block.category == "guarded_return"
+
+
+def test_guarded_return_with_preludes():
+    analyzer = PipelineAnalyzer(build_knowledge())
+    instructions = [
+        make_word(0, 0x01, 0x18),
+        make_word(4, 0x00, 0x69),
+        make_word(8, 0x27),
+        make_word(12, 0x02, 0x66),
+        make_word(16, 0x30, 0x69),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    assert len(report.blocks) == 1
+    block = report.blocks[0]
+    assert block.pattern is not None
+    assert block.pattern.pattern.name in {
+        "guarded_return_with_marker_teardown",
+        "guarded_return_with_marker",
+        "guarded_return_with_teardown",
+        "guarded_return",
+    }
+    assert block.category == "guarded_return"
 
 
 class _DummyContainer:
