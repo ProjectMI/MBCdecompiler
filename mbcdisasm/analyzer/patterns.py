@@ -143,6 +143,7 @@ def default_patterns() -> PatternRegistry:
             marker_run_pattern(),
             literal_pipeline(),
             ascii_pipeline(),
+            *guarded_return_patterns(),
             reduce_pipeline(),
             call_preparation_pipeline(),
             return_pipeline(),
@@ -279,6 +280,62 @@ def ascii_pipeline() -> PipelinePattern:
         stack_change=-1,
         description="Load ASCII chunk and collapse into a single value",
     )
+
+
+def guarded_return_patterns() -> Tuple[PipelinePattern, ...]:
+    """Return patterns describing conditional guards with immediate returns."""
+
+    branch_token = PatternToken(
+        kinds=(InstructionKind.BRANCH, InstructionKind.TEST),
+        min_delta=-2,
+        max_delta=1,
+        description="guard branch",
+    )
+    guard_token = PatternToken(
+        kinds=(InstructionKind.PUSH, InstructionKind.LITERAL, InstructionKind.STACK_COPY),
+        min_delta=-1,
+        max_delta=2,
+        description="guard payload",
+    )
+    return_token = PatternToken(
+        kinds=(InstructionKind.RETURN, InstructionKind.TERMINATOR),
+        min_delta=-2,
+        max_delta=0,
+        description="guarded return",
+    )
+
+    prep_token = PatternToken(
+        kinds=(InstructionKind.STACK_TEARDOWN,),
+        min_delta=-4,
+        max_delta=0,
+        description="guard prep",
+    )
+    literal_token = PatternToken(
+        kinds=(InstructionKind.LITERAL, InstructionKind.PUSH),
+        min_delta=-1,
+        max_delta=2,
+        description="guard literal",
+    )
+
+    variants: Tuple[Tuple[PatternToken, ...], ...] = (
+        (),
+        (prep_token,),
+        (literal_token,),
+        (prep_token, literal_token),
+    )
+
+    patterns: List[PipelinePattern] = []
+    for prefix in variants:
+        tokens = prefix + (branch_token, guard_token, return_token)
+        patterns.append(
+            PipelinePattern(
+                name="guarded_return",
+                category="return",
+                tokens=tokens,
+                description="Conditional branch with guarded return",
+            )
+        )
+    return tuple(patterns)
 
 
 def reduce_pipeline() -> PipelinePattern:
