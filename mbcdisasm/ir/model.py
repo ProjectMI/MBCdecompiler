@@ -64,6 +64,43 @@ class IRReturn(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteral(IRNode):
+    """Push a literal value onto the VM stack."""
+
+    value: int
+    mode: int
+    source: str
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        return f"lit(0x{self.value:04X})"
+
+
+@dataclass(frozen=True)
+class IRLiteralChunk(IRNode):
+    """Inline ASCII chunk embedded directly in the code stream."""
+
+    data: bytes
+    source: str
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        printable = []
+        for byte in self.data:
+            if 0x20 <= byte <= 0x7E:
+                printable.append(chr(byte))
+            elif byte in {0x09, 0x0A, 0x0D}:
+                printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+            else:
+                printable.append(f"\\x{byte:02x}")
+        text = "".join(printable)
+        note = f"ascii({text})"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
 class IRBuildArray(IRNode):
     """Aggregate literal values into a positional container."""
 
@@ -200,6 +237,8 @@ class NormalizerMetrics:
     calls: int = 0
     tail_calls: int = 0
     returns: int = 0
+    literals: int = 0
+    literal_chunks: int = 0
     aggregates: int = 0
     testset_branches: int = 0
     if_branches: int = 0
@@ -214,6 +253,8 @@ class NormalizerMetrics:
         self.calls += other.calls
         self.tail_calls += other.tail_calls
         self.returns += other.returns
+        self.literals += other.literals
+        self.literal_chunks += other.literal_chunks
         self.aggregates += other.aggregates
         self.testset_branches += other.testset_branches
         self.if_branches += other.if_branches
@@ -229,6 +270,8 @@ class NormalizerMetrics:
             f"calls={self.calls}",
             f"tail_calls={self.tail_calls}",
             f"returns={self.returns}",
+            f"literals={self.literals}",
+            f"literal_chunks={self.literal_chunks}",
             f"aggregates={self.aggregates}",
             f"testset_branches={self.testset_branches}",
             f"if_branches={self.if_branches}",
@@ -253,6 +296,8 @@ __all__ = [
     "IRTestSetBranch",
     "IRLoad",
     "IRStore",
+    "IRLiteral",
+    "IRLiteralChunk",
     "IRSlot",
     "IRRaw",
     "MemSpace",

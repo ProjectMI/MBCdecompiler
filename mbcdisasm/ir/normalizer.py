@@ -16,6 +16,8 @@ from .model import (
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    IRLiteral,
+    IRLiteralChunk,
     IRLoad,
     IRNode,
     IRProgram,
@@ -31,7 +33,7 @@ from .model import (
 )
 
 
-ANNOTATION_MNEMONICS = {"literal_marker", "inline_ascii_chunk"}
+ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
@@ -225,6 +227,7 @@ class IRNormalizer:
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
+        self._pass_literals(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
         self._pass_branches(items, metrics)
@@ -261,6 +264,54 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # individual pass implementations
     # ------------------------------------------------------------------
+    def _pass_literals(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            literal = self._literal_from_instruction(item)
+            if literal is None:
+                index += 1
+                continue
+
+            if isinstance(literal, IRLiteral):
+                metrics.literals += 1
+            elif isinstance(literal, IRLiteralChunk):
+                metrics.literal_chunks += 1
+
+            items.replace_slice(index, index + 1, [literal])
+            index += 1
+
+    def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
+        profile = instruction.profile
+
+        if profile.is_literal_marker():
+            self._annotation_offsets.add(instruction.offset)
+            return None
+
+        if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
+            "inline_ascii_chunk"
+        ):
+            data = instruction.profile.word.raw.to_bytes(4, "big")
+            return IRLiteralChunk(
+                data=data,
+                source=profile.mnemonic,
+                annotations=instruction.annotations,
+            )
+
+        if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
+            return IRLiteral(
+                value=instruction.operand,
+                mode=profile.mode,
+                source=profile.mnemonic,
+                annotations=instruction.annotations,
+            )
+
+        return None
+
     def _pass_calls_and_returns(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -301,13 +352,18 @@ class IRNormalizer:
         scan = call_index - 1
         while scan >= 0:
             candidate = items[scan]
-            if not isinstance(candidate, RawInstruction):
-                break
-            if candidate.pushes_value():
-                args.append(self._describe_value(candidate))
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                args.append(candidate.describe())
                 scan -= 1
                 continue
-            break
+            if isinstance(candidate, RawInstruction):
+                if candidate.pushes_value():
+                    args.append(self._describe_value(candidate))
+                    scan -= 1
+                    continue
+                break
+            else:
+                break
         args.reverse()
         start = scan + 1
         return args, start
@@ -393,27 +449,31 @@ class IRNormalizer:
     def _pass_aggregates(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
-            item = items[index]
-            if not isinstance(item, RawInstruction) or item.mnemonic != "push_literal":
+            literal = self._literal_at(items, index)
+            if literal is None:
                 index += 1
                 continue
 
-            literal_instructions: List[RawInstruction] = []
+            literal_nodes: List[IRLiteral] = [literal]
             reducers: List[RawInstruction] = []
             spacers: List[RawInstruction] = []
-            scan = index
-            added_literal_since_reduce = False
+            scan = index + 1
+            added_literal_since_reduce = True
+
             while scan < len(items):
-                candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and candidate.mnemonic == "push_literal":
-                    literal_instructions.append(candidate)
+                candidate_literal = self._literal_at(items, scan)
+                if candidate_literal is not None:
+                    literal_nodes.append(candidate_literal)
                     scan += 1
                     added_literal_since_reduce = True
                     continue
+
+                candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
                     spacers.append(candidate)
                     scan += 1
                     continue
+
                 if isinstance(candidate, RawInstruction) and candidate.mnemonic.startswith("reduce"):
                     if not added_literal_since_reduce:
                         self._annotation_offsets.add(candidate.offset)
@@ -424,13 +484,14 @@ class IRNormalizer:
                     scan += 1
                     added_literal_since_reduce = False
                     continue
+
                 break
 
             if not reducers:
                 index += 1
                 continue
 
-            literals = [self._describe_value(instr) for instr in literal_instructions]
+            literals = [self._literal_repr(node) for node in literal_nodes]
             replacement: IRNode
             if len(literals) >= 2 and len(literals) == 2 * len(reducers):
                 entries = []
@@ -449,6 +510,26 @@ class IRNormalizer:
                 replacement_sequence.extend(spacers)
             items.replace_slice(index, scan, replacement_sequence)
             index += 1
+
+    def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
+        item = items[index]
+        if isinstance(item, IRLiteral):
+            return item
+        if isinstance(item, RawInstruction):
+            if item.profile.kind is InstructionKind.LITERAL and item.pushes_value():
+                literal = IRLiteral(
+                    value=item.operand,
+                    mode=item.profile.mode,
+                    source=item.profile.mnemonic,
+                    annotations=item.annotations,
+                )
+                items.replace_slice(index, index + 1, [literal])
+                return literal
+        return None
+
+    @staticmethod
+    def _literal_repr(node: IRLiteral) -> str:
+        return node.describe()
 
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -534,6 +615,12 @@ class IRNormalizer:
                     return self._describe_value(candidate)
                 if skip_literals:
                     return self._describe_value(candidate)
+            if isinstance(candidate, IRLiteral) and skip_literals:
+                scan -= 1
+                continue
+            if isinstance(candidate, IRLiteralChunk) and skip_literals:
+                scan -= 1
+                continue
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1

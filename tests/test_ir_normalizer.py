@@ -111,6 +111,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.calls == 1
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
+    assert program.metrics.literals == 5
+    assert program.metrics.literal_chunks == 0
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches == 1
     assert program.metrics.if_branches == 1
