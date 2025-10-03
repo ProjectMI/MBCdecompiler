@@ -88,6 +88,23 @@ def test_return_pipeline_detection():
     assert report.total_stack_change() <= 0
 
 
+def test_guarded_return_pipeline_detection():
+    analyzer = PipelineAnalyzer(build_knowledge())
+    instructions = [
+        make_word(0, 0x30),
+        make_word(4, 0x10),
+        make_word(8, 0x12),
+        make_word(12, 0x11),
+        make_word(16, 0x31),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    assert report.blocks
+    block = report.blocks[0]
+    assert block.category == "return"
+    assert block.pattern is not None
+    assert block.pattern.pattern.name == "guarded_return_with_setup"
+
+
 class _DummyContainer:
     def __init__(self, segment: Segment) -> None:
         self._segment = segment

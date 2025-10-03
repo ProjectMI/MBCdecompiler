@@ -146,6 +146,7 @@ def default_patterns() -> PatternRegistry:
             reduce_pipeline(),
             call_preparation_pipeline(),
             return_pipeline(),
+            *guarded_return_pipelines(),
             indirect_load_pipeline(),
         ]
     )
@@ -365,6 +366,65 @@ def return_pipeline() -> PipelinePattern:
         tokens=tokens,
         allow_extra=True,
         description="Drop frame values and return",
+    )
+
+
+def guarded_return_pipelines() -> Tuple[PipelinePattern, ...]:
+    """Return patterns for guarded early returns."""
+
+    guard_token = PatternToken(
+        kinds=(InstructionKind.BRANCH, InstructionKind.TEST),
+        min_delta=-2,
+        max_delta=0,
+        description="guard branch",
+    )
+    value_token = PatternToken(
+        kinds=(InstructionKind.PUSH, InstructionKind.LITERAL, InstructionKind.STACK_COPY),
+        min_delta=-1,
+        max_delta=2,
+        description="return value prep",
+    )
+    return_token = PatternToken(
+        kinds=(InstructionKind.RETURN, InstructionKind.TERMINATOR),
+        min_delta=-3,
+        max_delta=0,
+        description="return",
+    )
+
+    def make_pattern(name: str, prefix: Tuple[PatternToken, ...]) -> PipelinePattern:
+        tokens = prefix + (guard_token, value_token, return_token)
+        return PipelinePattern(
+            name=name,
+            category="return",
+            tokens=tokens,
+            description="Lua-style guard with immediate return",
+        )
+
+    teardown_prefix = (
+        PatternToken(
+            kinds=(InstructionKind.STACK_TEARDOWN,),
+            min_delta=-4,
+            max_delta=-1,
+            description="return guard teardown",
+        ),
+    )
+    literal_prefix = (
+        PatternToken(
+            kinds=(InstructionKind.LITERAL, InstructionKind.PUSH),
+            min_delta=0,
+            max_delta=2,
+            description="return guard literal",
+        ),
+    )
+
+    return (
+        make_pattern("guarded_return", tuple()),
+        make_pattern("guarded_return_with_teardown", teardown_prefix),
+        make_pattern("guarded_return_with_literal", literal_prefix),
+        make_pattern(
+            "guarded_return_with_setup",
+            teardown_prefix + literal_prefix,
+        ),
     )
 
 
