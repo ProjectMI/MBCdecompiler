@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, TYPE_CHECKING
 from .analyzer import PipelineAnalyzer
 from .analyzer.instruction_profile import InstructionKind, resolve_opcode_info
 from .instruction import InstructionWord, read_instructions
+from .ir import build_segment_ir
 from .knowledge import KnowledgeBase
 from .mbc import MbcContainer, Segment
 
@@ -213,3 +214,60 @@ class Disassembler:
         )
         output_path.write_text(listing, "utf-8")
         return self._summary
+
+    # ------------------------------------------------------------------
+    # IR generation helpers
+    # ------------------------------------------------------------------
+
+    def generate_ir(
+        self,
+        container: MbcContainer,
+        *,
+        segment_indices: Optional[Sequence[int]] = None,
+        max_instructions: Optional[int] = None,
+    ) -> str:
+        """Return the normalised IR for ``container`` as a textual dump."""
+
+        lines: List[str] = []
+        selection = tuple(segment_indices or [])
+
+        def _emit_segment(segment: Segment) -> None:
+            instructions, _ = read_instructions(segment.data, segment.start)
+            if max_instructions is not None:
+                instructions = instructions[:max_instructions]
+            program = build_segment_ir(instructions, self.knowledge)
+            lines.append(
+                f"; ir segment {segment.index} offset=0x{segment.start:06X} length={segment.length}"
+            )
+            lines.extend(program.render())
+            lines.append("")
+
+        if selection:
+            segment_map = {segment.index: segment for segment in container.segments()}
+            for index in selection:
+                segment = segment_map.get(index)
+                if segment is None:
+                    continue
+                _emit_segment(segment)
+        else:
+            for segment in container.segments():
+                _emit_segment(segment)
+
+        return "\n".join(lines) + "\n"
+
+    def write_ir(
+        self,
+        container: MbcContainer,
+        output_path: Path,
+        *,
+        segment_indices: Optional[Sequence[int]] = None,
+        max_instructions: Optional[int] = None,
+    ) -> None:
+        """Generate an IR dump and save it to ``output_path``."""
+
+        ir_text = self.generate_ir(
+            container,
+            segment_indices=segment_indices,
+            max_instructions=max_instructions,
+        )
+        output_path.write_text(ir_text, "utf-8")

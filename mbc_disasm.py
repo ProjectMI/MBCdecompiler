@@ -69,7 +69,15 @@ def main() -> None:
         segment_indices=resolve_segments(args),
         max_instructions=args.max_instr,
     )
+    ir_output = output_path.with_suffix(".ir.txt")
+    disassembler.write_ir(
+        container,
+        ir_output,
+        segment_indices=resolve_segments(args),
+        max_instructions=args.max_instr,
+    )
     print(f"disassembly written to {output_path}")
+    print(f"ir written to {ir_output}")
     if summary:
         print(
             "analysis summary: "
