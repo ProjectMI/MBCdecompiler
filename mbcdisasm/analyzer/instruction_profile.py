@@ -66,6 +66,7 @@ class InstructionKind(Enum):
     LOGICAL = auto()
     BITWISE = auto()
     META = auto()
+    MARKER = auto()
     UNKNOWN = auto()
 
 
@@ -198,6 +199,8 @@ class InstructionProfile:
         """Return the stack hint adjusted by heuristics."""
 
         hint = self.stack_hint
+        if self.kind is InstructionKind.MARKER:
+            return StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.95)
         modifier = heuristic_stack_adjustment(self)
         if modifier is None:
             return hint
@@ -251,6 +254,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
         category = info.category.lower()
         if "ascii" in category:
             return InstructionKind.ASCII_CHUNK
+        if "marker" in category:
+            return InstructionKind.MARKER
         if "literal" in category:
             return InstructionKind.LITERAL
         if "push" in category:
@@ -278,6 +283,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
     for source in (mnemonic, summary):
         if not source:
             continue
+        if "marker" in source:
+            return InstructionKind.MARKER
         if "literal" in source or "const" in source:
             return InstructionKind.LITERAL
         if "push" in source and "stack" in source:

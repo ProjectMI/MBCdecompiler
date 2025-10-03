@@ -73,7 +73,11 @@ class PipelineAnalyzer:
 
     def _compute_events(self, profiles: Sequence[InstructionProfile]) -> Tuple[StackEvent, ...]:
         tracker = StackTracker()
-        events = [tracker.process(profile) for profile in profiles]
+        events: List[StackEvent] = []
+        total = len(profiles)
+        for idx, profile in enumerate(profiles):
+            following = profiles[idx + 1 : idx + 4]
+            events.append(tracker.process(profile, following=following))
         return tuple(events)
 
     def _segment_into_blocks(
@@ -154,7 +158,7 @@ class PipelineAnalyzer:
         category = "unknown"
         confidence = self.settings.min_confidence
 
-        if dominant in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+        if dominant in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH, InstructionKind.MARKER}:
             category = "literal"
             confidence = 0.55
         elif dominant in {InstructionKind.REDUCE, InstructionKind.ARITHMETIC}:

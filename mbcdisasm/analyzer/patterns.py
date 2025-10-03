@@ -26,6 +26,7 @@ class PatternToken:
     min_delta: int = -999
     max_delta: int = 999
     allow_unknown: bool = False
+    tags: Tuple[str, ...] = tuple()
     description: str = ""
 
     def matches(self, event: StackEvent) -> bool:
@@ -36,6 +37,8 @@ class PatternToken:
         if self.kinds and event.profile.kind not in self.kinds:
             return False
         if event.delta < self.min_delta or event.delta > self.max_delta:
+            return False
+        if self.tags and (event.tag not in self.tags):
             return False
         return True
 
@@ -58,29 +61,32 @@ class PipelinePattern:
     def match(self, events: Sequence[StackEvent]) -> Optional["PatternMatch"]:
         """Return a :class:`PatternMatch` if ``events`` fit the pattern."""
 
-        if len(events) < len(self.tokens):
+        filtered = [event for event in events if not event.ignore_for_tokens]
+        if len(filtered) < len(self.tokens):
             return None
 
-        slices = events[: len(self.tokens)]
-        for token, event in zip(self.tokens, slices):
+        matched = filtered[: len(self.tokens)]
+        for token, event in zip(self.tokens, matched):
             if not token.matches(event):
                 return None
 
-        if not self.allow_extra and len(events) != len(self.tokens):
+        if not self.allow_extra and len(filtered) != len(self.tokens):
             return None
 
+        used_events = matched if not self.allow_extra else filtered
+
         if self.stack_change is not None:
-            delta = sum(event.delta for event in events)
+            delta = sum(event.delta for event in used_events)
             if delta != self.stack_change:
                 return None
 
         score = 1.0
-        if any(event.uncertain for event in events):
+        if any(event.uncertain for event in used_events):
             score *= 0.85
-        if any(event.profile.kind is InstructionKind.UNKNOWN for event in events):
+        if any(event.profile.kind is InstructionKind.UNKNOWN for event in used_events):
             score *= 0.5
 
-        return PatternMatch(pattern=self, events=tuple(events), score=score)
+        return PatternMatch(pattern=self, events=tuple(used_events), score=score)
 
     def describe(self) -> str:
         return f"pattern {self.name} ({self.category})"
@@ -441,8 +447,9 @@ def indirect_load_pipeline() -> PipelinePattern:
         ),
         PatternToken(
             kinds=(InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP),
-            min_delta=-1,
-            max_delta=0,
+            min_delta=0,
+            max_delta=1,
+            tags=("indirect_load",),
             description="indirect read",
         ),
     )
