@@ -154,6 +154,23 @@ def test_signature_detector_matches_tailcall_return_combo():
     assert match.name == "tailcall_return_combo"
 
 
+def test_signature_detector_matches_tailcall_return_combo_with_decor():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x52, 0x0000, 0),
+        make_word(0x29, 0x10, 0x003D, 4),
+        InstructionWord(8, int.from_bytes(b"TAIL", "big")),
+        make_word(0x40, 0x00, 0x0000, 12),
+        InstructionWord(16, int.from_bytes(b"AUX_", "big")),
+        make_word(0x30, 0x69, 0x0000, 20),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_combo"
+
+
 def test_signature_detector_matches_tailcall_return_marker():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [
@@ -162,6 +179,24 @@ def test_signature_detector_matches_tailcall_return_marker():
         make_word(0x30, 0x69, 0x0000, 8),
         make_word(0x00, 0x00, 0x6704, 12),
         make_word(0x00, 0x00, 0x0067, 16),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_marker"
+
+
+def test_signature_detector_matches_tailcall_return_marker_with_decor():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x52, 0x0000, 0),
+        make_word(0x29, 0x10, 0x0001, 4),
+        InstructionWord(8, int.from_bytes(b"POST", "big")),
+        make_word(0x69, 0x00, 0x0000, 12),
+        make_word(0x30, 0x69, 0x0000, 16),
+        make_word(0x00, 0x00, 0x6704, 20),
+        make_word(0x00, 0x00, 0x0067, 24),
     ]
     profiles, summary = profiles_from_words(words, knowledge)
     detector = SignatureDetector()

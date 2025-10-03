@@ -20,7 +20,7 @@ the heuristics easier to audit and tweak during future reversing sessions.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile
@@ -53,6 +53,12 @@ def is_literal_like(profile: InstructionProfile) -> bool:
     """Return ``True`` when the instruction behaves like a literal loader."""
 
     return profile.kind in LiteralLike or is_literal_marker(profile)
+
+
+def is_ascii_or_marker(profile: InstructionProfile) -> bool:
+    """Return ``True`` for inline ASCII chunks or literal marker opcodes."""
+
+    return profile.kind is InstructionKind.ASCII_CHUNK or is_literal_marker(profile)
 
 
 def is_call_helper(profile: InstructionProfile) -> bool:
@@ -1093,15 +1099,17 @@ class TailcallReturnComboSignature(SignatureRule):
         if tail_idx is None:
             return None
 
-        return_idx = next(
-            (
-                idx
-                for idx, profile in enumerate(profiles)
-                if idx > tail_idx and profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
-            ),
-            None,
-        )
-        if return_idx is None:
+        decorative = 0
+        return_idx = tail_idx + 1
+        while return_idx < len(profiles) and is_ascii_or_marker(profiles[return_idx]):
+            decorative += 1
+            if decorative > 4:
+                return None
+            return_idx += 1
+        if return_idx >= len(profiles):
+            return None
+
+        if profiles[return_idx].kind not in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
             return None
 
         prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
@@ -1111,6 +1119,7 @@ class TailcallReturnComboSignature(SignatureRule):
         notes = (
             f"tail_idx={tail_idx}",
             f"return_idx={return_idx}",
+            f"decorative={decorative}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = self.base_confidence
@@ -1136,11 +1145,21 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if tail_idx is None or tail_idx >= len(profiles) - 2:
             return None
 
-        return_profile = profiles[tail_idx + 1]
+        decorative = 0
+        return_idx = tail_idx + 1
+        while return_idx < len(profiles) and is_ascii_or_marker(profiles[return_idx]):
+            decorative += 1
+            if decorative > 4:
+                return None
+            return_idx += 1
+        if return_idx >= len(profiles):
+            return None
+
+        return_profile = profiles[return_idx]
         if return_profile.kind is not InstructionKind.RETURN:
             return None
 
-        suffix = profiles[tail_idx + 2 :]
+        suffix = profiles[return_idx + 1 :]
         if not suffix:
             return None
 
@@ -1164,6 +1183,7 @@ class TailcallReturnMarkerSignature(SignatureRule):
             f"tail_idx={tail_idx}",
             f"literal_tail={len(literal_tail)}",
             f"prefix_literals={prefix_literals}",
+            f"decorative={decorative}",
             f"stackΔ={stack.change:+d}",
         )
 
@@ -1934,8 +1954,52 @@ class SignatureDetector:
     def detect(
         self, profiles: Sequence[InstructionProfile], stack: StackSummary
     ) -> Optional[SignatureMatch]:
-        for rule in self.rules:
+        match = self._run_rules(self.rules, profiles, stack)
+        if match is not None:
+            return match
+
+        coalesced = self._coalesce_marker_runs(profiles)
+        if len(coalesced) != len(profiles):
+            return self._run_rules(self.rules, coalesced, stack)
+        return None
+
+    def _run_rules(
+        self,
+        rules: Sequence[SignatureRule],
+        profiles: Sequence[InstructionProfile],
+        stack: StackSummary,
+    ) -> Optional[SignatureMatch]:
+        for rule in rules:
             match = rule.match(profiles, stack)
             if match is not None:
                 return match
         return None
+
+    @staticmethod
+    def _coalesce_marker_runs(
+        profiles: Sequence[InstructionProfile],
+    ) -> Tuple[InstructionProfile, ...]:
+        collapsed: list[InstructionProfile] = []
+        idx = 0
+        total = len(profiles)
+        while idx < total:
+            profile = profiles[idx]
+            if not is_literal_marker(profile):
+                collapsed.append(profile)
+                idx += 1
+                continue
+
+            run_length = 1
+            while idx + run_length < total and is_literal_marker(profiles[idx + run_length]):
+                run_length += 1
+
+            if run_length == 1:
+                collapsed.append(profile)
+            else:
+                traits = dict(profile.traits)
+                traits["marker_run"] = True
+                traits["marker_run_length"] = run_length
+                collapsed.append(replace(profile, traits=traits))
+            idx += run_length
+
+        return tuple(collapsed)
