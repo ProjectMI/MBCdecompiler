@@ -61,26 +61,68 @@ class PipelinePattern:
         if len(events) < len(self.tokens):
             return None
 
-        slices = events[: len(self.tokens)]
-        for token, event in zip(self.tokens, slices):
-            if not token.matches(event):
-                return None
+        if self.allow_extra:
+            matched = self._match_with_extras(events)
+        else:
+            matched = self._match_strict(events)
 
-        if not self.allow_extra and len(events) != len(self.tokens):
+        if matched is None:
             return None
 
         if self.stack_change is not None:
-            delta = sum(event.delta for event in events)
+            delta = sum(event.delta for event in matched)
             if delta != self.stack_change:
                 return None
 
         score = 1.0
-        if any(event.uncertain for event in events):
+        if any(event.uncertain for event in matched):
             score *= 0.85
-        if any(event.kind is InstructionKind.UNKNOWN for event in events):
+        if any(event.kind is InstructionKind.UNKNOWN for event in matched):
             score *= 0.5
 
-        return PatternMatch(pattern=self, events=tuple(events), score=score)
+        return PatternMatch(pattern=self, events=matched, score=score)
+
+    def _match_strict(self, events: Sequence[StackEvent]) -> Optional[Tuple[StackEvent, ...]]:
+        slices = events[: len(self.tokens)]
+        for token, event in zip(self.tokens, slices):
+            if not token.matches(event):
+                return None
+        if len(events) != len(self.tokens):
+            return None
+        return tuple(events)
+
+    def _match_with_extras(self, events: Sequence[StackEvent]) -> Optional[Tuple[StackEvent, ...]]:
+        matched: List[StackEvent] = []
+        token_index = 0
+        event_index = 0
+        total_tokens = len(self.tokens)
+        total_events = len(events)
+        while token_index < total_tokens and event_index < total_events:
+            event = events[event_index]
+            token = self.tokens[token_index]
+            if token.matches(event):
+                matched.append(event)
+                token_index += 1
+                event_index += 1
+                continue
+            if self._is_neutral_event(event):
+                matched.append(event)
+                event_index += 1
+                continue
+            return None
+        if token_index < total_tokens:
+            return None
+        while event_index < total_events:
+            event = events[event_index]
+            if not self._is_neutral_event(event):
+                return None
+            matched.append(event)
+            event_index += 1
+        return tuple(matched)
+
+    @staticmethod
+    def _is_neutral_event(event: StackEvent) -> bool:
+        return event.profile.is_literal_marker()
 
     def describe(self) -> str:
         return f"pattern {self.name} ({self.category})"
@@ -247,6 +289,7 @@ def literal_pipeline() -> PipelinePattern:
         name="literal_push_test",
         category="literal",
         tokens=tokens,
+        allow_extra=True,
         stack_change=1,
         description="Load literal value, push to stack, perform test",
     )
@@ -277,6 +320,7 @@ def ascii_pipeline() -> PipelinePattern:
         name="ascii_reduce_push",
         category="literal",
         tokens=tokens,
+        allow_extra=True,
         stack_change=-1,
         description="Load ASCII chunk and collapse into a single value",
     )
@@ -332,6 +376,7 @@ def guarded_return_patterns() -> Tuple[PipelinePattern, ...]:
                 name="guarded_return",
                 category="return",
                 tokens=tokens,
+                allow_extra=True,
                 description="Conditional branch with guarded return",
             )
         )
@@ -455,5 +500,6 @@ def indirect_load_pipeline() -> PipelinePattern:
         name="indirect_lookup",
         category="indirect",
         tokens=tokens,
+        allow_extra=True,
         description="Push base/key then resolve table entry",
     )

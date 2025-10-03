@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import chain
 from typing import List, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
@@ -20,6 +21,15 @@ from .signatures import SignatureDetector
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
+
+
+@dataclass(frozen=True)
+class AggregatedEvent:
+    """Represents a stack event that may cover several instructions."""
+
+    event: StackEvent
+    start: int
+    span: int
 
 
 @dataclass
@@ -81,30 +91,58 @@ class PipelineAnalyzer:
         events: Sequence[StackEvent],
     ) -> List[PipelineBlock]:
         blocks: List[PipelineBlock] = []
-        idx = 0
-        window = self.settings.max_window
-        total = len(profiles)
-        while idx < total:
+        clustered = self._cluster_marker_events(events)
+        total_profiles = len(profiles)
+        total_clusters = len(clustered)
+        cluster_index = 0
+        profile_index = 0
+        hard_window = self.settings.max_window
+        extended_window = min(9, hard_window + 3)
+
+        while cluster_index < total_clusters and profile_index < total_profiles:
+            start_profile = clustered[cluster_index].start
+            profile_index = start_profile
             best_match: Optional[PatternMatch] = None
-            best_span = 1
-            for size in range(2, window + 1):
-                end = idx + size
-                if end > total:
+            best_clusters = 1
+
+            remaining_instructions = total_profiles - start_profile
+            search_window = min(remaining_instructions, extended_window)
+
+            instruction_span = 0
+            for span_clusters in range(1, total_clusters - cluster_index + 1):
+                instruction_span += clustered[cluster_index + span_clusters - 1].span
+                if instruction_span > search_window:
                     break
-                slice_events = events[idx:end]
+                slice_events = [item.event for item in clustered[cluster_index : cluster_index + span_clusters]]
                 match = self.automaton.best_match(slice_events)
                 if match is None:
                     continue
                 if best_match is None or match.score > best_match.score:
                     best_match = match
-                    best_span = size
-            span = best_span
+                    best_clusters = span_clusters
+
             if best_match is None:
-                span = max(1, min(window, total - idx))
-            block_profiles = profiles[idx : idx + span]
+                soft_target = search_window
+                if remaining_instructions >= 4:
+                    soft_target = max(4, soft_target)
+                soft_target = max(clustered[cluster_index].span, soft_target)
+                instruction_span = 0
+                span_clusters = 0
+                while cluster_index + span_clusters < total_clusters and instruction_span < soft_target:
+                    instruction_span += clustered[cluster_index + span_clusters].span
+                    span_clusters += 1
+                best_clusters = max(1, span_clusters)
+
+            clusters_to_consume = best_clusters
+            span_instructions = sum(
+                clustered[cluster_index + offset].span
+                for offset in range(clusters_to_consume)
+            )
+            block_profiles = profiles[start_profile : start_profile + span_instructions]
             stack_summary = StackTracker().process_block(block_profiles)
-            previous = profiles[idx - 1] if idx > 0 else None
-            following = profiles[idx + span] if idx + span < total else None
+            previous = profiles[start_profile - 1] if start_profile > 0 else None
+            following_index = start_profile + span_instructions
+            following = profiles[following_index] if following_index < total_profiles else None
             heuristic_report = self.heuristics.analyse(
                 block_profiles,
                 stack_summary,
@@ -120,8 +158,54 @@ class PipelineAnalyzer:
             notes.append(heuristic_report.describe())
             block = build_block(block_profiles, stack_summary, best_match, category, confidence, notes)
             blocks.append(block)
-            idx += span
+            profile_index += span_instructions
+            cluster_index += clusters_to_consume
+
         return blocks
+
+    def _cluster_marker_events(self, events: Sequence[StackEvent]) -> Tuple[AggregatedEvent, ...]:
+        clustered: List[AggregatedEvent] = []
+        index = 0
+        total = len(events)
+        while index < total:
+            event = events[index]
+            if event.profile.is_literal_marker():
+                start = index
+                cluster_events: List[StackEvent] = [event]
+                index += 1
+                while index < total and events[index].profile.is_literal_marker():
+                    cluster_events.append(events[index])
+                    index += 1
+                aggregated = self._merge_marker_cluster(cluster_events)
+                clustered.append(AggregatedEvent(event=aggregated, start=start, span=len(cluster_events)))
+            else:
+                clustered.append(AggregatedEvent(event=event, start=index, span=1))
+                index += 1
+        return tuple(clustered)
+
+    def _merge_marker_cluster(self, events: Sequence[StackEvent]) -> StackEvent:
+        first = events[0]
+        last = events[-1]
+        delta = sum(event.delta for event in events)
+        minimum = min(event.minimum for event in events)
+        maximum = max(event.maximum for event in events)
+        confidence = min(event.confidence for event in events)
+        popped = tuple(chain.from_iterable(event.popped_types for event in events))
+        pushed = tuple(chain.from_iterable(event.pushed_types for event in events))
+        uncertain = any(event.uncertain for event in events)
+        return StackEvent(
+            profile=first.profile,
+            delta=delta,
+            minimum=minimum,
+            maximum=maximum,
+            confidence=confidence,
+            depth_before=first.depth_before,
+            depth_after=last.depth_after,
+            kind=first.kind,
+            popped_types=popped,
+            pushed_types=pushed,
+            uncertain=uncertain,
+        )
 
     def _classify_block(
         self,
