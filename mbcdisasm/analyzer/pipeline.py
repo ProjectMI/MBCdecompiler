@@ -75,6 +75,19 @@ class PipelineAnalyzer:
         tracker = StackTracker()
         return tracker.process_sequence(profiles)
 
+    def _normalise_events(self, events: Sequence[StackEvent]) -> Tuple[StackEvent, ...]:
+        """Collapse marker runs so patterns see a single sentinel event."""
+
+        normalised: List[StackEvent] = []
+        previous_was_marker = False
+        for event in events:
+            is_marker = event.profile.is_literal_marker()
+            if is_marker and previous_was_marker:
+                continue
+            normalised.append(event)
+            previous_was_marker = is_marker
+        return tuple(normalised)
+
     def _segment_into_blocks(
         self,
         profiles: Sequence[InstructionProfile],
@@ -83,24 +96,40 @@ class PipelineAnalyzer:
         blocks: List[PipelineBlock] = []
         idx = 0
         window = self.settings.max_window
+        soft_window = max(window, 9)
+        search_ranges: Tuple[range, ...]
+        if soft_window > window:
+            search_ranges = (range(2, window + 1), range(max(window + 1, 4), soft_window + 1))
+        else:
+            search_ranges = (range(2, window + 1),)
         total = len(profiles)
         while idx < total:
             best_match: Optional[PatternMatch] = None
             best_span = 1
-            for size in range(2, window + 1):
-                end = idx + size
-                if end > total:
+            for size_range in search_ranges:
+                for size in size_range:
+                    end = idx + size
+                    if end > total:
+                        break
+                    slice_events = events[idx:end]
+                    normalised_events = self._normalise_events(slice_events)
+                    match = self.automaton.best_match(normalised_events)
+                    if match is None:
+                        continue
+                    if len(normalised_events) != len(slice_events):
+                        match = PatternMatch(
+                            pattern=match.pattern,
+                            events=tuple(slice_events),
+                            score=match.score,
+                        )
+                    if best_match is None or match.score > best_match.score:
+                        best_match = match
+                        best_span = size
+                if best_match is not None:
                     break
-                slice_events = events[idx:end]
-                match = self.automaton.best_match(slice_events)
-                if match is None:
-                    continue
-                if best_match is None or match.score > best_match.score:
-                    best_match = match
-                    best_span = size
             span = best_span
             if best_match is None:
-                span = max(1, min(window, total - idx))
+                span = max(1, min(soft_window, total - idx))
             block_profiles = profiles[idx : idx + span]
             stack_summary = StackTracker().process_block(block_profiles)
             previous = profiles[idx - 1] if idx > 0 else None

@@ -103,6 +103,9 @@ class DeterministicAutomaton:
                     # allow extra instructions until a control boundary is hit
                     extra_end = end
                     while extra_end < len(events):
+                        candidate = events[extra_end]
+                        if candidate.profile.is_control():
+                            break
                         extended = events[start:extra_end + 1]
                         extended_match = pattern.match(extended)
                         if extended_match is None:

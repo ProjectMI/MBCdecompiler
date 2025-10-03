@@ -18,6 +18,15 @@ from .instruction_profile import InstructionKind
 from .stack import StackEvent
 
 
+def _is_permissible_extra(event: StackEvent) -> bool:
+    """Return ``True`` if ``event`` can be ignored when matching extras."""
+
+    profile = event.profile
+    if profile.is_literal_marker():
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class PatternToken:
     """Describe a single position in a pipeline pattern."""
@@ -61,13 +70,29 @@ class PipelinePattern:
         if len(events) < len(self.tokens):
             return None
 
-        slices = events[: len(self.tokens)]
-        for token, event in zip(self.tokens, slices):
-            if not token.matches(event):
+        if not self.allow_extra:
+            slices = events[: len(self.tokens)]
+            for token, event in zip(self.tokens, slices):
+                if not token.matches(event):
+                    return None
+            if len(events) != len(self.tokens):
                 return None
-
-        if not self.allow_extra and len(events) != len(self.tokens):
-            return None
+        else:
+            token_idx = 0
+            for event in events:
+                if token_idx >= len(self.tokens):
+                    if not _is_permissible_extra(event):
+                        return None
+                    continue
+                token = self.tokens[token_idx]
+                if token.matches(event):
+                    token_idx += 1
+                    continue
+                if _is_permissible_extra(event):
+                    continue
+                return None
+            if token_idx != len(self.tokens):
+                return None
 
         if self.stack_change is not None:
             delta = sum(event.delta for event in events)
@@ -332,6 +357,7 @@ def guarded_return_patterns() -> Tuple[PipelinePattern, ...]:
                 name="guarded_return",
                 category="return",
                 tokens=tokens,
+                allow_extra=True,
                 description="Conditional branch with guarded return",
             )
         )
