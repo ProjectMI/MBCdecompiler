@@ -27,6 +27,7 @@ class PatternToken:
     max_delta: int = 999
     allow_unknown: bool = False
     description: str = ""
+    tokens: Tuple[str, ...] = tuple()
 
     def matches(self, event: StackEvent) -> bool:
         """Return ``True`` if ``event`` satisfies this token."""
@@ -37,11 +38,16 @@ class PatternToken:
             return False
         if event.delta < self.min_delta or event.delta > self.max_delta:
             return False
+        if self.tokens:
+            token = event.token or ""
+            if token not in self.tokens:
+                return False
         return True
 
     def describe(self) -> str:
         names = ",".join(kind.name for kind in self.kinds) if self.kinds else "*"
-        return f"token({names} Δ∈[{self.min_delta},{self.max_delta}])"
+        label = f" tokens={self.tokens}" if self.tokens else ""
+        return f"token({names} Δ∈[{self.min_delta},{self.max_delta}]{label})"
 
 
 @dataclass(frozen=True)
@@ -441,8 +447,9 @@ def indirect_load_pipeline() -> PipelinePattern:
         ),
         PatternToken(
             kinds=(InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP),
-            min_delta=-1,
-            max_delta=0,
+            min_delta=0,
+            max_delta=1,
+            tokens=("indirect_load",),
             description="indirect read",
         ),
     )

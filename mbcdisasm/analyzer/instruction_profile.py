@@ -398,6 +398,9 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
     """Return additional stack delta adjustments derived from heuristics."""
 
+    if profile.mnemonic == "literal_marker":
+        return 0
+
     kind = profile.kind
     word = profile.word
 
