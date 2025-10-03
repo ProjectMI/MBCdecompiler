@@ -18,6 +18,12 @@ from .instruction_profile import InstructionKind
 from .stack import StackEvent
 
 
+def _is_marker_event(event: StackEvent) -> bool:
+    """Return ``True`` when ``event`` represents a literal marker."""
+
+    return event.profile.is_literal_marker()
+
+
 @dataclass(frozen=True)
 class PatternToken:
     """Describe a single position in a pipeline pattern."""
@@ -61,10 +67,18 @@ class PipelinePattern:
         if len(events) < len(self.tokens):
             return None
 
-        slices = events[: len(self.tokens)]
-        for token, event in zip(self.tokens, slices):
-            if not token.matches(event):
+        token_index = 0
+        for event in events:
+            if token_index < len(self.tokens) and self.tokens[token_index].matches(event):
+                token_index += 1
+                continue
+            if not self.allow_extra:
                 return None
+            if not _is_marker_event(event):
+                return None
+
+        if token_index != len(self.tokens):
+            return None
 
         if not self.allow_extra and len(events) != len(self.tokens):
             return None
@@ -95,8 +109,10 @@ class PatternMatch:
     score: float
 
     def span(self) -> Tuple[int, int]:
-        start = self.events[0].profile.word.offset
-        end = self.events[-1].profile.word.offset
+        first_event = self.events[0]
+        last_event = self.events[-1]
+        start = getattr(first_event, "cluster_start", first_event.profile.word.offset)
+        end = getattr(last_event, "cluster_end", last_event.profile.word.offset)
         return start, end
 
     def describe(self) -> str:
@@ -247,6 +263,7 @@ def literal_pipeline() -> PipelinePattern:
         name="literal_push_test",
         category="literal",
         tokens=tokens,
+        allow_extra=True,
         stack_change=1,
         description="Load literal value, push to stack, perform test",
     )
@@ -277,6 +294,7 @@ def ascii_pipeline() -> PipelinePattern:
         name="ascii_reduce_push",
         category="literal",
         tokens=tokens,
+        allow_extra=True,
         stack_change=-1,
         description="Load ASCII chunk and collapse into a single value",
     )
@@ -332,6 +350,7 @@ def guarded_return_patterns() -> Tuple[PipelinePattern, ...]:
                 name="guarded_return",
                 category="return",
                 tokens=tokens,
+                allow_extra=True,
                 description="Conditional branch with guarded return",
             )
         )

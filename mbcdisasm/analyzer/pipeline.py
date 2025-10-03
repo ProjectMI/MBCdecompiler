@@ -22,6 +22,15 @@ from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
 
 
+@dataclass(frozen=True)
+class _EventCluster:
+    """Aggregate representing one or more stack events."""
+
+    start: int
+    end: int
+    event: StackEvent
+
+
 @dataclass
 class AnalyzerSettings:
     """Configuration knobs for :class:`PipelineAnalyzer`."""
@@ -80,18 +89,19 @@ class PipelineAnalyzer:
         profiles: Sequence[InstructionProfile],
         events: Sequence[StackEvent],
     ) -> List[PipelineBlock]:
+        clusters = self._cluster_stack_events(events)
         blocks: List[PipelineBlock] = []
         idx = 0
-        window = self.settings.max_window
-        total = len(profiles)
-        while idx < total:
+        soft_window = max(self.settings.max_window, 9)
+        total_clusters = len(clusters)
+        total_profiles = len(profiles)
+        while idx < total_clusters:
             best_match: Optional[PatternMatch] = None
             best_span = 1
-            for size in range(2, window + 1):
+            max_window = min(total_clusters - idx, soft_window)
+            for size in range(2, max_window + 1):
                 end = idx + size
-                if end > total:
-                    break
-                slice_events = events[idx:end]
+                slice_events = tuple(cluster.event for cluster in clusters[idx:end])
                 match = self.automaton.best_match(slice_events)
                 if match is None:
                     continue
@@ -100,11 +110,13 @@ class PipelineAnalyzer:
                     best_span = size
             span = best_span
             if best_match is None:
-                span = max(1, min(window, total - idx))
-            block_profiles = profiles[idx : idx + span]
+                span = self._fallback_span(clusters, idx, max_window)
+            cluster_start = clusters[idx].start
+            cluster_end = clusters[idx + span - 1].end if idx + span - 1 < total_clusters else total_profiles
+            block_profiles = profiles[cluster_start:cluster_end]
             stack_summary = StackTracker().process_block(block_profiles)
-            previous = profiles[idx - 1] if idx > 0 else None
-            following = profiles[idx + span] if idx + span < total else None
+            previous = profiles[cluster_start - 1] if cluster_start > 0 else None
+            following = profiles[cluster_end] if cluster_end < total_profiles else None
             heuristic_report = self.heuristics.analyse(
                 block_profiles,
                 stack_summary,
@@ -122,6 +134,80 @@ class PipelineAnalyzer:
             blocks.append(block)
             idx += span
         return blocks
+
+    def _fallback_span(self, clusters: Sequence[_EventCluster], start: int, limit: int) -> int:
+        """Return the number of clusters to consume when no pattern matched."""
+
+        if limit <= 1:
+            return limit
+
+        max_index = min(start + limit, len(clusters))
+        eligible_span: Optional[int] = None
+        best_span: int = 1
+        block_start = clusters[start].start
+        for offset in range(start, max_index):
+            span = offset - start + 1
+            block_end = clusters[offset].end
+            length = block_end - block_start
+            if length > 9:
+                break
+            best_span = span
+            if length >= 4:
+                eligible_span = span
+        if eligible_span is not None:
+            return eligible_span
+        return best_span
+
+    def _cluster_stack_events(self, events: Sequence[StackEvent]) -> Tuple[_EventCluster, ...]:
+        """Collapse consecutive literal markers into a single matching unit."""
+
+        clusters: List[_EventCluster] = []
+        idx = 0
+        total = len(events)
+        while idx < total:
+            event = events[idx]
+            if event.profile.is_literal_marker():
+                start = idx
+                end = idx + 1
+                while end < total and events[end].profile.is_literal_marker():
+                    end += 1
+                merged = self._merge_marker_events(events[start:end])
+                clusters.append(_EventCluster(start=start, end=end, event=merged))
+                idx = end
+            else:
+                clusters.append(_EventCluster(start=idx, end=idx + 1, event=event))
+                idx += 1
+        return tuple(clusters)
+
+    def _merge_marker_events(self, events: Sequence[StackEvent]) -> StackEvent:
+        """Return a synthetic stack event representing a marker cluster."""
+
+        if len(events) == 1:
+            return events[0]
+
+        first = events[0]
+        last = events[-1]
+        delta = sum(event.delta for event in events)
+        minimum = min(event.minimum for event in events)
+        maximum = max(event.maximum for event in events)
+        confidence = min(event.confidence for event in events)
+        uncertain = any(event.uncertain for event in events)
+        merged = StackEvent(
+            profile=first.profile,
+            delta=delta,
+            minimum=minimum,
+            maximum=maximum,
+            confidence=confidence,
+            depth_before=first.depth_before,
+            depth_after=last.depth_after,
+            kind=first.kind,
+            popped_types=first.popped_types,
+            pushed_types=last.pushed_types,
+            uncertain=uncertain,
+        )
+        setattr(merged, "cluster_start", first.profile.word.offset)
+        setattr(merged, "cluster_end", last.profile.word.offset)
+        return merged
 
     def _classify_block(
         self,
