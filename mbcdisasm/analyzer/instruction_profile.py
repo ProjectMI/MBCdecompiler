@@ -61,6 +61,8 @@ class InstructionKind(Enum):
     STACK_COPY = auto()
     TEST = auto()
     INDIRECT = auto()
+    INDIRECT_LOAD = auto()
+    INDIRECT_STORE = auto()
     TABLE_LOOKUP = auto()
     ARITHMETIC = auto()
     LOGICAL = auto()
@@ -194,6 +196,18 @@ class InstructionProfile:
     def operand(self) -> int:
         return self.word.operand
 
+    def is_literal_marker(self) -> bool:
+        """Return ``True`` when the instruction represents a literal marker."""
+
+        if self.mnemonic == "literal_marker":
+            return True
+
+        opcode = self.label.split(":", 1)[0]
+        if opcode in {"40", "67", "69"}:
+            return True
+
+        return False
+
     def estimated_stack_delta(self) -> StackEffectHint:
         """Return the stack hint adjusted by heuristics."""
 
@@ -278,6 +292,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
     for source in (mnemonic, summary):
         if not source:
             continue
+        if "indirect" in source:
+            return InstructionKind.INDIRECT
         if "literal" in source or "const" in source:
             return InstructionKind.LITERAL
         if "push" in source and "stack" in source:
@@ -400,6 +416,9 @@ def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
 
     kind = profile.kind
     word = profile.word
+
+    if profile.is_literal_marker():
+        return 0
 
     if kind is InstructionKind.ASCII_CHUNK and profile.stack_hint.nominal == 0:
         return 1

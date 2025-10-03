@@ -73,8 +73,7 @@ class PipelineAnalyzer:
 
     def _compute_events(self, profiles: Sequence[InstructionProfile]) -> Tuple[StackEvent, ...]:
         tracker = StackTracker()
-        events = [tracker.process(profile) for profile in profiles]
-        return tuple(events)
+        return tracker.process_sequence(profiles)
 
     def _segment_into_blocks(
         self,
@@ -169,7 +168,12 @@ class PipelineAnalyzer:
         elif dominant is InstructionKind.TEST:
             category = "test"
             confidence = 0.5
-        elif dominant in {InstructionKind.INDIRECT, InstructionKind.TABLE_LOOKUP}:
+        elif dominant in {
+            InstructionKind.INDIRECT,
+            InstructionKind.INDIRECT_LOAD,
+            InstructionKind.INDIRECT_STORE,
+            InstructionKind.TABLE_LOOKUP,
+        }:
             category = "indirect"
             confidence = 0.5
 

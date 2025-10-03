@@ -12,10 +12,31 @@ literal loader or whether it should be flagged for manual review.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Iterable, List, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, StackEffectHint
+
+
+class StackValueType(Enum):
+    """Lightweight classification for stack values."""
+
+    UNKNOWN = auto()
+    NUMBER = auto()
+    SLOT = auto()
+    IDENTIFIER = auto()
+    MARKER = auto()
+
+
+@dataclass(frozen=True)
+class StackEffectDetails:
+    """Combined stack effect information for an instruction."""
+
+    hint: StackEffectHint
+    popped: Tuple[StackValueType, ...] = tuple()
+    pushed: Tuple[StackValueType, ...] = tuple()
+    kind: InstructionKind | None = None
 
 
 @dataclass
@@ -29,6 +50,9 @@ class StackEvent:
     confidence: float
     depth_before: int
     depth_after: int
+    kind: InstructionKind
+    popped_types: Tuple[StackValueType, ...] = tuple()
+    pushed_types: Tuple[StackValueType, ...] = tuple()
     uncertain: bool = False
 
     def describe(self) -> str:
@@ -47,6 +71,7 @@ class StackState:
     minimum_depth: int = 0
     maximum_depth: int = 0
     uncertain: bool = False
+    types: List[StackValueType] = field(default_factory=list)
 
     def apply(self, hint: StackEffectHint) -> Tuple[int, int, int, bool]:
         """Apply ``hint`` and return the resulting statistics."""
@@ -74,6 +99,7 @@ class StackState:
             minimum_depth=self.minimum_depth,
             maximum_depth=self.maximum_depth,
             uncertain=self.uncertain,
+            types=list(self.types),
         )
 
 
@@ -99,30 +125,70 @@ class StackTracker:
         self._state = StackState(depth=initial_depth)
         self._events: List[StackEvent] = []
 
-    def process(self, profile: InstructionProfile) -> StackEvent:
+    def process(
+        self, profile: InstructionProfile, *, effect: StackEffectDetails | None = None
+    ) -> StackEvent:
         """Process ``profile`` and record the resulting stack event."""
 
-        hint = profile.estimated_stack_delta()
+        if effect is None:
+            effect = infer_stack_effect((profile,), 0, prior_types=tuple(self._state.types))
+
+        hint = effect.hint
+        before = self._state.depth
         minimum, maximum, after, uncertain = self._state.apply(hint)
+        self._apply_types(effect.popped, effect.pushed)
         event = StackEvent(
             profile=profile,
             delta=hint.nominal,
             minimum=minimum,
             maximum=maximum,
             confidence=hint.confidence,
-            depth_before=after - hint.nominal,
+            depth_before=before,
             depth_after=after,
+            kind=effect.kind or profile.kind,
+            popped_types=effect.popped,
+            pushed_types=effect.pushed,
             uncertain=uncertain,
         )
         self._events.append(event)
         return event
 
+    def _apply_types(
+        self, popped: Sequence[StackValueType], pushed: Sequence[StackValueType]
+    ) -> None:
+        if not popped and not pushed:
+            return
+
+        # Trim the current stack representation using best-effort semantics.
+        for value in popped:
+            if value is StackValueType.MARKER:
+                continue
+            if self._state.types:
+                self._state.types.pop()
+        for value in pushed:
+            if value is StackValueType.MARKER:
+                continue
+            self._state.types.append(value)
+
     def run(self, profiles: Sequence[InstructionProfile]) -> StackSummary:
         """Process ``profiles`` sequentially and return the summary."""
 
-        for profile in profiles:
-            self.process(profile)
+        self.process_sequence(profiles)
         return self.summarise()
+
+    def process_sequence(self, profiles: Sequence[InstructionProfile]) -> Tuple[StackEvent, ...]:
+        """Process ``profiles`` while taking local context into account."""
+
+        events: List[StackEvent] = []
+        total = len(profiles)
+        for index, profile in enumerate(profiles):
+            effect = infer_stack_effect(
+                profiles,
+                index,
+                prior_types=tuple(self._state.types),
+            )
+            events.append(self.process(profile, effect=effect))
+        return tuple(events)
 
     def summarise(self) -> StackSummary:
         """Return a :class:`StackSummary` covering all processed instructions."""
@@ -172,6 +238,129 @@ class StackTracker:
             uncertain=summary.uncertain,
             events=summary.events,
         )
+
+
+class IndirectVariant(Enum):
+    """Flavours of ``indirect_access`` opcodes recognised by the tracker."""
+
+    LOAD = auto()
+    STORE = auto()
+
+
+def infer_stack_effect(
+    profiles: Sequence[InstructionProfile],
+    index: int,
+    *,
+    prior_types: Sequence[StackValueType] = (),
+) -> StackEffectDetails:
+    """Return a :class:`StackEffectDetails` for ``profiles[index]``."""
+
+    profile = profiles[index]
+    hint = profile.estimated_stack_delta()
+    pushed = list(_default_push_types(profile))
+    popped: List[StackValueType] = []
+    kind_override: InstructionKind | None = None
+
+    if profile.is_literal_marker():
+        hint = StackEffectHint(
+            nominal=0,
+            minimum=0,
+            maximum=0,
+            confidence=max(0.85, hint.confidence),
+        )
+        # Markers carry metadata but should not occupy stack slots.
+        pushed = [StackValueType.MARKER]
+
+    if _is_indirect_candidate(profile):
+        variant = classify_indirect_variant(profiles, index, prior_types)
+        if variant is IndirectVariant.STORE:
+            hint = StackEffectHint(
+                nominal=0,
+                minimum=0,
+                maximum=0,
+                confidence=max(0.65, hint.confidence),
+            )
+            kind_override = InstructionKind.INDIRECT_STORE
+            popped = [StackValueType.SLOT, StackValueType.NUMBER]
+            pushed = []
+        else:
+            hint = StackEffectHint(
+                nominal=1,
+                minimum=1,
+                maximum=1,
+                confidence=max(0.65, hint.confidence),
+            )
+            kind_override = InstructionKind.INDIRECT_LOAD
+            popped = [StackValueType.SLOT]
+            pushed = [StackValueType.NUMBER]
+
+    return StackEffectDetails(
+        hint=hint,
+        popped=tuple(popped),
+        pushed=tuple(pushed),
+        kind=kind_override,
+    )
+
+
+def _default_push_types(profile: InstructionProfile) -> Tuple[StackValueType, ...]:
+    if profile.is_literal_marker():
+        return (StackValueType.MARKER,)
+    if profile.kind is InstructionKind.LITERAL:
+        return (StackValueType.NUMBER,)
+    if profile.kind is InstructionKind.ASCII_CHUNK:
+        return (StackValueType.IDENTIFIER,)
+    if profile.kind is InstructionKind.PUSH:
+        return (StackValueType.SLOT,)
+    if profile.kind in {InstructionKind.TABLE_LOOKUP, InstructionKind.INDIRECT}:
+        return (StackValueType.NUMBER,)
+    return tuple()
+
+
+def _is_indirect_candidate(profile: InstructionProfile) -> bool:
+    if profile.kind in {
+        InstructionKind.INDIRECT,
+        InstructionKind.INDIRECT_LOAD,
+        InstructionKind.INDIRECT_STORE,
+    }:
+        return True
+    mnemonic = profile.mnemonic.lower()
+    if "indirect" in mnemonic:
+        return True
+    return profile.label.startswith("69:")
+
+
+def classify_indirect_variant(
+    profiles: Sequence[InstructionProfile],
+    index: int,
+    prior_types: Sequence[StackValueType],
+) -> IndirectVariant:
+    """Return whether the current instruction behaves like a load or a store."""
+
+    # Look ahead for teardown helpers that typically follow store sequences.
+    for offset in range(1, 4):
+        next_index = index + offset
+        if next_index >= len(profiles):
+            break
+        follower = profiles[next_index]
+        label = follower.label.upper()
+        if label in {"F1:3D", "01:F0"}:
+            return IndirectVariant.STORE
+        if follower.kind in {InstructionKind.REDUCE, InstructionKind.STACK_TEARDOWN}:
+            return IndirectVariant.STORE
+        if follower.kind not in {
+            InstructionKind.LITERAL,
+            InstructionKind.ASCII_CHUNK,
+            InstructionKind.PUSH,
+            InstructionKind.UNKNOWN,
+            InstructionKind.META,
+        }:
+            break
+
+    if prior_types:
+        if prior_types[-1] is StackValueType.SLOT:
+            return IndirectVariant.LOAD
+
+    return IndirectVariant.LOAD
 
 
 def stack_change(profiles: Sequence[InstructionProfile]) -> int:
