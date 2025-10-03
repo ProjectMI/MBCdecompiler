@@ -52,8 +52,13 @@ class IRReturn(IRNode):
     """Return from the current routine."""
 
     values: Tuple[str, ...]
+    varargs: bool = False
 
     def describe(self) -> str:
+        if self.varargs:
+            if self.values:
+                return f"return varargs({', '.join(self.values)})"
+            return "return varargs"
         values = ", ".join(self.values)
         return f"return [{values}]"
 
@@ -166,6 +171,7 @@ class IRBlock:
     label: str
     start_offset: int
     nodes: Tuple[IRNode, ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker
@@ -32,6 +32,7 @@ from .model import (
 
 
 ANNOTATION_MNEMONICS = {"literal_marker", "inline_ascii_chunk"}
+RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ class IRNormalizer:
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
+        self._annotation_offsets: Set[int] = set()
 
     # ------------------------------------------------------------------
     # public entry points
@@ -219,6 +221,7 @@ class IRNormalizer:
     # normalisation passes
     # ------------------------------------------------------------------
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
+        self._annotation_offsets.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -228,8 +231,14 @@ class IRNormalizer:
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
+        block_annotations: List[str] = []
         for item in items:
             if isinstance(item, RawInstruction):
+                if self._is_annotation_only(item):
+                    annotation = self._format_annotation(item)
+                    if annotation:
+                        block_annotations.append(annotation)
+                    continue
                 metrics.raw_remaining += 1
                 nodes.append(
                     IRRaw(
@@ -241,7 +250,12 @@ class IRNormalizer:
             else:
                 nodes.append(item)
 
-        ir_block = IRBlock(label=f"block_{block.index}", start_offset=block.start_offset, nodes=tuple(nodes))
+        ir_block = IRBlock(
+            label=f"block_{block.index}",
+            start_offset=block.start_offset,
+            nodes=tuple(nodes),
+            annotations=tuple(block_annotations),
+        )
         return ir_block, metrics
 
     # ------------------------------------------------------------------
@@ -269,9 +283,11 @@ class IRNormalizer:
                 continue
 
             if mnemonic == "return_values":
-                arity = self._return_arity(item)
-                values = tuple(f"ret{i}" for i in range(arity))
-                items.replace_slice(index, index + 1, [IRReturn(values=values)])
+                count, varargs = self._resolve_return_signature(items, index)
+                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+                if varargs and not values:
+                    values = ("ret*",)
+                items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
                 metrics.returns += 1
                 continue
 
@@ -301,9 +317,11 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
-                arity = self._return_arity(item)
-                values = tuple(f"ret{i}" for i in range(arity))
-                items.replace_slice(index, index + 1, [IRReturn(values=values)])
+                count, varargs = self._resolve_return_signature(items, index)
+                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+                if varargs and not values:
+                    values = ("ret*",)
+                items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
                 metrics.returns += 1
                 return
             if isinstance(item, RawInstruction) and item.profile.kind in {
@@ -314,15 +332,63 @@ class IRNormalizer:
                 continue
             break
 
-    def _return_arity(self, instruction: RawInstruction) -> int:
+    def _resolve_return_signature(self, items: _ItemList, index: int) -> Tuple[int, bool]:
+        instruction = items[index]
+        assert isinstance(instruction, RawInstruction)
+
         operand = instruction.operand
         lo = operand & 0xFF
         hi = (operand >> 8) & 0xFF
+        mode = instruction.profile.mode
+        nibble = lo & 0x0F
+
+        if mode in RETURN_NIBBLE_MODES:
+            if nibble:
+                return nibble, False
+            hint = self._stack_teardown_hint(items, index)
+            if hint is not None:
+                return hint, False
+            base = hi & 0x1F
+            if base:
+                return base, False
+            return 0, True
+
         if lo:
-            return lo
+            if lo > 0x3F:
+                narrowed = lo & 0x0F
+                if narrowed:
+                    return narrowed, False
+            return lo, False
         if hi:
-            return hi
-        return 1
+            return hi, False
+
+        hint = self._stack_teardown_hint(items, index)
+        if hint is not None:
+            return hint, False
+
+        return 1, False
+
+    def _stack_teardown_hint(self, items: _ItemList, index: int) -> Optional[int]:
+        scan = index - 1
+        total = 0
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                kind = candidate.profile.kind
+                if kind is InstructionKind.STACK_TEARDOWN:
+                    delta = -candidate.event.delta
+                    if delta > 0:
+                        total += delta
+                    scan -= 1
+                    continue
+                if kind in {InstructionKind.RETURN, InstructionKind.BRANCH, InstructionKind.TERMINATOR}:
+                    break
+            else:
+                break
+            scan -= 1
+        if total:
+            return total
+        return None
 
     def _pass_aggregates(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -334,16 +400,29 @@ class IRNormalizer:
 
             literal_instructions: List[RawInstruction] = []
             reducers: List[RawInstruction] = []
+            spacers: List[RawInstruction] = []
             scan = index
+            added_literal_since_reduce = False
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and candidate.mnemonic == "push_literal":
                     literal_instructions.append(candidate)
                     scan += 1
+                    added_literal_since_reduce = True
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                    spacers.append(candidate)
+                    scan += 1
                     continue
                 if isinstance(candidate, RawInstruction) and candidate.mnemonic.startswith("reduce"):
+                    if not added_literal_since_reduce:
+                        self._annotation_offsets.add(candidate.offset)
+                        spacers.append(candidate)
+                        scan += 1
+                        continue
                     reducers.append(candidate)
                     scan += 1
+                    added_literal_since_reduce = False
                     continue
                 break
 
@@ -365,7 +444,10 @@ class IRNormalizer:
 
             metrics.aggregates += 1
             metrics.reduce_replaced += len(reducers)
-            items.replace_slice(index, scan, [replacement])
+            replacement_sequence: List[Union[RawInstruction, IRNode]] = [replacement]
+            if spacers:
+                replacement_sequence.extend(spacers)
+            items.replace_slice(index, scan, replacement_sequence)
             index += 1
 
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
@@ -377,9 +459,9 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index)
+                expr = self._describe_condition(items, index, skip_literals=True)
                 node = IRTestSetBranch(
-                    var=f"t{index}",
+                    var=self._format_testset_var(item),
                     expr=expr,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
@@ -436,14 +518,22 @@ class IRNormalizer:
             return f"reduce(0x{operand:04X})"
         if "slot" in mnemonic:
             return f"slot(0x{operand:04X})"
+        if instruction.profile.kind is InstructionKind.LITERAL:
+            return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
-    def _describe_condition(self, items: _ItemList, index: int) -> str:
+    def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
-            if isinstance(candidate, RawInstruction) and candidate.pushes_value():
-                return self._describe_value(candidate)
+            if isinstance(candidate, RawInstruction):
+                if candidate.pushes_value():
+                    if skip_literals and candidate.mnemonic == "push_literal":
+                        scan -= 1
+                        continue
+                    return self._describe_value(candidate)
+                if skip_literals:
+                    return self._describe_value(candidate)
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
@@ -466,6 +556,38 @@ class IRNormalizer:
         else:
             space = MemSpace.CONST
         return IRSlot(space=space, index=operand)
+
+    # ------------------------------------------------------------------
+    # annotation helpers
+    # ------------------------------------------------------------------
+    def _is_annotation_only(self, instruction: RawInstruction) -> bool:
+        if instruction.offset in self._annotation_offsets:
+            return True
+        if instruction.profile.is_literal_marker():
+            return True
+        if not instruction.annotations:
+            return False
+        for note in instruction.annotations:
+            if note in ANNOTATION_MNEMONICS:
+                return True
+            if note.startswith("literal_marker") or note.startswith("inline_ascii_chunk"):
+                return True
+            if note.startswith("op_") and instruction.profile.kind is InstructionKind.LITERAL:
+                return True
+        return False
+
+    def _format_annotation(self, instruction: RawInstruction) -> str:
+        parts = [f"0x{instruction.offset:06X}"]
+        if instruction.annotations:
+            parts.extend(instruction.annotations)
+        else:
+            parts.append(instruction.mnemonic)
+        return " ".join(parts)
+
+    @staticmethod
+    def _format_testset_var(instruction: RawInstruction) -> str:
+        operand = instruction.operand
+        return f"slot(0x{operand:04X})"
 
 
 __all__ = ["IRNormalizer", "RawInstruction", "RawBlock"]
