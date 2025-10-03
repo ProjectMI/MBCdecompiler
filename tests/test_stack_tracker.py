@@ -64,3 +64,18 @@ def test_indirect_access_store_variant_detects_cleanup():
     assert indirect_event.delta == 0
     assert indirect_event.pushed_types == tuple()
     assert StackValueType.SLOT in indirect_event.popped_types
+
+
+def test_stack_shuffle_preserves_depth():
+    words = [
+        make_word(0x00, 0x00, 0x0001, 0),
+        make_word(0x00, 0x00, 0x0002, 4),
+        make_word(0x66, 0x10, 0x0000, 8),
+    ]
+    profiles = load_profiles(words)
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    shuffle_event = events[-1]
+    assert shuffle_event.kind is InstructionKind.STACK_COPY
+    assert shuffle_event.delta == 0

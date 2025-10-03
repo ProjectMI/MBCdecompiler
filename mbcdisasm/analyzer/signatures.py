@@ -44,7 +44,7 @@ def is_literal_marker(profile: InstructionProfile) -> bool:
         return True
 
     opcode = profile.label.split(":", 1)[0]
-    if opcode in {"40", "67", "69"}:
+    if opcode in {"40", "67"}:
         return True
     return False
 
@@ -1721,7 +1721,13 @@ class IndirectCallExSignature(SignatureRule):
             (
                 idx
                 for idx, profile in enumerate(profiles[lead_idx + 1 :], start=lead_idx + 1)
-                if is_literal_marker(profile) and profile.label.startswith("69:")
+                if profile.label.startswith("69:")
+                and profile.kind
+                in {
+                    InstructionKind.INDIRECT,
+                    InstructionKind.INDIRECT_LOAD,
+                    InstructionKind.INDIRECT_STORE,
+                }
             ),
             None,
         )
