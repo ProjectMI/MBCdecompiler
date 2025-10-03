@@ -364,7 +364,6 @@
     "diapasone": "0x00–0xFF",
     "comment": "Вспомогательные вызовы с разными модами (00, 04, 64, 84, AC, D0 и др.)"
   },
-    },
   "66:*": {
     "category": "stack_shuffle",
     "diapasone": "0x00–0xFF",
