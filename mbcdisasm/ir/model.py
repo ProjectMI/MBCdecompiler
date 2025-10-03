@@ -166,6 +166,7 @@ class IRBlock:
     label: str
     start_offset: int
     nodes: Tuple[IRNode, ...]
+    annotations: Tuple[Tuple[int, Tuple[str, ...]], ...] = tuple()
 
 
 @dataclass(frozen=True)

@@ -37,6 +37,9 @@ class IRTextRenderer:
 
     def _render_block(self, block: IRBlock) -> Iterable[str]:
         yield f"block {block.label} offset=0x{block.start_offset:06X}"
+        for offset, labels in block.annotations:
+            joined = ", ".join(labels)
+            yield f"  ; annotations 0x{offset:06X}: {joined}"
         for node in block.nodes:
             describe = getattr(node, "describe", None)
             if callable(describe):
