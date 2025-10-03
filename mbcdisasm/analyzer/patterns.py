@@ -61,12 +61,28 @@ class PipelinePattern:
         if len(events) < len(self.tokens):
             return None
 
-        slices = events[: len(self.tokens)]
-        for token, event in zip(self.tokens, slices):
-            if not token.matches(event):
-                return None
+        matched = 0
+        extras = 0
+        for event in events:
+            if matched >= len(self.tokens):
+                extras += 1
+                continue
 
-        if not self.allow_extra and len(events) != len(self.tokens):
+            token = self.tokens[matched]
+            if token.matches(event):
+                matched += 1
+                continue
+
+            if self.allow_extra and event.profile.is_literal_marker():
+                extras += 1
+                continue
+
+            return None
+
+        if matched != len(self.tokens):
+            return None
+
+        if extras and not self.allow_extra:
             return None
 
         if self.stack_change is not None:
@@ -247,6 +263,7 @@ def literal_pipeline() -> PipelinePattern:
         name="literal_push_test",
         category="literal",
         tokens=tokens,
+        allow_extra=True,
         stack_change=1,
         description="Load literal value, push to stack, perform test",
     )
@@ -277,6 +294,7 @@ def ascii_pipeline() -> PipelinePattern:
         name="ascii_reduce_push",
         category="literal",
         tokens=tokens,
+        allow_extra=True,
         stack_change=-1,
         description="Load ASCII chunk and collapse into a single value",
     )
@@ -332,6 +350,7 @@ def guarded_return_patterns() -> Tuple[PipelinePattern, ...]:
                 name="guarded_return",
                 category="return",
                 tokens=tokens,
+                allow_extra=True,
                 description="Conditional branch with guarded return",
             )
         )

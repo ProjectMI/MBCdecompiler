@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
+from .instruction_profile import InstructionKind
 from .patterns import PatternRegistry, PipelinePattern, PatternMatch
 from .stack import StackEvent
 
@@ -56,6 +57,15 @@ class AutomatonTrace:
 class DeterministicAutomaton:
     """Simple DFA for scanning instruction streams."""
 
+    _CONTROL_BOUNDARY_KINDS = {
+        InstructionKind.BRANCH,
+        InstructionKind.CALL,
+        InstructionKind.CONTROL,
+        InstructionKind.RETURN,
+        InstructionKind.TAILCALL,
+        InstructionKind.TERMINATOR,
+    }
+
     def __init__(self, registry: PatternRegistry) -> None:
         self.registry = registry
         self.patterns: Tuple[PipelinePattern, ...] = tuple(registry)
@@ -98,18 +108,31 @@ class DeterministicAutomaton:
                 if match is None:
                     continue
                 if not pattern.allow_extra and len(slice_events) != len(pattern.tokens):
-                    yield AutomatonMatch(pattern_index=pattern_index, start=start, end=end, score=match.score)
+                    yield AutomatonMatch(
+                        pattern_index=pattern_index,
+                        start=start,
+                        end=end,
+                        score=match.score,
+                    )
                 else:
                     # allow extra instructions until a control boundary is hit
                     extra_end = end
                     while extra_end < len(events):
-                        extended = events[start:extra_end + 1]
+                        next_event = events[extra_end]
+                        if next_event.kind in self._CONTROL_BOUNDARY_KINDS:
+                            break
+                        extended = events[start : extra_end + 1]
                         extended_match = pattern.match(extended)
                         if extended_match is None:
                             break
                         extra_end += 1
                         match = extended_match
-                    yield AutomatonMatch(pattern_index=pattern_index, start=start, end=extra_end, score=match.score)
+                    yield AutomatonMatch(
+                        pattern_index=pattern_index,
+                        start=start,
+                        end=extra_end,
+                        score=match.score,
+                    )
 
     def best_match(self, events: Sequence[StackEvent]) -> Optional[PatternMatch]:
         """Return the best scoring :class:`PatternMatch` for ``events``."""
