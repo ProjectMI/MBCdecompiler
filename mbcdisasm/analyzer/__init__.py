@@ -41,7 +41,16 @@ information to build higher level control flow graphs or to detect suspicious
 patterns that need manual review.
 """
 
+from .normalizer import IntermediateSummary, MacroNormalizer, NormalizedBlock, NormalizedOp
 from .pipeline import PipelineAnalyzer
 from .report import PipelineBlock, PipelineReport
 
-__all__ = ["PipelineAnalyzer", "PipelineBlock", "PipelineReport"]
+__all__ = [
+    "PipelineAnalyzer",
+    "PipelineBlock",
+    "PipelineReport",
+    "MacroNormalizer",
+    "NormalizedBlock",
+    "NormalizedOp",
+    "IntermediateSummary",
+]
