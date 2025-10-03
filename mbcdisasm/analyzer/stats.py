@@ -105,7 +105,7 @@ class StatisticsBuilder:
             total_delta += block.stack.change
             categories.setdefault(block.category, CategoryStats()).record(block)
             for profile in block.profiles:
-                kind_stats.record(profile.kind)
+                kind_stats.record(profile.normalized_kind)
 
         return PipelineStatistics(
             block_count=len(blocks),

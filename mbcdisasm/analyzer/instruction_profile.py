@@ -69,6 +69,14 @@ class InstructionKind(Enum):
     BITWISE = auto()
     META = auto()
     UNKNOWN = auto()
+    MACRO_CALL = auto()
+    MACRO_FRAME_END = auto()
+    MACRO_LITERAL_ARRAY = auto()
+    MACRO_LITERAL_TUPLE = auto()
+    MACRO_LITERAL_TABLE = auto()
+    MACRO_PREDICATE = auto()
+    MACRO_FRAME_SLOT = auto()
+    MACRO_GLOBAL_SLOT = auto()
 
 
 @dataclass(frozen=True)
@@ -150,6 +158,53 @@ class InstructionProfile:
     kind: InstructionKind
     traits: Mapping[str, object] = field(default_factory=dict)
 
+    # ------------------------------------------------------------------
+    # normalisation helpers
+    # ------------------------------------------------------------------
+
+    def _ensure_trait_dict(self) -> dict[str, object]:
+        """Return a mutable mapping backed by ``traits``."""
+
+        if not isinstance(self.traits, dict):
+            self.traits = dict(self.traits)
+        return self.traits  # type: ignore[return-value]
+
+    def tag_macro(
+        self,
+        name: str,
+        kind: InstructionKind,
+        *,
+        category: Optional[str] = None,
+        span: int = 1,
+        extra: Optional[Mapping[str, object]] = None,
+    ) -> None:
+        """Attach macro normalisation metadata to the profile."""
+
+        traits = self._ensure_trait_dict()
+        traits["macro"] = name
+        traits["macro_kind"] = kind
+        traits["macro_span"] = span
+        if category:
+            traits["macro_category"] = category
+        if extra:
+            for key, value in extra.items():
+                traits[key] = value
+
+    def mark_macro_member(self, name: str) -> None:
+        """Annotate the profile as part of ``name`` macro."""
+
+        traits = self._ensure_trait_dict()
+        traits.setdefault("macro_member", name)
+
+    @property
+    def normalized_kind(self) -> InstructionKind:
+        """Return the macro-adjusted :class:`InstructionKind`."""
+
+        macro_kind = self.traits.get("macro_kind") if isinstance(self.traits, Mapping) else None
+        if isinstance(macro_kind, InstructionKind):
+            return macro_kind
+        return self.kind
+
     @classmethod
     def from_word(cls, word: InstructionWord, knowledge: KnowledgeBase) -> "InstructionProfile":
         """Create a profile for ``word`` using ``knowledge`` annotations."""
@@ -224,7 +279,8 @@ class InstructionProfile:
         )
 
     def is_control(self) -> bool:
-        return self.kind in {InstructionKind.CONTROL, InstructionKind.BRANCH, InstructionKind.TERMINATOR}
+        effective = self.normalized_kind
+        return effective in {InstructionKind.CONTROL, InstructionKind.BRANCH, InstructionKind.TERMINATOR}
 
     def is_terminator(self) -> bool:
         return self.kind is InstructionKind.TERMINATOR
@@ -449,7 +505,8 @@ def summarise_profiles(profiles: Sequence[InstructionProfile]) -> Mapping[Instru
 
     histogram: dict[InstructionKind, int] = {}
     for profile in profiles:
-        histogram[profile.kind] = histogram.get(profile.kind, 0) + 1
+        kind = profile.normalized_kind
+        histogram[kind] = histogram.get(kind, 0) + 1
     return histogram
 
 

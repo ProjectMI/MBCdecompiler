@@ -15,6 +15,7 @@ from .instruction_profile import (
 from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
+from .normalizer import MacroNormalizer
 from .patterns import PatternMatch, PatternRegistry, default_patterns
 from .signatures import SignatureDetector
 from .stats import StatisticsBuilder
@@ -49,6 +50,7 @@ class PipelineAnalyzer:
         self.statistics_builder = StatisticsBuilder()
         self.automaton = DeterministicAutomaton(self.registry)
         self.signatures = SignatureDetector()
+        self.normalizer = MacroNormalizer()
 
     # ------------------------------------------------------------------
     # public API
@@ -69,7 +71,9 @@ class PipelineAnalyzer:
     # helpers
     # ------------------------------------------------------------------
     def _profile_instructions(self, instructions: Sequence[InstructionWord]) -> Tuple[InstructionProfile, ...]:
-        return tuple(InstructionProfile.from_word(word, self.knowledge) for word in instructions)
+        profiles = [InstructionProfile.from_word(word, self.knowledge) for word in instructions]
+        self.normalizer.apply(profiles)
+        return tuple(profiles)
 
     def _compute_events(self, profiles: Sequence[InstructionProfile]) -> Tuple[StackEvent, ...]:
         tracker = StackTracker()

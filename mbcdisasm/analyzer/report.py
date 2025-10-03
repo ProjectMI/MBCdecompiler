@@ -42,7 +42,8 @@ class PipelineBlock:
     def histogram(self) -> dict[InstructionKind, int]:
         counts: dict[InstructionKind, int] = {}
         for profile in self.profiles:
-            counts[profile.kind] = counts.get(profile.kind, 0) + 1
+            kind = profile.normalized_kind
+            counts[kind] = counts.get(kind, 0) + 1
         return counts
 
     def add_note(self, message: str) -> None:
