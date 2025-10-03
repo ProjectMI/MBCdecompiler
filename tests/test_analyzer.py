@@ -44,6 +44,13 @@ def build_knowledge() -> KnowledgeBase:
             category="return",
             stack_delta=-1,
         ),
+        "29:10": OpcodeInfo(
+            mnemonic="tailcall_dispatch",
+            summary="tailcall",
+            control_flow="call",
+            category="tailcall_dispatch",
+            stack_delta=-1,
+        ),
     }
     return KnowledgeBase(annotations)
 
@@ -86,6 +93,22 @@ def test_return_pipeline_detection():
     categories = [block.category for block in report.blocks]
     assert "return" in categories
     assert report.total_stack_change() <= 0
+
+
+def test_tailcall_ascii_wrapper_merges_into_single_block():
+    analyzer = PipelineAnalyzer(build_knowledge())
+    instructions = [
+        make_word(0, 0x00),
+        InstructionWord(4, int.from_bytes(b"HEAD", "big")),
+        make_word(8, 0x29, 0x10),
+        InstructionWord(12, int.from_bytes(b"TAIL", "big")),
+        make_word(16, 0x31, 0x00),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    assert len(report.blocks) == 1
+    block = report.blocks[0]
+    assert block.category == "call"
+    assert any("signature=ascii_tailcall_pattern" in note for note in block.notes)
 
 
 class _DummyContainer:

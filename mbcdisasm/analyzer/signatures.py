@@ -872,8 +872,11 @@ class TailcallAsciiWrapperSignature(SignatureRule):
         if ascii_after == 0:
             return None
 
-        branch_after = any(profile.kind is InstructionKind.BRANCH for profile in profiles[tail_idx + 1 :])
-        if not branch_after:
+        control_after = any(
+            profile.kind in {InstructionKind.BRANCH, InstructionKind.RETURN, InstructionKind.TERMINATOR}
+            for profile in profiles[tail_idx + 1 :]
+        )
+        if not control_after:
             return None
 
         literal_prefix = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))

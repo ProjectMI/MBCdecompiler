@@ -16,7 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
-from .signatures import SignatureDetector
+from .signatures import SignatureDetector, is_literal_like, is_tailcall
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -102,6 +102,12 @@ class PipelineAnalyzer:
             span = best_span
             if best_match is None:
                 span = max(1, min(window, total - idx))
+
+            extended_span = self._extend_tailcall_span(profiles, idx, span)
+            if extended_span != span:
+                span = extended_span
+                best_match = None
+
             block_profiles = profiles[idx : idx + span]
             stack_summary = StackTracker().process_block(block_profiles)
             previous = profiles[idx - 1] if idx > 0 else None
@@ -123,6 +129,60 @@ class PipelineAnalyzer:
             blocks.append(block)
             idx += span
         return blocks
+
+    def _extend_tailcall_span(
+        self, profiles: Sequence[InstructionProfile], start: int, span: int
+    ) -> int:
+        """Extend tailcall spans to include harmless ASCII wrappers."""
+
+        if span <= 0:
+            return span
+
+        block = profiles[start : start + span]
+        if not any(is_tailcall(profile) for profile in block):
+            return span
+
+        if any(
+            profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
+            for profile in block
+        ):
+            return span
+
+        total = len(profiles)
+        end = start + span
+        extra_tokens = 0
+        max_extra = 6
+
+        while end < total and extra_tokens < max_extra:
+            profile = profiles[end]
+            if profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
+                end += 1
+                return end - start
+
+            if self._is_tailcall_padding(profile):
+                end += 1
+                extra_tokens += 1
+                continue
+
+            break
+
+        return span
+
+    @staticmethod
+    def _is_tailcall_padding(profile: InstructionProfile) -> bool:
+        """Return ``True`` for neutral tokens that pad tailcall wrappers."""
+
+        if is_literal_like(profile):
+            return True
+
+        if profile.kind in {InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+            return True
+
+        label = profile.label
+        if label.startswith(("52:", "23:", "72:", "32:")):
+            return True
+
+        return False
 
     def _classify_block(
         self,
