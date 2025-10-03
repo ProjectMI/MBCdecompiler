@@ -203,7 +203,7 @@ class InstructionProfile:
             return True
 
         opcode = self.label.split(":", 1)[0]
-        if opcode in {"40", "67", "69"}:
+        if opcode in {"40", "67"}:
             return True
 
         return False

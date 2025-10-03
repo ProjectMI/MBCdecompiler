@@ -44,7 +44,7 @@ def is_literal_marker(profile: InstructionProfile) -> bool:
         return True
 
     opcode = profile.label.split(":", 1)[0]
-    if opcode in {"40", "67", "69"}:
+    if opcode in {"40", "67"}:
         return True
     return False
 
