@@ -3,6 +3,7 @@
 from .adb import SegmentDescriptor, SegmentIndex
 from .disassembler import Disassembler
 from .instruction import InstructionWord
+from .ir import IRNormalizer, IRTextRenderer
 from .knowledge import KnowledgeBase
 from .mbc import MbcContainer, Segment
 
@@ -14,4 +15,6 @@ __all__ = [
     "KnowledgeBase",
     "MbcContainer",
     "Segment",
+    "IRNormalizer",
+    "IRTextRenderer",
 ]

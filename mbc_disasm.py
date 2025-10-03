@@ -7,7 +7,13 @@ import argparse
 from pathlib import Path
 from typing import Sequence
 
-from mbcdisasm import Disassembler, KnowledgeBase, MbcContainer
+from mbcdisasm import (
+    Disassembler,
+    IRNormalizer,
+    IRTextRenderer,
+    KnowledgeBase,
+    MbcContainer,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,6 +38,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Override the default <mbc>.disasm.txt output path",
+    )
+    parser.add_argument(
+        "--ir-out",
+        type=Path,
+        default=None,
+        help="Override the default <mbc>.ir.txt output path",
     )
     parser.add_argument(
         "--knowledge-base",
@@ -63,10 +75,11 @@ def main() -> None:
 
     output_path = args.disasm_out or args.mbc.with_suffix(".disasm.txt")
     disassembler = Disassembler(knowledge)
+    selection = resolve_segments(args)
     summary = disassembler.write_listing(
         container,
         output_path,
-        segment_indices=resolve_segments(args),
+        segment_indices=selection,
         max_instructions=args.max_instr,
     )
     print(f"disassembly written to {output_path}")
@@ -79,6 +92,12 @@ def main() -> None:
             f"dominant={summary.unknown_dominant} "
             f"warnings={summary.warning_count}"
         )
+
+    ir_normalizer = IRNormalizer(knowledge)
+    program = ir_normalizer.normalise_container(container, segment_indices=selection)
+    ir_output_path = args.ir_out or args.mbc.with_suffix(".ir.txt")
+    IRTextRenderer().write(program, ir_output_path)
+    print(f"ir written to {ir_output_path}")
 
 
 if __name__ == "__main__":

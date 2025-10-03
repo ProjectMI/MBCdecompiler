@@ -58,3 +58,8 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
     assert "manual_push" in listing
     assert "Manual override for CLI test." in listing
     assert "disassembly written" in result.stdout
+    ir_output = mbc_path.with_suffix(".ir.txt")
+    assert ir_output.exists()
+    ir_text = ir_output.read_text("utf-8")
+    assert "normalizer metrics" in ir_text
+    assert "segment" in ir_text
