@@ -1,8 +1,13 @@
 from mbcdisasm import Disassembler, Segment, SegmentDescriptor
 from mbcdisasm.analyzer import PipelineAnalyzer
-from mbcdisasm.analyzer.instruction_profile import InstructionKind, InstructionProfile
+from mbcdisasm.analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    StackEffectHint,
+)
+from mbcdisasm.analyzer.pipeline import AnalyzerSettings
 from mbcdisasm.analyzer.report import PipelineBlock, PipelineReport
-from mbcdisasm.analyzer.stack import StackSummary
+from mbcdisasm.analyzer.stack import StackSummary, StackTracker
 from mbcdisasm.analyzer.stats import CategoryStats, KindStats, PipelineStatistics
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
@@ -16,6 +21,36 @@ def make_word(offset: int, opcode: int, mode: int = 0, operand: int = 0) -> Inst
 def encode_word(opcode: int, mode: int = 0, operand: int = 0) -> bytes:
     raw = (opcode << 24) | (mode << 16) | (operand & 0xFFFF)
     return raw.to_bytes(4, "big")
+
+
+def make_profile(
+    offset: int,
+    opcode: int,
+    mode: int,
+    mnemonic: str,
+    kind: InstructionKind,
+    *,
+    stack_delta: int = 0,
+) -> InstructionProfile:
+    raw = (opcode << 24) | (mode << 16)
+    word = InstructionWord(offset, raw)
+    hint = StackEffectHint(
+        nominal=stack_delta,
+        minimum=stack_delta,
+        maximum=stack_delta,
+        confidence=1.0,
+    )
+    return InstructionProfile(
+        word=word,
+        info=None,
+        mnemonic=mnemonic,
+        summary=None,
+        category=None,
+        control_flow=None,
+        stack_hint=hint,
+        kind=kind,
+        traits={},
+    )
 
 
 def build_knowledge() -> KnowledgeBase:
@@ -168,3 +203,73 @@ def test_listing_summary_counts_unknowns():
     assert summary.unknown_patterns == 1
     assert summary.unknown_dominant == 1
     assert summary.warning_count == 1
+
+
+def test_pipeline_analyzer_normalises_marker_runs():
+    knowledge = KnowledgeBase({})
+    analyzer = PipelineAnalyzer(knowledge)
+
+    profiles = [
+        make_profile(0, 0x29, 0x10, "tailcall_dispatch", InstructionKind.TAILCALL),
+        make_profile(4, 0x41, 0x00, "inline_ascii_chunk", InstructionKind.ASCII_CHUNK),
+        make_profile(8, 0x40, 0x00, "literal_marker", InstructionKind.LITERAL),
+        make_profile(12, 0x67, 0x00, "literal_marker", InstructionKind.LITERAL),
+        make_profile(16, 0x30, 0x69, "return_values", InstructionKind.RETURN, stack_delta=-1),
+    ]
+
+    tracker = StackTracker()
+    events = tuple(tracker.process(profile) for profile in profiles)
+    normalised, spans = analyzer._normalise_events(events)
+
+    assert len(events) == 5
+    assert len(normalised) == 4
+    assert spans[2] == (2, 4)
+    assert normalised[2].delta == 2
+    assert normalised[2].profile.label == "40:00"
+
+
+def test_pipeline_analyzer_groups_tailcall_ascii_return_with_markers():
+    annotations = {
+        "29:10": OpcodeInfo(
+            mnemonic="tailcall_dispatch",
+            summary="tailcall",
+            control_flow="call",
+            category="tailcall",
+            stack_delta=0,
+        ),
+        "30:69": OpcodeInfo(
+            mnemonic="return_values",
+            summary="return",
+            control_flow="return",
+            category="return",
+            stack_delta=-1,
+        ),
+        "40:00": OpcodeInfo(
+            mnemonic="literal_marker",
+            summary="marker",
+            category="literal_marker",
+            stack_delta=0,
+        ),
+        "67:00": OpcodeInfo(
+            mnemonic="literal_marker",
+            summary="marker",
+            category="literal_marker",
+            stack_delta=0,
+        ),
+    }
+
+    knowledge = KnowledgeBase(annotations)
+    analyzer = PipelineAnalyzer(knowledge, settings=AnalyzerSettings(max_window=4))
+
+    instructions = [
+        InstructionWord(0, (0x29 << 24) | (0x10 << 16)),
+        InstructionWord(4, int.from_bytes(b"ASCI", "big")),
+        InstructionWord(8, (0x40 << 24)),
+        InstructionWord(12, (0x67 << 24)),
+        InstructionWord(16, (0x30 << 24) | (0x69 << 16)),
+    ]
+
+    report = analyzer.analyse_segment(instructions)
+    assert len(report.blocks) == 1
+    block = report.blocks[0]
+    assert [profile.word.offset for profile in block.profiles] == [0, 4, 8, 12, 16]

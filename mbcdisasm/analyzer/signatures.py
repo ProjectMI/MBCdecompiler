@@ -1136,11 +1136,22 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if tail_idx is None or tail_idx >= len(profiles) - 2:
             return None
 
-        return_profile = profiles[tail_idx + 1]
-        if return_profile.kind is not InstructionKind.RETURN:
+        return_idx = None
+        harmless_between = 0
+        for idx in range(tail_idx + 1, len(profiles)):
+            profile = profiles[idx]
+            if profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
+                return_idx = idx
+                break
+            if is_literal_like(profile):
+                harmless_between += 1
+                continue
             return None
 
-        suffix = profiles[tail_idx + 2 :]
+        if return_idx is None:
+            return None
+
+        suffix = profiles[return_idx + 1 :]
         if not suffix:
             return None
 
@@ -1154,22 +1165,21 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if not all(is_literal_like(profile) for profile in suffix):
             return None
 
-        literal_tail = list(suffix)
-
-        if not literal_tail:
-            return None
-
         prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
         notes = (
             f"tail_idx={tail_idx}",
-            f"literal_tail={len(literal_tail)}",
+            f"return_idx={return_idx}",
+            f"literal_tail={len(suffix)}",
             f"prefix_literals={prefix_literals}",
+            f"harmless_between={harmless_between}",
             f"stackΔ={stack.change:+d}",
         )
 
         confidence = self.base_confidence
         if prefix_literals:
             confidence += min(0.05, 0.02 * prefix_literals)
+        if harmless_between:
+            confidence += min(0.03, 0.01 * harmless_between)
         if stack.change <= 0:
             confidence += 0.03
         return SignatureMatch(self.name, self.category, min(0.89, confidence), notes)

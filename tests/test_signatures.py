@@ -159,9 +159,10 @@ def test_signature_detector_matches_tailcall_return_marker():
     words = [
         make_word(0x00, 0x52, 0x0000, 0),
         make_word(0x29, 0x10, 0x0001, 4),
-        make_word(0x30, 0x69, 0x0000, 8),
-        make_word(0x00, 0x00, 0x6704, 12),
-        make_word(0x00, 0x00, 0x0067, 16),
+        InstructionWord(8, int.from_bytes(b"tail", "big")),
+        make_word(0x30, 0x69, 0x0000, 12),
+        make_word(0x00, 0x00, 0x6704, 16),
+        make_word(0x00, 0x00, 0x0067, 20),
     ]
     profiles, summary = profiles_from_words(words, knowledge)
     detector = SignatureDetector()

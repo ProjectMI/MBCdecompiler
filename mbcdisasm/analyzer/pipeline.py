@@ -16,7 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
-from .signatures import SignatureDetector
+from .signatures import SignatureDetector, is_literal_marker
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -58,7 +58,8 @@ class PipelineAnalyzer:
         if not profiles:
             return PipelineReport.empty()
         events = self._compute_events(profiles)
-        blocks = self._segment_into_blocks(profiles, events)
+        normalised_events, spans = self._normalise_events(events)
+        blocks = self._segment_into_blocks(profiles, normalised_events, spans)
         warnings = self._generate_warnings(blocks)
         statistics = self.statistics_builder.collect(blocks)
         return PipelineReport(blocks=tuple(blocks), warnings=tuple(warnings), statistics=statistics)
@@ -79,12 +80,13 @@ class PipelineAnalyzer:
     def _segment_into_blocks(
         self,
         profiles: Sequence[InstructionProfile],
-        events: Sequence[StackEvent],
+        normalised: Sequence[StackEvent],
+        spans: Sequence[Tuple[int, int]],
     ) -> List[PipelineBlock]:
         blocks: List[PipelineBlock] = []
         idx = 0
         window = self.settings.max_window
-        total = len(profiles)
+        total = len(normalised)
         while idx < total:
             best_match: Optional[PatternMatch] = None
             best_span = 1
@@ -92,7 +94,7 @@ class PipelineAnalyzer:
                 end = idx + size
                 if end > total:
                     break
-                slice_events = events[idx:end]
+                slice_events = normalised[idx:end]
                 match = self.automaton.best_match(slice_events)
                 if match is None:
                     continue
@@ -102,10 +104,11 @@ class PipelineAnalyzer:
             span = best_span
             if best_match is None:
                 span = max(1, min(window, total - idx))
-            block_profiles = profiles[idx : idx + span]
+            span_start, span_end = spans[idx][0], spans[idx + span - 1][1]
+            block_profiles = profiles[span_start:span_end]
             stack_summary = StackTracker().process_block(block_profiles)
-            previous = profiles[idx - 1] if idx > 0 else None
-            following = profiles[idx + span] if idx + span < total else None
+            previous = profiles[span_start - 1] if span_start > 0 else None
+            following = profiles[span_end] if span_end < len(profiles) else None
             heuristic_report = self.heuristics.analyse(
                 block_profiles,
                 stack_summary,
@@ -123,6 +126,64 @@ class PipelineAnalyzer:
             blocks.append(block)
             idx += span
         return blocks
+
+    def _normalise_events(
+        self, events: Sequence[StackEvent]
+    ) -> Tuple[Tuple[StackEvent, ...], Tuple[Tuple[int, int], ...]]:
+        """Collapse literal marker runs into pseudo events for DFA matching."""
+
+        compressed: List[StackEvent] = []
+        spans: List[Tuple[int, int]] = []
+        idx = 0
+        total = len(events)
+
+        while idx < total:
+            event = events[idx]
+            start_idx = idx
+            if self._is_marker_event(event):
+                while idx < total and self._is_marker_event(events[idx]):
+                    idx += 1
+                grouped = events[start_idx:idx]
+                compressed.append(self._collapse_group(grouped))
+                spans.append((start_idx, idx))
+                continue
+
+            compressed.append(event)
+            spans.append((idx, idx + 1))
+            idx += 1
+
+        return tuple(compressed), tuple(spans)
+
+    @staticmethod
+    def _collapse_group(group: Sequence[StackEvent]) -> StackEvent:
+        """Return a synthetic stack event that represents ``group``."""
+
+        first = group[0]
+        last = group[-1]
+        delta = sum(event.delta for event in group)
+        minimum = min(event.minimum for event in group)
+        maximum = max(event.maximum for event in group)
+        confidence = min(event.confidence for event in group)
+        uncertain = any(event.uncertain for event in group)
+        return StackEvent(
+            profile=first.profile,
+            delta=delta,
+            minimum=minimum,
+            maximum=maximum,
+            confidence=confidence,
+            depth_before=first.depth_before,
+            depth_after=last.depth_after,
+            uncertain=uncertain,
+        )
+
+    @staticmethod
+    def _is_marker_event(event: StackEvent) -> bool:
+        profile = event.profile
+        if profile.kind is not InstructionKind.LITERAL:
+            return False
+        if not is_literal_marker(profile):
+            return False
+        return True
 
     def _classify_block(
         self,
