@@ -61,6 +61,7 @@ class PipelineStatistics:
     total_stack_delta: int
     categories: Mapping[str, CategoryStats]
     kinds: KindStats
+    macro_categories: Mapping[str, int] = field(default_factory=dict)
 
     def category_ratio(self, category: str) -> float:
         stats = self.categories.get(category)
@@ -88,6 +89,11 @@ class PipelineStatistics:
         for category, stats in self.categories.items():
             pieces.append(f"{category}:{stats.count}")
         pieces.append("kinds=" + self.kinds.describe())
+        if self.macro_categories:
+            macro_desc = ", ".join(
+                f"{name}:{count}" for name, count in sorted(self.macro_categories.items())
+            )
+            pieces.append("macros={" + macro_desc + "}")
         return " ".join(pieces)
 
 
@@ -99,6 +105,7 @@ class StatisticsBuilder:
         kind_stats = KindStats()
         instruction_count = 0
         total_delta = 0
+        macro_counts: Dict[str, int] = {}
 
         for block in blocks:
             instruction_count += len(block.profiles)
@@ -106,6 +113,8 @@ class StatisticsBuilder:
             categories.setdefault(block.category, CategoryStats()).record(block)
             for profile in block.profiles:
                 kind_stats.record(profile.kind)
+            for operation in block.normalized:
+                macro_counts[operation.category] = macro_counts.get(operation.category, 0) + 1
 
         return PipelineStatistics(
             block_count=len(blocks),
@@ -113,4 +122,5 @@ class StatisticsBuilder:
             total_stack_delta=total_delta,
             categories=categories,
             kinds=kind_stats,
+            macro_categories=macro_counts,
         )

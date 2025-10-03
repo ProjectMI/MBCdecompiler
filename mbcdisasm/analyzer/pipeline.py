@@ -16,6 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
+from .normalizer import MacroNormalizer
 from .signatures import SignatureDetector
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
@@ -49,6 +50,7 @@ class PipelineAnalyzer:
         self.statistics_builder = StatisticsBuilder()
         self.automaton = DeterministicAutomaton(self.registry)
         self.signatures = SignatureDetector()
+        self.normalizer = MacroNormalizer()
 
     # ------------------------------------------------------------------
     # public API
@@ -118,7 +120,18 @@ class PipelineAnalyzer:
                 heuristic_report,
             )
             notes.append(heuristic_report.describe())
-            block = build_block(block_profiles, stack_summary, best_match, category, confidence, notes)
+            normalized = self.normalizer.normalize(block_profiles, stack_summary)
+            for operation in normalized:
+                notes.append(f"macro={operation.name}:{operation.category}")
+            block = build_block(
+                block_profiles,
+                stack_summary,
+                best_match,
+                category,
+                confidence,
+                notes,
+                normalized=normalized,
+            )
             blocks.append(block)
             idx += span
         return blocks

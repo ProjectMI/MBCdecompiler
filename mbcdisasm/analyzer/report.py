@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, dominant_kind
+from .normalizer import NormalizedOperation
 from .patterns import PatternMatch
 from .stack import StackSummary
 from .stats import PipelineStatistics
@@ -21,6 +22,7 @@ class PipelineBlock:
     category: str
     pattern: Optional[PatternMatch] = None
     confidence: float = 0.0
+    normalized: Tuple[NormalizedOperation, ...] = field(default_factory=tuple)
     notes: List[str] = field(default_factory=list)
 
     @property
@@ -59,6 +61,7 @@ class PipelineBlock:
             "stack_max": self.stack.maximum,
             "confidence": self.confidence,
             "pattern": self.pattern.pattern.name if self.pattern else None,
+            "normalized": [operation.as_dict() for operation in self.normalized],
             "notes": list(self.notes),
         }
 
@@ -101,6 +104,8 @@ def build_block(
     category: str,
     confidence: float,
     notes: Optional[Iterable[str]] = None,
+    *,
+    normalized: Optional[Sequence[NormalizedOperation]] = None,
 ) -> PipelineBlock:
     dominant = dominant_kind(profiles)
     block = PipelineBlock(
@@ -110,6 +115,7 @@ def build_block(
         category=category,
         pattern=pattern,
         confidence=confidence,
+        normalized=tuple(normalized or ()),
     )
     for note in notes or []:
         block.add_note(note)

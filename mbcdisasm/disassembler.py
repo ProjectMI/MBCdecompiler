@@ -184,9 +184,19 @@ class Disassembler:
             f"len={len(block.profiles)} pattern={pattern} conf={block.confidence:.2f}"
         )
         lines = [header]
+        macro_lines = self._format_block_macros(block.normalized)
+        lines.extend(macro_lines)
         note_lines = self._format_block_notes(block.notes)
         lines.extend(note_lines)
         return lines
+
+    @staticmethod
+    def _format_block_macros(macros):
+        formatted: List[str] = []
+        for operation in macros:
+            details = operation.describe()
+            formatted.append(f";   macro: {details}")
+        return formatted
 
     @staticmethod
     def _format_block_notes(notes: Iterable[str]) -> List[str]:
