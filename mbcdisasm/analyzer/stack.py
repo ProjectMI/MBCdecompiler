@@ -30,6 +30,8 @@ class StackEvent:
     depth_before: int
     depth_after: int
     uncertain: bool = False
+    marker_run: bool = False
+    span: int = 1
 
     def describe(self) -> str:
         return (

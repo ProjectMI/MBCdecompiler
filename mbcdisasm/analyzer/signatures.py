@@ -37,6 +37,18 @@ LiteralLike = {
 INDIRECT_RETURN_TERMINALS = {"2C:01", "66:3E", "F1:3D", "10:48"}
 
 
+INLINE_ASCII_LABELS = {
+    "23:48",
+    "23:4F",
+    "23:50",
+    "52:05",
+    "52:0F",
+    "72:23",
+}
+
+SAFE_GAP_LIMIT = 6
+
+
 def is_literal_marker(profile: InstructionProfile) -> bool:
     """Return ``True`` when ``profile`` represents a literal marker opcode."""
 
@@ -53,6 +65,34 @@ def is_literal_like(profile: InstructionProfile) -> bool:
     """Return ``True`` when the instruction behaves like a literal loader."""
 
     return profile.kind in LiteralLike or is_literal_marker(profile)
+
+
+def is_inline_ascii_marker(profile: InstructionProfile) -> bool:
+    """Return ``True`` for inline ASCII sentinels embedded in literal runs."""
+
+    if profile.kind is InstructionKind.ASCII_CHUNK:
+        return True
+
+    label = profile.label.upper()
+    if label in INLINE_ASCII_LABELS:
+        return True
+
+    summary = (profile.summary or "").lower()
+    category = (profile.category or "").lower()
+    if "ascii" in summary or "ascii" in category:
+        return True
+
+    return False
+
+
+def is_tailcall_gap_safe(profile: InstructionProfile) -> bool:
+    """Return ``True`` when ``profile`` can be skipped between tailcall/return."""
+
+    if is_literal_marker(profile):
+        return True
+    if is_inline_ascii_marker(profile):
+        return True
+    return False
 
 
 def is_call_helper(profile: InstructionProfile) -> bool:
@@ -91,6 +131,27 @@ def is_tailcall(profile: InstructionProfile) -> bool:
         return True
 
     return False
+
+
+def find_return_after_tail(
+    profiles: Sequence[InstructionProfile],
+    tail_idx: int,
+    *,
+    max_gap: int = SAFE_GAP_LIMIT,
+) -> Optional[int]:
+    """Return the index of the first return after ``tail_idx`` allowing safe gaps."""
+
+    gap = 0
+    for offset, profile in enumerate(profiles[tail_idx + 1 :], start=1):
+        if profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
+            return tail_idx + offset
+        if is_tailcall_gap_safe(profile):
+            gap += 1
+            if gap > max_gap:
+                return None
+            continue
+        return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -1093,14 +1154,7 @@ class TailcallReturnComboSignature(SignatureRule):
         if tail_idx is None:
             return None
 
-        return_idx = next(
-            (
-                idx
-                for idx, profile in enumerate(profiles)
-                if idx > tail_idx and profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
-            ),
-            None,
-        )
+        return_idx = find_return_after_tail(profiles, tail_idx)
         if return_idx is None:
             return None
 
@@ -1108,9 +1162,11 @@ class TailcallReturnComboSignature(SignatureRule):
         if prefix_literals == 0:
             return None
 
+        safe_gap = max(0, return_idx - tail_idx - 1)
         notes = (
             f"tail_idx={tail_idx}",
             f"return_idx={return_idx}",
+            f"gap_safe={safe_gap}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = self.base_confidence
@@ -1136,11 +1192,15 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if tail_idx is None or tail_idx >= len(profiles) - 2:
             return None
 
-        return_profile = profiles[tail_idx + 1]
+        return_idx = find_return_after_tail(profiles, tail_idx)
+        if return_idx is None or return_idx >= len(profiles) - 1:
+            return None
+
+        return_profile = profiles[return_idx]
         if return_profile.kind is not InstructionKind.RETURN:
             return None
 
-        suffix = profiles[tail_idx + 2 :]
+        suffix = profiles[return_idx + 1 :]
         if not suffix:
             return None
 
@@ -1154,15 +1214,14 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if not all(is_literal_like(profile) for profile in suffix):
             return None
 
-        literal_tail = list(suffix)
-
-        if not literal_tail:
-            return None
+        marker_hits = sum(1 for profile in suffix if is_literal_marker(profile))
 
         prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
+        safe_gap = max(0, return_idx - tail_idx - 1)
         notes = (
             f"tail_idx={tail_idx}",
-            f"literal_tail={len(literal_tail)}",
+            f"gap_safe={safe_gap}",
+            f"markers={marker_hits}",
             f"prefix_literals={prefix_literals}",
             f"stackΔ={stack.change:+d}",
         )
@@ -1195,14 +1254,7 @@ class TailcallReturnIndirectSignature(SignatureRule):
         if tail_idx is None:
             return None
 
-        return_idx = next(
-            (
-                idx
-                for idx in range(tail_idx + 1, len(profiles))
-                if profiles[idx].kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
-            ),
-            None,
-        )
+        return_idx = find_return_after_tail(profiles, tail_idx)
         if return_idx is None:
             return None
 
@@ -1235,9 +1287,11 @@ class TailcallReturnIndirectSignature(SignatureRule):
         if indirect_idx is None:
             return None
 
+        safe_gap = max(0, return_idx - tail_idx - 1)
         notes = (
             f"tail_idx={tail_idx}",
             f"return_idx={return_idx}",
+            f"gap_safe={safe_gap}",
             f"indirect_idx={indirect_idx}",
             f"stackΔ={stack.change:+d}",
         )

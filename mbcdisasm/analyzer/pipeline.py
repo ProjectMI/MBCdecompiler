@@ -16,7 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
-from .signatures import SignatureDetector
+from .signatures import SignatureDetector, is_literal_marker
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -74,7 +74,7 @@ class PipelineAnalyzer:
     def _compute_events(self, profiles: Sequence[InstructionProfile]) -> Tuple[StackEvent, ...]:
         tracker = StackTracker()
         events = [tracker.process(profile) for profile in profiles]
-        return tuple(events)
+        return tuple(self._compress_marker_runs(events))
 
     def _segment_into_blocks(
         self,
@@ -82,30 +82,43 @@ class PipelineAnalyzer:
         events: Sequence[StackEvent],
     ) -> List[PipelineBlock]:
         blocks: List[PipelineBlock] = []
-        idx = 0
+        idx_event = 0
+        idx_profile = 0
         window = self.settings.max_window
-        total = len(profiles)
-        while idx < total:
+        total_events = len(events)
+        total_profiles = len(profiles)
+        while idx_event < total_events and idx_profile < total_profiles:
             best_match: Optional[PatternMatch] = None
-            best_span = 1
+            best_span_events = 1
+            best_span_profiles = events[idx_event].span if events else 1
             for size in range(2, window + 1):
-                end = idx + size
-                if end > total:
+                end_event = idx_event + size
+                if end_event > total_events:
                     break
-                slice_events = events[idx:end]
+                slice_events = events[idx_event:end_event]
                 match = self.automaton.best_match(slice_events)
                 if match is None:
                     continue
+                span_profiles = sum(event.span for event in slice_events)
+                if idx_profile + span_profiles > total_profiles:
+                    continue
                 if best_match is None or match.score > best_match.score:
                     best_match = match
-                    best_span = size
-            span = best_span
+                    best_span_events = size
+                    best_span_profiles = span_profiles
+            span_events = best_span_events
+            span_profiles = best_span_profiles
             if best_match is None:
-                span = max(1, min(window, total - idx))
-            block_profiles = profiles[idx : idx + span]
+                span_events = 1
+                span_profiles = events[idx_event].span if events else 1
+            block_profiles = profiles[idx_profile : idx_profile + span_profiles]
             stack_summary = StackTracker().process_block(block_profiles)
-            previous = profiles[idx - 1] if idx > 0 else None
-            following = profiles[idx + span] if idx + span < total else None
+            previous = profiles[idx_profile - 1] if idx_profile > 0 else None
+            following = (
+                profiles[idx_profile + span_profiles]
+                if idx_profile + span_profiles < total_profiles
+                else None
+            )
             heuristic_report = self.heuristics.analyse(
                 block_profiles,
                 stack_summary,
@@ -121,8 +134,56 @@ class PipelineAnalyzer:
             notes.append(heuristic_report.describe())
             block = build_block(block_profiles, stack_summary, best_match, category, confidence, notes)
             blocks.append(block)
-            idx += span
+            idx_event += span_events
+            idx_profile += span_profiles
         return blocks
+
+    def _compress_marker_runs(self, events: Sequence[StackEvent]) -> List[StackEvent]:
+        if not events:
+            return []
+
+        compressed: List[StackEvent] = []
+        run: List[StackEvent] = []
+
+        def flush_run() -> None:
+            if not run:
+                return
+            compressed.append(self._merge_marker_run(run))
+            run.clear()
+
+        for event in events:
+            if is_literal_marker(event.profile):
+                run.append(event)
+                continue
+            flush_run()
+            compressed.append(event)
+
+        flush_run()
+        return compressed
+
+    @staticmethod
+    def _merge_marker_run(run: Sequence[StackEvent]) -> StackEvent:
+        first = run[0]
+        span = sum(event.span for event in run)
+        delta = sum(event.delta for event in run)
+        minimum = min(event.minimum for event in run)
+        maximum = max(event.maximum for event in run)
+        confidence = min(event.confidence for event in run)
+        depth_before = first.depth_before
+        depth_after = run[-1].depth_after
+        uncertain = any(event.uncertain for event in run)
+        return StackEvent(
+            profile=first.profile,
+            delta=delta,
+            minimum=minimum,
+            maximum=maximum,
+            confidence=confidence,
+            depth_before=depth_before,
+            depth_after=depth_after,
+            uncertain=uncertain,
+            marker_run=True,
+            span=span,
+        )
 
     def _classify_block(
         self,
