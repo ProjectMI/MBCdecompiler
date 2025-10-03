@@ -6,7 +6,11 @@ from mbcdisasm.analyzer.instruction_profile import (
     InstructionProfile,
     looks_like_ascii_chunk,
 )
-from mbcdisasm.analyzer.signatures import SignatureDetector
+from mbcdisasm.analyzer.signatures import (
+    SignatureDetector,
+    TailcallReturnComboSignature,
+    TailcallReturnMarkerSignature,
+)
 from mbcdisasm.analyzer.stack import StackTracker
 from mbcdisasm.instruction import InstructionWord
 
@@ -154,6 +158,23 @@ def test_signature_detector_matches_tailcall_return_combo():
     assert match.name == "tailcall_return_combo"
 
 
+def test_signature_detector_matches_tailcall_return_combo_with_padding():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x52, 0x0000, 0),
+        make_word(0x29, 0x10, 0x003D, 4),
+        InstructionWord(8, int.from_bytes(b"tail", "big")),
+        make_word(0x23, 0x4F, 0x0000, 12),
+        make_word(0x52, 0x05, 0x0000, 16),
+        make_word(0x30, 0x69, 0x0000, 20),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    signature = TailcallReturnComboSignature()
+    match = signature.match(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_combo"
+
+
 def test_signature_detector_matches_tailcall_return_marker():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [
@@ -166,6 +187,25 @@ def test_signature_detector_matches_tailcall_return_marker():
     profiles, summary = profiles_from_words(words, knowledge)
     detector = SignatureDetector()
     match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_marker"
+
+
+def test_signature_detector_matches_tailcall_return_marker_with_ascii_padding():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x52, 0x0000, 0),
+        make_word(0x29, 0x10, 0x0001, 4),
+        InstructionWord(8, int.from_bytes(b"pad_", "big")),
+        make_word(0x40, 0x00, 0x0000, 12),
+        make_word(0x40, 0x10, 0x0000, 16),
+        make_word(0x30, 0x69, 0x0000, 20),
+        make_word(0x00, 0x00, 0x6704, 24),
+        make_word(0x00, 0x00, 0x0067, 28),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    signature = TailcallReturnMarkerSignature()
+    match = signature.match(profiles, summary)
     assert match is not None
     assert match.name == "tailcall_return_marker"
 

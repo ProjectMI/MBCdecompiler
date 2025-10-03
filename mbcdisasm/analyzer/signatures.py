@@ -37,6 +37,14 @@ LiteralLike = {
 INDIRECT_RETURN_TERMINALS = {"2C:01", "66:3E", "F1:3D", "10:48"}
 
 
+TAILCALL_ASCII_PADDING_LABELS = {
+    "23:4F",
+    "32:29",
+    "52:05",
+    "72:23",
+}
+
+
 def is_literal_marker(profile: InstructionProfile) -> bool:
     """Return ``True`` when ``profile`` represents a literal marker opcode."""
 
@@ -90,6 +98,44 @@ def is_tailcall(profile: InstructionProfile) -> bool:
     if "tail" in mnemonic or "tail" in summary:
         return True
 
+    return False
+
+
+@dataclass(frozen=True)
+class ProfileSpan:
+    """Collapsed view of profiles that records the covered indices."""
+
+    profile: InstructionProfile
+    start: int
+    end: int
+
+
+def collapse_marker_runs(profiles: Sequence[InstructionProfile]) -> Tuple[ProfileSpan, ...]:
+    """Collapse consecutive literal marker instructions into single spans."""
+
+    spans = []
+    idx = 0
+    total = len(profiles)
+    while idx < total:
+        profile = profiles[idx]
+        start = idx
+        idx += 1
+        if is_literal_marker(profile):
+            while idx < total and is_literal_marker(profiles[idx]):
+                idx += 1
+        spans.append(ProfileSpan(profile=profile, start=start, end=idx))
+    return tuple(spans)
+
+
+def is_tailcall_padding(profile: InstructionProfile) -> bool:
+    """Return ``True`` when ``profile`` is harmless padding after a tailcall."""
+
+    if profile.kind is InstructionKind.ASCII_CHUNK:
+        return True
+    if profile.label in TAILCALL_ASCII_PADDING_LABELS:
+        return True
+    if is_literal_marker(profile):
+        return True
     return False
 
 
@@ -1089,28 +1135,44 @@ class TailcallReturnComboSignature(SignatureRule):
         if len(profiles) < 4:
             return None
 
-        tail_idx = next((idx for idx, profile in enumerate(profiles) if is_tailcall(profile)), None)
-        if tail_idx is None:
-            return None
-
-        return_idx = next(
-            (
-                idx
-                for idx, profile in enumerate(profiles)
-                if idx > tail_idx and profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
-            ),
-            None,
+        spans = collapse_marker_runs(profiles)
+        tail_entry = next(
+            ((idx, span) for idx, span in enumerate(spans) if is_tailcall(span.profile)), None
         )
-        if return_idx is None:
+        if tail_entry is None:
             return None
 
-        prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
+        tail_idx, tail_span = tail_entry
+        suffix = spans[tail_idx + 1 :]
+        if not suffix:
+            return None
+
+        return_entry = None
+        padding_spans = []
+        for offset, span in enumerate(suffix, start=tail_idx + 1):
+            if span.profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
+                return_entry = (offset, span)
+                break
+            if is_tailcall_padding(span.profile):
+                padding_spans.append(span)
+                continue
+            return None
+
+        if return_entry is None:
+            return None
+
+        return_idx, return_span = return_entry
+        prefix_literals = sum(
+            1 for profile in profiles[: tail_span.start] if is_literal_like(profile)
+        )
         if prefix_literals == 0:
             return None
 
+        padding = sum(span.end - span.start for span in padding_spans)
         notes = (
-            f"tail_idx={tail_idx}",
-            f"return_idx={return_idx}",
+            f"tail_idx={tail_span.start}",
+            f"return_idx={return_span.start}",
+            f"padding={padding}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = self.base_confidence
@@ -1132,38 +1194,57 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if len(profiles) < 5:
             return None
 
-        tail_idx = next((idx for idx, profile in enumerate(profiles) if is_tailcall(profile)), None)
-        if tail_idx is None or tail_idx >= len(profiles) - 2:
+        spans = collapse_marker_runs(profiles)
+        tail_entry = next(
+            ((idx, span) for idx, span in enumerate(spans) if is_tailcall(span.profile)), None
+        )
+        if tail_entry is None or tail_entry[0] >= len(spans) - 1:
             return None
 
-        return_profile = profiles[tail_idx + 1]
-        if return_profile.kind is not InstructionKind.RETURN:
+        tail_idx, tail_span = tail_entry
+        suffix = spans[tail_idx + 1 :]
+        padding_spans = []
+        return_span = None
+        for span in suffix:
+            if span.profile.kind is InstructionKind.RETURN:
+                return_span = span
+                break
+            if is_tailcall_padding(span.profile):
+                padding_spans.append(span)
+                continue
             return None
 
-        suffix = profiles[tail_idx + 2 :]
-        if not suffix:
+        if return_span is None:
+            return None
+
+        suffix_profiles = profiles[return_span.end :]
+        if not suffix_profiles:
             return None
 
         if any(
             profile.kind in {InstructionKind.CALL, InstructionKind.TAILCALL, InstructionKind.INDIRECT}
             or is_call_helper(profile)
-            for profile in suffix
+            for profile in suffix_profiles
         ):
             return None
 
-        if not all(is_literal_like(profile) for profile in suffix):
+        if not all(is_literal_like(profile) for profile in suffix_profiles):
             return None
 
-        literal_tail = list(suffix)
+        literal_tail = list(suffix_profiles)
 
         if not literal_tail:
             return None
 
-        prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
+        prefix_literals = sum(
+            1 for profile in profiles[: tail_span.start] if is_literal_like(profile)
+        )
+        padding = sum(span.end - span.start for span in padding_spans)
         notes = (
-            f"tail_idx={tail_idx}",
+            f"tail_idx={tail_span.start}",
             f"literal_tail={len(literal_tail)}",
             f"prefix_literals={prefix_literals}",
+            f"padding={padding}",
             f"stackΔ={stack.change:+d}",
         )
 
