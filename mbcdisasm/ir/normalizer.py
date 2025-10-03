@@ -81,7 +81,10 @@ class Normalizer:
             metrics_counter["raw_remaining"] += sum(
                 1 for token in tokens if not isinstance(token, IRNode)
             )
-            blocks.append(IRBlock.from_nodes(ir_nodes))
+            start_offset = (
+                block.instructions[0].word.offset if block.instructions else None
+            )
+            blocks.append(IRBlock.from_nodes(ir_nodes, start_offset=start_offset))
 
         metrics = NormalizerMetrics(
             calls=metrics_counter.get("calls", 0),

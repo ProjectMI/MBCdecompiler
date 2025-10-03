@@ -36,6 +36,7 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
     adb_path, mbc_path = _write_container(tmp_path)
     manual_path = _write_knowledge(tmp_path)
     output_path = tmp_path / "out.txt"
+    ir_path = tmp_path / "out.ir.json"
 
     result = subprocess.run(
         [
@@ -47,6 +48,8 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
             str(manual_path),
             "--disasm-out",
             str(output_path),
+            "--ir-out",
+            str(ir_path),
         ],
         check=True,
         capture_output=True,
@@ -58,3 +61,15 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
     assert "manual_push" in listing
     assert "Manual override for CLI test." in listing
     assert "disassembly written" in result.stdout
+    assert "ir written" in result.stdout
+    assert "normalizer metrics:" in result.stdout
+
+    assert ir_path.exists()
+    payload = json.loads(ir_path.read_text("utf-8"))
+    assert payload["container"].endswith("sample.mbc")
+    assert "metrics" in payload
+    assert "segments" in payload and len(payload["segments"]) == 1
+    segment_entry = payload["segments"][0]
+    assert segment_entry["segment_index"] == 0
+    assert "blocks" in segment_entry
+    assert "metrics" in segment_entry

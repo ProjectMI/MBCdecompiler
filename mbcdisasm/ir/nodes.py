@@ -133,8 +133,11 @@ class IRTestSetBranch(IRNode):
 class IRBlock:
     """A normalised basic block."""
 
+    start_offset: int | None = None
     nodes: Tuple[IRNode, ...] = field(default_factory=tuple)
 
     @classmethod
-    def from_nodes(cls, nodes: Sequence[IRNode]) -> "IRBlock":
-        return cls(nodes=tuple(nodes))
+    def from_nodes(
+        cls, nodes: Sequence[IRNode], *, start_offset: int | None = None
+    ) -> "IRBlock":
+        return cls(start_offset=start_offset, nodes=tuple(nodes))
