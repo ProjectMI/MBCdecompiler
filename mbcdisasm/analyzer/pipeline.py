@@ -16,7 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
-from .signatures import SignatureDetector
+from .signatures import SignatureDetector, is_literal_marker
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -76,6 +76,55 @@ class PipelineAnalyzer:
         events = [tracker.process(profile) for profile in profiles]
         return tuple(events)
 
+    def _normalise_events(self, events: Sequence[StackEvent]) -> Tuple[StackEvent, ...]:
+        """Collapse harmless marker bursts into single stack events.
+
+        Literal marker opcodes frequently appear as dense runs that do not
+        influence control flow or the stack height.  When fed directly into the
+        DFA these runs inflate the token stream which in turn makes otherwise
+        contiguous patterns appear fragmented.  Collapsing them into a single
+        pseudo-event keeps the automaton focused on the meaningful transitions
+        while preserving the surrounding stack deltas.
+        """
+
+        if len(events) < 2:
+            return tuple(events)
+
+        collapsed: List[StackEvent] = []
+        idx = 0
+        total = len(events)
+        while idx < total:
+            event = events[idx]
+            if not is_literal_marker(event.profile):
+                collapsed.append(event)
+                idx += 1
+                continue
+
+            start = idx
+            while idx < total and is_literal_marker(events[idx].profile):
+                idx += 1
+
+            cluster = events[start:idx]
+            if len(cluster) == 1:
+                collapsed.append(cluster[0])
+                continue
+
+            first = cluster[0]
+            last = cluster[-1]
+            combined = StackEvent(
+                profile=first.profile,
+                delta=sum(item.delta for item in cluster),
+                minimum=min(item.minimum for item in cluster),
+                maximum=max(item.maximum for item in cluster),
+                confidence=min(item.confidence for item in cluster),
+                depth_before=first.depth_before,
+                depth_after=last.depth_after,
+                uncertain=any(item.uncertain for item in cluster),
+            )
+            collapsed.append(combined)
+
+        return tuple(collapsed)
+
     def _segment_into_blocks(
         self,
         profiles: Sequence[InstructionProfile],
@@ -93,7 +142,7 @@ class PipelineAnalyzer:
                 if end > total:
                     break
                 slice_events = events[idx:end]
-                match = self.automaton.best_match(slice_events)
+                match = self.automaton.best_match(self._normalise_events(slice_events))
                 if match is None:
                     continue
                 if best_match is None or match.score > best_match.score:

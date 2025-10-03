@@ -170,6 +170,24 @@ def test_signature_detector_matches_tailcall_return_marker():
     assert match.name == "tailcall_return_marker"
 
 
+def test_signature_detector_matches_tailcall_return_marker_with_gap():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x52, 0x0000, 0),
+        make_word(0x29, 0x10, 0x0001, 4),
+        InstructionWord(8, int.from_bytes(b"gap_", "big")),
+        make_word(0x00, 0x40, 0x0000, 12),
+        make_word(0x30, 0x69, 0x0000, 16),
+        make_word(0x00, 0x00, 0x6704, 20),
+        make_word(0x00, 0x00, 0x0067, 24),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_marker"
+
+
 def test_signature_detector_matches_indirect_call_ex():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [

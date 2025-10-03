@@ -1125,6 +1125,7 @@ class TailcallReturnMarkerSignature(SignatureRule):
     name = "tailcall_return_marker"
     category = "call"
     base_confidence = 0.61
+    _safe_gap_limit = 4
 
     def match(
         self, profiles: Sequence[InstructionProfile], stack: StackSummary
@@ -1136,11 +1137,33 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if tail_idx is None or tail_idx >= len(profiles) - 2:
             return None
 
-        return_profile = profiles[tail_idx + 1]
-        if return_profile.kind is not InstructionKind.RETURN:
+        safe_between = 0
+        return_idx = None
+        for idx in range(tail_idx + 1, len(profiles)):
+            candidate = profiles[idx]
+            if candidate.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
+                return_idx = idx
+                break
+            if candidate.kind is InstructionKind.ASCII_CHUNK or is_literal_marker(candidate):
+                safe_between += 1
+                if safe_between > self._safe_gap_limit:
+                    return None
+                continue
+            if is_literal_like(candidate):
+                safe_between += 1
+                if safe_between > self._safe_gap_limit:
+                    return None
+                continue
             return None
 
-        suffix = profiles[tail_idx + 2 :]
+        if return_idx is None:
+            return None
+
+        return_profile = profiles[return_idx]
+        if return_profile.kind not in {InstructionKind.RETURN, InstructionKind.TERMINATOR}:
+            return None
+
+        suffix = profiles[return_idx + 1 :]
         if not suffix:
             return None
 
@@ -1164,12 +1187,15 @@ class TailcallReturnMarkerSignature(SignatureRule):
             f"tail_idx={tail_idx}",
             f"literal_tail={len(literal_tail)}",
             f"prefix_literals={prefix_literals}",
+            f"gap_literals={safe_between}",
             f"stackΔ={stack.change:+d}",
         )
 
         confidence = self.base_confidence
         if prefix_literals:
             confidence += min(0.05, 0.02 * prefix_literals)
+        if safe_between:
+            confidence -= min(0.04, 0.01 * safe_between)
         if stack.change <= 0:
             confidence += 0.03
         return SignatureMatch(self.name, self.category, min(0.89, confidence), notes)
