@@ -12,10 +12,32 @@ literal loader or whether it should be flagged for manual review.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, StackEffectHint
+
+
+class StackValueKind(Enum):
+    """Lightweight tag assigned to values tracked on the evaluation stack."""
+
+    UNKNOWN = auto()
+    NUMBER = auto()
+    SLOT = auto()
+    IDENTIFIER = auto()
+    MARKER = auto()
+
+
+@dataclass(frozen=True)
+class StackTypeEffect:
+    """Typed stack mutation produced by a single instruction."""
+
+    pops: int = 0
+    pushes: Tuple[StackValueKind, ...] = tuple()
+    marker: bool = False
+    tags: Tuple[str, ...] = tuple()
+    uncertain: bool = False
 
 
 @dataclass
@@ -30,6 +52,10 @@ class StackEvent:
     depth_before: int
     depth_after: int
     uncertain: bool = False
+    types_before: Tuple[StackValueKind, ...] = tuple()
+    types_after: Tuple[StackValueKind, ...] = tuple()
+    marker: bool = False
+    tags: Tuple[str, ...] = tuple()
 
     def describe(self) -> str:
         return (
@@ -47,6 +73,7 @@ class StackState:
     minimum_depth: int = 0
     maximum_depth: int = 0
     uncertain: bool = False
+    types: List[StackValueKind] = field(default_factory=list)
 
     def apply(self, hint: StackEffectHint) -> Tuple[int, int, int, bool]:
         """Apply ``hint`` and return the resulting statistics."""
@@ -74,6 +101,7 @@ class StackState:
             minimum_depth=self.minimum_depth,
             maximum_depth=self.maximum_depth,
             uncertain=self.uncertain,
+            types=list(self.types),
         )
 
 
@@ -99,11 +127,20 @@ class StackTracker:
         self._state = StackState(depth=initial_depth)
         self._events: List[StackEvent] = []
 
-    def process(self, profile: InstructionProfile) -> StackEvent:
+    def process(
+        self, profile: InstructionProfile, *, following: Optional[InstructionProfile] = None
+    ) -> StackEvent:
         """Process ``profile`` and record the resulting stack event."""
 
         hint = profile.estimated_stack_delta()
+        types_before = tuple(self._state.types)
+        hint, typed_effect = self._compute_typed_effect(profile, hint, types_before, following)
         minimum, maximum, after, uncertain = self._state.apply(hint)
+        type_uncertain = self._apply_type_effect(typed_effect)
+        if type_uncertain:
+            uncertain = True
+            self._state.uncertain = True
+        types_after = tuple(self._state.types)
         event = StackEvent(
             profile=profile,
             delta=hint.nominal,
@@ -113,6 +150,10 @@ class StackTracker:
             depth_before=after - hint.nominal,
             depth_after=after,
             uncertain=uncertain,
+            types_before=types_before,
+            types_after=types_after,
+            marker=typed_effect.marker,
+            tags=typed_effect.tags,
         )
         self._events.append(event)
         return event
@@ -120,8 +161,10 @@ class StackTracker:
     def run(self, profiles: Sequence[InstructionProfile]) -> StackSummary:
         """Process ``profiles`` sequentially and return the summary."""
 
-        for profile in profiles:
-            self.process(profile)
+        total = len(profiles)
+        for idx, profile in enumerate(profiles):
+            following = self._next_meaningful(profiles, idx + 1)
+            self.process(profile, following=following)
         return self.summarise()
 
     def summarise(self) -> StackSummary:
@@ -172,6 +215,103 @@ class StackTracker:
             uncertain=summary.uncertain,
             events=summary.events,
         )
+
+    def _apply_type_effect(self, effect: StackTypeEffect) -> bool:
+        """Mutate the tracked types according to ``effect``."""
+
+        uncertain = effect.uncertain
+        types = self._state.types
+        if effect.pops > len(types):
+            types.clear()
+            uncertain = True
+        else:
+            for _ in range(effect.pops):
+                types.pop()
+        types.extend(effect.pushes)
+        return uncertain
+
+    def _next_meaningful(
+        self, profiles: Sequence[InstructionProfile], start: int
+    ) -> Optional[InstructionProfile]:
+        """Return the next instruction that is not a literal marker."""
+
+        for idx in range(start, len(profiles)):
+            profile = profiles[idx]
+            if profile.mnemonic == "literal_marker":
+                continue
+            return profile
+        return None
+
+    def _compute_typed_effect(
+        self,
+        profile: InstructionProfile,
+        hint: StackEffectHint,
+        types_before: Tuple[StackValueKind, ...],
+        following: Optional[InstructionProfile],
+    ) -> Tuple[StackEffectHint, StackTypeEffect]:
+        """Return the refined stack hint and typed effect for ``profile``."""
+
+        mnemonic = profile.mnemonic
+        label = profile.label
+
+        if mnemonic == "literal_marker":
+            typed = StackTypeEffect(marker=True, pushes=tuple(), pops=0, tags=("marker",))
+            refined = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=1.0)
+            return refined, typed
+
+        if label.startswith("10:") and mnemonic != "literal_marker":
+            refined = StackEffectHint(nominal=1, minimum=0, maximum=1, confidence=max(0.75, hint.confidence))
+            typed = StackTypeEffect(pushes=(StackValueKind.SLOT,))
+            return refined, typed
+
+        if profile.kind is InstructionKind.LITERAL:
+            refined = hint
+            if hint.nominal <= 0:
+                refined = StackEffectHint(nominal=1, minimum=hint.minimum, maximum=max(1, hint.maximum), confidence=max(0.75, hint.confidence))
+            typed = StackTypeEffect(pushes=(StackValueKind.NUMBER,) * max(0, refined.nominal))
+            return refined, typed
+
+        if profile.kind is InstructionKind.ASCII_CHUNK:
+            refined = hint
+            if hint.nominal <= 0:
+                refined = StackEffectHint(nominal=1, minimum=hint.minimum, maximum=max(1, hint.maximum), confidence=max(0.75, hint.confidence))
+            typed = StackTypeEffect(pushes=(StackValueKind.IDENTIFIER,) * max(0, refined.nominal))
+            return refined, typed
+
+        if label.startswith("69:"):
+            refined, typed = self._indirect_effect(types_before, following, hint)
+            return refined, typed
+
+        # fallback behaviour keeps the type stack aligned with the numeric hint
+        pushes = tuple(StackValueKind.UNKNOWN for _ in range(max(0, hint.nominal)))
+        pops = max(0, -hint.nominal)
+        typed = StackTypeEffect(pops=pops, pushes=pushes)
+        return hint, typed
+
+    def _indirect_effect(
+        self,
+        types_before: Tuple[StackValueKind, ...],
+        following: Optional[InstructionProfile],
+        hint: StackEffectHint,
+    ) -> Tuple[StackEffectHint, StackTypeEffect]:
+        """Special handling for indirect access helpers."""
+
+        next_profile = following
+        is_store = False
+        if next_profile is not None:
+            if next_profile.kind in {InstructionKind.REDUCE, InstructionKind.STACK_TEARDOWN}:
+                is_store = True
+            elif next_profile.label.startswith(("3D:", "01:F0")):
+                is_store = True
+
+        if is_store:
+            refined = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.55)
+            typed = StackTypeEffect(tags=("indirect_store",))
+            return refined, typed
+
+        refined = StackEffectHint(nominal=1, minimum=0, maximum=1, confidence=0.6)
+        typed = StackTypeEffect(pushes=(StackValueKind.NUMBER,), tags=("indirect_load",))
+        return refined, typed
 
 
 def stack_change(profiles: Sequence[InstructionProfile]) -> int:

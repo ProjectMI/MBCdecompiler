@@ -73,7 +73,17 @@ class PipelineAnalyzer:
 
     def _compute_events(self, profiles: Sequence[InstructionProfile]) -> Tuple[StackEvent, ...]:
         tracker = StackTracker()
-        events = [tracker.process(profile) for profile in profiles]
+        events: List[StackEvent] = []
+        total = len(profiles)
+        for idx, profile in enumerate(profiles):
+            following: Optional[InstructionProfile] = None
+            for lookahead in range(idx + 1, total):
+                candidate = profiles[lookahead]
+                if candidate.mnemonic == "literal_marker":
+                    continue
+                following = candidate
+                break
+            events.append(tracker.process(profile, following=following))
         return tuple(events)
 
     def _segment_into_blocks(
