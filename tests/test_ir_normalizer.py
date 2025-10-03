@@ -112,6 +112,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
     assert program.metrics.aggregates == 1
+    assert program.metrics.literals >= 1
     assert program.metrics.testset_branches == 1
     assert program.metrics.if_branches == 1
     assert program.metrics.loads == 1
@@ -129,6 +130,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert any(text.startswith("testset") for text in descriptions)
     assert any(text.startswith("load") for text in descriptions)
     assert any(text.startswith("store") for text in descriptions)
+    assert any(text.startswith("literal") for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)

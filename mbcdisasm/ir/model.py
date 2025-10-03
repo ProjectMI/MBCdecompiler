@@ -97,6 +97,31 @@ class IRBuildTuple(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteral(IRNode):
+    """Representation of literal loader instructions after normalisation."""
+
+    values: Tuple[str, ...]
+    confidence: float
+    uncertain: bool = False
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        if len(self.values) == 1:
+            payload = self.values[0]
+        else:
+            payload = f"[{', '.join(self.values)}]"
+
+        notes = []
+        if self.uncertain or self.confidence < 0.75:
+            notes.append(f"conf={self.confidence:.2f}")
+        if self.annotations:
+            notes.extend(self.annotations)
+
+        suffix = f" ({', '.join(notes)})" if notes else ""
+        return f"literal {payload}{suffix}"
+
+
+@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
@@ -201,6 +226,7 @@ class NormalizerMetrics:
     tail_calls: int = 0
     returns: int = 0
     aggregates: int = 0
+    literals: int = 0
     testset_branches: int = 0
     if_branches: int = 0
     loads: int = 0
@@ -215,6 +241,7 @@ class NormalizerMetrics:
         self.tail_calls += other.tail_calls
         self.returns += other.returns
         self.aggregates += other.aggregates
+        self.literals += other.literals
         self.testset_branches += other.testset_branches
         self.if_branches += other.if_branches
         self.loads += other.loads
@@ -230,6 +257,7 @@ class NormalizerMetrics:
             f"tail_calls={self.tail_calls}",
             f"returns={self.returns}",
             f"aggregates={self.aggregates}",
+            f"literals={self.literals}",
             f"testset_branches={self.testset_branches}",
             f"if_branches={self.if_branches}",
             f"loads={self.loads}",
@@ -249,6 +277,7 @@ __all__ = [
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
+    "IRLiteral",
     "IRIf",
     "IRTestSetBranch",
     "IRLoad",

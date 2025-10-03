@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
-from ..analyzer.stack import StackEvent, StackTracker
+from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
@@ -18,6 +18,7 @@ from .model import (
     IRCall,
     IRLoad,
     IRNode,
+    IRLiteral,
     IRProgram,
     IRRaw,
     IRReturn,
@@ -227,6 +228,7 @@ class IRNormalizer:
 
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
+        self._pass_literals(items, metrics)
         self._pass_branches(items, metrics)
         self._pass_indirect_access(items, metrics)
 
@@ -450,6 +452,33 @@ class IRNormalizer:
             items.replace_slice(index, scan, replacement_sequence)
             index += 1
 
+    def _pass_literals(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not item.pushes_value():
+                index += 1
+                continue
+
+            if self._is_annotation_only(item):
+                index += 1
+                continue
+
+            if item.mnemonic == "push_literal" or item.profile.kind in {
+                InstructionKind.LITERAL,
+                InstructionKind.ASCII_CHUNK,
+            }:
+                node = self._build_literal_node(item)
+                metrics.literals += len(node.values)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            index += 1
+
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -509,6 +538,28 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    def _build_literal_node(self, instruction: RawInstruction) -> IRLiteral:
+        values = self._literal_values(instruction)
+        return IRLiteral(
+            values=values,
+            confidence=instruction.event.confidence,
+            uncertain=instruction.event.uncertain,
+            annotations=instruction.annotations,
+        )
+
+    def _literal_values(self, instruction: RawInstruction) -> Tuple[str, ...]:
+        base = self._describe_value(instruction)
+        count = sum(
+            1 for kind in instruction.event.pushed_types if kind is not StackValueType.MARKER
+        )
+        if count <= 0:
+            count = max(1, instruction.event.delta)
+        if count <= 0:
+            count = 1
+        if count == 1:
+            return (base,)
+        return tuple(f"{base}[{index}]" for index in range(count))
+
     def _describe_value(self, instruction: RawInstruction) -> str:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
@@ -535,6 +586,9 @@ class IRNormalizer:
                 if skip_literals:
                     return self._describe_value(candidate)
             if isinstance(candidate, IRNode):
+                if skip_literals and isinstance(candidate, IRLiteral):
+                    scan -= 1
+                    continue
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
