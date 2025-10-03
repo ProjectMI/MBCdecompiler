@@ -16,7 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
-from .signatures import SignatureDetector
+from .signatures import SignatureDetector, is_literal_marker
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -92,7 +92,7 @@ class PipelineAnalyzer:
                 end = idx + size
                 if end > total:
                     break
-                slice_events = events[idx:end]
+                slice_events = self._squash_marker_runs(events[idx:end])
                 match = self.automaton.best_match(slice_events)
                 if match is None:
                     continue
@@ -123,6 +123,31 @@ class PipelineAnalyzer:
             blocks.append(block)
             idx += span
         return blocks
+
+    def _squash_marker_runs(
+        self, events: Sequence[StackEvent]
+    ) -> Tuple[StackEvent, ...]:
+        """Collapse consecutive literal marker events into a single token.
+
+        Dense marker runs frequently appear around tailcall wrappers and can
+        confuse the DFA-backed pattern matcher by artificially inflating the
+        slice length.  Coalescing these runs keeps the signal while ensuring
+        patterns that expect compact call/return structures still match.
+        """
+
+        if len(events) < 2:
+            return tuple(events)
+
+        squashed: List[StackEvent] = []
+        idx = 0
+        while idx < len(events):
+            current = events[idx]
+            squashed.append(current)
+            idx += 1
+            if is_literal_marker(current.profile):
+                while idx < len(events) and is_literal_marker(events[idx].profile):
+                    idx += 1
+        return tuple(squashed)
 
     def _classify_block(
         self,

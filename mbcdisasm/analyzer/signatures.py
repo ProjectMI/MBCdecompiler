@@ -93,6 +93,21 @@ def is_tailcall(profile: InstructionProfile) -> bool:
     return False
 
 
+ASCII_WRAPPER_LABELS = {"23:48", "72:23", "52:05", "23:4F", "32:29"}
+
+
+def is_ascii_tail_padding(profile: InstructionProfile) -> bool:
+    """Return ``True`` for instructions that form benign call wrappers."""
+
+    if profile.kind in {InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+        return True
+    if is_literal_marker(profile):
+        return True
+    if profile.label in ASCII_WRAPPER_LABELS:
+        return True
+    return False
+
+
 @dataclass(frozen=True)
 class SignatureMatch:
     """Result of a successful signature detection."""
@@ -866,13 +881,23 @@ class TailcallAsciiWrapperSignature(SignatureRule):
         if not self._anchors.issubset(labels[tail_idx + 1 :]):
             return None
 
-        ascii_after = sum(
-            1 for profile in profiles[tail_idx + 1 :] if profile.kind is InstructionKind.ASCII_CHUNK
-        )
-        if ascii_after == 0:
+        tail_padding = profiles[tail_idx + 1 :]
+        ascii_after = sum(1 for profile in tail_padding if profile.kind is InstructionKind.ASCII_CHUNK)
+        marker_padding = sum(1 for profile in tail_padding if is_literal_marker(profile))
+        if ascii_after == 0 and marker_padding == 0:
             return None
 
-        branch_after = any(profile.kind is InstructionKind.BRANCH for profile in profiles[tail_idx + 1 :])
+        if not all(
+            profile.kind in {InstructionKind.BRANCH, InstructionKind.CONTROL}
+            or is_ascii_tail_padding(profile)
+            for profile in tail_padding
+        ):
+            return None
+
+        branch_after = any(
+            profile.kind in {InstructionKind.BRANCH, InstructionKind.CONTROL}
+            for profile in tail_padding
+        )
         if not branch_after:
             return None
 
@@ -882,16 +907,19 @@ class TailcallAsciiWrapperSignature(SignatureRule):
         notes = (
             f"tail_idx={tail_idx}",
             f"ascii_after={ascii_after}",
+            f"marker_padding={marker_padding}",
             f"literal_prefix={literal_prefix}",
             f"stackΔ={stack.change:+d}",
         )
 
-        confidence = self.base_confidence + 0.04 * ascii_after
+        confidence = self.base_confidence + 0.04 * min(ascii_after, 3)
         if prefix_push:
             confidence += 0.03
         if literal_prefix:
             confidence += min(0.03, 0.01 * literal_prefix)
-        return SignatureMatch(self.name, self.category, min(0.88, confidence), notes)
+        if marker_padding:
+            confidence += min(0.03, 0.01 * marker_padding)
+        return SignatureMatch(self.name, self.category, min(0.9, confidence), notes)
 
 
 class JumpAsciiTailcallSignature(SignatureRule):
@@ -1104,6 +1132,10 @@ class TailcallReturnComboSignature(SignatureRule):
         if return_idx is None:
             return None
 
+        padding = profiles[tail_idx + 1 : return_idx]
+        if padding and not all(is_ascii_tail_padding(profile) for profile in padding):
+            return None
+
         prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
         if prefix_literals == 0:
             return None
@@ -1111,11 +1143,14 @@ class TailcallReturnComboSignature(SignatureRule):
         notes = (
             f"tail_idx={tail_idx}",
             f"return_idx={return_idx}",
+            f"padding={len(padding)}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = self.base_confidence
         if stack.change <= 0:
             confidence += 0.05
+        if padding:
+            confidence += min(0.03, 0.01 * len(padding))
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
@@ -1136,11 +1171,22 @@ class TailcallReturnMarkerSignature(SignatureRule):
         if tail_idx is None or tail_idx >= len(profiles) - 2:
             return None
 
-        return_profile = profiles[tail_idx + 1]
-        if return_profile.kind is not InstructionKind.RETURN:
+        return_idx = next(
+            (
+                idx
+                for idx, profile in enumerate(profiles)
+                if idx > tail_idx and profile.kind in {InstructionKind.RETURN, InstructionKind.TERMINATOR}
+            ),
+            None,
+        )
+        if return_idx is None or return_idx >= len(profiles) - 1:
             return None
 
-        suffix = profiles[tail_idx + 2 :]
+        padding = profiles[tail_idx + 1 : return_idx]
+        if padding and not all(is_ascii_tail_padding(profile) for profile in padding):
+            return None
+
+        suffix = profiles[return_idx + 1 :]
         if not suffix:
             return None
 
@@ -1156,12 +1202,11 @@ class TailcallReturnMarkerSignature(SignatureRule):
 
         literal_tail = list(suffix)
 
-        if not literal_tail:
-            return None
-
         prefix_literals = sum(1 for profile in profiles[:tail_idx] if is_literal_like(profile))
         notes = (
             f"tail_idx={tail_idx}",
+            f"return_idx={return_idx}",
+            f"padding={len(padding)}",
             f"literal_tail={len(literal_tail)}",
             f"prefix_literals={prefix_literals}",
             f"stackΔ={stack.change:+d}",
@@ -1172,6 +1217,8 @@ class TailcallReturnMarkerSignature(SignatureRule):
             confidence += min(0.05, 0.02 * prefix_literals)
         if stack.change <= 0:
             confidence += 0.03
+        if padding:
+            confidence += min(0.02, 0.01 * len(padding))
         return SignatureMatch(self.name, self.category, min(0.89, confidence), notes)
 
 
