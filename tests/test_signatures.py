@@ -424,6 +424,40 @@ def test_signature_detector_matches_tailcall_ascii_wrapper():
     assert match.name == "tailcall_ascii_wrapper"
 
 
+def test_signature_detector_tailcall_return_combo_allows_padding():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x00, 0x0001, 0),
+        make_word(0x29, 0x10, 0x0000, 4),
+        InstructionWord(8, int.from_bytes(b"TAIL", "big")),
+        make_word(0x40, 0x00, 0x0000, 12),
+        make_word(0x30, 0x00, 0x0000, 16),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_combo"
+
+
+def test_signature_detector_tailcall_return_marker_allows_padding():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x00, 0x0001, 0),
+        make_word(0x29, 0x10, 0x0000, 4),
+        InstructionWord(8, int.from_bytes(b"WRAP", "big")),
+        make_word(0x40, 0x00, 0x0001, 12),
+        make_word(0x30, 0x00, 0x0000, 16),
+        make_word(0x40, 0x00, 0x0002, 20),
+        make_word(0x40, 0x00, 0x0003, 24),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_return_marker"
+
+
 def test_signature_detector_matches_jump_ascii_tailcall():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [
@@ -487,6 +521,23 @@ def test_signature_detector_matches_double_tailcall_branch():
     match = detector.detect(profiles, summary)
     assert match is not None
     assert match.name == "double_tailcall_branch"
+
+
+def test_signature_detector_ascii_reduce_marker_tolerates_padding():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        InstructionWord(0, int.from_bytes(b"HEAD", "big")),
+        make_word(0x66, 0x1B, 0x0000, 4),
+        InstructionWord(8, int.from_bytes(b"PADD", "big")),
+        make_word(0x00, 0x52, 0x0000, 12),
+        make_word(0x4A, 0x05, 0x0000, 16),
+        make_word(0x00, 0x00, 0x0001, 20),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "ascii_reduce_marker_seq"
 
 
 def test_signature_detector_matches_callprep_ascii_dispatch():

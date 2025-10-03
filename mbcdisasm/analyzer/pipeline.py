@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
@@ -16,7 +16,7 @@ from .diagnostics import DiagnosticBuilder
 from .dfa import DeterministicAutomaton
 from .heuristics import HeuristicEngine, HeuristicReport
 from .patterns import PatternMatch, PatternRegistry, default_patterns
-from .signatures import SignatureDetector
+from .signatures import SignatureDetector, is_literal_marker
 from .stats import StatisticsBuilder
 from .report import PipelineBlock, PipelineReport, build_block
 from .stack import StackEvent, StackSummary, StackTracker
@@ -93,7 +93,7 @@ class PipelineAnalyzer:
                 if end > total:
                     break
                 slice_events = events[idx:end]
-                match = self.automaton.best_match(slice_events)
+                match = self.automaton.best_match(self._collapse_marker_runs(slice_events))
                 if match is None:
                     continue
                 if best_match is None or match.score > best_match.score:
@@ -123,6 +123,58 @@ class PipelineAnalyzer:
             blocks.append(block)
             idx += span
         return blocks
+
+    def _collapse_marker_runs(self, events: Sequence[StackEvent]) -> Tuple[StackEvent, ...]:
+        """Return ``events`` with consecutive literal markers merged."""
+
+        if not events:
+            return tuple()
+        if not any(is_literal_marker(event.profile) for event in events):
+            return tuple(events)
+
+        collapsed: List[StackEvent] = []
+        idx = 0
+        total = len(events)
+        while idx < total:
+            event = events[idx]
+            if not is_literal_marker(event.profile):
+                collapsed.append(event)
+                idx += 1
+                continue
+
+            start_event = event
+            delta = 0
+            minimum = start_event.minimum
+            maximum = start_event.maximum
+            depth_before = start_event.depth_before
+            depth_after = start_event.depth_after
+            confidence = start_event.confidence
+            uncertain = start_event.uncertain
+
+            while idx < total and is_literal_marker(events[idx].profile):
+                current = events[idx]
+                delta += current.delta
+                minimum = min(minimum, current.minimum)
+                maximum = max(maximum, current.maximum)
+                depth_after = current.depth_after
+                confidence = min(confidence, current.confidence)
+                uncertain = uncertain or current.uncertain
+                idx += 1
+
+            collapsed.append(
+                replace(
+                    start_event,
+                    delta=delta,
+                    minimum=minimum,
+                    maximum=maximum,
+                    confidence=confidence,
+                    depth_before=depth_before,
+                    depth_after=depth_after,
+                    uncertain=uncertain,
+                )
+            )
+
+        return tuple(collapsed)
 
     def _classify_block(
         self,
