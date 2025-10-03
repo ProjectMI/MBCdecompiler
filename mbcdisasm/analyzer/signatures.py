@@ -49,6 +49,19 @@ def is_literal_marker(profile: InstructionProfile) -> bool:
     return False
 
 
+def is_indirect_access(profile: InstructionProfile) -> bool:
+    """Return ``True`` for helper opcodes involved in indirect access."""
+
+    if profile.kind in {
+        InstructionKind.INDIRECT,
+        InstructionKind.INDIRECT_LOAD,
+        InstructionKind.INDIRECT_STORE,
+    }:
+        return True
+
+    return profile.label.startswith("69:")
+
+
 def is_literal_like(profile: InstructionProfile) -> bool:
     """Return ``True`` when the instruction behaves like a literal loader."""
 
@@ -999,7 +1012,11 @@ class AsciiIndirectTailcallSignature(SignatureRule):
             return None
 
         marker_69_idx = next(
-            (idx for idx in range(marker_4b_idx + 1, len(profiles)) if labels[idx].startswith("69:")),
+            (
+                idx
+                for idx in range(marker_4b_idx + 1, len(profiles))
+                if is_indirect_access(profiles[idx])
+            ),
             None,
         )
         if marker_69_idx is None:
@@ -1058,7 +1075,11 @@ class TailcallPostJumpSignature(SignatureRule):
             return None
 
         marker_idx = next(
-            (idx for idx in range(tail_idx + 1, len(profiles)) if profiles[idx].label.startswith("69:")),
+            (
+                idx
+                for idx in range(tail_idx + 1, len(profiles))
+                if is_indirect_access(profiles[idx])
+            ),
             None,
         )
         if marker_idx is None:
@@ -1229,7 +1250,11 @@ class TailcallReturnIndirectSignature(SignatureRule):
             return None
 
         indirect_idx = next(
-            (idx for idx in range(helper_idx + 1, len(profiles)) if profiles[idx].label.startswith("69:")),
+            (
+                idx
+                for idx in range(helper_idx + 1, len(profiles))
+                if is_indirect_access(profiles[idx])
+            ),
             None,
         )
         if indirect_idx is None:
@@ -1685,7 +1710,7 @@ class IndirectCallDualLiteralSignature(SignatureRule):
         if helper_idx is None:
             return None
 
-        if not any(label.startswith("69:") for label in labels[second_push + 1 :]):
+        if not any(is_indirect_access(profile) for profile in profiles[second_push + 1 :]):
             return None
 
         notes = (
@@ -1721,7 +1746,7 @@ class IndirectCallExSignature(SignatureRule):
             (
                 idx
                 for idx, profile in enumerate(profiles[lead_idx + 1 :], start=lead_idx + 1)
-                if is_literal_marker(profile) and profile.label.startswith("69:")
+                if is_indirect_access(profile)
             ),
             None,
         )
@@ -1782,7 +1807,7 @@ class IndirectCallMiniSignature(SignatureRule):
             (
                 idx
                 for idx in range(helper_idx + 1, len(profiles))
-                if profiles[idx].label.startswith("69:")
+                if is_indirect_access(profiles[idx])
             ),
             None,
         )

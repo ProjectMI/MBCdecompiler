@@ -273,7 +273,7 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.REDUCE
         if "teardown" in category or "pop" in category:
             return InstructionKind.STACK_TEARDOWN
-        if "copy" in category or "dup" in category:
+        if "copy" in category or "dup" in category or "shuffle" in category:
             return InstructionKind.STACK_COPY
         if "test" in category:
             return InstructionKind.TEST
@@ -356,6 +356,12 @@ def guess_kind_from_opcode(word: InstructionWord) -> InstructionKind:
 
     if opcode in {0x05, 0x06, 0x07, 0x08}:
         return InstructionKind.ARITHMETIC
+
+    if opcode == 0x66:
+        return InstructionKind.STACK_COPY
+
+    if opcode == 0x69:
+        return InstructionKind.INDIRECT
 
     return InstructionKind.UNKNOWN
 

@@ -311,7 +311,11 @@ def _default_push_types(profile: InstructionProfile) -> Tuple[StackValueType, ..
         return (StackValueType.IDENTIFIER,)
     if profile.kind is InstructionKind.PUSH:
         return (StackValueType.SLOT,)
-    if profile.kind in {InstructionKind.TABLE_LOOKUP, InstructionKind.INDIRECT}:
+    if profile.kind in {
+        InstructionKind.TABLE_LOOKUP,
+        InstructionKind.INDIRECT,
+        InstructionKind.INDIRECT_LOAD,
+    }:
         return (StackValueType.NUMBER,)
     return tuple()
 
