@@ -109,6 +109,7 @@ class IRNormalizer:
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
+        self._temp_counters: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -224,6 +225,7 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
+        self._temp_counters.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -253,11 +255,16 @@ class IRNormalizer:
             else:
                 nodes.append(item)
 
+        data_block = bool(nodes) and all(isinstance(node, IRLiteralChunk) for node in nodes)
+        if data_block:
+            block_annotations.append("data_block")
+
         ir_block = IRBlock(
             label=f"block_{block.index}",
             start_offset=block.start_offset,
             nodes=tuple(nodes),
             annotations=tuple(block_annotations),
+            data_block=data_block,
         )
         return ir_block, metrics
 
@@ -552,8 +559,9 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                condition = self._prepare_branch_condition(items, index)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -562,6 +570,14 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _prepare_branch_condition(self, items: _ItemList, index: int) -> str:
+        located = self._locate_condition_source(items, index)
+        if located is not None:
+            position, node = located
+            if isinstance(node, IRCall):
+                return self._assign_call_result(items, position, node)
+        return self._describe_condition(items, index)
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -603,28 +619,60 @@ class IRNormalizer:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
-    def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
+    def _describe_condition(
+        self, items: _ItemList, index: int, *, skip_literals: bool = False
+    ) -> str:
+        located = self._locate_condition_source(items, index, skip_literals=skip_literals)
+        if located is None:
+            return "stack_top"
+        _, node = located
+        if isinstance(node, RawInstruction):
+            return self._describe_value(node)
+        if isinstance(node, IRNode):
+            describe = getattr(node, "describe", None)
+            if callable(describe):
+                return describe()
+        return "expr()"
+
+    def _locate_condition_source(
+        self, items: _ItemList, index: int, *, skip_literals: bool = False
+    ) -> Optional[Tuple[int, Union[RawInstruction, IRNode]]]:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
+            if isinstance(candidate, IRLiteralChunk):
+                scan -= 1
+                continue
+            if isinstance(candidate, IRLiteral) and skip_literals:
+                scan -= 1
+                continue
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
                     if skip_literals and candidate.mnemonic == "push_literal":
                         scan -= 1
                         continue
-                    return self._describe_value(candidate)
-                if skip_literals:
-                    return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
-                scan -= 1
-                continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
-                scan -= 1
-                continue
+                    return scan, candidate
+                if skip_literals and candidate.profile.kind is InstructionKind.LITERAL:
+                    scan -= 1
+                    continue
+                return scan, candidate
             if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+                return scan, candidate
             scan -= 1
-        return "stack_top"
+        return None
+
+    def _assign_call_result(self, items: _ItemList, index: int, call: IRCall) -> str:
+        if call.result is not None:
+            return call.result
+        name = self._fresh_temp("call")
+        replacement = IRCall(target=call.target, args=call.args, tail=call.tail, result=name)
+        items.replace_slice(index, index + 1, [replacement])
+        return name
+
+    def _fresh_temp(self, prefix: str) -> str:
+        counter = self._temp_counters.get(prefix, 0)
+        self._temp_counters[prefix] = counter + 1
+        return f"{prefix}_{counter}"
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
-from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir import IRCall, IRIf, IRLiteralChunk, IRTextRenderer
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -30,6 +30,12 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "reduce_pair",
             "category": "reduce",
             "stack_delta": -1,
+        },
+        "call_dispatch": {
+            "opcodes": ["0x28:0x00"],
+            "name": "call_dispatch",
+            "category": "call_dispatch",
+            "stack_push": 1,
         },
         "tailcall_dispatch": {
             "opcodes": ["0x29:0x00"],
@@ -136,3 +142,58 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+
+def test_branch_condition_ignores_ascii_chunks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    literal = build_word(0, 0x00, 0x00, 0x0001)
+    ascii_raw = int.from_bytes(b"H#H#", "big")
+    ascii_word = InstructionWord(offset=4, raw=ascii_raw)
+    branch = build_word(8, 0x23, 0x00, 0x0010)
+    seg_bytes = encode_instructions([literal, ascii_word, branch])
+    segment = Segment(SegmentDescriptor(0, 0, len(seg_bytes)), seg_bytes)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    assert isinstance(block.nodes[1], IRLiteralChunk)
+    assert isinstance(block.nodes[2], IRIf)
+    assert block.nodes[2].condition == "lit(0x0001)"
+    assert "ascii" not in block.nodes[2].condition
+
+
+def test_branch_condition_materialises_call_result(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    call = build_word(0, 0x28, 0x00, 0x0100)
+    branch = build_word(4, 0x23, 0x00, 0x0010)
+    seg_bytes = encode_instructions([call, branch])
+    segment = Segment(SegmentDescriptor(0, 0, len(seg_bytes)), seg_bytes)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    assert isinstance(block.nodes[0], IRCall)
+    assert block.nodes[0].result == "call_0"
+    assert isinstance(block.nodes[1], IRIf)
+    assert block.nodes[1].condition == "call_0"
+
+
+def test_ascii_only_block_marked_as_data(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    ascii_one = InstructionWord(offset=0, raw=int.from_bytes(b"DATA", "big"))
+    ascii_two = InstructionWord(offset=4, raw=int.from_bytes(b"TEXT", "big"))
+    seg_bytes = encode_instructions([ascii_one, ascii_two])
+    segment = Segment(SegmentDescriptor(0, 0, len(seg_bytes)), seg_bytes)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    assert all(isinstance(node, IRLiteralChunk) for node in block.nodes)
+    assert block.data_block
+    assert "data_block" in block.annotations

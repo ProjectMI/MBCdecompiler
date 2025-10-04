@@ -37,6 +37,8 @@ class IRTextRenderer:
 
     def _render_block(self, block: IRBlock) -> Iterable[str]:
         yield f"block {block.label} offset=0x{block.start_offset:06X}"
+        if block.data_block:
+            yield "  ; classified as data"
         if block.annotations:
             for note in block.annotations:
                 yield f"  ; {note}"
