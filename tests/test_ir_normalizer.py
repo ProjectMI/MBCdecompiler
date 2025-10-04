@@ -244,6 +244,29 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
 
 
+def test_normalizer_materializes_tailcall_conditions(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x2B, 0x00, 0x0072),
+        build_word(8, 0x23, 0x00, 0x0100),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert "call target=0x0072 args=[lit(0x0001)]" in descriptions
+    assert "if cond=stack_top then=0x0100 else=0x000C" in descriptions
+
+
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
     words = [

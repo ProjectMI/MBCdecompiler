@@ -262,6 +262,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_branches(items, metrics)
+        self._pass_tailcall_conditions(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
@@ -1088,6 +1089,39 @@ class IRNormalizer:
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
                 continue
+
+            index += 1
+
+    def _pass_tailcall_conditions(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRIf):
+                index += 1
+                continue
+
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, IRNode):
+                    if isinstance(candidate, IRCall) and candidate.tail:
+                        description = candidate.describe()
+                        if item.condition == description:
+                            new_call = IRCall(
+                                target=candidate.target,
+                                args=candidate.args,
+                                tail=False,
+                            )
+                            items.replace_slice(scan, scan + 1, [new_call])
+                            updated = IRIf(
+                                condition="stack_top",
+                                then_target=item.then_target,
+                                else_target=item.else_target,
+                            )
+                            items.replace_slice(index, index + 1, [updated])
+                            item = updated
+                    break
+                scan -= 1
 
             index += 1
 
