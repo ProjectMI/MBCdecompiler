@@ -132,6 +132,7 @@ class IRNormalizer:
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
+        self._raw_by_offset: Dict[int, RawInstruction] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -247,6 +248,7 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
+        self._raw_by_offset = {instruction.offset: instruction for instruction in block.instructions}
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -298,6 +300,7 @@ class IRNormalizer:
             nodes=tuple(nodes),
             annotations=tuple(block_annotations),
         )
+        self._raw_by_offset = {}
         return ir_block, metrics
 
     # ------------------------------------------------------------------
@@ -923,9 +926,15 @@ class IRNormalizer:
             predicate_node: Optional[IRPredicateAssign] = None
             branch: Optional[IRIf] = None
             branch_index = scan
-            if branch_index < len(items) and isinstance(items[branch_index], IRPredicateAssign):
-                predicate_node = items[branch_index]
+            while branch_index < len(items) and isinstance(
+                items[branch_index], IRPredicateAssign
+            ):
+                candidate = items[branch_index]
                 branch_index += 1
+                if isinstance(candidate, IRPredicateAssign) and candidate.operator == "pop":
+                    continue
+                predicate_node = candidate
+                break
             if branch_index < len(items) and isinstance(items[branch_index], IRIf):
                 candidate = items[branch_index]
                 first_chunk = ascii_chunks[0]
@@ -935,7 +944,19 @@ class IRNormalizer:
                         predicate_node.name == candidate.condition
                         and predicate_node.operands
                     ):
-                        cond_matches = predicate_node.operands[0] == first_chunk
+                        operand_name = predicate_node.operands[0]
+                        if operand_name == first_chunk:
+                            cond_matches = True
+                        else:
+                            pop_node, _ = self._find_predicate_definition(
+                                items, branch_index, operand_name
+                            )
+                            if (
+                                pop_node is not None
+                                and pop_node.operator == "pop"
+                                and pop_node.operands
+                            ):
+                                cond_matches = pop_node.operands[0] == first_chunk
                 if cond_matches and item.tail:
                     branch = candidate
                 else:
@@ -1116,43 +1137,19 @@ class IRNormalizer:
     def _pass_branch_predicates(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
-            item = items[index]
-            if not isinstance(item, IRIf):
+            node = items[index]
+            if not isinstance(node, IRIf):
                 index += 1
                 continue
 
-            if not self._condition_requires_fix(item.condition):
+            if not self._condition_requires_fix(node.condition):
                 index += 1
                 continue
 
-            predicate_name = self._make_predicate_name(item)
-            operand = item.condition
-            if not operand or operand == "stack_top":
-                operand = self._describe_stack_top(items, index)
-            if not operand:
-                operand = "stack_top"
-
-            insert_assignment = True
-            if index > 0:
-                previous = items[index - 1]
-                if (
-                    isinstance(previous, IRPredicateAssign)
-                    and previous.name == predicate_name
-                ):
-                    insert_assignment = False
-
-            if insert_assignment:
-                operator = self._infer_predicate_operator(items, index)
-                assignment = IRPredicateAssign(
-                    name=predicate_name,
-                    operator=operator,
-                    operands=(operand,),
-                    source_offset=item.source_offset,
-                )
-                items.insert(index, assignment)
-                index += 1  # account for the inserted predicate
-
-            branch = items[index]
+            predicate_name, branch_position = self._ensure_predicate_definition(
+                items, index
+            )
+            branch = items[branch_position]
             if isinstance(branch, IRIf):
                 rewritten = IRIf(
                     condition=predicate_name,
@@ -1160,8 +1157,94 @@ class IRNormalizer:
                     else_target=branch.else_target,
                     source_offset=branch.source_offset,
                 )
-                items.replace_slice(index, index + 1, [rewritten])
-            index += 1
+                items.replace_slice(branch_position, branch_position + 1, [rewritten])
+            index = branch_position + 1
+
+    def _ensure_predicate_definition(
+        self, items: _ItemList, branch_index: int
+    ) -> Tuple[str, int]:
+        branch = items[branch_index]
+        assert isinstance(branch, IRIf)
+
+        existing = self._find_existing_predicate(items, branch_index, branch)
+        if existing is not None:
+            return existing.name, branch_index
+
+        predicate_name = self._make_predicate_name(branch)
+        nodes = self._recover_predicate_nodes(items, branch_index, branch, predicate_name)
+        for offset, node in enumerate(nodes):
+            items.insert(branch_index + offset, node)
+        return predicate_name, branch_index + len(nodes)
+
+    def _find_existing_predicate(
+        self, items: _ItemList, branch_index: int, branch: IRIf
+    ) -> Optional[IRPredicateAssign]:
+        scan = branch_index - 1
+        window = 0
+        while scan >= 0 and window < 8:
+            candidate = items[scan]
+            if isinstance(candidate, IRPredicateAssign):
+                if (
+                    branch.source_offset is not None
+                    and candidate.source_offset == branch.source_offset
+                ):
+                    return candidate
+            if isinstance(candidate, IRIf):
+                break
+            scan -= 1
+            window += 1
+        return None
+
+    def _recover_predicate_nodes(
+        self,
+        items: _ItemList,
+        branch_index: int,
+        branch: IRIf,
+        predicate_name: str,
+    ) -> Tuple[IRPredicateAssign, ...]:
+        source_offset = branch.source_offset
+        raw = self._raw_by_offset.get(source_offset) if source_offset is not None else None
+        if raw is not None and raw.mnemonic == "test_branch":
+            return self._synthesise_truthy_predicate(
+                items, branch_index, branch, predicate_name, source_offset
+            )
+        return self._synthesise_truthy_predicate(
+            items, branch_index, branch, predicate_name, source_offset
+        )
+
+    def _synthesise_truthy_predicate(
+        self,
+        items: _ItemList,
+        branch_index: int,
+        branch: IRIf,
+        predicate_name: str,
+        source_offset: Optional[int],
+    ) -> Tuple[IRPredicateAssign, IRPredicateAssign]:
+        operand = self._describe_stack_top(items, branch_index)
+        if not operand:
+            operand = "stack_top"
+        value_name = self._make_stack_value_name(branch, branch_index)
+        pop_node = IRPredicateAssign(
+            name=value_name,
+            operator="pop",
+            operands=(operand,),
+            source_offset=source_offset,
+            synthetic=True,
+        )
+        predicate_node = IRPredicateAssign(
+            name=predicate_name,
+            operator="truthy",
+            operands=(value_name,),
+            source_offset=source_offset,
+            synthetic=True,
+        )
+        return pop_node, predicate_node
+
+    @staticmethod
+    def _make_stack_value_name(branch: IRIf, branch_index: int) -> str:
+        if branch.source_offset is not None:
+            return f"value@0x{branch.source_offset:04X}"
+        return f"value@{branch_index}"
 
     @staticmethod
     def _condition_requires_fix(condition: str) -> bool:
@@ -1191,30 +1274,80 @@ class IRNormalizer:
             return f"pred@0x{branch.source_offset:04X}"
         return "pred@unknown"
 
-    def _infer_predicate_operator(self, items: _ItemList, index: int) -> str:
-        scan = index - 1
+    def _find_predicate_definition(
+        self, items: _ItemList, start_index: int, name: str
+    ) -> Tuple[Optional[IRPredicateAssign], int]:
+        scan = start_index - 1
         while scan >= 0:
             candidate = items[scan]
-            if isinstance(candidate, IRPredicateAssign):
-                return candidate.operator
-            if isinstance(candidate, RawInstruction):
-                mnemonic = candidate.mnemonic.lower()
-                if mnemonic == "test_branch":
-                    return "test"
-                if mnemonic == "testset_branch":
-                    return "testset"
-                summary = (candidate.profile.summary or "").lower()
-                if "compare" in summary or "cmp" in mnemonic:
-                    return "compare"
+            if isinstance(candidate, IRPredicateAssign) and candidate.name == name:
+                return candidate, scan
             scan -= 1
-        return "truthy"
+        return None, -1
 
     def _verify_branch_conditions(self, items: _ItemList) -> None:
         problems: List[str] = []
-        for node in items:
-            if isinstance(node, IRIf) and self._condition_requires_fix(node.condition):
-                location = f"0x{node.source_offset:04X}" if node.source_offset is not None else "unknown"
+        allowed = {"test", "testset", "compare", "truthy", "bool_call"}
+        for index, node in enumerate(items):
+            if not isinstance(node, IRIf):
+                continue
+            if self._condition_requires_fix(node.condition):
+                location = (
+                    f"0x{node.source_offset:04X}"
+                    if node.source_offset is not None
+                    else "unknown"
+                )
                 problems.append(f"invalid predicate {node.condition} at {location}")
+                continue
+
+            assignment, assign_index = self._find_predicate_definition(
+                items, index, node.condition
+            )
+            if assignment is None:
+                location = (
+                    f"0x{node.source_offset:04X}"
+                    if node.source_offset is not None
+                    else "unknown"
+                )
+                problems.append(f"missing predicate definition for {node.condition} at {location}")
+                continue
+
+            if assignment.operator not in allowed:
+                location = (
+                    f"0x{assignment.source_offset:04X}"
+                    if assignment.source_offset is not None
+                    else "unknown"
+                )
+                problems.append(
+                    f"unsupported predicate operator {assignment.operator} for {assignment.name} at {location}"
+                )
+                continue
+
+            if assignment.operator == "truthy":
+                if not assignment.synthetic:
+                    location = (
+                        f"0x{assignment.source_offset:04X}"
+                        if assignment.source_offset is not None
+                        else "unknown"
+                    )
+                    problems.append(
+                        f"truthy predicate {assignment.name} at {location} must be synthetic"
+                    )
+                    continue
+                if not assignment.operands:
+                    problems.append(f"truthy predicate {assignment.name} is missing operand")
+                    continue
+                value_name = assignment.operands[0]
+                value_def, _ = self._find_predicate_definition(items, assign_index, value_name)
+                if value_def is None or value_def.operator != "pop":
+                    problems.append(
+                        f"truthy predicate {assignment.name} is not backed by pop({value_name})"
+                    )
+                elif not value_def.synthetic:
+                    problems.append(
+                        f"stack value {value_name} feeding {assignment.name} must be synthetic"
+                    )
+
         if problems:
             details = "; ".join(problems)
             raise ValueError(f"IR branch predicate verification failed: {details}")

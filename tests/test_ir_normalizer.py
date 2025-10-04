@@ -3,7 +3,7 @@ from pathlib import Path
 
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
-from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir import IRIf, IRPredicateAssign, IRTextRenderer
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -62,6 +62,13 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x23:0x00"],
             "name": "branch_eq",
             "category": "branch_eq",
+        },
+        "test_branch": {
+            "opcodes": ["0x26:0x00"],
+            "name": "test_branch",
+            "category": "test_branch",
+            "control_flow": "branch",
+            "stack_delta": -1,
         },
         "testset_branch": {
             "opcodes": ["0x27:0x00"],
@@ -266,3 +273,45 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_synthesises_stack_truthy(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x2910),
+        build_word(4, 0x26, 0x00, 0x0010),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    pop_nodes = [
+        node
+        for node in block.nodes
+        if isinstance(node, IRPredicateAssign) and node.operator == "pop"
+    ]
+    assert pop_nodes, "expected synthetic pop assignment"
+    pop_node = pop_nodes[0]
+    assert pop_node.synthetic
+    assert pop_node.operands == ("lit(0x2910)",)
+
+    truthy_nodes = [
+        node
+        for node in block.nodes
+        if isinstance(node, IRPredicateAssign) and node.operator == "truthy"
+    ]
+    assert truthy_nodes, "expected synthetic truthy assignment"
+    truthy_node = truthy_nodes[0]
+    assert truthy_node.synthetic
+    assert truthy_node.operands == (pop_node.name,)
+
+    branches = [node for node in block.nodes if isinstance(node, IRIf)]
+    assert branches
+    assert branches[0].condition == truthy_node.name

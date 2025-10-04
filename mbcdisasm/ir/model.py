@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 class MemSpace(Enum):
@@ -216,12 +216,19 @@ class IRPredicateAssign(IRNode):
     operator: str
     operands: Tuple[str, ...]
     source_offset: Optional[int] = None
+    synthetic: bool = False
 
     def describe(self) -> str:
         args = ", ".join(self.operands)
-        if self.source_offset is None:
-            return f"{self.name} := {self.operator}({args})"
-        return f"{self.name} := {self.operator}({args}) @ 0x{self.source_offset:04X}"
+        base = f"{self.name} := {self.operator}({args})"
+        suffix: List[str] = []
+        if self.source_offset is not None:
+            suffix.append(f"@ 0x{self.source_offset:04X}")
+        if self.synthetic:
+            suffix.append("synthetic")
+        if suffix:
+            base = f"{base} {' '.join(suffix)}"
+        return base
 
 
 @dataclass(frozen=True)
