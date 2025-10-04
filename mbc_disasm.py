@@ -18,8 +18,18 @@ from mbcdisasm import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("adb", type=Path, help="Path to the companion .adb index file")
-    parser.add_argument("mbc", type=Path, help="Path to the .mbc container")
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="Either <stem> or <adb> <mbc>. When a single stem is provided,"
+        " the input files are resolved relative to --root.",
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path("mbc"),
+        help="Base directory used when resolving inputs from a single stem",
+    )
     parser.add_argument(
         "--segment",
         type=int,
@@ -54,8 +64,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_inputs(args: argparse.Namespace) -> None:
-    for path in (args.adb, args.mbc):
+def validate_inputs(adb_path: Path, mbc_path: Path) -> None:
+    for path in (adb_path, mbc_path):
         if not path.exists():
             raise SystemExit(f"missing input file: {path}")
 
@@ -66,14 +76,28 @@ def resolve_segments(args: argparse.Namespace) -> Sequence[int]:
     return ()
 
 
+def resolve_input_paths(args: argparse.Namespace) -> tuple[Path, Path]:
+    inputs = args.inputs
+    if len(inputs) == 1:
+        stem = Path(inputs[0])
+        adb_path = (args.root / stem).with_suffix(".adb")
+        mbc_path = (args.root / stem).with_suffix(".mbc")
+        return adb_path, mbc_path
+    if len(inputs) == 2:
+        adb_path, mbc_path = map(Path, inputs)
+        return adb_path, mbc_path
+    raise SystemExit("expected either a single stem or <adb> <mbc> inputs")
+
+
 def main() -> None:
     args = parse_args()
-    validate_inputs(args)
+    adb_path, mbc_path = resolve_input_paths(args)
+    validate_inputs(adb_path, mbc_path)
 
     knowledge = KnowledgeBase.load(args.knowledge_base)
-    container = MbcContainer.load(args.mbc, args.adb)
+    container = MbcContainer.load(mbc_path, adb_path)
 
-    output_path = args.disasm_out or args.mbc.with_suffix(".disasm.txt")
+    output_path = args.disasm_out or mbc_path.with_suffix(".disasm.txt")
     disassembler = Disassembler(knowledge)
     selection = resolve_segments(args)
     summary = disassembler.write_listing(
@@ -95,7 +119,7 @@ def main() -> None:
 
     ir_normalizer = IRNormalizer(knowledge)
     program = ir_normalizer.normalise_container(container, segment_indices=selection)
-    ir_output_path = args.ir_out or args.mbc.with_suffix(".ir.txt")
+    ir_output_path = args.ir_out or mbc_path.with_suffix(".ir.txt")
     IRTextRenderer().write(program, ir_output_path)
     print(f"ir written to {ir_output_path}")
 
