@@ -25,6 +25,7 @@ from .model import (
     IRReturn,
     IRSegment,
     IRSlot,
+    IRStackCopy,
     IRStore,
     IRTestSetBranch,
     IRIf,
@@ -228,6 +229,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_stack_copies(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
         self._pass_branches(items, metrics)
@@ -285,6 +287,32 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [literal])
             index += 1
 
+    def _pass_stack_copies(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if item.profile.kind is not InstructionKind.STACK_COPY:
+                index += 1
+                continue
+
+            pattern = self._decode_stack_pattern(item.operand)
+            sources = self._format_stack_sources(pattern)
+            node = IRStackCopy(
+                mnemonic=item.mnemonic,
+                mode=item.profile.mode,
+                operand=item.operand,
+                pattern=pattern,
+                sources=sources,
+                delta=item.event.delta,
+            )
+            metrics.stack_copies += 1
+            items.replace_slice(index, index + 1, [node])
+            index += 1
+
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
 
@@ -311,6 +339,23 @@ class IRNormalizer:
             )
 
         return None
+
+    @staticmethod
+    def _decode_stack_pattern(operand: int) -> Tuple[int, ...]:
+        encoded = f"{operand:04X}"
+        return tuple(int(ch, 16) for ch in encoded)
+
+    @staticmethod
+    def _format_stack_sources(pattern: Tuple[int, ...]) -> Tuple[str, ...]:
+        return tuple(IRNormalizer._format_stack_source(value) for value in pattern)
+
+    @staticmethod
+    def _format_stack_source(index: int) -> str:
+        if index < 0:
+            return "ssa?"
+        if index < 10:
+            return f"ssa{index}"
+        return f"ssa{index:X}"
 
     def _pass_calls_and_returns(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0

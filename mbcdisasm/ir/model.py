@@ -134,6 +134,27 @@ class IRBuildTuple(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStackCopy(IRNode):
+    """Explicit representation of stack shuffling helpers."""
+
+    mnemonic: str
+    mode: int
+    operand: int
+    pattern: Tuple[int, ...]
+    sources: Tuple[str, ...]
+    delta: int
+
+    def describe(self) -> str:
+        pattern = ", ".join(f"0x{value:X}" for value in self.pattern)
+        sources = ", ".join(self.sources)
+        return (
+            f"stack_copy {self.mnemonic} mode=0x{self.mode:02X} "
+            f"operand=0x{self.operand:04X} pattern=[{pattern}] "
+            f"sources=[{sources}] Δ={self.delta:+d}"
+        )
+
+
+@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
@@ -245,6 +266,7 @@ class NormalizerMetrics:
     loads: int = 0
     stores: int = 0
     reduce_replaced: int = 0
+    stack_copies: int = 0
     raw_remaining: int = 0
 
     def observe(self, other: "NormalizerMetrics") -> None:
@@ -261,6 +283,7 @@ class NormalizerMetrics:
         self.loads += other.loads
         self.stores += other.stores
         self.reduce_replaced += other.reduce_replaced
+        self.stack_copies += other.stack_copies
         self.raw_remaining += other.raw_remaining
 
     def describe(self) -> str:
@@ -278,6 +301,7 @@ class NormalizerMetrics:
             f"loads={self.loads}",
             f"stores={self.stores}",
             f"reduce_replaced={self.reduce_replaced}",
+            f"stack_copies={self.stack_copies}",
             f"raw_remaining={self.raw_remaining}",
         ]
         return " ".join(parts)
@@ -292,6 +316,7 @@ __all__ = [
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
+    "IRStackCopy",
     "IRIf",
     "IRTestSetBranch",
     "IRLoad",
