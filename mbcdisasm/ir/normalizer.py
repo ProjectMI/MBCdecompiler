@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker
@@ -11,12 +11,17 @@ from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
+    IRAsciiFinalize,
+    IRAsciiPreamble,
     IRBlock,
     IRBuildArray,
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    IRCallSetup,
+    IRIf,
     IRLiteral,
+    IRLiteralBlock,
     IRLiteralChunk,
     IRLoad,
     IRNode,
@@ -28,8 +33,9 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRTablePatch,
+    IRTailCallSetup,
     IRTestSetBranch,
-    IRIf,
     MemSpace,
     NormalizerMetrics,
 )
@@ -230,9 +236,15 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_literal_preambles(items, metrics)
         self._pass_stack_manipulation(items, metrics)
+        self._pass_ascii_preamble(items, metrics)
+        self._pass_tailcall_setup(items, metrics)
+        self._pass_call_setup_sequences(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
+        self._pass_table_patches(items, metrics)
+        self._pass_ascii_helpers(items, metrics)
         self._pass_branches(items, metrics)
         self._pass_indirect_access(items, metrics)
 
@@ -288,6 +300,46 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [literal])
             index += 1
 
+    def _pass_literal_preambles(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        pattern = (0x6704, 0x0067, 0x0400)
+        index = 0
+        while index <= len(items) - len(pattern):
+            segment = items[index : index + len(pattern)]
+            if not all(
+                isinstance(node, IRLiteral) and node.value == expected
+                for node, expected in zip(segment, pattern)
+            ):
+                index += 1
+                continue
+
+            start = index
+            values: List[int] = []
+            while index <= len(items) - len(pattern):
+                window = items[index : index + len(pattern)]
+                if all(
+                    isinstance(node, IRLiteral) and node.value == expected
+                    for node, expected in zip(window, pattern)
+                ):
+                    values.extend(cast(IRLiteral, lit).value for lit in window)
+                    index += len(pattern)
+                    continue
+                break
+
+            reduced = False
+            if index < len(items):
+                next_item = items[index]
+                if (
+                    isinstance(next_item, RawInstruction)
+                    and next_item.mnemonic == "reduce_pair"
+                    and next_item.operand == 0
+                ):
+                    reduced = True
+                    index += 1
+
+            block = IRLiteralBlock(values=tuple(values), reduced=reduced)
+            items.replace_slice(start, index, [block])
+            index = start + 1
+
     def _pass_stack_manipulation(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -318,6 +370,113 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_ascii_preamble(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index + 2 < len(items):
+            first = items[index]
+            second = items[index + 1]
+            third = items[index + 2]
+
+            if not (
+                isinstance(first, RawInstruction)
+                and isinstance(second, RawInstruction)
+                and isinstance(third, RawInstruction)
+            ):
+                index += 1
+                continue
+
+            if not (
+                self._matches_opcode(first, 0x72, 0x23)
+                and first.operand == 0x4F00
+                and self._matches_opcode(second, 0x31, 0x30)
+                and second.operand == 0x2C00
+            ):
+                index += 1
+                continue
+
+            if not self._is_ascii_marker_tail(third):
+                index += 1
+                continue
+
+            items.replace_slice(index, index + 3, [IRAsciiPreamble()])
+            continue
+
+    def _is_ascii_marker_tail(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic == "stack_shuffle" and instruction.operand == 0x4B08:
+            return True
+        if self._matches_opcode(instruction, 0x66) and instruction.operand == 0x4B08:
+            return True
+        if self._matches_opcode(instruction, 0x4B, 0x08):
+            return True
+        return False
+
+    def _pass_tailcall_setup(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            if index + 3 >= len(items):
+                break
+
+            first = items[index]
+            second = items[index + 1]
+            third = items[index + 2]
+            fourth = items[index + 3]
+
+            if not (
+                isinstance(first, RawInstruction)
+                and isinstance(second, RawInstruction)
+                and isinstance(third, RawInstruction)
+                and isinstance(fourth, RawInstruction)
+            ):
+                index += 1
+                continue
+
+            if not (
+                self._matches_opcode(first, 0x3D, 0x30)
+                and self._matches_opcode(second, 0x32, 0x29)
+                and third.profile.word.opcode == 0x4B
+                and self._matches_opcode(fourth, 0xF0, 0x4B)
+            ):
+                index += 1
+                continue
+
+            setup = IRTailCallSetup(
+                frame_operand=first.operand,
+                layout_operand=second.operand,
+                shuffle_operand=third.operand,
+                helper_operand=fourth.operand,
+            )
+            items.replace_slice(index, index + 4, [setup])
+            index += 1
+
+    def _pass_call_setup_sequences(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_call_setup_instruction(item):
+                index += 1
+                continue
+
+            start = index
+            operations: List[Tuple[str, int]] = []
+            anchor = False
+
+            while index < len(items):
+                candidate = items[index]
+                if isinstance(candidate, RawInstruction) and self._is_call_setup_instruction(candidate):
+                    operations.append((candidate.mnemonic, candidate.operand))
+                    if candidate.profile.word.opcode == 0x4A or candidate.mnemonic.startswith("op_4A_"):
+                        anchor = True
+                    index += 1
+                    continue
+                break
+
+            if anchor and operations:
+                items.replace_slice(start, index, [IRCallSetup(operations=tuple(operations))])
+                index = start + 1
+                continue
+
+            index = start + 1
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
@@ -549,6 +708,48 @@ class IRNormalizer:
             items.replace_slice(index, scan, replacement_sequence)
             index += 1
 
+    def _pass_table_patches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or item.profile.word.opcode != 0x2C:
+                index += 1
+                continue
+
+            start = index
+            operations: List[str] = []
+
+            while index < len(items):
+                candidate = items[index]
+                if isinstance(candidate, RawInstruction):
+                    if candidate.profile.word.opcode == 0x2C:
+                        operations.append(self._format_table_operation(candidate))
+                        index += 1
+                        continue
+                    if candidate.mnemonic.startswith("fanout"):
+                        operations.append(self._format_table_operation(candidate))
+                        index += 1
+                        continue
+                break
+
+            if len(operations) >= 2:
+                items.replace_slice(start, index, [IRTablePatch(operations=tuple(operations))])
+                index = start + 1
+                continue
+
+            index = start + 1
+
+    def _pass_ascii_helpers(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        ascii_helpers = {0xF172, 0x7223, 0x3D30}
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, RawInstruction) and item.mnemonic == "call_helpers" and item.operand in ascii_helpers:
+                items.replace_slice(index, index + 1, [IRAsciiFinalize(helper=item.operand)])
+                index += 1
+                continue
+            index += 1
+
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
         if isinstance(item, IRLiteral):
@@ -628,6 +829,38 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _matches_opcode(instruction: RawInstruction, opcode: int, mode: Optional[int] = None) -> bool:
+        if instruction.profile.word.opcode != opcode:
+            return False
+        if mode is not None and instruction.profile.word.mode != mode:
+            return False
+        return True
+
+    @staticmethod
+    def _is_call_setup_instruction(instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic.startswith("stack_teardown"):
+            return True
+        if mnemonic.startswith("stack_shuffle"):
+            return True
+        if mnemonic.startswith("fanout"):
+            return True
+        if mnemonic.startswith("op_4A_") or instruction.profile.word.opcode == 0x4A:
+            return True
+        if mnemonic.startswith("op_4B_") or instruction.profile.word.opcode == 0x4B:
+            return True
+        return False
+
+    @staticmethod
+    def _format_table_operation(instruction: RawInstruction) -> str:
+        return f"{instruction.mnemonic}(0x{instruction.operand:04X})"
+
+    @staticmethod
+    def _flag_name(value: int) -> Optional[str]:
+        mapping = {0x0166: "FLAG_0166", 0x0266: "FLAG_0266"}
+        return mapping.get(value)
+
     def _describe_stack_top(self, items: _ItemList, index: int) -> str:
         scan = index - 1
         while scan >= 0:
@@ -667,15 +900,26 @@ class IRNormalizer:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
+                    flag = self._flag_name(candidate.operand)
+                    if flag is not None:
+                        return f"check_flag({flag})"
                     if skip_literals and candidate.mnemonic == "push_literal":
                         scan -= 1
                         continue
                     return self._describe_value(candidate)
                 if skip_literals:
+                    flag = self._flag_name(candidate.operand)
+                    if flag is not None:
+                        return f"check_flag({flag})"
                     return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
-                scan -= 1
-                continue
+            if isinstance(candidate, IRLiteral):
+                flag = self._flag_name(candidate.value)
+                if flag is not None:
+                    return f"check_flag({flag})"
+                if skip_literals:
+                    scan -= 1
+                    continue
+                return candidate.describe()
             if isinstance(candidate, IRLiteralChunk) and skip_literals:
                 scan -= 1
                 continue

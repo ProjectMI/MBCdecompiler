@@ -101,6 +101,79 @@ class IRLiteralChunk(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteralBlock(IRNode):
+    """Repeated literal preamble used by aggregate initialisers."""
+
+    values: Tuple[int, ...]
+    reduced: bool = False
+
+    def describe(self) -> str:
+        words = ", ".join(f"0x{value:04X}" for value in self.values)
+        suffix = " reduce" if self.reduced else ""
+        return f"literal_block{suffix}([{words}])"
+
+
+@dataclass(frozen=True)
+class IRAsciiPreamble(IRNode):
+    """Marker emitted before large inline ASCII payloads."""
+
+    def describe(self) -> str:
+        return "ascii_preamble"
+
+
+@dataclass(frozen=True)
+class IRCallSetup(IRNode):
+    """Canonical call-frame preparation sequence."""
+
+    operations: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        return f"prep_call_args([{ops}])"
+
+
+@dataclass(frozen=True)
+class IRTailCallSetup(IRNode):
+    """Structured representation of the tailcall preparation preamble."""
+
+    frame_operand: int
+    layout_operand: int
+    shuffle_operand: int
+    helper_operand: int
+
+    def describe(self) -> str:
+        return (
+            "tailcall_setup("
+            f"frame=0x{self.frame_operand:04X}, "
+            f"layout=0x{self.layout_operand:04X}, "
+            f"shuffle=0x{self.shuffle_operand:04X}, "
+            f"helper=0x{self.helper_operand:04X}"
+            ")"
+        )
+
+
+@dataclass(frozen=True)
+class IRTablePatch(IRNode):
+    """Normalised form of late table/array patch operations."""
+
+    operations: Tuple[str, ...]
+
+    def describe(self) -> str:
+        ops = ", ".join(self.operations)
+        return f"table_patch([{ops}])"
+
+
+@dataclass(frozen=True)
+class IRAsciiFinalize(IRNode):
+    """Helper call finishing the construction of an ASCII block."""
+
+    helper: int
+
+    def describe(self) -> str:
+        return f"finalize_ascii(helper=0x{self.helper:04X})"
+
+
+@dataclass(frozen=True)
 class IRBuildArray(IRNode):
     """Aggregate literal values into a positional container."""
 
@@ -315,6 +388,12 @@ __all__ = [
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
+    "IRLiteralBlock",
+    "IRAsciiPreamble",
+    "IRCallSetup",
+    "IRTailCallSetup",
+    "IRTablePatch",
+    "IRAsciiFinalize",
     "IRIf",
     "IRTestSetBranch",
     "IRLoad",

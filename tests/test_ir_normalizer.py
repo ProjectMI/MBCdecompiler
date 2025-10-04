@@ -4,6 +4,14 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir.model import (
+    IRAsciiFinalize,
+    IRAsciiPreamble,
+    IRCallSetup,
+    IRLiteralBlock,
+    IRTablePatch,
+    IRTailCallSetup,
+)
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -61,6 +69,21 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "stack_teardown_1",
             "category": "stack_teardown",
         },
+        "call_helpers": {
+            "opcodes": ["0x16:0x00"],
+            "name": "call_helpers",
+            "category": "call_helpers",
+        },
+        "stack_shuffle": {
+            "opcodes": ["0x66:0x15"],
+            "name": "stack_shuffle",
+            "category": "stack_shuffle",
+        },
+        "fanout": {
+            "opcodes": ["0x66:0x20"],
+            "name": "fanout",
+            "category": "fanout",
+        },
     }
     manual_path = path / "manual_annotations.json"
     manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
@@ -103,6 +126,47 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
     return container, knowledge
 
 
+def build_pattern_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x6704),
+        build_word(4, 0x00, 0x00, 0x0067),
+        build_word(8, 0x00, 0x00, 0x0400),
+        build_word(12, 0x00, 0x00, 0x6704),
+        build_word(16, 0x00, 0x00, 0x0067),
+        build_word(20, 0x00, 0x00, 0x0400),
+        build_word(24, 0x04, 0x00, 0x0000),
+        build_word(28, 0x72, 0x23, 0x4F00),
+        build_word(32, 0x31, 0x30, 0x2C00),
+        build_word(36, 0x66, 0x15, 0x4B08),
+        build_word(40, 0x66, 0x15, 0x0001),
+        build_word(44, 0x66, 0x20, 0x0002),
+        build_word(48, 0x4A, 0x05, 0x0030),
+        build_word(52, 0x28, 0x00, 0x1111),
+        build_word(56, 0x3D, 0x30, 0x6910),
+        build_word(60, 0x32, 0x29, 0x1000),
+        build_word(64, 0x4B, 0x01, 0x0030),
+        build_word(68, 0xF0, 0x4B, 0x1B00),
+        build_word(72, 0x29, 0x00, 0x2222),
+        build_word(76, 0x00, 0x00, 0x0266),
+        build_word(80, 0x23, 0x00, 0x0100),
+        build_word(84, 0x00, 0x00, 0x0166),
+        build_word(88, 0x27, 0x00, 0x0200),
+        build_word(92, 0x2C, 0x00, 0x6601),
+        build_word(96, 0x2C, 0x02, 0x6602),
+        build_word(100, 0x2C, 0x03, 0x6603),
+        build_word(104, 0x66, 0x20, 0x0000),
+        build_word(108, 0x16, 0x00, 0xF172),
+        build_word(112, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("pattern"), [segment])
+    return container, knowledge
+
+
 def test_normalizer_builds_ir(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
@@ -136,3 +200,28 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+
+def test_normalizer_detects_global_patterns(tmp_path: Path) -> None:
+    container, knowledge = build_pattern_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    nodes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    literal_blocks = [node for node in nodes if isinstance(node, IRLiteralBlock)]
+    assert literal_blocks and literal_blocks[0].reduced
+    assert any(isinstance(node, IRAsciiPreamble) for node in nodes)
+    assert any(isinstance(node, IRCallSetup) for node in nodes)
+    assert any(isinstance(node, IRTailCallSetup) for node in nodes)
+    assert any(isinstance(node, IRTablePatch) for node in nodes)
+    assert any(isinstance(node, IRAsciiFinalize) for node in nodes)
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in nodes]
+    assert any("check_flag(FLAG_0266)" in text for text in descriptions)
+    assert any("check_flag(FLAG_0166)" in text for text in descriptions)
