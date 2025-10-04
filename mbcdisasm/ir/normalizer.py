@@ -12,14 +12,18 @@ from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
     IRAsciiFinalize,
+    IRAsciiHeader,
     IRAsciiPreamble,
+    IRAsciiWrapperCall,
     IRBlock,
     IRBuildArray,
     IRBuildMap,
     IRBuildTuple,
     IRCall,
     IRCallPreparation,
+    IRCallReturn,
     IRFlagCheck,
+    IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
@@ -33,6 +37,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
     IRTestSetBranch,
@@ -241,6 +246,7 @@ class IRNormalizer:
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
         self._pass_literal_blocks(items)
+        self._pass_literal_block_reducers(items, metrics)
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_tailcall_frames(items)
@@ -248,6 +254,10 @@ class IRNormalizer:
         self._pass_ascii_finalize(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
+        self._pass_function_prologues(items)
+        self._pass_ascii_wrappers(items)
+        self._pass_ascii_headers(items)
+        self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -569,20 +579,92 @@ class IRNormalizer:
             item = items[index]
             if isinstance(item, IRBuildTuple):
                 values = self._parse_literal_list(item.elements)
-                if values and self._is_literal_block(values):
-                    triplets = tuple(
-                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
-                    )
-                    items.replace_slice(index, index + 1, [IRLiteralBlock(triplets=triplets)])
+                block = self._literal_block_from_values(values)
+                if block is not None:
+                    items.replace_slice(index, index + 1, [block])
                     continue
             if isinstance(item, IRLiteral):
                 values, end = self._collect_literal_block_literals(items, index)
-                if values:
-                    triplets = tuple(
-                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
-                    )
-                    items.replace_slice(index, end, [IRLiteralBlock(triplets=triplets)])
+                block = self._literal_block_from_values(values)
+                if block is not None:
+                    items.replace_slice(index, end, [block])
                     continue
+            index += 1
+
+    def _literal_block_from_values(
+        self,
+        values: Sequence[int],
+        *,
+        reducer: Optional[str] = None,
+        operand: Optional[int] = None,
+    ) -> Optional[IRLiteralBlock]:
+        if not values:
+            return None
+        if self._is_literal_block(values):
+            triplets = tuple(
+                tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
+            )
+            return IRLiteralBlock(
+                triplets=triplets, reducer=reducer, reducer_operand=operand
+            )
+
+        if len(values) < 6:
+            return None
+
+        trip_count = len(values) // 3
+        if trip_count < 2:
+            return None
+
+        triplets = [tuple(values[pos : pos + 3]) for pos in range(0, trip_count * 3, 3)]
+        prefix = triplets[0][:2]
+        if not all(chunk[:2] == prefix for chunk in triplets):
+            return None
+
+        tail = tuple(values[trip_count * 3 :])
+        return IRLiteralBlock(
+            triplets=tuple(triplets),
+            reducer=reducer,
+            reducer_operand=operand,
+            tail=tail,
+        )
+
+    def _pass_literal_block_reducers(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
+        index = 0
+        while index < len(items) - 1:
+            first = items[index]
+            second = items[index + 1]
+            if isinstance(first, RawInstruction) and first.mnemonic.startswith("reduce"):
+                if isinstance(second, IRLiteralBlock):
+                    if second.reducer is None:
+                        updated = IRLiteralBlock(
+                            triplets=second.triplets,
+                            reducer=first.mnemonic,
+                            reducer_operand=first.operand,
+                            tail=second.tail,
+                        )
+                        items.replace_slice(index, index + 2, [updated])
+                        metrics.reduce_replaced += 1
+                        continue
+                if isinstance(second, IRBuildTuple):
+                    values = self._parse_literal_list(second.elements)
+                    block = self._literal_block_from_values(
+                        values, reducer=first.mnemonic, operand=first.operand
+                    )
+                    if block is not None:
+                        items.replace_slice(index, index + 2, [block])
+                        metrics.reduce_replaced += 1
+                        continue
+                if isinstance(second, IRLiteral):
+                    values, end = self._collect_literal_block_literals(items, index + 1)
+                    block = self._literal_block_from_values(
+                        values, reducer=first.mnemonic, operand=first.operand
+                    )
+                    if block is not None:
+                        items.replace_slice(index, end, [block])
+                        metrics.reduce_replaced += 1
+                        continue
             index += 1
 
     def _pass_ascii_preamble(self, items: _ItemList) -> None:
@@ -742,6 +824,109 @@ class IRNormalizer:
                     index += 1
                     continue
             index += 1
+
+    def _pass_function_prologues(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRTestSetBranch):
+                if index == 0 or all(
+                    isinstance(items[pos], IRAsciiHeader) for pos in range(index)
+                ):
+                    if item.var.startswith("slot("):
+                        node = IRFunctionPrologue(
+                            var=item.var,
+                            expr=item.expr,
+                            then_target=item.then_target,
+                            else_target=item.else_target,
+                        )
+                        items.replace_slice(index, index + 1, [node])
+                        index += 1
+                        continue
+            index += 1
+
+    def _pass_ascii_wrappers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+
+            ascii_chunks: List[str] = []
+            scan = index + 1
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, IRLiteralChunk):
+                    ascii_chunks.append(candidate.describe())
+                    scan += 1
+                    continue
+                break
+
+            if not ascii_chunks:
+                index += 1
+                continue
+
+            branch: Optional[IRIf] = None
+            if scan < len(items) and isinstance(items[scan], IRIf):
+                candidate = items[scan]
+                first_chunk = ascii_chunks[0]
+                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                    branch = candidate
+                    scan += 1
+
+            ascii_tuple = tuple(ascii_chunks)
+            if branch is not None:
+                node = IRTailcallAscii(
+                    target=item.target,
+                    args=item.args,
+                    ascii_chunks=ascii_tuple,
+                    condition=branch.condition,
+                    then_target=branch.then_target,
+                    else_target=branch.else_target,
+                )
+                items.replace_slice(index, scan, [node])
+                continue
+
+            node = IRAsciiWrapperCall(
+                target=item.target,
+                args=item.args,
+                ascii_chunks=ascii_tuple,
+                tail=item.tail,
+            )
+            end = index + 1 + len(ascii_chunks)
+            items.replace_slice(index, end, [node])
+            index += 1
+
+    def _pass_ascii_headers(self, items: _ItemList) -> None:
+        if not items:
+            return
+        chunks: List[str] = []
+        index = 0
+        while index < len(items) and isinstance(items[index], IRLiteralChunk):
+            chunks.append(items[index].describe())
+            index += 1
+        if len(chunks) >= 2:
+            items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(chunks))])
+
+    def _pass_call_return_templates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items) - 1:
+            call = items[index]
+            if isinstance(call, IRCall):
+                nxt = items[index + 1]
+                if isinstance(nxt, IRReturn):
+                    node = IRCallReturn(
+                        target=call.target,
+                        args=call.args,
+                        tail=call.tail,
+                        returns=nxt.values,
+                        varargs=nxt.varargs,
+                    )
+                    items.replace_slice(index, index + 2, [node])
+                    continue
+            index += 1
+
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
         if isinstance(item, IRLiteral):
@@ -793,7 +978,7 @@ class IRNormalizer:
                 continue
             break
         sequence = tuple(values)
-        if sequence and self._is_literal_block(sequence):
+        if sequence:
             return sequence, index
         return tuple(), start
 

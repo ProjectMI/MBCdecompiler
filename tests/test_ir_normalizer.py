@@ -13,6 +13,11 @@ def build_word(offset: int, opcode: int, mode: int, operand: int) -> Instruction
     return InstructionWord(offset=offset, raw=raw)
 
 
+def build_ascii_word(offset: int, text: str) -> InstructionWord:
+    data = text.encode("ascii", "replace")[:4].ljust(4, b" ")
+    return InstructionWord(offset=offset, raw=int.from_bytes(data, "big"))
+
+
 def encode_instructions(words: list[InstructionWord]) -> bytes:
     return b"".join(word.raw.to_bytes(4, "big") for word in words)
 
@@ -32,14 +37,21 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": -1,
         },
         "tailcall_dispatch": {
-            "opcodes": ["0x29:0x00"],
+            "opcodes": ["0x2B:0x00"],
             "name": "tailcall_dispatch",
-            "category": "tailcall_dispatch",
+            "category": "call_dispatch",
+            "stack_delta": -1,
         },
         "return_values": {
             "opcodes": ["0x30:0x00"],
             "name": "return_values",
             "category": "return_values",
+        },
+        "call_dispatch": {
+            "opcodes": ["0x28:0x00"],
+            "name": "call_dispatch",
+            "category": "call_dispatch",
+            "stack_delta": -1,
         },
         "branch_eq": {
             "opcodes": ["0x23:0x00"],
@@ -73,7 +85,7 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
     seg0_words = [
         build_word(0, 0x00, 0x00, 0x0001),
         build_word(4, 0x00, 0x00, 0x0002),
-        build_word(8, 0x29, 0x00, 0x1234),
+        build_word(8, 0x2B, 0x00, 0x1234),
         build_word(12, 0x30, 0x00, 0x0002),
     ]
     seg1_words = [
@@ -98,6 +110,75 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
             seg1_bytes,
         ),
     ]
+
+    container = MbcContainer(Path("dummy"), segments)
+    return container, knowledge
+
+
+def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    segments: list[Segment] = []
+    offset = 0
+
+    def add_segment(words: list[InstructionWord]) -> None:
+        nonlocal offset
+        data = encode_instructions(words)
+        descriptor = SegmentDescriptor(len(segments), offset, offset + len(data))
+        segments.append(Segment(descriptor, data))
+        offset += len(data)
+
+    add_segment(
+        [
+            build_word(0, 0x04, 0x00, 0x0000),
+            build_word(4, 0x00, 0x00, 0x0067),
+            build_word(8, 0x00, 0x00, 0x0400),
+            build_word(12, 0x00, 0x00, 0x6704),
+            build_word(16, 0x00, 0x00, 0x0067),
+            build_word(20, 0x00, 0x00, 0x0400),
+            build_word(24, 0x00, 0x00, 0x6704),
+            build_word(28, 0x00, 0x00, 0x6910),
+            build_word(32, 0x30, 0x00, 0x0000),
+        ]
+    )
+
+    add_segment(
+        [
+            build_word(0, 0x00, 0x00, 0x0001),
+            build_word(4, 0x2B, 0x00, 0x0010),
+            build_ascii_word(8, "COND"),
+            build_word(12, 0x23, 0x00, 0x0008),
+        ]
+    )
+
+    add_segment(
+        [
+            build_ascii_word(0, "HEAD"),
+            build_ascii_word(4, "ER00"),
+            build_word(8, 0x30, 0x00, 0x0000),
+        ]
+    )
+
+    add_segment(
+        [
+            build_word(0, 0x28, 0x00, 0x0020),
+            build_word(4, 0x30, 0x00, 0x0001),
+        ]
+    )
+
+    add_segment(
+        [
+            build_word(0, 0x27, 0x00, 0x0004),
+        ]
+    )
+
+    add_segment(
+        [
+            build_word(0, 0x28, 0x00, 0x0030),
+            build_ascii_word(4, "TEXT"),
+            build_word(8, 0x30, 0x00, 0x0000),
+        ]
+    )
 
     container = MbcContainer(Path("dummy"), segments)
     return container, knowledge
@@ -136,3 +217,23 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+
+def test_normalizer_structural_templates(tmp_path: Path) -> None:
+    container, knowledge = build_template_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    descriptions = [
+        getattr(node, "describe", lambda: "")()
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
+    assert any(text.startswith("tailcall_ascii") for text in descriptions)
+    assert any(text.startswith("ascii_header[") for text in descriptions)
+    assert any(text.startswith("function_prologue") for text in descriptions)
+    assert any(text.startswith("call_return") for text in descriptions)
+    assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
