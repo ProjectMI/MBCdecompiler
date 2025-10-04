@@ -101,6 +101,127 @@ class IRLiteralChunk(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteralBlock(IRNode):
+    """Compact representation of mirrored literal bootstrap blocks."""
+
+    pair: Tuple[int, int]
+    terminator: int
+    count: int
+    reducers: int = 0
+    mirrored: bool = False
+
+    def describe(self) -> str:
+        first, second = self.pair
+        pair_text = f"0x{first:04X}/0x{second:04X}"
+        suffix = " mirrored" if self.mirrored else ""
+        reducer_note = f" reducers={self.reducers}" if self.reducers else ""
+        return (
+            f"literal_block pair={pair_text} term=0x{self.terminator:04X} "
+            f"count={self.count}{suffix}{reducer_note}"
+        )
+
+
+@dataclass(frozen=True)
+class IRAsciiPrologue(IRNode):
+    """Marker that denotes the start of an inline ASCII payload."""
+
+    marker_operand: int
+    layout_operand: int
+    shuffle_operand: int
+
+    def describe(self) -> str:
+        return (
+            "ascii_prologue marker=0x"
+            f"{self.marker_operand:04X} layout=0x{self.layout_operand:04X} "
+            f"shuffle=0x{self.shuffle_operand:04X}"
+        )
+
+
+@dataclass(frozen=True)
+class IRCallArgPrep(IRNode):
+    """Normalised wrapper for call argument stack preparation helpers."""
+
+    steps: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        parts = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"prep_call_args[{parts}]"
+
+
+@dataclass(frozen=True)
+class IRTailcallPrep(IRNode):
+    """Structured representation of tailcall frame preparation."""
+
+    steps: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        parts = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"prep_tailcall[{parts}]"
+
+
+@dataclass(frozen=True)
+class IRTableChunk(IRNode):
+    """Capture the recurring table patch helpers used across scripts."""
+
+    base_operand: int
+    key_operand: int
+    value_operand: int
+    extras: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        extras = ""
+        if self.extras:
+            extras = ", extras=[" + ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.extras
+            ) + "]"
+        return (
+            "table_chunk base=0x"
+            f"{self.base_operand:04X} key=0x{self.key_operand:04X} "
+            f"value=0x{self.value_operand:04X}{extras}"
+        )
+
+
+@dataclass(frozen=True)
+class IRAsciiBlock(IRNode):
+    """Aggregate consecutive ASCII chunks finalised by helper calls."""
+
+    data: bytes
+    helper_operand: int
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        printable = []
+        for byte in self.data:
+            if 0x20 <= byte <= 0x7E:
+                printable.append(chr(byte))
+            elif byte in {0x09, 0x0A, 0x0D}:
+                printable.append({0x09: "\t", 0x0A: "\n", 0x0D: "\r"}[byte])
+            else:
+                printable.append(f"\\x{byte:02x}")
+        text = "".join(printable)
+        note = f"ascii_block({text}) helper=0x{self.helper_operand:04X}"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
+class IRCheckFlag(IRNode):
+    """Branch that explicitly checks a VM flag constant."""
+
+    flag: int
+    then_target: int
+    else_target: int
+
+    def describe(self) -> str:
+        name = f"FLAG_{self.flag:04X}"
+        return (
+            f"check_flag {name} then=0x{self.then_target:04X} "
+            f"else=0x{self.else_target:04X}"
+        )
+
+
+@dataclass(frozen=True)
 class IRBuildArray(IRNode):
     """Aggregate literal values into a positional container."""
 
@@ -312,6 +433,13 @@ __all__ = [
     "IRBlock",
     "IRCall",
     "IRReturn",
+    "IRLiteralBlock",
+    "IRAsciiPrologue",
+    "IRCallArgPrep",
+    "IRTailcallPrep",
+    "IRTableChunk",
+    "IRAsciiBlock",
+    "IRCheckFlag",
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",

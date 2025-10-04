@@ -3,7 +3,7 @@ from pathlib import Path
 
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
-from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir import IRAsciiBlock, IRCheckFlag, IRLiteralBlock, IRTextRenderer
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -60,6 +60,12 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+        },
+        "call_helpers": {
+            "opcodes": ["0x10:0x00"],
+            "name": "call_helpers",
+            "category": "call_helpers",
+            "stack_delta": -1,
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -136,3 +142,52 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+
+def test_literal_block_collapses_to_node(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x6704),
+        build_word(4, 0x00, 0x00, 0x0067),
+        build_word(8, 0x00, 0x00, 0x0400),
+        build_word(12, 0x00, 0x00, 0x6704),
+        build_word(16, 0x00, 0x00, 0x0067),
+        build_word(20, 0x00, 0x00, 0x0400),
+        build_word(24, 0x04, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("literal_block"), [segment])
+    program = IRNormalizer(knowledge).normalise_container(container)
+    nodes = [node for seg in program.segments for block in seg.blocks for node in block.nodes]
+    assert any(isinstance(node, IRLiteralBlock) for node in nodes)
+
+
+def test_ascii_block_helper_collapse(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x41, 0x42, 0x4344),
+        build_word(4, 0x45, 0x46, 0x4748),
+        build_word(8, 0x10, 0x00, 0xF172),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("ascii_block"), [segment])
+    program = IRNormalizer(knowledge).normalise_container(container)
+    nodes = [node for seg in program.segments for block in seg.blocks for node in block.nodes]
+    assert any(isinstance(node, IRAsciiBlock) for node in nodes)
+
+
+def test_flag_branch_becomes_check_flag(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0266),
+        build_word(4, 0x23, 0x00, 0x0008),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("flag_branch"), [segment])
+    program = IRNormalizer(knowledge).normalise_container(container)
+    nodes = [node for seg in program.segments for block in seg.blocks for node in block.nodes]
+    assert any(isinstance(node, IRCheckFlag) for node in nodes)
