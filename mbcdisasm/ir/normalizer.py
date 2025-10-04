@@ -59,6 +59,24 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
+_CONDITION_DATA_NODES = (
+    IRLiteral,
+    IRBuildArray,
+    IRBuildMap,
+    IRBuildTuple,
+    IRLiteralBlock,
+)
+
+
+_CONDITION_FALLBACK_KINDS = {
+    InstructionKind.TEST,
+    InstructionKind.ARITHMETIC,
+    InstructionKind.LOGICAL,
+    InstructionKind.BITWISE,
+    InstructionKind.CALL,
+}
+
+
 @dataclass(frozen=True)
 class RawInstruction:
     """Wrapper that couples a profile with stack tracking details."""
@@ -1156,23 +1174,37 @@ class IRNormalizer:
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
+                kind = candidate.profile.kind
+                if kind in _CONDITION_FALLBACK_KINDS:
+                    return self._describe_value(candidate)
                 if candidate.pushes_value():
                     if skip_literals and candidate.mnemonic == "push_literal":
+                        scan -= 1
+                        continue
+                    if candidate.mnemonic == "push_literal":
                         scan -= 1
                         continue
                     return self._describe_value(candidate)
                 if skip_literals:
                     return self._describe_value(candidate)
+            if isinstance(candidate, IRStackDuplicate):
+                scan -= 1
+                continue
+            if isinstance(candidate, _CONDITION_DATA_NODES):
+                scan -= 1
+                continue
             if isinstance(candidate, IRLiteral) and skip_literals:
                 scan -= 1
                 continue
             if isinstance(candidate, IRLiteralChunk) and skip_literals:
                 scan -= 1
                 continue
-            if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
             if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+                description = getattr(candidate, "describe", lambda: "expr()")()
+                if description.startswith("lit(") or description.startswith("tuple("):
+                    scan -= 1
+                    continue
+                return description
             scan -= 1
         return "stack_top"
 
