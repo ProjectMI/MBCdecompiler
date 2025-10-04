@@ -12,7 +12,9 @@ from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
     IRAsciiFinalize,
+    IRAsciiHeader,
     IRAsciiPreamble,
+    IRAsciiWrapperCall,
     IRBlock,
     IRBuildArray,
     IRBuildMap,
@@ -20,6 +22,7 @@ from .model import (
     IRCall,
     IRCallPreparation,
     IRFlagCheck,
+    IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
@@ -34,6 +37,7 @@ from .model import (
     IRStackDuplicate,
     IRStackDrop,
     IRTablePatch,
+    IRTailcallAscii,
     IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
@@ -246,6 +250,9 @@ class IRNormalizer:
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
+        self._pass_ascii_headers(items)
+        self._pass_ascii_wrappers(items)
+        self._pass_function_prologues(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_indirect_access(items, metrics)
@@ -553,7 +560,11 @@ class IRNormalizer:
             elif len(literals) == len(reducers) + 1:
                 replacement = IRBuildArray(elements=tuple(literals))
             else:
-                replacement = IRBuildTuple(elements=tuple(literals))
+                parsed_values = self._parse_literal_list(literals)
+                if parsed_values:
+                    replacement = self._build_literal_block(parsed_values, reducers)
+                else:
+                    replacement = IRBuildTuple(elements=tuple(literals))
 
             metrics.aggregates += 1
             metrics.reduce_replaced += len(reducers)
@@ -570,18 +581,22 @@ class IRNormalizer:
             if isinstance(item, IRBuildTuple):
                 values = self._parse_literal_list(item.elements)
                 if values and self._is_literal_block(values):
-                    triplets = tuple(
-                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
+                    node = IRLiteralBlock(
+                        kind="marker_triplet",
+                        values=values,
+                        group_size=3,
                     )
-                    items.replace_slice(index, index + 1, [IRLiteralBlock(triplets=triplets)])
+                    items.replace_slice(index, index + 1, [node])
                     continue
             if isinstance(item, IRLiteral):
                 values, end = self._collect_literal_block_literals(items, index)
                 if values:
-                    triplets = tuple(
-                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
+                    node = IRLiteralBlock(
+                        kind="marker_triplet",
+                        values=values,
+                        group_size=3,
                     )
-                    items.replace_slice(index, end, [IRLiteralBlock(triplets=triplets)])
+                    items.replace_slice(index, end, [node])
                     continue
             index += 1
 
@@ -726,6 +741,132 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [node])
             index += 1
 
+    def _pass_ascii_headers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRLiteralChunk):
+                index += 1
+                continue
+
+            start = index
+            chunks: List[IRLiteralChunk] = []
+            while index < len(items) and isinstance(items[index], IRLiteralChunk):
+                chunks.append(items[index])
+                index += 1
+
+            if len(chunks) >= 2:
+                data = b"".join(chunk.data for chunk in chunks)
+                summary = self._render_ascii_summary(data)
+                node = IRAsciiHeader(data=data, chunk_count=len(chunks), summary=summary)
+                items.replace_slice(start, start + len(chunks), [node])
+                index = start + 1
+                continue
+
+            index = start + len(chunks)
+
+    def _pass_ascii_wrappers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRAsciiPreamble):
+                index += 1
+                continue
+
+            scan = index + 1
+            ascii_nodes: List[IRNode] = []
+            prep_steps: List[Tuple[str, int]] = []
+            call_node: Optional[IRCall] = None
+            finalize: Optional[IRAsciiFinalize] = None
+
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, (IRLiteralChunk, IRAsciiHeader)):
+                    ascii_nodes.append(candidate)
+                    scan += 1
+                    continue
+                if isinstance(candidate, IRCallPreparation):
+                    prep_steps.extend(candidate.steps)
+                    scan += 1
+                    continue
+                if isinstance(candidate, IRCall):
+                    call_node = candidate
+                    scan += 1
+                    continue
+                if isinstance(candidate, IRAsciiFinalize):
+                    finalize = candidate
+                    scan += 1
+                    break
+                if isinstance(candidate, RawInstruction):
+                    break
+                else:
+                    break
+
+            if call_node and finalize:
+                chunk_count = self._count_ascii_chunks(ascii_nodes)
+                summary = finalize.summary
+                if (not summary or summary == "ascii") and ascii_nodes:
+                    data = self._gather_ascii_bytes(ascii_nodes)
+                    summary = self._render_ascii_summary(data)
+                if not summary and ascii_nodes:
+                    summary = self._render_ascii_summary(self._gather_ascii_bytes(ascii_nodes))
+                if not summary and not ascii_nodes:
+                    summary = "ascii"
+                preamble = (
+                    item.loader_operand,
+                    item.mode_operand,
+                    item.shuffle_operand,
+                )
+                steps = tuple(prep_steps)
+                if call_node.tail:
+                    node: IRNode = IRTailcallAscii(
+                        target=call_node.target,
+                        helper=finalize.helper,
+                        summary=summary,
+                        chunk_count=chunk_count,
+                        preamble=preamble,
+                        preparation=steps,
+                    )
+                else:
+                    node = IRAsciiWrapperCall(
+                        target=call_node.target,
+                        helper=finalize.helper,
+                        summary=summary,
+                        chunk_count=chunk_count,
+                        preamble=preamble,
+                        preparation=steps,
+                    )
+                items.replace_slice(index, scan, [node])
+                continue
+
+            index += 1
+
+    def _pass_function_prologues(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items) - 1:
+            first = items[index]
+            second = items[index + 1]
+            if isinstance(first, IRTestSetBranch) and isinstance(
+                second, (IRAsciiWrapperCall, IRTailcallAscii)
+            ):
+                node = IRFunctionPrologue(
+                    var=first.var,
+                    expr=first.expr,
+                    then_target=first.then_target,
+                    else_target=first.else_target,
+                    call_target=second.target,
+                    helper=second.helper,
+                    summary=second.summary,
+                    tail=isinstance(second, IRTailcallAscii),
+                    preamble=second.preamble,
+                    preparation=second.preparation,
+                    chunk_count=second.chunk_count,
+                )
+                items.replace_slice(index, index + 2, [node])
+                continue
+
+            index += 1
+
     def _pass_flag_checks(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -779,6 +920,82 @@ class IRNormalizer:
             except ValueError:
                 return None
         return None
+
+    def _build_literal_block(
+        self, values: Sequence[int], reducers: Sequence[RawInstruction]
+    ) -> IRLiteralBlock:
+        reducer_names = tuple(reducer.mnemonic for reducer in reducers)
+        if reducer_names:
+            if len(set(reducer_names)) == 1:
+                kind = reducer_names[0]
+            else:
+                kind = "mixed_reduce"
+        else:
+            kind = "literal_chain"
+        group_size = self._infer_literal_block_group_size(reducer_names, values)
+        return IRLiteralBlock(
+            kind=kind,
+            values=tuple(values),
+            reducers=reducer_names,
+            group_size=group_size,
+        )
+
+    def _infer_literal_block_group_size(
+        self, reducer_names: Sequence[str], values: Sequence[int]
+    ) -> Optional[int]:
+        if not reducer_names:
+            return None
+        primary = reducer_names[0]
+        lowered = primary.lower()
+        if "pair" in lowered:
+            return 2
+        if "triple" in lowered or "triplet" in lowered:
+            return 3
+        count = len(reducer_names)
+        if count and len(values) % count == 0:
+            size = len(values) // count
+            if 1 <= size <= 8:
+                return size
+        return None
+
+    @staticmethod
+    def _count_ascii_chunks(nodes: Sequence[IRNode]) -> int:
+        total = 0
+        for node in nodes:
+            if isinstance(node, IRLiteralChunk):
+                total += 1
+            elif isinstance(node, IRAsciiHeader):
+                total += node.chunk_count
+        return total
+
+    @staticmethod
+    def _gather_ascii_bytes(nodes: Sequence[IRNode]) -> bytes:
+        data = bytearray()
+        for node in nodes:
+            if isinstance(node, IRLiteralChunk):
+                data.extend(node.data)
+            elif isinstance(node, IRAsciiHeader):
+                data.extend(node.data)
+        return bytes(data)
+
+    @staticmethod
+    def _render_ascii_summary(data: bytes) -> str:
+        if not data:
+            return "ascii"
+        printable: List[str] = []
+        for byte in data:
+            if 0x20 <= byte <= 0x7E:
+                printable.append(chr(byte))
+            elif byte == 0x09:
+                printable.append("\\t")
+            elif byte == 0x0A:
+                printable.append("\\n")
+            elif byte == 0x0D:
+                printable.append("\\r")
+            else:
+                printable.append(f"\\x{byte:02x}")
+        text = "".join(printable)
+        return f"ascii({text})" if text else "ascii"
 
     def _collect_literal_block_literals(
         self, items: _ItemList, start: int

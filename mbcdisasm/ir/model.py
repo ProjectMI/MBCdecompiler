@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class MemSpace(Enum):
@@ -135,15 +135,22 @@ class IRBuildTuple(IRNode):
 
 @dataclass(frozen=True)
 class IRLiteralBlock(IRNode):
-    """Canonical representation of the ubiquitous literal prefix blocks."""
+    """Structured representation of recurring literal/reduce sequences."""
 
-    triplets: Tuple[Tuple[int, int, int], ...]
+    kind: str
+    values: Tuple[int, ...]
+    reducers: Tuple[str, ...] = tuple()
+    group_size: Optional[int] = None
 
     def describe(self) -> str:
-        chunks = []
-        for a, b, c in self.triplets:
-            chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        return "literal_block[" + ", ".join(chunks) + "]"
+        rendered = ", ".join(f"0x{value:04X}" for value in self.values)
+        parts = [f"literal_block kind={self.kind}", f"values=[{rendered}]"]
+        if self.group_size:
+            parts.append(f"group={self.group_size}")
+        if self.reducers:
+            reducers = ", ".join(self.reducers)
+            parts.append(f"reducers=[{reducers}]")
+        return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -287,6 +294,124 @@ class IRAsciiFinalize(IRNode):
 
 
 @dataclass(frozen=True)
+class IRAsciiHeader(IRNode):
+    """Aggregated ASCII header constructed from consecutive inline chunks."""
+
+    data: bytes
+    chunk_count: int
+    summary: str
+
+    def describe(self) -> str:
+        return f"ascii_header chunks={self.chunk_count} {self.summary}"
+
+
+@dataclass(frozen=True)
+class IRAsciiWrapperCall(IRNode):
+    """High level node describing helper mediated ASCII wrapper invocations."""
+
+    target: int
+    helper: int
+    summary: str
+    chunk_count: int
+    preamble: Optional[Tuple[int, int, int]] = None
+    preparation: Tuple[Tuple[str, int], ...] = tuple()
+
+    def describe(self) -> str:
+        parts = [
+            f"target=0x{self.target:04X}",
+            f"helper=0x{self.helper:04X}",
+            f"text={self.summary}",
+        ]
+        if self.chunk_count:
+            parts.append(f"chunks={self.chunk_count}")
+        if self.preamble:
+            load, mode, shuffle = self.preamble
+            parts.append(
+                f"preamble=(0x{load:04X},0x{mode:04X},0x{shuffle:04X})"
+            )
+        if self.preparation:
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.preparation
+            )
+            parts.append(f"prep=[{rendered}]")
+        return "ascii_wrapper_call " + " ".join(parts)
+
+
+@dataclass(frozen=True)
+class IRTailcallAscii(IRNode):
+    """Tail call variant of :class:`IRAsciiWrapperCall`."""
+
+    target: int
+    helper: int
+    summary: str
+    chunk_count: int
+    preamble: Optional[Tuple[int, int, int]] = None
+    preparation: Tuple[Tuple[str, int], ...] = tuple()
+
+    def describe(self) -> str:
+        parts = [
+            f"target=0x{self.target:04X}",
+            f"helper=0x{self.helper:04X}",
+            f"text={self.summary}",
+        ]
+        if self.chunk_count:
+            parts.append(f"chunks={self.chunk_count}")
+        if self.preamble:
+            load, mode, shuffle = self.preamble
+            parts.append(
+                f"preamble=(0x{load:04X},0x{mode:04X},0x{shuffle:04X})"
+            )
+        if self.preparation:
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.preparation
+            )
+            parts.append(f"prep=[{rendered}]")
+        return "tailcall_ascii " + " ".join(parts)
+
+
+@dataclass(frozen=True)
+class IRFunctionPrologue(IRNode):
+    """Specialised node that captures the common testset → ASCII wrapper prologue."""
+
+    var: str
+    expr: str
+    then_target: int
+    else_target: int
+    call_target: int
+    helper: int
+    summary: str
+    tail: bool = False
+    preamble: Optional[Tuple[int, int, int]] = None
+    preparation: Tuple[Tuple[str, int], ...] = tuple()
+    chunk_count: int = 0
+
+    def describe(self) -> str:
+        parts = [
+            f"test={self.var}={self.expr}",
+            f"then=0x{self.then_target:04X}",
+            f"else=0x{self.else_target:04X}",
+            f"call=0x{self.call_target:04X}",
+            f"helper=0x{self.helper:04X}",
+            f"text={self.summary}",
+        ]
+        if self.chunk_count:
+            parts.append(f"chunks={self.chunk_count}")
+        if self.preamble:
+            load, mode, shuffle = self.preamble
+            parts.append(
+                f"preamble=(0x{load:04X},0x{mode:04X},0x{shuffle:04X})"
+            )
+        if self.preparation:
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.preparation
+            )
+            parts.append(f"prep=[{rendered}]")
+        if self.tail:
+            parts.append("tailcall")
+        return "function_prologue " + " ".join(parts)
+
+
+@dataclass(frozen=True)
 class IRStackDrop(IRNode):
     """Discard the value currently residing at the top of the VM stack."""
 
@@ -417,6 +542,10 @@ __all__ = [
     "IRTailcallFrame",
     "IRTablePatch",
     "IRAsciiFinalize",
+    "IRAsciiHeader",
+    "IRAsciiWrapperCall",
+    "IRTailcallAscii",
+    "IRFunctionPrologue",
     "IRSlot",
     "IRRaw",
     "MemSpace",
