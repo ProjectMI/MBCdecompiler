@@ -70,6 +70,7 @@ class IRLiteral(IRNode):
     value: int
     mode: int
     source: str
+    source_offset: Optional[int] = None
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
@@ -82,6 +83,7 @@ class IRLiteralChunk(IRNode):
 
     data: bytes
     source: str
+    source_offset: Optional[int] = None
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
@@ -199,12 +201,58 @@ class IRIf(IRNode):
     condition: str
     then_target: int
     else_target: int
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         return (
             f"if cond={self.condition} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+
+
+@dataclass(frozen=True)
+class IRPredicateAssign(IRNode):
+    """Explicit SSA predicate recovered for a conditional branch."""
+
+    name: str
+    operator: str
+    operands: Tuple[str, ...]
+    source_offset: Optional[int] = None
+    synthetic: bool = False
+
+    def describe(self) -> str:
+        args = ", ".join(self.operands)
+        suffix = ""
+        if self.source_offset is not None:
+            suffix += f" @ 0x{self.source_offset:04X}"
+        if self.synthetic:
+            suffix += " synthetic"
+        return f"{self.name} := {self.operator}({args}){suffix}"
+
+
+@dataclass(frozen=True)
+class IRStackValueAssign(IRNode):
+    """Materialised stack value consumed while recovering a predicate."""
+
+    name: str
+    source: str
+    value: str
+    source_offset: Optional[int] = None
+    value_offset: Optional[int] = None
+    synthetic: bool = False
+
+    def describe(self) -> str:
+        suffix = ""
+        if self.source_offset is not None:
+            suffix += f" @ 0x{self.source_offset:04X}"
+        if self.synthetic:
+            suffix += " synthetic"
+        detail = f"{self.name} := pop({self.source})"
+        if self.value:
+            detail += f" ; {self.value}"
+        if self.value_offset is not None:
+            detail += f" from 0x{self.value_offset:04X}"
+        return f"{detail}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -518,4 +566,6 @@ __all__ = [
     "IRRaw",
     "MemSpace",
     "NormalizerMetrics",
+    "IRPredicateAssign",
+    "IRStackValueAssign",
 ]
