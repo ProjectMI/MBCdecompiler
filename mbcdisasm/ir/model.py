@@ -187,6 +187,29 @@ class IRStore(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStackDuplicate(IRNode):
+    """Duplicate the value currently at the top of the VM stack."""
+
+    value: str
+    copies: int = 2
+
+    def describe(self) -> str:
+        if self.copies <= 1:
+            return f"dup {self.value}"
+        return f"dup {self.value} -> copies={self.copies}"
+
+
+@dataclass(frozen=True)
+class IRStackDrop(IRNode):
+    """Discard the value currently residing at the top of the VM stack."""
+
+    value: str
+
+    def describe(self) -> str:
+        return f"drop {self.value}"
+
+
+@dataclass(frozen=True)
 class IRRaw(IRNode):
     """Fallback wrapper for instructions that have not been normalised."""
 
@@ -296,6 +319,8 @@ __all__ = [
     "IRTestSetBranch",
     "IRLoad",
     "IRStore",
+    "IRStackDuplicate",
+    "IRStackDrop",
     "IRLiteral",
     "IRLiteralChunk",
     "IRSlot",
