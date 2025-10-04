@@ -331,14 +331,14 @@ class IRNormalizer:
 
             mnemonic = item.mnemonic
             if mnemonic == "op_02_66":
-                value = self._describe_stack_top(items, index)
+                value = self._describe_stack_top(items, index, metrics)
                 copies = max(1, item.event.depth_after - item.event.depth_before)
                 node = IRStackDuplicate(value=value, copies=copies + 1)
                 items.replace_slice(index, index + 1, [node])
                 continue
 
             if mnemonic == "op_01_66":
-                value = self._describe_stack_top(items, index)
+                value = self._describe_stack_top(items, index, metrics)
                 node = IRStackDrop(value=value)
                 items.replace_slice(index, index + 1, [node])
                 continue
@@ -479,6 +479,25 @@ class IRNormalizer:
         args.reverse()
         start = scan + 1
         return args, start
+
+    def _materialise_call(
+        self,
+        items: _ItemList,
+        index: int,
+        metrics: Optional[NormalizerMetrics] = None,
+    ) -> IRCall:
+        """Replace a tail call at ``index`` with a materialised regular call."""
+
+        node = items[index]
+        assert isinstance(node, IRCall)
+        if not node.tail:
+            return node
+
+        replacement = IRCall(target=node.target, args=node.args, tail=False)
+        items.replace_slice(index, index + 1, [replacement])
+        if metrics is not None and metrics.tail_calls > 0:
+            metrics.tail_calls -= 1
+        return replacement
 
     def _collapse_tail_return(self, items: _ItemList, call_index: int, metrics: NormalizerMetrics) -> None:
         index = call_index + 1
@@ -1068,7 +1087,7 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                expr = self._describe_condition(items, index, metrics, skip_literals=True)
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
@@ -1081,7 +1100,7 @@ class IRNormalizer:
 
             if item.profile.kind is InstructionKind.BRANCH:
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=self._describe_condition(items, index, metrics),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1118,7 +1137,12 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
-    def _describe_stack_top(self, items: _ItemList, index: int) -> str:
+    def _describe_stack_top(
+        self,
+        items: _ItemList,
+        index: int,
+        metrics: Optional[NormalizerMetrics] = None,
+    ) -> str:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -1131,6 +1155,9 @@ class IRNormalizer:
                 return candidate.describe()
             elif isinstance(candidate, IRStackDuplicate):
                 return candidate.value
+            elif isinstance(candidate, IRCall):
+                call = self._materialise_call(items, scan, metrics)
+                return call.describe()
             elif isinstance(candidate, IRNode):
                 describe = getattr(candidate, "describe", None)
                 if callable(describe):
@@ -1151,7 +1178,14 @@ class IRNormalizer:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
-    def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
+    def _describe_condition(
+        self,
+        items: _ItemList,
+        index: int,
+        metrics: Optional[NormalizerMetrics] = None,
+        *,
+        skip_literals: bool = False,
+    ) -> str:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -1171,6 +1205,9 @@ class IRNormalizer:
                 continue
             if isinstance(candidate, IRStackDuplicate):
                 return candidate.value
+            if isinstance(candidate, IRCall):
+                call = self._materialise_call(items, scan, metrics)
+                return call.describe()
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1

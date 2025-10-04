@@ -189,6 +189,22 @@ def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBas
     return container, knowledge
 
 
+def build_tail_condition_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x00, 0x0042),
+        build_word(4, 0x23, 0x00, 0x0008),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    return container, knowledge
+
+
 def test_normalizer_builds_ir(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
@@ -242,6 +258,20 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
+
+
+def test_normalizer_materialises_tail_condition(tmp_path: Path) -> None:
+    container, knowledge = build_tail_condition_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert any(text.startswith("call target") for text in descriptions)
+    assert any(text.startswith("if cond=call target") for text in descriptions)
+    assert all("call tail" not in text for text in descriptions)
+    assert program.metrics.tail_calls == 0
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
