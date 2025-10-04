@@ -47,6 +47,25 @@ from .model import (
 )
 
 
+_LITERAL_NODE_TYPES: Tuple[type, ...] = (
+    IRLiteral,
+    IRLiteralChunk,
+    IRLiteralBlock,
+    IRBuildArray,
+    IRBuildMap,
+    IRBuildTuple,
+)
+
+_LITERAL_TEXT_PREFIXES = (
+    "lit(",
+    "literal_block[",
+    "array([",
+    "tuple([",
+    "map([",
+    "ascii(",
+)
+
+
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
@@ -1010,6 +1029,21 @@ class IRNormalizer:
     def _literal_repr(node: IRLiteral) -> str:
         return node.describe()
 
+    @staticmethod
+    def _is_literal_text(text: str) -> bool:
+        return text.startswith(_LITERAL_TEXT_PREFIXES)
+
+    @staticmethod
+    def _is_literal_instruction(instruction: RawInstruction) -> bool:
+        if instruction.mnemonic == "push_literal":
+            return True
+        kind = instruction.event.kind
+        if kind is InstructionKind.LITERAL:
+            return True
+        if instruction.profile.kind is InstructionKind.LITERAL:
+            return True
+        return False
+
     def _parse_literal_list(self, elements: Sequence[str]) -> Tuple[int, ...]:
         values: List[int] = []
         for text in elements:
@@ -1153,27 +1187,56 @@ class IRNormalizer:
 
     def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1
+        literal_fallback: Optional[str] = None
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
-                    if skip_literals and candidate.mnemonic == "push_literal":
+                    if skip_literals or self._is_literal_instruction(candidate):
+                        if literal_fallback is None:
+                            literal_fallback = self._describe_value(candidate)
                         scan -= 1
                         continue
                     return self._describe_value(candidate)
-                if skip_literals:
+                if candidate.event.kind is InstructionKind.TEST:
                     return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
-                scan -= 1
-                continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
-                scan -= 1
-                continue
+                if skip_literals and self._is_literal_instruction(candidate):
+                    scan -= 1
+                    continue
             if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
+                value = candidate.value
+                if self._is_literal_text(value):
+                    if literal_fallback is None:
+                        literal_fallback = value
+                    scan -= 1
+                    continue
+                return value
+            if isinstance(candidate, _LITERAL_NODE_TYPES):
+                describe = getattr(candidate, "describe", None)
+                text = describe() if callable(describe) else ""
+                if text and self._is_literal_text(text) and literal_fallback is None:
+                    literal_fallback = text
+                if skip_literals:
+                    scan -= 1
+                    continue
+                if text:
+                    return text
+                scan -= 1
+                continue
             if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    text = describe()
+                    if self._is_literal_text(text):
+                        if literal_fallback is None:
+                            literal_fallback = text
+                        scan -= 1
+                        continue
+                    return text
+                return "expr()"
             scan -= 1
+        if literal_fallback is not None:
+            return literal_fallback
         return "stack_top"
 
     @staticmethod

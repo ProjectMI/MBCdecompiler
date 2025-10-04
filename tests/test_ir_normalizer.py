@@ -4,6 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir.model import IRIf
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -77,6 +78,12 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+        },
+        "test_top": {
+            "opcodes": ["0x10:0x00"],
+            "name": "test_top",
+            "category": "test",
+            "stack_pop": 1,
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -266,3 +273,30 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_prefers_test_instructions_for_branch_conditions(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x02, 0x66, 0x0000),
+        build_word(8, 0x10, 0x00, 0x0000),
+        build_word(12, 0x23, 0x00, 0x0010),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    branches = [node for node in block.nodes if isinstance(node, IRIf)]
+    assert branches, "expected a branch in the block"
+    branch = branches[0]
+
+    assert "@0x000008" in branch.condition
+    assert not branch.condition.startswith("lit(")
+    assert "literal_block" not in branch.condition
