@@ -71,6 +71,7 @@ class IRLiteral(IRNode):
     mode: int
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         return f"lit(0x{self.value:04X})"
@@ -83,6 +84,7 @@ class IRLiteralChunk(IRNode):
     data: bytes
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         printable = []
@@ -199,12 +201,51 @@ class IRIf(IRNode):
     condition: str
     then_target: int
     else_target: int
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         return (
             f"if cond={self.condition} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+
+
+@dataclass(frozen=True)
+class IRPredicateAssign(IRNode):
+    """Explicit SSA predicate recovered for a conditional branch."""
+
+    name: str
+    operator: str
+    operands: Tuple[str, ...]
+    source_offset: Optional[int] = None
+    synthetic: bool = False
+
+    def describe(self) -> str:
+        args = ", ".join(self.operands)
+        suffix = ""
+        if self.source_offset is not None:
+            suffix += f" @ 0x{self.source_offset:04X}"
+        if self.synthetic:
+            suffix += " synthetic"
+        return f"{self.name} := {self.operator}({args}){suffix}"
+
+
+@dataclass(frozen=True)
+class IRStackValueAssign(IRNode):
+    """Materialised stack value consumed while recovering a predicate."""
+
+    name: str
+    value: str
+    source_offset: Optional[int] = None
+    synthetic: bool = False
+
+    def describe(self) -> str:
+        suffix = ""
+        if self.source_offset is not None:
+            suffix += f" @ 0x{self.source_offset:04X}"
+        if self.synthetic:
+            suffix += " synthetic"
+        return f"{self.name} := pop({self.value}){suffix}"
 
 
 @dataclass(frozen=True)
@@ -282,6 +323,7 @@ class IRStackDuplicate(IRNode):
 
     value: str
     copies: int = 2
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         if self.copies <= 1:
@@ -518,4 +560,6 @@ __all__ = [
     "IRRaw",
     "MemSpace",
     "NormalizerMetrics",
+    "IRPredicateAssign",
+    "IRStackValueAssign",
 ]
