@@ -681,3 +681,114 @@ def test_signature_detector_matches_indirect_call_dual_literal():
     match = detector.detect(profiles, summary)
     assert match is not None
     assert match.name == "indirect_call_dual_literal"
+
+
+def test_signature_detector_matches_literal_tuple_header():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x00, 0x6704, 0),
+        make_word(0x00, 0x00, 0x0067, 4),
+        make_word(0x00, 0x00, 0x0400, 8),
+        make_word(0x00, 0x00, 0x6704, 12),
+        make_word(0x00, 0x00, 0x0067, 16),
+        make_word(0x00, 0x00, 0x0400, 20),
+        make_word(0x04, 0x00, 0x0000, 24),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "literal_tuple_header"
+
+
+def test_signature_detector_matches_ascii_bootstrap_header():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x72, 0x23, 0x4F00, 0),
+        make_word(0x31, 0x30, 0x2C00, 4),
+        make_word(0x66, 0x20, 0x4B08, 8),
+        InstructionWord(12, int.from_bytes(b"TEXT", "big")),
+        InstructionWord(16, int.from_bytes(b"DATA", "big")),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "ascii_bootstrap_header"
+
+
+def test_signature_detector_matches_call_arg_fanout():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x00, 0x1000, 0),
+        make_word(0x00, 0x00, 0x1001, 4),
+        make_word(0x66, 0x20, 0x4B08, 8),
+        make_word(0x01, 0x08, 0x0000, 12),
+        make_word(0x4B, 0x10, 0x0000, 16),
+        make_word(0x4A, 0x05, 0x0000, 20),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "call_arg_fanout"
+
+
+def test_signature_detector_matches_flag_literal_test():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x00, 0x00, 0x0266, 0),
+        make_word(0x22, 0x10, 0x0004, 4),
+        make_word(0x25, 0x00, 0x0000, 8),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "flag_literal_test"
+
+
+def test_signature_detector_matches_tailcall_frame_setup():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x3D, 0x30, 0x6910, 0),
+        make_word(0x32, 0x29, 0x1000, 4),
+        make_word(0x4B, 0x30, 0x0030, 8),
+        make_word(0xF0, 0x4B, 0x1B00, 12),
+        make_word(0x29, 0x10, 0x0000, 16),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "tailcall_frame_setup"
+
+
+def test_signature_detector_matches_literal_table_patch():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x2C, 0x00, 0x6601, 0),
+        make_word(0x2C, 0x02, 0x6602, 4),
+        make_word(0x2C, 0x03, 0x66F0, 8),
+        make_word(0x66, 0x15, 0x0000, 12),
+        make_word(0x29, 0x00, 0x0000, 16),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "literal_table_patch"
+
+
+def test_signature_detector_matches_ascii_helper_finalize():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        InstructionWord(0, int.from_bytes(b"TEXT", "big")),
+        InstructionWord(4, int.from_bytes(b"DATA", "big")),
+        make_word(0x10, 0x00, 0xF172, 8),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "ascii_helper_finalize"

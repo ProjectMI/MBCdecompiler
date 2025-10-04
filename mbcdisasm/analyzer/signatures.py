@@ -236,6 +236,42 @@ class ScriptHeaderPrologSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class AsciiBootstrapHeaderSignature(SignatureRule):
+    """Match the universal ASCII bootstrap ``72:23``/``31:30``/``66:*`` trio."""
+
+    name = "ascii_bootstrap_header"
+    category = "literal"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 3:
+            return None
+
+        first, second, third = profiles[0], profiles[1], profiles[2]
+        if first.label != "72:23" or first.operand != 0x4F00:
+            return None
+        if second.label != "31:30" or second.operand != 0x2C00:
+            return None
+        if third.kind is not InstructionKind.STACK_COPY:
+            return None
+        if third.operand != 0x4B08:
+            return None
+
+        ascii_tail = sum(1 for profile in profiles[3:] if profile.kind is InstructionKind.ASCII_CHUNK)
+        if ascii_tail == 0:
+            return None
+
+        notes = (
+            "ascii_bootstrap",
+            f"ascii_tail={ascii_tail}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.87, self.base_confidence + 0.05 * min(ascii_tail, 3))
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class LiteralRunSignature(SignatureRule):
     """Match blocks that contain a dense sequence of literal pushes."""
 
@@ -292,6 +328,122 @@ class LiteralRunWithMarkersSignature(SignatureRule):
         )
         confidence = min(0.85, self.base_confidence + 0.04 * (density - 0.6))
         return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class LiteralTupleHeaderSignature(SignatureRule):
+    """Detect the repeating ``6704/0067/0400`` literal tuples at segment starts."""
+
+    name = "literal_tuple_header"
+    category = "literal"
+    base_confidence = 0.64
+    _pattern = (0x6704, 0x0067, 0x0400)
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        minimum_length = len(self._pattern) * 2
+        if len(profiles) < minimum_length:
+            return None
+
+        idx = 0
+        runs = 0
+        while idx + len(self._pattern) <= len(profiles):
+            window = profiles[idx : idx + len(self._pattern)]
+            if all(
+                window[pos].kind in LiteralLike and window[pos].operand == self._pattern[pos]
+                for pos in range(len(self._pattern))
+            ):
+                runs += 1
+                idx += len(self._pattern)
+                continue
+            break
+
+        if runs < 2:
+            return None
+
+        tail = profiles[idx:]
+        reduce_hits = sum(1 for profile in tail if profile.kind is InstructionKind.REDUCE)
+        helper_hits = sum(1 for profile in tail if is_call_helper(profile))
+        if tail:
+            literal_tail = sum(1 for profile in tail if is_literal_like(profile))
+            if not (reduce_hits or helper_hits or literal_tail == len(tail)):
+                return None
+
+        notes = (
+            f"runs={runs}",
+            f"reduce_hits={reduce_hits}",
+            f"helper_hits={helper_hits}",
+            f"stackΔ={stack.change:+d}",
+        )
+
+        confidence = self.base_confidence + 0.04 * (runs - 2)
+        if reduce_hits:
+            confidence += 0.03 * min(reduce_hits, 2)
+        if helper_hits:
+            confidence += 0.02 * min(helper_hits, 2)
+        confidence = min(0.9, confidence)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class LiteralTablePatchSignature(SignatureRule):
+    """Recognise ``2C:`` literal patchers that feed into fanout/return blocks."""
+
+    name = "literal_table_patch"
+    category = "literal"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 5:
+            return None
+
+        for idx in range(len(profiles) - 2):
+            window = profiles[idx : idx + 3]
+            if not all(item.label.startswith("2C:") for item in window):
+                continue
+            if not all((item.operand & 0xFF00) == 0x6600 for item in window):
+                continue
+
+            tail = profiles[idx + 3 :]
+            if not tail:
+                continue
+
+            has_fanout = any(
+                candidate.kind is InstructionKind.STACK_COPY
+                or candidate.mnemonic.lower().startswith("fanout")
+                for candidate in tail[:3]
+            )
+            if not has_fanout:
+                continue
+
+            terminator = next(
+                (
+                    candidate
+                    for candidate in tail
+                    if candidate.kind
+                    in {
+                        InstructionKind.RETURN,
+                        InstructionKind.TERMINATOR,
+                        InstructionKind.CALL,
+                        InstructionKind.TAILCALL,
+                    }
+                    or is_call_helper(candidate)
+                ),
+                None,
+            )
+            if terminator is None:
+                continue
+
+            notes = (
+                f"window_idx={idx}",
+                f"terminator={terminator.label}",
+                f"stackΔ={stack.change:+d}",
+            )
+            confidence = min(0.86, self.base_confidence + 0.04)
+            return SignatureMatch(self.name, self.category, confidence, notes)
+
+        return None
 
 
 class ReduceAsciiPrologSignature(SignatureRule):
@@ -657,6 +809,47 @@ class LiteralZeroInitSignature(SignatureRule):
         )
         confidence = min(0.85, self.base_confidence + 0.04 * (len(tail) - 1))
         return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class FlagLiteralTestSignature(SignatureRule):
+    """Recognise flag checks built around ``0x0166``/``0x0266`` literals."""
+
+    name = "flag_literal_test"
+    category = "control"
+    base_confidence = 0.6
+    _flag_operands = {0x0166, 0x0266}
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        for idx, profile in enumerate(profiles):
+            if not is_literal_like(profile):
+                continue
+            if profile.operand not in self._flag_operands:
+                continue
+
+            tail = profiles[idx + 1 : idx + 4]
+            if not tail:
+                continue
+
+            branch_hits = sum(
+                1 for item in tail if item.kind in {InstructionKind.TEST, InstructionKind.BRANCH}
+            )
+            if branch_hits == 0:
+                continue
+
+            notes = (
+                f"flag=0x{profile.operand:04X}",
+                f"branch_hits={branch_hits}",
+                f"stackΔ={stack.change:+d}",
+            )
+            confidence = min(
+                0.86,
+                self.base_confidence + 0.04 * max(0, branch_hits - 1),
+            )
+            return SignatureMatch(self.name, self.category, confidence, notes)
+
+        return None
 
 
 class MarkerRunSignature(SignatureRule):
@@ -1097,6 +1290,38 @@ class TailcallPostJumpSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class TailcallFrameSetupSignature(SignatureRule):
+    """Recognise the fixed call frame prelude before tailcall dispatch."""
+
+    name = "tailcall_frame_setup"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        tail_idx = next((idx for idx, profile in enumerate(profiles) if is_tailcall(profile)), None)
+        if tail_idx is None or tail_idx < 4:
+            return None
+
+        setup = profiles[tail_idx - 4 : tail_idx]
+        if setup[0].label != "3D:30":
+            return None
+        if setup[1].label != "32:29":
+            return None
+        if not setup[2].label.startswith("4B:"):
+            return None
+        if setup[3].label != "F0:4B":
+            return None
+
+        notes = (
+            f"tail_idx={tail_idx}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.88, self.base_confidence + 0.05)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class TailcallReturnComboSignature(SignatureRule):
     """Detect tailcalls that immediately collapse into a return."""
 
@@ -1520,6 +1745,53 @@ class B4SlotReturnSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class CallArgumentFanoutSignature(SignatureRule):
+    """Collapse the fanout/teardown/``4B`` staging before ``4A:05`` helpers."""
+
+    name = "call_arg_fanout"
+    category = "call"
+    base_confidence = 0.58
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 5:
+            return None
+
+        try:
+            anchor = next(idx for idx, profile in enumerate(profiles) if profile.label == "4A:05")
+        except StopIteration:
+            return None
+
+        if anchor < 3:
+            return None
+
+        prefix = profiles[:anchor]
+        literal_prefix = sum(1 for profile in prefix if is_literal_like(profile))
+        if literal_prefix < 2:
+            return None
+
+        recent = prefix[-6:]
+        has_fanout = any(
+            profile.kind is InstructionKind.STACK_COPY
+            or profile.mnemonic.lower().startswith("fanout")
+            for profile in recent
+        )
+        has_teardown = any(profile.kind is InstructionKind.STACK_TEARDOWN for profile in recent)
+        has_marker = any(profile.label.startswith("4B:") for profile in recent)
+
+        if not (has_fanout and has_teardown and has_marker):
+            return None
+
+        notes = (
+            f"anchor_idx={anchor}",
+            f"literal_prefix={literal_prefix}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(0.85, self.base_confidence + 0.03 * min(literal_prefix, 3))
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class CallprepAsciiDispatchSignature(SignatureRule):
     """Recognise call helpers that dispatch via ASCII payloads."""
 
@@ -1552,6 +1824,50 @@ class CallprepAsciiDispatchSignature(SignatureRule):
             f"stackΔ={stack.change:+d}",
         )
         confidence = min(0.86, self.base_confidence + 0.05 * anchor_hits)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class AsciiHelperFinalizeSignature(SignatureRule):
+    """Recognise ASCII clusters followed by fixed helper finalisers."""
+
+    name = "ascii_helper_finalize"
+    category = "literal"
+    base_confidence = 0.6
+    _helper_operands = {0xF172, 0x7223, 0x3D30}
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 2:
+            return None
+
+        helper_indices = [
+            idx
+            for idx, profile in enumerate(profiles)
+            if is_call_helper(profile) and profile.operand in self._helper_operands
+        ]
+
+        if not helper_indices:
+            return None
+
+        first_helper = helper_indices[0]
+        ascii_before = sum(
+            1 for profile in profiles[:first_helper] if profile.kind is InstructionKind.ASCII_CHUNK
+        )
+        if ascii_before == 0:
+            return None
+
+        notes = (
+            f"ascii_before={ascii_before}",
+            f"helper_hits={len(helper_indices)}",
+            f"stackΔ={stack.change:+d}",
+        )
+        confidence = min(
+            0.87,
+            self.base_confidence
+            + 0.04 * min(ascii_before, 3)
+            + 0.03 * min(len(helper_indices), 2),
+        )
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
@@ -1916,6 +2232,7 @@ class SignatureDetector:
             AsciiControlClusterSignature(),
             HeaderAsciiCtrlSeqSignature(),
             ScriptHeaderPrologSignature(),
+            AsciiBootstrapHeaderSignature(),
             ModeSweepSignature(),
             TableStoreSignature(),
             IndirectFetchSignature(),
@@ -1925,6 +2242,9 @@ class SignatureDetector:
             AsciiReduceMarkerSignature(),
             MarkerFenceReduceSignature(),
             LiteralZeroInitSignature(),
+            FlagLiteralTestSignature(),
+            LiteralTupleHeaderSignature(),
+            LiteralTablePatchSignature(),
             LiteralRunWithMarkersSignature(),
             LiteralMirrorReduceSignature(),
             LiteralReduceChainExSignature(),
@@ -1934,6 +2254,7 @@ class SignatureDetector:
             JumpAsciiTailcallSignature(),
             AsciiIndirectTailcallSignature(),
             TailcallPostJumpSignature(),
+            TailcallFrameSetupSignature(),
             TailcallReturnMarkerSignature(),
             TailcallReturnComboSignature(),
             TailcallReturnIndirectSignature(),
@@ -1944,7 +2265,9 @@ class SignatureDetector:
             PoisonReturnPrologSignature(),
             ReturnAsciiEpilogueSignature(),
             B4SlotReturnSignature(),
+            CallArgumentFanoutSignature(),
             CallprepAsciiDispatchSignature(),
+            AsciiHelperFinalizeSignature(),
             FanoutTeardownExtendedSignature(),
             FanoutTeardownSignature(),
             DoubleTailcallBranchSignature(),
