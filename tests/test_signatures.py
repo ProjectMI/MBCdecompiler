@@ -1,3 +1,4 @@
+import struct
 from pathlib import Path
 
 from mbcdisasm import KnowledgeBase
@@ -31,6 +32,16 @@ def test_ascii_detection_marks_inline_chunk():
     assert profile.mnemonic == "inline_ascii_chunk"
     assert profile.kind is InstructionKind.ASCII_CHUNK
     assert profile.traits.get("heuristic")
+
+
+def test_ascii_detection_accepts_wide_pairs():
+    wide_be = InstructionWord(0, int.from_bytes(b"\x00A\x00B", "big"))
+    wide_le = InstructionWord(4, int.from_bytes(b"A\x00B\x00", "big"))
+    pair_le = InstructionWord(8, int.from_bytes(struct.pack("<HH", 0x4142, 0x4344), "big"))
+
+    assert looks_like_ascii_chunk(wide_be)
+    assert looks_like_ascii_chunk(wide_le)
+    assert looks_like_ascii_chunk(pair_le)
 
 
 def test_signature_detector_matches_ascii_run():

@@ -279,6 +279,10 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.TEST
         if "indirect" in category or "table" in category:
             return InstructionKind.INDIRECT
+        if "call" in category:
+            if "tail" in category:
+                return InstructionKind.TAILCALL
+            return InstructionKind.CALL
         if "tailcall" in category:
             return InstructionKind.TAILCALL
         if "return" in category:
@@ -407,13 +411,26 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     raw = word.raw.to_bytes(4, "big")
     if all(byte == 0 for byte in raw):
         return False
+
     printable = 0
-    for byte in raw:
-        if byte in ASCII_ALLOWED:
+    for pair_start in range(0, 4, 2):
+        pair = raw[pair_start : pair_start + 2]
+        if pair == b"\x00\x00":
+            return False
+
+        seen_ascii = False
+        for byte in pair:
+            if byte == 0:
+                continue
+            if byte not in ASCII_ALLOWED:
+                return False
+            seen_ascii = True
             if 0x20 <= byte <= 0x7E:
                 printable += 1
-            continue
-        return False
+
+        if not seen_ascii:
+            return False
+
     return printable > 0
 
 
