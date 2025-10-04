@@ -26,6 +26,8 @@ from .model import (
     IRSegment,
     IRSlot,
     IRStore,
+    IRStackDuplicate,
+    IRStackDrop,
     IRTestSetBranch,
     IRIf,
     MemSpace,
@@ -228,6 +230,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
         self._pass_branches(items, metrics)
@@ -283,6 +286,37 @@ class IRNormalizer:
                 metrics.literal_chunks += 1
 
             items.replace_slice(index, index + 1, [literal])
+            index += 1
+
+    def _pass_stack_manipulation(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            mnemonic = item.mnemonic
+            if mnemonic == "op_02_66":
+                value = self._describe_stack_top(items, index)
+                copies = max(1, item.event.depth_after - item.event.depth_before)
+                node = IRStackDuplicate(value=value, copies=copies + 1)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            if mnemonic == "op_01_66":
+                value = self._describe_stack_top(items, index)
+                node = IRStackDrop(value=value)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            if mnemonic == "op_03_66":
+                slot = self._classify_slot(item.operand)
+                node = IRLoad(slot=slot)
+                items.replace_slice(index, index + 1, [node])
+                metrics.loads += 1
+                continue
+
             index += 1
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
@@ -354,6 +388,10 @@ class IRNormalizer:
             candidate = items[scan]
             if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
                 args.append(candidate.describe())
+                scan -= 1
+                continue
+            if isinstance(candidate, IRStackDuplicate):
+                args.append(candidate.value)
                 scan -= 1
                 continue
             if isinstance(candidate, RawInstruction):
@@ -590,6 +628,26 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    def _describe_stack_top(self, items: _ItemList, index: int) -> str:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if candidate.pushes_value():
+                    return self._describe_value(candidate)
+            elif isinstance(candidate, IRLiteral):
+                return candidate.describe()
+            elif isinstance(candidate, IRLiteralChunk):
+                return candidate.describe()
+            elif isinstance(candidate, IRStackDuplicate):
+                return candidate.value
+            elif isinstance(candidate, IRNode):
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    return describe()
+            scan -= 1
+        return "stack_top"
+
     def _describe_value(self, instruction: RawInstruction) -> str:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
@@ -621,6 +679,8 @@ class IRNormalizer:
             if isinstance(candidate, IRLiteralChunk) and skip_literals:
                 scan -= 1
                 continue
+            if isinstance(candidate, IRStackDuplicate):
+                return candidate.value
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
