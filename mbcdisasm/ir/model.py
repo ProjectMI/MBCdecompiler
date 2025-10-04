@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class MemSpace(Enum):
@@ -45,6 +45,24 @@ class IRCall(IRNode):
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
         return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+
+
+@dataclass(frozen=True)
+class IRTailcallReturn(IRNode):
+    """Combined view of a tailcall immediately followed by a return."""
+
+    target: int
+    args: Tuple[str, ...]
+    values: Tuple[str, ...]
+    varargs: bool = False
+
+    def describe(self) -> str:
+        args = ", ".join(self.args)
+        returns = ", ".join(self.values)
+        text = f"tailcall_return target=0x{self.target:04X} args=[{args}] returns=[{returns}]"
+        if self.varargs:
+            text += " varargs"
+        return text
 
 
 @dataclass(frozen=True)
@@ -137,13 +155,20 @@ class IRBuildTuple(IRNode):
 class IRLiteralBlock(IRNode):
     """Canonical representation of the ubiquitous literal prefix blocks."""
 
-    triplets: Tuple[Tuple[int, int, int], ...]
+    kind: str
+    groups: Tuple[Tuple[int, ...], ...]
+    trailer: Tuple[int, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        chunks = []
-        for a, b, c in self.triplets:
-            chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        return "literal_block[" + ", ".join(chunks) + "]"
+        rendered_groups = []
+        for group in self.groups:
+            formatted = ", ".join(f"0x{value:04X}" for value in group)
+            rendered_groups.append(f"({formatted})")
+        text = f"literal_block kind={self.kind} groups=[{', '.join(rendered_groups)}]"
+        if self.trailer:
+            tail = ", ".join(f"0x{value:04X}" for value in self.trailer)
+            text += f" trailer=[{tail}]"
+        return text
 
 
 @dataclass(frozen=True)
@@ -174,6 +199,22 @@ class IRTestSetBranch(IRNode):
         return (
             f"testset {self.var}={self.expr} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
+        )
+
+
+@dataclass(frozen=True)
+class IRFunctionPrologue(IRNode):
+    """Canonical Lua-style function entry guard."""
+
+    slot: str
+    guard: str
+    entry_target: int
+    else_target: int
+
+    def describe(self) -> str:
+        return (
+            f"function_prologue slot={self.slot} guard={self.guard} "
+            f"entry=0x{self.entry_target:04X} else=0x{self.else_target:04X}"
         )
 
 
@@ -284,6 +325,44 @@ class IRAsciiFinalize(IRNode):
 
     def describe(self) -> str:
         return f"ascii_finalize helper=0x{self.helper:04X} source={self.summary}"
+
+
+@dataclass(frozen=True)
+class IRAsciiHeader(IRNode):
+    """Represents static ASCII headers found at the start of code segments."""
+
+    text: str
+    trailers: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        rendered = repr(self.text)
+        note = f"ascii_header text={rendered}"
+        if self.trailers:
+            extras = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.trailers)
+            note += f" trailers=[{extras}]"
+        return note
+
+
+@dataclass(frozen=True)
+class IRAsciiWrapperCall(IRNode):
+    """Tailored representation of calls guarded by inline ASCII tests."""
+
+    target: int
+    args: Tuple[str, ...]
+    ascii_text: str
+    then_target: Optional[int] = None
+    else_target: Optional[int] = None
+    tail: bool = False
+
+    def describe(self) -> str:
+        prefix = "tailcall_ascii" if self.tail else "ascii_wrapper_call"
+        args = ", ".join(self.args)
+        text = f"{prefix} target=0x{self.target:04X} args=[{args}] ascii={repr(self.ascii_text)}"
+        if self.then_target is not None or self.else_target is not None:
+            then_text = f"0x{self.then_target:04X}" if self.then_target is not None else "None"
+            else_text = f"0x{self.else_target:04X}" if self.else_target is not None else "None"
+            text += f" then={then_text} else={else_text}"
+        return text
 
 
 @dataclass(frozen=True)
@@ -398,6 +477,7 @@ __all__ = [
     "IRSegment",
     "IRBlock",
     "IRCall",
+    "IRTailcallReturn",
     "IRReturn",
     "IRBuildArray",
     "IRBuildMap",
@@ -405,6 +485,7 @@ __all__ = [
     "IRLiteralBlock",
     "IRIf",
     "IRTestSetBranch",
+    "IRFunctionPrologue",
     "IRFlagCheck",
     "IRLoad",
     "IRStore",
@@ -417,6 +498,8 @@ __all__ = [
     "IRTailcallFrame",
     "IRTablePatch",
     "IRAsciiFinalize",
+    "IRAsciiHeader",
+    "IRAsciiWrapperCall",
     "IRSlot",
     "IRRaw",
     "MemSpace",

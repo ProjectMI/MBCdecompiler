@@ -12,7 +12,9 @@ from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
     IRAsciiFinalize,
+    IRAsciiHeader,
     IRAsciiPreamble,
+    IRAsciiWrapperCall,
     IRBlock,
     IRBuildArray,
     IRBuildMap,
@@ -20,6 +22,7 @@ from .model import (
     IRCall,
     IRCallPreparation,
     IRFlagCheck,
+    IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
@@ -35,6 +38,7 @@ from .model import (
     IRStackDrop,
     IRTablePatch,
     IRTailcallFrame,
+    IRTailcallReturn,
     IRTestSetBranch,
     IRIf,
     MemSpace,
@@ -246,8 +250,12 @@ class IRNormalizer:
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
+        self._pass_ascii_headers(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
+        self._pass_ascii_wrapper_calls(items)
+        self._pass_tailcall_return(items)
+        self._pass_function_prologues(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -567,23 +575,33 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
+            values: Tuple[int, ...] = tuple()
+            end = index + 1
             if isinstance(item, IRBuildTuple):
                 values = self._parse_literal_list(item.elements)
-                if values and self._is_literal_block(values):
-                    triplets = tuple(
-                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
-                    )
-                    items.replace_slice(index, index + 1, [IRLiteralBlock(triplets=triplets)])
-                    continue
-            if isinstance(item, IRLiteral):
+            elif isinstance(item, IRLiteral):
                 values, end = self._collect_literal_block_literals(items, index)
-                if values:
-                    triplets = tuple(
-                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
-                    )
-                    items.replace_slice(index, end, [IRLiteralBlock(triplets=triplets)])
+            if not values:
+                index += 1
+                continue
+
+            block = self._build_literal_block(values)
+            if block is None:
+                index += 1
+                continue
+
+            start = index
+            while start > 0:
+                previous = items[start - 1]
+                if isinstance(previous, RawInstruction) and previous.mnemonic.startswith(
+                    "reduce"
+                ):
+                    start -= 1
                     continue
-            index += 1
+                break
+
+            items.replace_slice(start, end, [block])
+            index = start + 1
 
     def _pass_ascii_preamble(self, items: _ItemList) -> None:
         index = 0
@@ -726,6 +744,87 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [node])
             index += 1
 
+    def _pass_ascii_headers(self, items: _ItemList) -> None:
+        if not items:
+            return
+        ascii_chunks: List[IRLiteralChunk] = []
+        index = 0
+        while index < len(items) and isinstance(items[index], IRLiteralChunk):
+            ascii_chunks.append(items[index])
+            index += 1
+
+        if len(ascii_chunks) < 2:
+            return
+
+        trailers: List[Tuple[str, int]] = []
+        scan = index
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                trailers.append((candidate.mnemonic, candidate.operand))
+                scan += 1
+                continue
+            break
+
+        text = "".join(self._chunk_to_text(chunk) for chunk in ascii_chunks)
+        header = IRAsciiHeader(text=text, trailers=tuple(trailers))
+        items.replace_slice(0, scan, [header])
+
+    def _pass_ascii_wrapper_calls(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+
+            ascii_index = index + 1
+            if ascii_index >= len(items):
+                index += 1
+                continue
+            ascii_node = items[ascii_index]
+            if not isinstance(ascii_node, IRLiteralChunk):
+                index += 1
+                continue
+
+            ascii_text = self._chunk_to_text(ascii_node)
+            then_target: Optional[int] = None
+            else_target: Optional[int] = None
+            end = ascii_index + 1
+            if end < len(items):
+                following = items[end]
+                if isinstance(following, IRIf) and following.condition == ascii_node.describe():
+                    then_target = following.then_target
+                    else_target = following.else_target
+                    end += 1
+
+            node = IRAsciiWrapperCall(
+                target=item.target,
+                args=item.args,
+                ascii_text=ascii_text,
+                then_target=then_target,
+                else_target=else_target,
+                tail=item.tail,
+            )
+            items.replace_slice(index, end, [node])
+            index += 1
+
+    def _pass_tailcall_return(self, items: _ItemList) -> None:
+        index = 0
+        while index + 1 < len(items):
+            first = items[index]
+            second = items[index + 1]
+            if isinstance(first, IRCall) and first.tail and isinstance(second, IRReturn):
+                node = IRTailcallReturn(
+                    target=first.target,
+                    args=first.args,
+                    values=second.values,
+                    varargs=second.varargs,
+                )
+                items.replace_slice(index, index + 2, [node])
+                continue
+            index += 1
+
     def _pass_flag_checks(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -742,6 +841,25 @@ class IRNormalizer:
                     index += 1
                     continue
             index += 1
+
+    def _pass_function_prologues(self, items: _ItemList) -> None:
+        if not items:
+            return
+        first = items[0]
+        if not isinstance(first, IRTestSetBranch):
+            return
+        if not first.var.startswith("slot("):
+            return
+        guard = first.expr
+        if "stack" not in guard and not guard.startswith("lit("):
+            return
+        prologue = IRFunctionPrologue(
+            slot=first.var,
+            guard=guard,
+            entry_target=first.then_target,
+            else_target=first.else_target,
+        )
+        items.replace_slice(0, 1, [prologue])
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
         if isinstance(item, IRLiteral):
@@ -761,6 +879,32 @@ class IRNormalizer:
     @staticmethod
     def _literal_repr(node: IRLiteral) -> str:
         return node.describe()
+
+    def _build_literal_block(self, values: Sequence[int]) -> Optional[IRLiteralBlock]:
+        if not values:
+            return None
+
+        groups: List[Tuple[int, int, int]] = []
+        pos = 0
+        while pos + 2 < len(values):
+            chunk = values[pos : pos + 3]
+            normalized = self._normalize_literal_reduce_chunk(chunk)
+            if normalized is None:
+                break
+            groups.append(normalized)
+            pos += 3
+
+        if groups:
+            trailer = tuple(values[pos:])
+            return IRLiteralBlock(kind="reduce_chain", groups=tuple(groups), trailer=trailer)
+
+        if self._is_literal_block(values):
+            triplets = tuple(
+                tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
+            )
+            return IRLiteralBlock(kind="triplets", groups=triplets)
+
+        return None
 
     def _parse_literal_list(self, elements: Sequence[str]) -> Tuple[int, ...]:
         values: List[int] = []
@@ -793,9 +937,24 @@ class IRNormalizer:
                 continue
             break
         sequence = tuple(values)
-        if sequence and self._is_literal_block(sequence):
+        if sequence:
             return sequence, index
         return tuple(), start
+
+    @staticmethod
+    def _normalize_literal_reduce_chunk(chunk: Sequence[int]) -> Optional[Tuple[int, int, int]]:
+        if len(chunk) != 3:
+            return None
+        if 0x6704 not in chunk or 0x0067 not in chunk:
+            return None
+        third_value: Optional[int] = None
+        for value in chunk:
+            if value not in {0x6704, 0x0067}:
+                third_value = value
+                break
+        if third_value is None or third_value not in {0x0400, 0x0110}:
+            return None
+        return (0x6704, 0x0067, third_value)
 
     @staticmethod
     def _is_literal_block(values: Sequence[int]) -> bool:
@@ -805,9 +964,8 @@ class IRNormalizer:
             chunk = values[pos : pos + 3]
             if len(chunk) < 3:
                 return False
-            if chunk[0] != 0x6704 or chunk[1] != 0x0067:
-                return False
-            if chunk[2] not in {0x0400, 0x0110}:
+            normalized = IRNormalizer._normalize_literal_reduce_chunk(chunk)
+            if normalized is None:
                 return False
         return True
 
@@ -870,6 +1028,22 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _chunk_to_text(chunk: IRLiteralChunk) -> str:
+        characters: List[str] = []
+        for byte in chunk.data:
+            if 0x20 <= byte <= 0x7E:
+                characters.append(chr(byte))
+            elif byte == 0x09:
+                characters.append("\t")
+            elif byte == 0x0A:
+                characters.append("\n")
+            elif byte == 0x0D:
+                characters.append("\r")
+            else:
+                characters.append(f"\\x{byte:02x}")
+        return "".join(characters)
+
     def _describe_stack_top(self, items: _ItemList, index: int) -> str:
         scan = index - 1
         while scan >= 0:
