@@ -40,11 +40,13 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    result: str | None = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
-        return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        prefix = f"{self.result} = " if self.result else ""
+        return f"{prefix}call{suffix} target=0x{self.target:04X} args=[{args}]"
 
 
 @dataclass(frozen=True)

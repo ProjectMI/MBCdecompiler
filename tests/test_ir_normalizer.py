@@ -3,7 +3,7 @@ from pathlib import Path
 
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
-from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir import IRCall, IRIf, IRTextRenderer
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -30,6 +30,12 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "reduce_pair",
             "category": "reduce",
             "stack_delta": -1,
+        },
+        "call_dispatch": {
+            "opcodes": ["0x28:0x00"],
+            "name": "call_dispatch",
+            "category": "call_dispatch",
+            "control_flow": "call",
         },
         "tailcall_dispatch": {
             "opcodes": ["0x29:0x00"],
@@ -88,14 +94,31 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
         build_word(32, 0x01, 0x00, 0x0000),
     ]
 
+    seg2_words = [
+        build_word(0, 0x28, 0x00, 0x0200),
+        build_word(4, 0x23, 0x00, 0x0010),
+        build_word(8, 0x00, 0x00, 0x0006),
+        build_word(12, 0x41, 0x42, 0x4344),
+        build_word(16, 0x23, 0x00, 0x0018),
+    ]
+
     seg0_bytes = encode_instructions(seg0_words)
     seg1_bytes = encode_instructions(seg1_words)
+    seg2_bytes = encode_instructions(seg2_words)
 
     segments = [
         Segment(SegmentDescriptor(0, 0, len(seg0_bytes)), seg0_bytes),
         Segment(
             SegmentDescriptor(1, len(seg0_bytes), len(seg0_bytes) + len(seg1_bytes)),
             seg1_bytes,
+        ),
+        Segment(
+            SegmentDescriptor(
+                2,
+                len(seg0_bytes) + len(seg1_bytes),
+                len(seg0_bytes) + len(seg1_bytes) + len(seg2_bytes),
+            ),
+            seg2_bytes,
         ),
     ]
 
@@ -108,14 +131,14 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
 
-    assert program.metrics.calls == 1
+    assert program.metrics.calls == 2
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
-    assert program.metrics.literals == 5
-    assert program.metrics.literal_chunks == 0
+    assert program.metrics.literals == 6
+    assert program.metrics.literal_chunks == 1
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches == 1
-    assert program.metrics.if_branches == 1
+    assert program.metrics.if_branches == 3
     assert program.metrics.loads == 1
     assert program.metrics.stores == 1
     assert program.metrics.reduce_replaced == 1
@@ -136,3 +159,30 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+
+def test_branch_condition_with_call_and_ascii(tmp_path: Path) -> None:
+    container, knowledge = build_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container, segment_indices=[2])
+
+    segment = program.segments[0]
+    blocks = segment.blocks
+
+    call_nodes = [
+        node
+        for block in blocks
+        for node in block.nodes
+        if isinstance(node, IRCall)
+    ]
+    assert call_nodes and all(not call.tail for call in call_nodes)
+    assert any(call.result for call in call_nodes)
+
+    branch_conditions = [
+        node.condition
+        for block in blocks
+        for node in block.nodes
+        if isinstance(node, IRIf)
+    ]
+    assert any(cond.startswith("t") for cond in branch_conditions)
+    assert all(not cond.startswith("ascii(") for cond in branch_conditions)

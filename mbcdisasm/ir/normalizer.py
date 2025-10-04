@@ -109,6 +109,7 @@ class IRNormalizer:
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
+        self._temp_counter = 0
 
     # ------------------------------------------------------------------
     # public entry points
@@ -225,6 +226,7 @@ class IRNormalizer:
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
         items = _ItemList(block.instructions)
+        self._temp_counter = 0
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
@@ -553,7 +555,7 @@ class IRNormalizer:
 
             if item.profile.kind is InstructionKind.BRANCH:
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=self._branch_condition(items, index),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -618,13 +620,58 @@ class IRNormalizer:
             if isinstance(candidate, IRLiteral) and skip_literals:
                 scan -= 1
                 continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
+            if isinstance(candidate, IRLiteralChunk):
                 scan -= 1
                 continue
+            if isinstance(candidate, IRCall) and candidate.result:
+                return candidate.result
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
+
+    def _branch_condition(self, items: _ItemList, index: int) -> str:
+        call_index = self._preceding_call_index(items, index)
+        if call_index is not None:
+            call = items[call_index]
+            assert isinstance(call, IRCall)
+            if not call.tail:
+                result = call.result
+                if result is None:
+                    result = self._fresh_temp()
+                    updated = IRCall(
+                        target=call.target,
+                        args=call.args,
+                        tail=call.tail,
+                        result=result,
+                    )
+                    items.replace_slice(call_index, call_index + 1, [updated])
+                return result
+        return self._describe_condition(items, index)
+
+    def _preceding_call_index(self, items: _ItemList, index: int) -> Optional[int]:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if self._is_annotation_only(candidate):
+                    scan -= 1
+                    continue
+                break
+            if isinstance(candidate, IRLiteralChunk):
+                scan -= 1
+                continue
+            if isinstance(candidate, IRCall):
+                return scan
+            if isinstance(candidate, IRNode):
+                break
+            scan -= 1
+        return None
+
+    def _fresh_temp(self) -> str:
+        name = f"t{self._temp_counter}"
+        self._temp_counter += 1
+        return name
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
