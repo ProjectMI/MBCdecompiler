@@ -1068,7 +1068,9 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                expr = self._describe_condition(
+                    items, index, skip_literals=True, metrics=metrics
+                )
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
@@ -1081,7 +1083,7 @@ class IRNormalizer:
 
             if item.profile.kind is InstructionKind.BRANCH:
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=self._describe_condition(items, index, metrics=metrics),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1151,7 +1153,14 @@ class IRNormalizer:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
-    def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
+    def _describe_condition(
+        self,
+        items: _ItemList,
+        index: int,
+        *,
+        skip_literals: bool = False,
+        metrics: Optional[NormalizerMetrics] = None,
+    ) -> str:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -1163,6 +1172,16 @@ class IRNormalizer:
                     return self._describe_value(candidate)
                 if skip_literals:
                     return self._describe_value(candidate)
+            if isinstance(candidate, IRCall):
+                if candidate.tail:
+                    replacement = IRCall(
+                        target=candidate.target, args=candidate.args, tail=False
+                    )
+                    items.replace_slice(scan, scan + 1, [replacement])
+                    if metrics is not None and metrics.tail_calls > 0:
+                        metrics.tail_calls -= 1
+                    candidate = replacement
+                return candidate.describe()
             if isinstance(candidate, IRLiteral) and skip_literals:
                 scan -= 1
                 continue
