@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class MemSpace(Enum):
@@ -135,15 +135,61 @@ class IRBuildTuple(IRNode):
 
 @dataclass(frozen=True)
 class IRLiteralBlock(IRNode):
-    """Canonical representation of the ubiquitous literal prefix blocks."""
+    """Canonical representation of literal marker chains."""
 
     triplets: Tuple[Tuple[int, int, int], ...]
+    reducer: Optional[str] = None
+    reducer_operand: Optional[int] = None
+    tail: Tuple[int, ...] = tuple()
 
     def describe(self) -> str:
         chunks = []
         for a, b, c in self.triplets:
             chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        return "literal_block[" + ", ".join(chunks) + "]"
+        base = "literal_block[" + ", ".join(chunks) + "]"
+        if self.tail:
+            tail_repr = ", ".join(f"0x{value:04X}" for value in self.tail)
+            base += f" tail=[{tail_repr}]"
+        if self.reducer:
+            operand = (
+                f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
+            )
+            base += f" via {self.reducer}{operand}"
+        return base
+
+
+@dataclass(frozen=True)
+class IRAsciiWrapperCall(IRNode):
+    """Tailored representation of helper calls guarded by inline ASCII chunks."""
+
+    target: int
+    args: Tuple[str, ...]
+    ascii_chunks: Tuple[str, ...]
+    tail: bool = False
+
+    def describe(self) -> str:
+        ascii_repr = ", ".join(self.ascii_chunks)
+        prefix = "ascii_wrapper_call tail" if self.tail else "ascii_wrapper_call"
+        return f"{prefix} target=0x{self.target:04X} ascii=[{ascii_repr}] args=[{', '.join(self.args)}]"
+
+
+@dataclass(frozen=True)
+class IRTailcallAscii(IRNode):
+    """Tail calls immediately followed by ASCII driven conditionals."""
+
+    target: int
+    args: Tuple[str, ...]
+    ascii_chunks: Tuple[str, ...]
+    condition: str
+    then_target: int
+    else_target: int
+
+    def describe(self) -> str:
+        ascii_repr = ", ".join(self.ascii_chunks)
+        return (
+            f"tailcall_ascii target=0x{self.target:04X} cond={self.condition} "
+            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X} ascii=[{ascii_repr}]"
+        )
 
 
 @dataclass(frozen=True)
@@ -189,6 +235,22 @@ class IRFlagCheck(IRNode):
         return (
             f"check_flag flag=0x{self.flag:04X} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
+        )
+
+
+@dataclass(frozen=True)
+class IRFunctionPrologue(IRNode):
+    """Grouped representation for the standard Lua-like function prologue."""
+
+    var: str
+    expr: str
+    then_target: int
+    else_target: int
+
+    def describe(self) -> str:
+        return (
+            f"function_prologue {self.var}={self.expr} "
+            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
         )
 
 
@@ -294,6 +356,36 @@ class IRStackDrop(IRNode):
 
     def describe(self) -> str:
         return f"drop {self.value}"
+
+
+@dataclass(frozen=True)
+class IRAsciiHeader(IRNode):
+    """Captures dense ASCII banners embedded at block boundaries."""
+
+    chunks: Tuple[str, ...]
+
+    def describe(self) -> str:
+        rendered = ", ".join(self.chunks)
+        return f"ascii_header[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRCallReturn(IRNode):
+    """Compact representation for immediate call/return templates."""
+
+    target: int
+    args: Tuple[str, ...]
+    tail: bool
+    returns: Tuple[str, ...]
+    varargs: bool = False
+
+    def describe(self) -> str:
+        prefix = "call_return tail" if self.tail else "call_return"
+        args = ", ".join(self.args)
+        ret = "varargs" if self.varargs else ", ".join(self.returns)
+        if self.varargs and self.returns:
+            ret = f"varargs({ret})"
+        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]"
 
 
 @dataclass(frozen=True)
@@ -403,13 +495,18 @@ __all__ = [
     "IRBuildMap",
     "IRBuildTuple",
     "IRLiteralBlock",
+    "IRAsciiWrapperCall",
+    "IRTailcallAscii",
     "IRIf",
     "IRTestSetBranch",
     "IRFlagCheck",
+    "IRFunctionPrologue",
     "IRLoad",
     "IRStore",
     "IRStackDuplicate",
     "IRStackDrop",
+    "IRAsciiHeader",
+    "IRCallReturn",
     "IRLiteral",
     "IRLiteralChunk",
     "IRAsciiPreamble",
