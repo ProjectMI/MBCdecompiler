@@ -33,6 +33,16 @@ def test_ascii_detection_marks_inline_chunk():
     assert profile.traits.get("heuristic")
 
 
+def test_ascii_detection_handles_wide_pairs():
+    word = InstructionWord(0, int.from_bytes(b"A\x00B\x00", "big"))
+    assert looks_like_ascii_chunk(word)
+
+
+def test_ascii_detection_handles_swapped_pairs():
+    word = InstructionWord(0, int.from_bytes(b"\x00C\x00D", "big"))
+    assert looks_like_ascii_chunk(word)
+
+
 def test_signature_detector_matches_ascii_run():
     knowledge = KnowledgeBase({})
     words = [

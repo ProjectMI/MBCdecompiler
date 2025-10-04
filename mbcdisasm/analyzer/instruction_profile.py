@@ -281,6 +281,8 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.INDIRECT
         if "tailcall" in category:
             return InstructionKind.TAILCALL
+        if "call" in category:
+            return InstructionKind.CALL
         if "return" in category:
             return InstructionKind.RETURN
         if "terminator" in category:
@@ -316,9 +318,11 @@ def classify_kind(word: InstructionWord, info: Optional[OpcodeInfo]) -> Instruct
             return InstructionKind.BITWISE
         if "meta" in source or "helper" in source:
             return InstructionKind.META
+        if "call" in source:
+            if "tail" in source:
+                return InstructionKind.TAILCALL
+            return InstructionKind.CALL
 
-    if looks_like_ascii_chunk(word):
-        return InstructionKind.ASCII_CHUNK
     return guess_kind_from_opcode(word)
 
 
@@ -407,14 +411,41 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     raw = word.raw.to_bytes(4, "big")
     if all(byte == 0 for byte in raw):
         return False
+
     printable = 0
+    allowed = 0
     for byte in raw:
         if byte in ASCII_ALLOWED:
+            allowed += 1
             if 0x20 <= byte <= 0x7E:
                 printable += 1
             continue
+        if byte == 0:
+            allowed += 1
+            continue
         return False
-    return printable > 0
+
+    if allowed == 4 and printable == 4:
+        return True
+
+    def _pair_has_text(first: int, second: int) -> bool:
+        combinations = ((first, second), (second, first))
+        for hi, lo in combinations:
+            if hi == 0 and lo == 0:
+                continue
+            if hi == 0 and lo in ASCII_ALLOWED:
+                return True
+            if hi in ASCII_ALLOWED and lo in ASCII_ALLOWED:
+                return True
+        return False
+
+    pairs = ((raw[0], raw[1]), (raw[2], raw[3]))
+    for hi, lo in pairs:
+        if _pair_has_text(hi, lo):
+            continue
+        return False
+
+    return True
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:

@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    looks_like_ascii_chunk,
+)
 from ..analyzer.stack import StackEvent, StackTracker
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
@@ -49,6 +53,7 @@ from .model import (
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
+STABLE_LITERAL_VALUES = {0x0067, 0x0110, 0x0400, 0x6704}
 
 
 @dataclass(frozen=True)
@@ -242,6 +247,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_runs(items)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -368,7 +374,58 @@ class IRNormalizer:
                 annotations=instruction.annotations,
             )
 
+        if instruction.operand in STABLE_LITERAL_VALUES:
+            return IRLiteral(
+                value=instruction.operand,
+                mode=profile.mode,
+                source=profile.mnemonic,
+                annotations=instruction.annotations,
+            )
+
         return None
+
+    def _pass_ascii_runs(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not self._is_ascii_literal_candidate(item):
+                index += 1
+                continue
+
+            start = index
+            replacements: List[IRLiteralChunk] = []
+            while index < len(items):
+                candidate = items[index]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                if not self._is_ascii_literal_candidate(candidate):
+                    break
+                replacements.append(
+                    IRLiteralChunk(
+                        data=candidate.profile.word.raw.to_bytes(4, "big"),
+                        source=candidate.mnemonic,
+                        annotations=candidate.annotations,
+                    )
+                )
+                index += 1
+
+            if replacements:
+                items.replace_slice(start, index, replacements)
+                index = start + len(replacements)
+                continue
+
+            index += 1
+
+    @staticmethod
+    def _is_ascii_literal_candidate(instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if not mnemonic.startswith("op_"):
+            return False
+        return looks_like_ascii_chunk(instruction.profile.word)
 
     def _pass_calls_and_returns(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0

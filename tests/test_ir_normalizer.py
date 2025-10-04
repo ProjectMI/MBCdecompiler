@@ -3,7 +3,7 @@ from pathlib import Path
 
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
-from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir import IRAsciiHeader, IRLiteralChunk, IRLiteral, IRTextRenderer
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -217,6 +217,54 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+    
+
+def test_normalizer_collapses_wide_ascii_sequences(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        InstructionWord(0, int.from_bytes(b"A\x00B\x00", "big")),
+        InstructionWord(4, int.from_bytes(b"\x00C\x00D", "big")),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    ascii_nodes = [
+        node for node in block.nodes if isinstance(node, (IRLiteralChunk, IRAsciiHeader))
+    ]
+    assert ascii_nodes
+    if isinstance(ascii_nodes[0], IRAsciiHeader):
+        rendered = ascii_nodes[0].describe()
+        assert "A\\x00B\\x00" in rendered
+        assert "\\x00C\\x00D" in rendered
+    else:
+        assert len(ascii_nodes) >= 2
+        assert ascii_nodes[0].data == b"A\x00B\x00"
+        assert ascii_nodes[1].data == b"\x00C\x00D"
+
+
+def test_normalizer_promotes_literal_hints(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0xAA, 0x00, 0x6704),
+        build_word(4, 0xBB, 0x00, 0x0400),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    literals = [node for node in block.nodes if isinstance(node, IRLiteral)]
+    assert [literal.value for literal in literals] == [0x6704, 0x0400]
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
