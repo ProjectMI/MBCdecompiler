@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
-from ..analyzer.stack import StackEvent, StackTracker
+from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
@@ -29,6 +29,8 @@ from .model import (
     IRLiteralChunk,
     IRLoad,
     IRNode,
+    IRPredicate,
+    IRPredicateKind,
     IRProgram,
     IRRaw,
     IRReturn,
@@ -268,6 +270,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
+        self._verify_branch_invariants(items)
 
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
@@ -863,15 +866,20 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             if isinstance(item, IRIf):
-                flag = self._flag_literal_value(item.condition)
+                predicate = self._predicate_for_condition(items, index, item.condition)
+                literal_source = predicate.value if predicate is not None else item.condition
+                flag = self._flag_literal_value(literal_source)
                 if flag is not None:
                     node = IRFlagCheck(
                         flag=flag,
                         then_target=item.then_target,
                         else_target=item.else_target,
                     )
-                    items.replace_slice(index, index + 1, [node])
-                    index += 1
+                    start = index
+                    if predicate is not None and index > 0 and items[index - 1] is predicate:
+                        start = index - 1
+                    items.replace_slice(start, index + 1, [node])
+                    index = start
                     continue
             index += 1
 
@@ -918,12 +926,22 @@ class IRNormalizer:
                 continue
 
             branch: Optional[IRIf] = None
-            if scan < len(items) and isinstance(items[scan], IRIf):
-                candidate = items[scan]
+            predicate: Optional[IRPredicate] = None
+            branch_index = scan
+            if branch_index < len(items) and isinstance(items[branch_index], IRPredicate):
+                predicate = items[branch_index]
+                branch_index += 1
+            if branch_index < len(items) and isinstance(items[branch_index], IRIf):
+                candidate = items[branch_index]
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                predicate_value = (
+                    predicate.value if predicate is not None else candidate.condition
+                )
+                if predicate_value in {first_chunk, "stack_top"} and item.tail:
                     branch = candidate
-                    scan += 1
+                    scan = branch_index + 1
+                else:
+                    predicate = None
 
             ascii_tuple = tuple(ascii_chunks)
             if branch is not None:
@@ -1080,12 +1098,19 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                condition = self._describe_condition(items, index)
+                predicate = self._build_branch_predicate(items, index, item, condition)
+                replacements: List[Union[RawInstruction, IRNode]] = []
+                if predicate is not None:
+                    replacements.append(predicate)
+                    condition = predicate.name
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
-                items.replace_slice(index, index + 1, [node])
+                replacements.append(node)
+                items.replace_slice(index, index + 1, replacements)
                 metrics.if_branches += 1
                 continue
 
@@ -1176,6 +1201,83 @@ class IRNormalizer:
             scan -= 1
         return "stack_top"
 
+    def _build_branch_predicate(
+        self,
+        items: _ItemList,
+        index: int,
+        instruction: RawInstruction,
+        condition: str,
+    ) -> Optional[IRPredicate]:
+        name = f"v@0x{instruction.offset:04X}"
+        pop_count = self._branch_pop_count(instruction)
+        source = instruction.mnemonic
+        slot: Optional[str] = None
+
+        kind: Optional[IRPredicateKind] = None
+        value = condition
+
+        if source == "test_branch":
+            kind = IRPredicateKind.STACK_TEST
+            value = self._describe_stack_top(items, index)
+        elif condition.startswith("call"):
+            kind = IRPredicateKind.CALL
+        elif condition.startswith("slot("):
+            kind = IRPredicateKind.SLOT_TEST
+            slot = condition
+        elif condition in {"stack_top"} or condition.startswith(
+            ("lit(", "tuple(", "ascii(", "literal_block", "reduce(", "array(", "map(")
+        ) or condition.startswith("ascii_finalize"):
+            kind = IRPredicateKind.TRUTHY
+            value = self._describe_stack_top(items, index)
+        elif instruction.event.popped_types or pop_count:
+            kind = IRPredicateKind.TRUTHY
+            value = self._describe_stack_top(items, index)
+        else:
+            kind = IRPredicateKind.COMPARISON
+
+        if kind is None:
+            return None
+
+        effective_pop = pop_count
+        if kind in {IRPredicateKind.STACK_TEST, IRPredicateKind.TRUTHY} and effective_pop == 0:
+            effective_pop = 1
+
+        return IRPredicate(
+            name=name,
+            kind=kind,
+            value=value,
+            source=source,
+            pop_count=effective_pop,
+            slot=slot,
+        )
+
+    @staticmethod
+    def _branch_pop_count(instruction: RawInstruction) -> int:
+        event = instruction.event
+        pop_count = max(0, event.depth_before - event.depth_after)
+        if pop_count:
+            return pop_count
+        if event.popped_types:
+            return sum(1 for value in event.popped_types if value is not StackValueType.MARKER)
+        return 0
+
+    def _predicate_for_condition(
+        self, items: _ItemList, index: int, condition: str
+    ) -> Optional[IRPredicate]:
+        if index > 0:
+            candidate = items[index - 1]
+            if isinstance(candidate, IRPredicate) and candidate.name == condition:
+                return candidate
+        scan = index - 2
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRPredicate) and candidate.name == condition:
+                return candidate
+            if isinstance(candidate, IRNode) and not isinstance(candidate, IRPredicate):
+                break
+            scan -= 1
+        return None
+
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
         return instruction.operand
@@ -1183,6 +1285,35 @@ class IRNormalizer:
     @staticmethod
     def _fallthrough_target(instruction: RawInstruction) -> int:
         return instruction.offset + 4
+
+    def _verify_branch_invariants(self, items: _ItemList) -> None:
+        allowed = {
+            IRPredicateKind.STACK_TEST,
+            IRPredicateKind.SLOT_TEST,
+            IRPredicateKind.TRUTHY,
+            IRPredicateKind.CALL,
+            IRPredicateKind.COMPARISON,
+        }
+        predicates: Dict[str, IRPredicate] = {}
+        for index, item in enumerate(items):
+            if isinstance(item, IRPredicate):
+                predicates[item.name] = item
+                continue
+            if isinstance(item, IRIf):
+                condition = item.condition
+                if not condition.startswith("v@"):
+                    raise ValueError(
+                        f"IR invariant violated: branch condition '{condition}' is not a predicate"
+                    )
+                predicate = predicates.get(condition)
+                if predicate is None:
+                    raise ValueError(
+                        f"IR invariant violated: predicate '{condition}' referenced before definition"
+                    )
+                if predicate.kind not in allowed:
+                    raise ValueError(
+                        f"IR invariant violated: predicate '{condition}' has unsupported kind {predicate.kind}"
+                    )
 
     @staticmethod
     def _classify_slot(operand: int) -> IRSlot:

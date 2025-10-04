@@ -207,6 +207,38 @@ class IRIf(IRNode):
         )
 
 
+class IRPredicateKind(Enum):
+    """Origin of a predicate used by :class:`IRIf` nodes."""
+
+    STACK_TEST = "stack_test"
+    SLOT_TEST = "slot_test"
+    TRUTHY = "truthy"
+    CALL = "call"
+    COMPARISON = "compare"
+
+
+@dataclass(frozen=True)
+class IRPredicate(IRNode):
+    """Explicit SSA-style predicate definition."""
+
+    name: str
+    kind: IRPredicateKind
+    value: str
+    source: str
+    pop_count: int = 0
+    slot: Optional[str] = None
+
+    def describe(self) -> str:
+        inner = self.value
+        if self.slot:
+            slot_note = f" slot={self.slot}"
+        else:
+            slot_note = ""
+        text = f"{self.kind.value}({inner})" if inner else self.kind.value
+        pop_note = f" pop={self.pop_count}" if self.pop_count else ""
+        return f"pred {self.name} := {text}{slot_note} source={self.source}{pop_note}"
+
+
 @dataclass(frozen=True)
 class IRTestSetBranch(IRNode):
     """Branch that stores the predicate before testing it."""
@@ -498,6 +530,8 @@ __all__ = [
     "IRAsciiWrapperCall",
     "IRTailcallAscii",
     "IRIf",
+    "IRPredicateKind",
+    "IRPredicate",
     "IRTestSetBranch",
     "IRFlagCheck",
     "IRFunctionPrologue",
