@@ -71,6 +71,7 @@ class IRLiteral(IRNode):
     mode: int
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         return f"lit(0x{self.value:04X})"
@@ -83,6 +84,7 @@ class IRLiteralChunk(IRNode):
     data: bytes
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         printable = []
@@ -233,7 +235,8 @@ class IRStackValueAssign(IRNode):
     """Materialised stack value consumed while recovering a predicate."""
 
     name: str
-    value: str
+    source: str
+    description: Optional[str] = None
     source_offset: Optional[int] = None
     synthetic: bool = False
 
@@ -243,7 +246,10 @@ class IRStackValueAssign(IRNode):
             suffix += f" @ 0x{self.source_offset:04X}"
         if self.synthetic:
             suffix += " synthetic"
-        return f"{self.name} := pop({self.value}){suffix}"
+        detail = ""
+        if self.description and self.description != self.source:
+            detail = f" ; value={self.description}"
+        return f"{self.name} := pop({self.source}){suffix}{detail}"
 
 
 @dataclass(frozen=True)
@@ -321,11 +327,17 @@ class IRStackDuplicate(IRNode):
 
     value: str
     copies: int = 2
+    description: Optional[str] = None
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
+        suffix = ""
+        if self.description and self.description != self.value:
+            suffix = f" ; value={self.description}"
+        base = f"dup {self.value}{suffix}"
         if self.copies <= 1:
-            return f"dup {self.value}"
-        return f"dup {self.value} -> copies={self.copies}"
+            return base
+        return f"{base} -> copies={self.copies}"
 
 
 @dataclass(frozen=True)
@@ -392,9 +404,14 @@ class IRStackDrop(IRNode):
     """Discard the value currently residing at the top of the VM stack."""
 
     value: str
+    description: Optional[str] = None
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
-        return f"drop {self.value}"
+        suffix = ""
+        if self.description and self.description != self.value:
+            suffix = f" ; value={self.description}"
+        return f"drop {self.value}{suffix}"
 
 
 @dataclass(frozen=True)

@@ -97,6 +97,15 @@ class RawBlock:
     instructions: Tuple[RawInstruction, ...]
 
 
+@dataclass(frozen=True)
+class _StackValueRef:
+    """Description of a stack value available to the normaliser."""
+
+    name: str
+    description: str
+    source_offset: Optional[int]
+
+
 class _ItemList:
     """Mutable wrapper around a block during normalisation passes."""
 
@@ -134,6 +143,8 @@ class IRNormalizer:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
         self._stack_name_counters: Dict[int, int] = {}
+        self._value_name_counters: Dict[int, int] = {}
+        self._value_aliases: Dict[int, Tuple[str, Optional[int]]] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -337,15 +348,24 @@ class IRNormalizer:
 
             mnemonic = item.mnemonic
             if mnemonic == "op_02_66":
-                value = self._describe_stack_top(items, index)
+                ref = self._stack_value_reference(items, index)
                 copies = max(1, item.event.depth_after - item.event.depth_before)
-                node = IRStackDuplicate(value=value, copies=copies + 1)
+                node = IRStackDuplicate(
+                    value=ref.name,
+                    copies=copies + 1,
+                    description=ref.description,
+                    source_offset=ref.source_offset,
+                )
                 items.replace_slice(index, index + 1, [node])
                 continue
 
             if mnemonic == "op_01_66":
-                value = self._describe_stack_top(items, index)
-                node = IRStackDrop(value=value)
+                ref = self._stack_value_reference(items, index)
+                node = IRStackDrop(
+                    value=ref.name,
+                    description=ref.description,
+                    source_offset=ref.source_offset,
+                )
                 items.replace_slice(index, index + 1, [node])
                 continue
 
@@ -370,6 +390,7 @@ class IRNormalizer:
                     mode=profile.mode,
                     source=hint,
                     annotations=instruction.annotations,
+                    source_offset=instruction.offset,
                 )
             return None
 
@@ -381,6 +402,7 @@ class IRNormalizer:
                 data=data,
                 source=profile.mnemonic,
                 annotations=instruction.annotations,
+                source_offset=instruction.offset,
             )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
@@ -389,6 +411,7 @@ class IRNormalizer:
                 mode=profile.mode,
                 source=profile.mnemonic,
                 annotations=instruction.annotations,
+                source_offset=instruction.offset,
             )
 
         return None
@@ -471,7 +494,7 @@ class IRNormalizer:
                 scan -= 1
                 continue
             if isinstance(candidate, IRStackDuplicate):
-                args.append(candidate.value)
+                args.append(candidate.description or candidate.value)
                 scan -= 1
                 continue
             if isinstance(candidate, RawInstruction):
@@ -949,7 +972,8 @@ class IRNormalizer:
                             and stack_value_node is not None
                             and operand == stack_value_node.name
                         ):
-                            cond_matches = stack_value_node.value == first_chunk
+                            description = stack_value_node.description or stack_value_node.source
+                            cond_matches = description == first_chunk
                 if cond_matches and item.tail:
                     branch = candidate
                 else:
@@ -1040,6 +1064,7 @@ class IRNormalizer:
                     mode=item.profile.mode,
                     source=item.profile.mnemonic,
                     annotations=item.annotations,
+                    source_offset=item.offset,
                 )
                 items.replace_slice(index, index + 1, [literal])
                 return literal
@@ -1292,11 +1317,12 @@ class IRNormalizer:
             inserted += 1
             return predicate_name, inserted
 
-        value = self._describe_stack_top(items, index)
+        ref = self._stack_value_reference(items, index)
         stack_name = self._make_stack_value_name(instruction.offset)
         stack_node = IRStackValueAssign(
             name=stack_name,
-            value=value,
+            source=ref.name,
+            description=ref.description,
             source_offset=instruction.offset,
             synthetic=False,
         )
@@ -1328,11 +1354,12 @@ class IRNormalizer:
         self, items: _ItemList, index: int, branch: IRIf
     ) -> Tuple[str, int]:
         predicate_name = self._make_predicate_name(branch)
-        value = self._describe_stack_top(items, index)
+        ref = self._stack_value_reference(items, index)
         stack_name = self._make_stack_value_name(branch.source_offset)
         stack_node = IRStackValueAssign(
             name=stack_name,
-            value=value,
+            source=ref.name,
+            description=ref.description,
             source_offset=branch.source_offset,
             synthetic=True,
         )
@@ -1385,24 +1412,8 @@ class IRNormalizer:
     # description helpers
     # ------------------------------------------------------------------
     def _describe_stack_top(self, items: _ItemList, index: int) -> str:
-        scan = index - 1
-        while scan >= 0:
-            candidate = items[scan]
-            if isinstance(candidate, RawInstruction):
-                if candidate.pushes_value():
-                    return self._describe_value(candidate)
-            elif isinstance(candidate, IRLiteral):
-                return candidate.describe()
-            elif isinstance(candidate, IRLiteralChunk):
-                return candidate.describe()
-            elif isinstance(candidate, IRStackDuplicate):
-                return candidate.value
-            elif isinstance(candidate, IRNode):
-                describe = getattr(candidate, "describe", None)
-                if callable(describe):
-                    return describe()
-            scan -= 1
-        return "stack_top"
+        ref = self._stack_value_reference(items, index)
+        return ref.description
 
     def _describe_value(self, instruction: RawInstruction) -> str:
         mnemonic = instruction.mnemonic
@@ -1416,6 +1427,59 @@ class IRNormalizer:
         if instruction.profile.kind is InstructionKind.LITERAL:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
+
+    def _stack_value_reference(self, items: _ItemList, index: int) -> _StackValueRef:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRStackValueAssign):
+                description = candidate.description or candidate.source
+                return _StackValueRef(candidate.name, description, candidate.source_offset)
+            if isinstance(candidate, IRStackDuplicate):
+                description = candidate.description or candidate.value
+                return _StackValueRef(candidate.value, description, candidate.source_offset)
+            if isinstance(candidate, IRStackDrop):
+                scan -= 1
+                continue
+            if isinstance(candidate, IRPredicateAssign):
+                scan -= 1
+                continue
+            if isinstance(candidate, IRNode):
+                describe = getattr(candidate, "describe", None)
+                text = describe() if callable(describe) else candidate.__class__.__name__
+                name, offset = self._value_name_for_node(candidate)
+                return _StackValueRef(name, text, offset)
+            if isinstance(candidate, RawInstruction) and candidate.pushes_value():
+                text = self._describe_value(candidate)
+                name = self._make_value_name(candidate.offset)
+                return _StackValueRef(name, text, candidate.offset)
+            scan -= 1
+        name = self._make_value_name(None)
+        return _StackValueRef(name, "stack_top", None)
+
+    def _value_name_for_node(self, node: IRNode) -> Tuple[str, Optional[int]]:
+        key = id(node)
+        cached = self._value_aliases.get(key)
+        if cached is not None:
+            return cached
+        offset = getattr(node, "source_offset", None)
+        name = self._make_value_name(offset)
+        result = (name, offset)
+        self._value_aliases[key] = result
+        return result
+
+    def _make_value_name(self, offset: Optional[int]) -> str:
+        if offset is None:
+            key = -1
+            base = "value@unknown"
+        else:
+            key = offset
+            base = f"value@0x{offset:04X}"
+        counter = self._value_name_counters.get(key, 0)
+        self._value_name_counters[key] = counter + 1
+        if counter:
+            return f"{base}#{counter}"
+        return base
 
     def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1
@@ -1436,7 +1500,7 @@ class IRNormalizer:
                 scan -= 1
                 continue
             if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
+                return candidate.description or candidate.value
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
