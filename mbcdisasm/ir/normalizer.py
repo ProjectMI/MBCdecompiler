@@ -41,6 +41,7 @@ from .model import (
     IRTablePatch,
     IRTailcallFrame,
     IRTestSetBranch,
+    IRTruthTest,
     IRIf,
     MemSpace,
     NormalizerMetrics,
@@ -918,12 +919,19 @@ class IRNormalizer:
                 continue
 
             branch: Optional[IRIf] = None
-            if scan < len(items) and isinstance(items[scan], IRIf):
-                candidate = items[scan]
+            truth_test: Optional[IRTruthTest] = None
+            branch_index = scan
+            while branch_index < len(items) and isinstance(items[branch_index], IRTruthTest):
+                truth_test = items[branch_index]
+                branch_index += 1
+
+            if branch_index < len(items) and isinstance(items[branch_index], IRIf):
+                candidate = items[branch_index]
+                predicate_value = truth_test.value if truth_test is not None else candidate.condition
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                if predicate_value in {first_chunk, "stack_top"} and item.tail:
                     branch = candidate
-                    scan += 1
+                    scan = branch_index + 1
 
             ascii_tuple = tuple(ascii_chunks)
             if branch is not None:
@@ -1080,16 +1088,20 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                condition, branch_index = self._prepare_branch_condition(items, index, item)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
-                items.replace_slice(index, index + 1, [node])
+                items.replace_slice(branch_index, branch_index + 1, [node])
                 metrics.if_branches += 1
+                index = branch_index + 1
                 continue
 
             index += 1
+
+        self._verify_branch_conditions(items)
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -1114,6 +1126,63 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _prepare_branch_condition(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> Tuple[str, int]:
+        condition = self._describe_condition(items, index)
+        if self._is_valid_branch_condition(condition):
+            return condition, index
+
+        rewired = self._rewire_existing_predicate(items, index, condition)
+        if rewired is not None:
+            return rewired, index
+
+        value = self._derive_truthy_value(items, index, fallback=condition)
+        name = f"pred@0x{instruction.offset:04X}"
+        test = IRTruthTest(name=name, value=value, source=instruction.describe_source())
+        items.insert(index, test)
+        return name, index + 1
+
+    def _rewire_existing_predicate(
+        self, items: _ItemList, index: int, condition: str
+    ) -> Optional[str]:
+        if condition.startswith("pred@"):
+            return condition
+        # No existing predicate found.
+        return None
+
+    @staticmethod
+    def _is_valid_branch_condition(condition: str) -> bool:
+        if not condition:
+            return False
+        allowed_prefixes = (
+            "pred@",
+            "test(",
+            "compare(",
+            "cmp(",
+            "call ",
+            "call_tail",  # defensive for textual variants
+        )
+        if condition.startswith(allowed_prefixes):
+            return True
+        if condition.startswith("call"):
+            return True
+        if condition.startswith("slot("):
+            return True
+        return False
+
+    def _derive_truthy_value(self, items: _ItemList, index: int, *, fallback: str) -> str:
+        if fallback != "stack_top":
+            return fallback
+        value = self._describe_stack_top(items, index)
+        return value if value else fallback
+
+    def _verify_branch_conditions(self, items: _ItemList) -> None:
+        for node in items:
+            if isinstance(node, IRIf):
+                if not self._is_valid_branch_condition(node.condition):
+                    raise ValueError(f"invalid branch predicate: {node.condition}")
 
     # ------------------------------------------------------------------
     # description helpers

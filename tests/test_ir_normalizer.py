@@ -217,6 +217,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert any(text.startswith("testset") for text in descriptions)
     assert any(text.startswith("load") for text in descriptions)
     assert any(text.startswith("store") for text in descriptions)
+    assert any(text.startswith("pred@") and "truthy" in text for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)

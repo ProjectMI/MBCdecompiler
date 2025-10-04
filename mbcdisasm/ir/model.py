@@ -208,6 +208,20 @@ class IRIf(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTruthTest(IRNode):
+    """Synthetic truthiness test reconstructed for damaged branches."""
+
+    name: str
+    value: str
+    source: str
+    consumes: int = 1
+
+    def describe(self) -> str:
+        suffix = "" if self.consumes == 1 else f" consumes={self.consumes}"
+        return f"{self.name} := truthy({self.value}){suffix}"
+
+
+@dataclass(frozen=True)
 class IRTestSetBranch(IRNode):
     """Branch that stores the predicate before testing it."""
 
@@ -498,6 +512,7 @@ __all__ = [
     "IRAsciiWrapperCall",
     "IRTailcallAscii",
     "IRIf",
+    "IRTruthTest",
     "IRTestSetBranch",
     "IRFlagCheck",
     "IRFunctionPrologue",
