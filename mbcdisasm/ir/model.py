@@ -359,6 +359,17 @@ class IRStackDrop(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStackTeardown(IRNode):
+    """Collapse the dedicated stack teardown helpers into a canonical node."""
+
+    count: int
+    operand: int
+
+    def describe(self) -> str:
+        return f"stack_teardown count={self.count} operand=0x{self.operand:04X}"
+
+
+@dataclass(frozen=True)
 class IRAsciiHeader(IRNode):
     """Captures dense ASCII banners embedded at block boundaries."""
 
@@ -505,6 +516,7 @@ __all__ = [
     "IRStore",
     "IRStackDuplicate",
     "IRStackDrop",
+    "IRStackTeardown",
     "IRAsciiHeader",
     "IRCallReturn",
     "IRLiteral",

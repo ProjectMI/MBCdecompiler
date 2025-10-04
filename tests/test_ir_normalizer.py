@@ -58,6 +58,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "call_dispatch",
             "stack_delta": -1,
         },
+        "call_helpers": {
+            "opcodes": ["0x10:0x00"],
+            "name": "call_helpers",
+            "category": "call_helper",
+        },
         "branch_eq": {
             "opcodes": ["0x23:0x00"],
             "name": "branch_eq",
@@ -77,6 +82,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+        },
+        "op_6C_01": {
+            "opcodes": ["0x6C:0x01"],
+            "name": "op_6C_01",
+            "category": "meta",
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -195,7 +205,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
 
     assert program.metrics.calls == 1
-    assert program.metrics.tail_calls == 1
+    assert program.metrics.tail_calls == 0
     assert program.metrics.returns >= 1
     assert program.metrics.literals == 5
     assert program.metrics.literal_chunks == 0
@@ -214,7 +224,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     ]
     assert any("map" in text for text in descriptions)
     assert any(text.startswith("if cond") for text in descriptions)
-    assert any(text.startswith("testset") for text in descriptions)
+    assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("load") for text in descriptions)
     assert any(text.startswith("store") for text in descriptions)
 
@@ -237,7 +247,7 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     ]
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
-    assert any(text.startswith("tailcall_ascii") for text in descriptions)
+    assert any(text.startswith("if cond=ascii(") for text in descriptions)
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
@@ -266,3 +276,100 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_demotes_tailcall_condition(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x2B, 0x00, 0x0010),
+        build_word(8, 0x23, 0x00, 0x000C),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = IRNormalizer(knowledge).normalise_container(container)
+    descriptions = [
+        getattr(node, "describe", lambda: "")()
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    ]
+
+    assert any(text.startswith("call target=0x0010") for text in descriptions)
+    assert not any(text.startswith("call tail target=0x0010") for text in descriptions)
+    assert any(text.startswith("if cond=call target=0x0010") for text in descriptions)
+
+
+def test_ascii_finalize_ignored_in_conditions(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_ascii_word(4, "TEXT"),
+        build_word(8, 0x10, 0x00, 0xF172),
+        build_word(12, 0x23, 0x00, 0x0008),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = IRNormalizer(knowledge).normalise_container(container)
+    descriptions = [
+        getattr(node, "describe", lambda: "")()
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    ]
+
+    assert any(text.startswith("ascii_finalize") for text in descriptions)
+    assert any(text.startswith("if cond=ascii(") for text in descriptions)
+    assert not any(text.startswith("if cond=ascii_finalize") for text in descriptions)
+
+
+def test_function_prologue_with_helper_prefix(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x6C, 0x01, 0xFC03),
+        build_word(4, 0x00, 0x00, 0x1400),
+        build_word(8, 0x00, 0x00, 0x5E29),
+        build_word(12, 0x10, 0x00, 0xF04B),
+        build_word(16, 0x27, 0x00, 0x306C),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = IRNormalizer(knowledge).normalise_container(container)
+    descriptions = [
+        getattr(node, "describe", lambda: "")()
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    ]
+
+    assert descriptions == [
+        "function_prologue slot(0x306C)=stack_top then=0x306C else=0x0014"
+    ]
+
+
+def test_stack_teardown_nodes_are_canonical(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [build_word(0, 0x01, 0x00, 0x0000)]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = IRNormalizer(knowledge).normalise_container(container)
+    descriptions = [
+        getattr(node, "describe", lambda: "")()
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    ]
+
+    assert descriptions == ["stack_teardown count=1 operand=0x0000"]

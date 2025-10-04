@@ -37,6 +37,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRStackTeardown,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -57,6 +58,9 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0400: "literal_hint",
     0x0110: "literal_hint",
 }
+
+PROLOGUE_HELPERS = {0xF04B, 0xF04D}
+PROLOGUE_PREFIX_MNEMONICS = {"op_6C_01", "op_6D_00"}
 
 
 @dataclass(frozen=True)
@@ -261,6 +265,7 @@ class IRNormalizer:
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
+        self._pass_stack_teardowns(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -406,6 +411,13 @@ class IRNormalizer:
                 index = start
                 if call.tail:
                     self._collapse_tail_return(items, index, metrics)
+                    if self._call_continues_flow(items, index):
+                        items.replace_slice(
+                            index,
+                            index + 1,
+                            [IRCall(target=call.target, args=call.args, tail=False)],
+                        )
+                        metrics.tail_calls -= 1
                 continue
 
             if mnemonic == "return_values":
@@ -499,6 +511,57 @@ class IRNormalizer:
                 items.pop(index)
                 continue
             break
+
+    def _call_continues_flow(self, items: _ItemList, index: int) -> bool:
+        scan = index + 1
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if self._is_annotation_only(candidate):
+                    scan += 1
+                    continue
+                kind = candidate.profile.kind
+                if kind in {InstructionKind.META, InstructionKind.STACK_TEARDOWN}:
+                    scan += 1
+                    continue
+                return True
+            elif isinstance(candidate, IRNode):
+                if isinstance(
+                    candidate,
+                    (IRLiteral, IRLiteralChunk, IRStackDuplicate, IRStackDrop, IRAsciiFinalize, IRStackTeardown),
+                ):
+                    scan += 1
+                    continue
+                return True
+            else:
+                scan += 1
+        return False
+
+    @staticmethod
+    def _is_semantics_free_node(node: IRNode) -> bool:
+        return isinstance(
+            node,
+            (
+                IRAsciiFinalize,
+                IRStackTeardown,
+                IRCallPreparation,
+                IRTailcallFrame,
+                IRTablePatch,
+            ),
+        )
+
+    @staticmethod
+    def _is_prologue_padding(node: IRNode) -> bool:
+        return isinstance(
+            node,
+            (
+                IRAsciiHeader,
+                IRAsciiFinalize,
+                IRLiteral,
+                IRLiteralChunk,
+                IRStackTeardown,
+            ),
+        )
 
     def _resolve_return_signature(self, items: _ItemList, index: int) -> Tuple[int, bool]:
         instruction = items[index]
@@ -858,6 +921,21 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [node])
             index += 1
 
+    def _pass_stack_teardowns(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, RawInstruction) and item.mnemonic.startswith("stack_teardown_"):
+                try:
+                    count = int(item.mnemonic.rsplit("_", 1)[1])
+                except (ValueError, IndexError):
+                    index += 1
+                    continue
+                node = IRStackTeardown(count=count, operand=item.operand)
+                items.replace_slice(index, index + 1, [node])
+                continue
+            index += 1
+
     def _pass_flag_checks(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -880,20 +958,68 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             if isinstance(item, IRTestSetBranch):
-                if index == 0 or all(
-                    isinstance(items[pos], IRAsciiHeader) for pos in range(index)
-                ):
-                    if item.var.startswith("slot("):
+                if item.var.startswith("slot("):
+                    start = self._function_prologue_start(items, index)
+                    if start is not None:
                         node = IRFunctionPrologue(
                             var=item.var,
-                            expr=item.expr,
+                            expr="stack_top",
                             then_target=item.then_target,
                             else_target=item.else_target,
                         )
-                        items.replace_slice(index, index + 1, [node])
-                        index += 1
+                        items.replace_slice(start, index + 1, [node])
+                        index = start + 1
                         continue
             index += 1
+
+    def _function_prologue_start(self, items: _ItemList, index: int) -> Optional[int]:
+        if index == 0:
+            return 0
+
+        helper_found = False
+        start = index
+        scan = index - 1
+
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if candidate.mnemonic == "call_helpers" and candidate.operand in PROLOGUE_HELPERS:
+                    helper_found = True
+                    start = scan
+                    scan -= 1
+                    continue
+                if candidate.mnemonic in PROLOGUE_PREFIX_MNEMONICS:
+                    start = scan
+                    scan -= 1
+                    continue
+                if self._is_annotation_only(candidate):
+                    start = scan
+                    scan -= 1
+                    continue
+                break
+            if isinstance(candidate, IRNode) and self._is_prologue_padding(candidate):
+                start = scan
+                scan -= 1
+                continue
+            break
+
+        if helper_found:
+            return start
+
+        if all(
+            (
+                isinstance(items[pos], IRNode)
+                and self._is_prologue_padding(items[pos])
+            )
+            or (
+                isinstance(items[pos], RawInstruction)
+                and self._is_annotation_only(items[pos])
+            )
+            for pos in range(index)
+        ):
+            return 0
+
+        return None
 
     def _pass_ascii_wrappers(self, items: _ItemList) -> None:
         index = 0
@@ -1132,6 +1258,9 @@ class IRNormalizer:
             elif isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             elif isinstance(candidate, IRNode):
+                if self._is_semantics_free_node(candidate):
+                    scan -= 1
+                    continue
                 describe = getattr(candidate, "describe", None)
                 if callable(describe):
                     return describe()
@@ -1172,6 +1301,9 @@ class IRNormalizer:
             if isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             if isinstance(candidate, IRNode):
+                if self._is_semantics_free_node(candidate):
+                    scan -= 1
+                    continue
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
