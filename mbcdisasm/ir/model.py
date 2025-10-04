@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 class MemSpace(Enum):
@@ -40,11 +40,15 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    result: Optional[str] = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
-        return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        base = f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        if self.result:
+            return f"{self.result} = {base}"
+        return base
 
 
 @dataclass(frozen=True)

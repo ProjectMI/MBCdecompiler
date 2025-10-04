@@ -109,6 +109,7 @@ class IRNormalizer:
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
+        self._temp_counter = 0
 
     # ------------------------------------------------------------------
     # public entry points
@@ -224,6 +225,7 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
+        self._temp_counter = 0
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -615,12 +617,26 @@ class IRNormalizer:
                     return self._describe_value(candidate)
                 if skip_literals:
                     return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
+            if isinstance(candidate, IRLiteral):
+                if skip_literals:
+                    scan -= 1
+                    continue
+                return candidate.describe()
+            if isinstance(candidate, IRLiteralChunk):
                 scan -= 1
                 continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
-                scan -= 1
-                continue
+            if isinstance(candidate, IRCall):
+                result = candidate.result
+                if result is None:
+                    result = self._allocate_temp_name()
+                    updated = IRCall(
+                        target=candidate.target,
+                        args=candidate.args,
+                        tail=candidate.tail,
+                        result=result,
+                    )
+                    items.replace_slice(scan, scan + 1, [updated])
+                return result
             if isinstance(candidate, IRNode):
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
@@ -675,6 +691,11 @@ class IRNormalizer:
     def _format_testset_var(instruction: RawInstruction) -> str:
         operand = instruction.operand
         return f"slot(0x{operand:04X})"
+
+    def _allocate_temp_name(self) -> str:
+        name = f"t{self._temp_counter}"
+        self._temp_counter += 1
+        return name
 
 
 __all__ = ["IRNormalizer", "RawInstruction", "RawBlock"]

@@ -1,16 +1,24 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
-from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.mbc import Segment
+from mbcdisasm.ir.normalizer import IRNormalizer
+from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.mbc import MbcContainer, Segment
 from mbcdisasm.instruction import InstructionWord
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
     raw = (opcode << 24) | (mode << 16) | (operand & 0xFFFF)
     return InstructionWord(offset=offset, raw=raw)
+
+
+def build_ascii_word(offset: int, data: bytes) -> InstructionWord:
+    assert len(data) == 4
+    return InstructionWord(offset=offset, raw=int.from_bytes(data, "big"))
 
 
 def encode_instructions(words: list[InstructionWord]) -> bytes:
@@ -30,6 +38,13 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "reduce_pair",
             "category": "reduce",
             "stack_delta": -1,
+        },
+        "call_dispatch": {
+            "opcodes": ["0x28:0x00"],
+            "name": "call_dispatch",
+            "category": "call_dispatch",
+            "control_flow": "call",
+            "stack_push": 1,
         },
         "tailcall_dispatch": {
             "opcodes": ["0x29:0x00"],
@@ -136,3 +151,26 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+
+def test_branch_condition_prefers_temporaries(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x28, 0x00, 0x0072),
+        build_ascii_word(8, b"H#H#"),
+        build_word(12, 0x23, 0x00, 0x0010),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert descriptions[0].startswith("t0 = call target=0x0072")
+    assert any(desc.startswith("ascii(") for desc in descriptions)
+    assert any(desc.startswith("if cond=t0") for desc in descriptions)
