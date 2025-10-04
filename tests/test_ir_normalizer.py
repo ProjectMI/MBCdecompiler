@@ -3,7 +3,7 @@ from pathlib import Path
 
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
-from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir import IRLiteral, IRLiteralChunk, IRTextRenderer
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -15,6 +15,10 @@ def build_word(offset: int, opcode: int, mode: int, operand: int) -> Instruction
 
 def build_ascii_word(offset: int, text: str) -> InstructionWord:
     data = text.encode("ascii", "replace")[:4].ljust(4, b" ")
+    return InstructionWord(offset=offset, raw=int.from_bytes(data, "big"))
+
+
+def build_bytes_word(offset: int, data: bytes) -> InstructionWord:
     return InstructionWord(offset=offset, raw=int.from_bytes(data, "big"))
 
 
@@ -237,3 +241,50 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
+
+
+def test_normalizer_collapses_ascii_runs(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_bytes_word(0, b"\x00H\x00i"),
+        build_bytes_word(4, b"\x00!\x00 "),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    nodes = [
+        node
+        for block in program.segments[0].blocks
+        for node in block.nodes
+        if isinstance(node, IRLiteralChunk)
+    ]
+
+    assert len(nodes) == 1
+    description = nodes[0].describe()
+    assert description.startswith("ascii(")
+    assert "H" in description and "!" in description
+
+
+def test_literal_override_promotes_constants(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [build_word(0, 0x10, 0x00, 0x3D30)]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    literals = [
+        node
+        for block in program.segments[0].blocks
+        for node in block.nodes
+        if isinstance(node, IRLiteral)
+    ]
+
+    assert literals
+    assert literals[0].value == 0x3D30

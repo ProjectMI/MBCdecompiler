@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import ASCII_ALLOWED, InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
@@ -49,6 +49,13 @@ from .model import (
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
+
+LITERAL_VALUE_OVERRIDES: Dict[int, str] = {
+    0x3D30: "literal_hint:ascii_helper",
+    0x7223: "literal_hint:ascii_helper",
+    0xF172: "literal_hint:ascii_helper",
+    0xEF48: "literal_hint:ascii_helper",
+}
 
 
 @dataclass(frozen=True)
@@ -247,6 +254,7 @@ class IRNormalizer:
         self._pass_aggregates(items, metrics)
         self._pass_literal_blocks(items)
         self._pass_literal_block_reducers(items, metrics)
+        self._pass_ascii_literals(items, metrics)
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_tailcall_frames(items)
@@ -257,6 +265,7 @@ class IRNormalizer:
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
+        self._pass_ascii_runs(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
 
@@ -310,6 +319,86 @@ class IRNormalizer:
                 metrics.literal_chunks += 1
 
             items.replace_slice(index, index + 1, [literal])
+            index += 1
+
+    def _pass_ascii_literals(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRLiteral):
+                index += 1
+                continue
+
+            if item.annotations and any(note.startswith("literal_hint") for note in item.annotations):
+                index += 1
+                continue
+
+            start = index
+            data = bytearray()
+            annotations: List[str] = []
+
+            while index < len(items):
+                candidate = items[index]
+                if not isinstance(candidate, IRLiteral):
+                    break
+                if candidate.annotations and any(
+                    note.startswith("literal_hint") for note in candidate.annotations
+                ):
+                    break
+                ascii_bytes = self._literal_ascii_bytes(candidate)
+                if ascii_bytes is None:
+                    break
+                data.extend(ascii_bytes)
+                if candidate.annotations:
+                    annotations.extend(candidate.annotations)
+                index += 1
+
+            if not data:
+                index = start + 1
+                continue
+
+            count = index - start
+            metrics.literals = max(0, metrics.literals - count)
+            metrics.literal_chunks += 1
+
+            chunk = IRLiteralChunk(
+                data=bytes(data),
+                source="literal_ascii",
+                annotations=tuple(annotations),
+            )
+            items.replace_slice(start, index, [chunk])
+            index = start + 1
+
+    def _pass_ascii_runs(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRLiteralChunk):
+                index += 1
+                continue
+
+            data = bytearray(item.data)
+            annotations: List[str] = list(item.annotations)
+            source = item.source
+            end = index + 1
+
+            while end < len(items):
+                candidate = items[end]
+                if not isinstance(candidate, IRLiteralChunk):
+                    break
+                data.extend(candidate.data)
+                if candidate.annotations:
+                    annotations.extend(candidate.annotations)
+                end += 1
+
+            if end > index + 1:
+                merged = IRLiteralChunk(
+                    data=bytes(data),
+                    source=source,
+                    annotations=tuple(annotations),
+                )
+                items.replace_slice(index, end, [merged])
+
             index += 1
 
     def _pass_stack_manipulation(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
@@ -368,7 +457,39 @@ class IRNormalizer:
                 annotations=instruction.annotations,
             )
 
+        override = self._literal_override(instruction)
+        if override is not None:
+            return override
+
         return None
+
+    def _literal_override(self, instruction: RawInstruction) -> Optional[IRLiteral]:
+        operand = instruction.operand
+        note = LITERAL_VALUE_OVERRIDES.get(operand)
+        if note is None:
+            return None
+
+        annotations = instruction.annotations
+        if note and note not in annotations:
+            annotations = annotations + (note,)
+
+        return IRLiteral(
+            value=operand,
+            mode=instruction.profile.mode,
+            source=instruction.mnemonic,
+            annotations=annotations,
+        )
+
+    def _literal_ascii_bytes(self, literal: IRLiteral) -> Optional[bytes]:
+        candidates = [literal.mode & 0xFF, (literal.value >> 8) & 0xFF, literal.value & 0xFF]
+        ascii_bytes: List[int] = []
+        for byte in candidates:
+            if byte == 0:
+                continue
+            if byte not in ASCII_ALLOWED:
+                return None
+            ascii_bytes.append(byte)
+        return bytes(ascii_bytes) if ascii_bytes else None
 
     def _pass_calls_and_returns(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
