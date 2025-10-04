@@ -1081,7 +1081,7 @@ class IRNormalizer:
 
             if item.profile.kind is InstructionKind.BRANCH:
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=self._describe_condition(items, index, skip_literals=True),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1157,24 +1157,67 @@ class IRNormalizer:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
-                    if skip_literals and candidate.mnemonic == "push_literal":
+                    if skip_literals and self._is_literal_instruction(candidate):
                         scan -= 1
                         continue
-                    return self._describe_value(candidate)
+                    description = self._describe_value(candidate)
+                    if skip_literals and self._is_literal_description(description):
+                        scan -= 1
+                        continue
+                    return description
                 if skip_literals:
-                    return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
-                scan -= 1
-                continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
+                    description = self._describe_value(candidate)
+                    if self._is_literal_description(description):
+                        scan -= 1
+                        continue
+                    return description
+            if skip_literals and self._is_literal_node(candidate):
                 scan -= 1
                 continue
             if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
+                value = candidate.value
+                if skip_literals and self._is_literal_description(value):
+                    scan -= 1
+                    continue
+                return value
             if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+                description = getattr(candidate, "describe", lambda: "expr()")()
+                if skip_literals and self._is_literal_description(description):
+                    scan -= 1
+                    continue
+                return description
             scan -= 1
         return "stack_top"
+
+    @staticmethod
+    def _is_literal_instruction(instruction: RawInstruction) -> bool:
+        if instruction.mnemonic == "push_literal":
+            return True
+        if instruction.profile.kind is InstructionKind.LITERAL:
+            return True
+        return False
+
+    @staticmethod
+    def _is_literal_node(candidate: Union[RawInstruction, IRNode]) -> bool:
+        literal_nodes = (
+            IRLiteral,
+            IRLiteralBlock,
+            IRBuildArray,
+            IRBuildMap,
+            IRBuildTuple,
+        )
+        return isinstance(candidate, literal_nodes)
+
+    @staticmethod
+    def _is_literal_description(text: str) -> bool:
+        prefixes = (
+            "lit(",
+            "literal_block[",
+            "array(",
+            "map(",
+            "tuple(",
+        )
+        return text.startswith(prefixes)
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
