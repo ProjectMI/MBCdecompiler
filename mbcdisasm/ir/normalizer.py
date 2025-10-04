@@ -37,6 +37,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRStackTeardown,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -350,6 +351,13 @@ class IRNormalizer:
                 metrics.loads += 1
                 continue
 
+            if mnemonic.startswith("stack_teardown_"):
+                count = self._parse_teardown_count(mnemonic)
+                if count is not None:
+                    node = IRStackTeardown(count=count, operand=item.operand)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+
             index += 1
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
@@ -498,6 +506,9 @@ class IRNormalizer:
             }:
                 items.pop(index)
                 continue
+            if isinstance(item, IRStackTeardown):
+                items.pop(index)
+                continue
             break
 
     def _resolve_return_signature(self, items: _ItemList, index: int) -> Tuple[int, bool]:
@@ -541,6 +552,13 @@ class IRNormalizer:
         total = 0
         while scan >= 0:
             candidate = items[scan]
+            if isinstance(candidate, IRStackTeardown):
+                total += max(0, candidate.count)
+                scan -= 1
+                continue
+            if isinstance(candidate, IRAsciiFinalize):
+                scan -= 1
+                continue
             if isinstance(candidate, RawInstruction):
                 kind = candidate.profile.kind
                 if kind is InstructionKind.STACK_TEARDOWN:
@@ -1028,6 +1046,20 @@ class IRNormalizer:
                 return None
         return None
 
+    @staticmethod
+    def _parse_teardown_count(mnemonic: str) -> Optional[int]:
+        suffix = mnemonic.rsplit("_", 1)[-1]
+        if suffix.isdigit():
+            try:
+                return int(suffix)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _call_result_name(target: int) -> str:
+        return f"call_result(0x{target:04X})"
+
     def _collect_literal_block_literals(
         self, items: _ItemList, start: int
     ) -> Tuple[Tuple[int, ...], int]:
@@ -1080,6 +1112,7 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                self._materialise_branch_condition(items, index, metrics)
                 node = IRIf(
                     condition=self._describe_condition(items, index),
                     then_target=self._branch_target(item),
@@ -1090,6 +1123,61 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _materialise_branch_condition(
+        self, items: _ItemList, index: int, metrics: NormalizerMetrics
+    ) -> None:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRNode) and self._is_semantic_noop_node(candidate):
+                scan -= 1
+                continue
+            if isinstance(candidate, IRCall):
+                if candidate.tail:
+                    replacement = IRCall(target=candidate.target, args=candidate.args, tail=False)
+                    items.replace_slice(scan, scan + 1, [replacement])
+                    if metrics.tail_calls > 0:
+                        metrics.tail_calls -= 1
+                return
+            if isinstance(candidate, IRAsciiWrapperCall):
+                if candidate.tail:
+                    replacement = IRAsciiWrapperCall(
+                        target=candidate.target,
+                        args=candidate.args,
+                        ascii_chunks=candidate.ascii_chunks,
+                        tail=False,
+                    )
+                    items.replace_slice(scan, scan + 1, [replacement])
+                    if metrics.tail_calls > 0:
+                        metrics.tail_calls -= 1
+                return
+            if isinstance(candidate, IRCallReturn):
+                if candidate.tail:
+                    replacement = IRCallReturn(
+                        target=candidate.target,
+                        args=candidate.args,
+                        tail=False,
+                        returns=candidate.returns,
+                        varargs=candidate.varargs,
+                    )
+                    items.replace_slice(scan, scan + 1, [replacement])
+                    if metrics.tail_calls > 0:
+                        metrics.tail_calls -= 1
+                return
+            if isinstance(candidate, RawInstruction):
+                if candidate.pushes_value():
+                    return
+                kind = candidate.profile.kind
+                if kind in {
+                    InstructionKind.BRANCH,
+                    InstructionKind.RETURN,
+                    InstructionKind.TERMINATOR,
+                }:
+                    return
+            elif isinstance(candidate, IRNode):
+                return
+            scan -= 1
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -1132,6 +1220,15 @@ class IRNormalizer:
             elif isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             elif isinstance(candidate, IRNode):
+                if self._is_semantic_noop_node(candidate):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRCall):
+                    return self._call_result_name(candidate.target)
+                if isinstance(candidate, IRAsciiWrapperCall):
+                    return self._call_result_name(candidate.target)
+                if isinstance(candidate, IRCallReturn):
+                    return self._call_result_name(candidate.target)
                 describe = getattr(candidate, "describe", None)
                 if callable(describe):
                     return describe()
@@ -1172,6 +1269,15 @@ class IRNormalizer:
             if isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             if isinstance(candidate, IRNode):
+                if self._is_semantic_noop_node(candidate):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRCall):
+                    return self._call_result_name(candidate.target)
+                if isinstance(candidate, IRAsciiWrapperCall):
+                    return self._call_result_name(candidate.target)
+                if isinstance(candidate, IRCallReturn):
+                    return self._call_result_name(candidate.target)
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
@@ -1208,6 +1314,10 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # annotation helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _is_semantic_noop_node(node: IRNode) -> bool:
+        return isinstance(node, IRAsciiFinalize)
+
     def _is_annotation_only(self, instruction: RawInstruction) -> bool:
         if instruction.offset in self._annotation_offsets:
             return True

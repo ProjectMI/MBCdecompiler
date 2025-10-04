@@ -217,6 +217,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert any(text.startswith("testset") for text in descriptions)
     assert any(text.startswith("load") for text in descriptions)
     assert any(text.startswith("store") for text in descriptions)
+    assert any(text.startswith("stack_teardown") for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
@@ -242,6 +243,30 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
+
+
+def test_normalizer_materialises_tail_call_branch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x2B, 0x00, 0x1234),
+        build_word(8, 0x23, 0x00, 0x0010),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert "call target=0x1234 args=[lit(0x0001)]" in descriptions
+    assert "if cond=call_result(0x1234) then=0x0010 else=0x000C" in descriptions
+    assert program.metrics.tail_calls == 0
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
