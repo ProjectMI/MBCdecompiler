@@ -29,6 +29,7 @@ from .model import (
     IRLiteralChunk,
     IRLoad,
     IRNode,
+    IRPredicateAssign,
     IRProgram,
     IRRaw,
     IRReturn,
@@ -262,12 +263,14 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_branches(items, metrics)
+        self._pass_branch_predicates(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
+        self._verify_branch_conditions(items)
 
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
@@ -917,13 +920,28 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            predicate_node: Optional[IRPredicateAssign] = None
             branch: Optional[IRIf] = None
-            if scan < len(items) and isinstance(items[scan], IRIf):
-                candidate = items[scan]
+            branch_index = scan
+            if branch_index < len(items) and isinstance(items[branch_index], IRPredicateAssign):
+                predicate_node = items[branch_index]
+                branch_index += 1
+            if branch_index < len(items) and isinstance(items[branch_index], IRIf):
+                candidate = items[branch_index]
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                cond_matches = candidate.condition in {first_chunk, "stack_top"}
+                if not cond_matches and predicate_node is not None:
+                    if (
+                        predicate_node.name == candidate.condition
+                        and predicate_node.operands
+                    ):
+                        cond_matches = predicate_node.operands[0] == first_chunk
+                if cond_matches and item.tail:
                     branch = candidate
-                    scan += 1
+                else:
+                    predicate_node = None
+            else:
+                predicate_node = None
 
             ascii_tuple = tuple(ascii_chunks)
             if branch is not None:
@@ -935,7 +953,10 @@ class IRNormalizer:
                     then_target=branch.then_target,
                     else_target=branch.else_target,
                 )
-                items.replace_slice(index, scan, [node])
+                if predicate_node is not None:
+                    items.replace_slice(index, branch_index + 1, [predicate_node, node])
+                else:
+                    items.replace_slice(index, branch_index + 1, [node])
                 continue
 
             node = IRAsciiWrapperCall(
@@ -1084,12 +1105,119 @@ class IRNormalizer:
                     condition=self._describe_condition(items, index),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    source_offset=item.offset,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
                 continue
 
             index += 1
+
+    def _pass_branch_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRIf):
+                index += 1
+                continue
+
+            if not self._condition_requires_fix(item.condition):
+                index += 1
+                continue
+
+            predicate_name = self._make_predicate_name(item)
+            operand = item.condition
+            if not operand or operand == "stack_top":
+                operand = self._describe_stack_top(items, index)
+            if not operand:
+                operand = "stack_top"
+
+            insert_assignment = True
+            if index > 0:
+                previous = items[index - 1]
+                if (
+                    isinstance(previous, IRPredicateAssign)
+                    and previous.name == predicate_name
+                ):
+                    insert_assignment = False
+
+            if insert_assignment:
+                operator = self._infer_predicate_operator(items, index)
+                assignment = IRPredicateAssign(
+                    name=predicate_name,
+                    operator=operator,
+                    operands=(operand,),
+                    source_offset=item.source_offset,
+                )
+                items.insert(index, assignment)
+                index += 1  # account for the inserted predicate
+
+            branch = items[index]
+            if isinstance(branch, IRIf):
+                rewritten = IRIf(
+                    condition=predicate_name,
+                    then_target=branch.then_target,
+                    else_target=branch.else_target,
+                    source_offset=branch.source_offset,
+                )
+                items.replace_slice(index, index + 1, [rewritten])
+            index += 1
+
+    @staticmethod
+    def _condition_requires_fix(condition: str) -> bool:
+        if not condition:
+            return True
+        lowered = condition.lower()
+        if lowered.startswith(("pred@", "test@", "cmp@", "bool@")):
+            return False
+        if condition.startswith("slot("):
+            return False
+        invalid_prefixes = (
+            "lit(",
+            "tuple(",
+            "array(",
+            "map(",
+            "ascii(",
+            "literal_block",
+            "dup ",
+        )
+        if condition == "stack_top":
+            return True
+        return condition.startswith(invalid_prefixes)
+
+    @staticmethod
+    def _make_predicate_name(branch: IRIf) -> str:
+        if branch.source_offset is not None:
+            return f"pred@0x{branch.source_offset:04X}"
+        return "pred@unknown"
+
+    def _infer_predicate_operator(self, items: _ItemList, index: int) -> str:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRPredicateAssign):
+                return candidate.operator
+            if isinstance(candidate, RawInstruction):
+                mnemonic = candidate.mnemonic.lower()
+                if mnemonic == "test_branch":
+                    return "test"
+                if mnemonic == "testset_branch":
+                    return "testset"
+                summary = (candidate.profile.summary or "").lower()
+                if "compare" in summary or "cmp" in mnemonic:
+                    return "compare"
+            scan -= 1
+        return "truthy"
+
+    def _verify_branch_conditions(self, items: _ItemList) -> None:
+        problems: List[str] = []
+        for node in items:
+            if isinstance(node, IRIf) and self._condition_requires_fix(node.condition):
+                location = f"0x{node.source_offset:04X}" if node.source_offset is not None else "unknown"
+                problems.append(f"invalid predicate {node.condition} at {location}")
+        if problems:
+            details = "; ".join(problems)
+            raise ValueError(f"IR branch predicate verification failed: {details}")
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0

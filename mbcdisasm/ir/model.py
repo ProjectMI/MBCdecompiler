@@ -199,12 +199,29 @@ class IRIf(IRNode):
     condition: str
     then_target: int
     else_target: int
+    source_offset: Optional[int] = None
 
     def describe(self) -> str:
         return (
             f"if cond={self.condition} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+
+
+@dataclass(frozen=True)
+class IRPredicateAssign(IRNode):
+    """Explicit SSA predicate recovered for a conditional branch."""
+
+    name: str
+    operator: str
+    operands: Tuple[str, ...]
+    source_offset: Optional[int] = None
+
+    def describe(self) -> str:
+        args = ", ".join(self.operands)
+        if self.source_offset is None:
+            return f"{self.name} := {self.operator}({args})"
+        return f"{self.name} := {self.operator}({args}) @ 0x{self.source_offset:04X}"
 
 
 @dataclass(frozen=True)
@@ -518,4 +535,5 @@ __all__ = [
     "IRRaw",
     "MemSpace",
     "NormalizerMetrics",
+    "IRPredicateAssign",
 ]
