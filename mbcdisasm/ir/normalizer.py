@@ -415,6 +415,7 @@ class IRNormalizer:
                     values = ("ret*",)
                 items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
                 metrics.returns += 1
+                self._prune_stack_teardown_before_return(items, index)
                 continue
 
             index += 1
@@ -881,7 +882,7 @@ class IRNormalizer:
             item = items[index]
             if isinstance(item, IRTestSetBranch):
                 if index == 0 or all(
-                    isinstance(items[pos], IRAsciiHeader) for pos in range(index)
+                    self._is_metadata_node(items[pos]) for pos in range(index)
                 ):
                     if item.var.startswith("slot("):
                         node = IRFunctionPrologue(
@@ -1068,7 +1069,9 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                expr = self._describe_condition(
+                    items, index, skip_literals=True, metrics=metrics
+                )
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
@@ -1081,7 +1084,7 @@ class IRNormalizer:
 
             if item.profile.kind is InstructionKind.BRANCH:
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=self._describe_condition(items, index, metrics=metrics),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1151,7 +1154,32 @@ class IRNormalizer:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
-    def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
+    def _describe_condition(
+        self,
+        items: _ItemList,
+        index: int,
+        *,
+        skip_literals: bool = False,
+        metrics: Optional[NormalizerMetrics] = None,
+    ) -> str:
+        source_index, description = self._locate_condition_source(
+            items, index, skip_literals=skip_literals
+        )
+        if source_index is not None:
+            new_description = self._materialize_condition_source(
+                items, source_index, metrics
+            )
+            if new_description is not None:
+                return new_description
+        return description
+
+    def _locate_condition_source(
+        self,
+        items: _ItemList,
+        index: int,
+        *,
+        skip_literals: bool = False,
+    ) -> Tuple[Optional[int], str]:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -1160,21 +1188,67 @@ class IRNormalizer:
                     if skip_literals and candidate.mnemonic == "push_literal":
                         scan -= 1
                         continue
-                    return self._describe_value(candidate)
+                    return scan, self._describe_value(candidate)
                 if skip_literals:
-                    return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
+                    return scan, self._describe_value(candidate)
+            elif isinstance(candidate, IRLiteral):
+                if skip_literals:
+                    scan -= 1
+                    continue
+                return scan, candidate.describe()
+            elif isinstance(candidate, IRLiteralChunk):
+                if skip_literals:
+                    scan -= 1
+                    continue
+                return scan, candidate.describe()
+            elif isinstance(candidate, IRStackDuplicate):
+                return scan, candidate.value
+            elif isinstance(candidate, IRAsciiFinalize):
                 scan -= 1
                 continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
-                scan -= 1
-                continue
-            if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
-            if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+            elif isinstance(candidate, IRNode):
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    return scan, describe()
+                return scan, candidate.__class__.__name__
             scan -= 1
-        return "stack_top"
+        return None, "stack_top"
+
+    def _materialize_condition_source(
+        self,
+        items: _ItemList,
+        source_index: int,
+        metrics: Optional[NormalizerMetrics],
+    ) -> Optional[str]:
+        candidate = items[source_index]
+        if isinstance(candidate, IRCall) and candidate.tail:
+            replacement = IRCall(target=candidate.target, args=candidate.args, tail=False)
+            items.replace_slice(source_index, source_index + 1, [replacement])
+            if metrics is not None and metrics.tail_calls > 0:
+                metrics.tail_calls -= 1
+            return replacement.describe()
+        return None
+
+    def _prune_stack_teardown_before_return(self, items: _ItemList, index: int) -> None:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                kind = candidate.profile.kind
+                if kind is InstructionKind.STACK_TEARDOWN:
+                    self._annotation_offsets.add(candidate.offset)
+                    items.pop(scan)
+                    index -= 1
+                    scan -= 1
+                    continue
+                if kind in {InstructionKind.RETURN, InstructionKind.BRANCH, InstructionKind.TERMINATOR}:
+                    break
+            elif isinstance(candidate, IRAsciiFinalize):
+                scan -= 1
+                continue
+            else:
+                break
+            scan -= 1
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
@@ -1236,6 +1310,14 @@ class IRNormalizer:
     def _format_testset_var(instruction: RawInstruction) -> str:
         operand = instruction.operand
         return f"slot(0x{operand:04X})"
+
+    @staticmethod
+    def _is_metadata_node(node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, IRAsciiHeader):
+            return True
+        if isinstance(node, IRAsciiFinalize):
+            return True
+        return False
 
 
 __all__ = ["IRNormalizer", "RawInstruction", "RawBlock"]

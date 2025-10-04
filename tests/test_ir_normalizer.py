@@ -78,6 +78,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "stack_teardown_1",
             "category": "stack_teardown",
         },
+        "call_helpers": {
+            "opcodes": ["0x40:0x00"],
+            "name": "call_helpers",
+            "category": "call_helper",
+        },
     }
     manual_path = path / "manual_annotations.json"
     manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
@@ -189,6 +194,53 @@ def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBas
     return container, knowledge
 
 
+def build_tail_branch_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x2B, 0x00, 0x0020),
+        build_word(8, 0x23, 0x00, 0x000C),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+    return container, knowledge
+
+
+def build_teardown_return_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x01, 0x00, 0x0000),
+        build_word(8, 0x30, 0x00, 0x0001),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+    return container, knowledge
+
+
+def build_ascii_prologue_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x40, 0x00, 0xF172),
+        build_word(4, 0x27, 0x00, 0x0008),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+    return container, knowledge
+
+
 def test_normalizer_builds_ir(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
@@ -266,3 +318,41 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_tailcall_condition_demoted(tmp_path: Path) -> None:
+    container, knowledge = build_tail_branch_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert any(text.startswith("call target=0x0020") for text in descriptions)
+    assert not any("call tail" in text for text in descriptions)
+    assert any(text.startswith("if cond=call target=0x0020") for text in descriptions)
+    assert program.metrics.tail_calls == 0
+
+
+def test_stack_teardown_removed_before_return(tmp_path: Path) -> None:
+    container, knowledge = build_teardown_return_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+
+    assert all(
+        not (getattr(node, "mnemonic", "") == "stack_teardown_1") for node in block.nodes
+    )
+    assert any(getattr(node, "describe", lambda: "")().startswith("return") for node in block.nodes)
+
+
+def test_function_prologue_allows_ascii_finalize_prefix(tmp_path: Path) -> None:
+    container, knowledge = build_ascii_prologue_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert any(text.startswith("function_prologue") for text in descriptions)
