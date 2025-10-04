@@ -193,12 +193,25 @@ class IRTailcallAscii(IRNode):
 
 
 @dataclass(frozen=True)
+class IRPredicate(IRNode):
+    """SSA-like boolean definition used by conditional branches."""
+
+    name: str
+    expr: str
+
+    def describe(self) -> str:
+        return f"{self.name} := {self.expr}"
+
+
+@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
     condition: str
     then_target: int
     else_target: int
+    origin: int = -1
+    mnemonic: str = ""
 
     def describe(self) -> str:
         return (
@@ -215,6 +228,7 @@ class IRTestSetBranch(IRNode):
     expr: str
     then_target: int
     else_target: int
+    origin: int = -1
 
     def describe(self) -> str:
         return (
@@ -497,6 +511,7 @@ __all__ = [
     "IRLiteralBlock",
     "IRAsciiWrapperCall",
     "IRTailcallAscii",
+    "IRPredicate",
     "IRIf",
     "IRTestSetBranch",
     "IRFlagCheck",

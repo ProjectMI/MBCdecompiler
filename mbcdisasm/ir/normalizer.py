@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
@@ -29,6 +29,7 @@ from .model import (
     IRLiteralChunk,
     IRLoad,
     IRNode,
+    IRPredicate,
     IRProgram,
     IRRaw,
     IRReturn,
@@ -265,6 +266,7 @@ class IRNormalizer:
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
+        self._pass_branch_predicates(items)
         self._pass_ascii_headers(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
@@ -948,6 +950,24 @@ class IRNormalizer:
             items.replace_slice(index, end, [node])
             index += 1
 
+    def _pass_branch_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRIf):
+                if not self._condition_needs_predicate(item.condition):
+                    index += 1
+                    continue
+                name = self._format_predicate_name(item, index)
+                expr = self._build_predicate_expression(items, index, item.condition)
+                predicate = IRPredicate(name=name, expr=expr)
+                items.insert(index, predicate)
+                updated = replace(item, condition=name)
+                items.replace_slice(index + 1, index + 2, [updated])
+                index += 2
+                continue
+            index += 1
+
     def _pass_ascii_headers(self, items: _ItemList) -> None:
         if not items:
             return
@@ -1074,6 +1094,7 @@ class IRNormalizer:
                     expr=expr,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    origin=item.offset,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.testset_branches += 1
@@ -1084,6 +1105,8 @@ class IRNormalizer:
                     condition=self._describe_condition(items, index),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    origin=item.offset,
+                    mnemonic=item.mnemonic,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
@@ -1175,6 +1198,70 @@ class IRNormalizer:
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
+
+    def _condition_needs_predicate(self, condition: str) -> bool:
+        if not condition:
+            return True
+        text = condition.strip()
+        if not text:
+            return True
+        lowered = text.lower()
+        if lowered.startswith("pred@") or lowered.startswith("truthy("):
+            return False
+        if lowered.startswith("call"):
+            return False
+        if lowered.startswith("slot("):
+            return False
+        prefixes = (
+            "lit(",
+            "tuple(",
+            "map(",
+            "array(",
+            "ascii(",
+            "literal_block",
+            "stack_top",
+            "load ",
+            "dup ",
+            "drop ",
+            "table_patch",
+            "prep_",
+            "return ",
+        )
+        if text.startswith(prefixes):
+            return True
+        first = text[0]
+        if first.isdigit() and ":" in text.partition("@")[0]:
+            return True
+        return False
+
+    def _format_predicate_name(self, branch: IRIf, index: int) -> str:
+        if branch.origin >= 0:
+            return f"pred@0x{branch.origin:04X}"
+        return f"pred#{index}"
+
+    def _build_predicate_expression(
+        self, items: _ItemList, index: int, condition: str
+    ) -> str:
+        provider = self._find_nearby_testset(items, index)
+        if provider is not None:
+            target = provider.var.strip()
+            if target:
+                return target
+        if condition.startswith("truthy("):
+            return condition
+        return f"truthy({condition})"
+
+    def _find_nearby_testset(self, items: _ItemList, index: int) -> Optional[IRTestSetBranch]:
+        window = 6
+        scan = index - 1
+        steps = 0
+        while scan >= 0 and steps < window:
+            candidate = items[scan]
+            if isinstance(candidate, IRTestSetBranch):
+                return candidate
+            scan -= 1
+            steps += 1
+        return None
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
