@@ -921,7 +921,10 @@ class IRNormalizer:
             if scan < len(items) and isinstance(items[scan], IRIf):
                 candidate = items[scan]
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                valid_conditions = {first_chunk, "stack_top"}
+                if item.tail:
+                    valid_conditions.add(item.describe())
+                if candidate.condition in valid_conditions and item.tail:
                     branch = candidate
                     scan += 1
 
@@ -1155,26 +1158,58 @@ class IRNormalizer:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
+            if isinstance(
+                candidate,
+                (
+                    IRLiteral,
+                    IRLiteralChunk,
+                    IRLiteralBlock,
+                    IRBuildArray,
+                    IRBuildMap,
+                    IRBuildTuple,
+                ),
+            ):
+                scan -= 1
+                continue
             if isinstance(candidate, RawInstruction):
-                if candidate.pushes_value():
-                    if skip_literals and candidate.mnemonic == "push_literal":
-                        scan -= 1
-                        continue
-                    return self._describe_value(candidate)
-                if skip_literals:
-                    return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
-                scan -= 1
-                continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
-                scan -= 1
-                continue
+                if skip_literals and candidate.mnemonic == "push_literal":
+                    scan -= 1
+                    continue
+                text = self._describe_value(candidate)
+                if self._is_data_expression(text):
+                    scan -= 1
+                    continue
+                return text
             if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
+                text = candidate.value
+                if self._is_data_expression(text):
+                    scan -= 1
+                    continue
+                return text
             if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+                text = getattr(candidate, "describe", lambda: "expr()")()
+                if self._is_data_expression(text):
+                    scan -= 1
+                    continue
+                return text
             scan -= 1
         return "stack_top"
+
+    @staticmethod
+    def _is_data_expression(text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        prefixes = (
+            "lit(",
+            "reduce(",
+            "array([",
+            "map([",
+            "tuple([",
+            "literal_block[",
+            "ascii(",
+        )
+        return any(stripped.startswith(prefix) for prefix in prefixes)
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
