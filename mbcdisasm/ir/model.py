@@ -134,6 +134,19 @@ class IRBuildTuple(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteralBlock(IRNode):
+    """Canonical representation of the ubiquitous literal prefix blocks."""
+
+    triplets: Tuple[Tuple[int, int, int], ...]
+
+    def describe(self) -> str:
+        chunks = []
+        for a, b, c in self.triplets:
+            chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
+        return "literal_block[" + ", ".join(chunks) + "]"
+
+
+@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
@@ -160,6 +173,21 @@ class IRTestSetBranch(IRNode):
     def describe(self) -> str:
         return (
             f"testset {self.var}={self.expr} then=0x{self.then_target:04X} "
+            f"else=0x{self.else_target:04X}"
+        )
+
+
+@dataclass(frozen=True)
+class IRFlagCheck(IRNode):
+    """Specialised branch that tests one of the global VM flags."""
+
+    flag: int
+    then_target: int
+    else_target: int
+
+    def describe(self) -> str:
+        return (
+            f"check_flag flag=0x{self.flag:04X} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
 
@@ -197,6 +225,65 @@ class IRStackDuplicate(IRNode):
         if self.copies <= 1:
             return f"dup {self.value}"
         return f"dup {self.value} -> copies={self.copies}"
+
+
+@dataclass(frozen=True)
+class IRAsciiPreamble(IRNode):
+    """Helper node that replaces the common ASCII initialisation prologue."""
+
+    loader_operand: int
+    mode_operand: int
+    shuffle_operand: int
+
+    def describe(self) -> str:
+        return (
+            f"ascii_preamble load=0x{self.loader_operand:04X} "
+            f"mode=0x{self.mode_operand:04X} shuffle=0x{self.shuffle_operand:04X}"
+        )
+
+
+@dataclass(frozen=True)
+class IRCallPreparation(IRNode):
+    """Grouped stack permutations that prepare arguments for helper calls."""
+
+    steps: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"prep_call_args[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRTailcallFrame(IRNode):
+    """Canonical frame setup that precedes the VM tailcall helpers."""
+
+    steps: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"prep_tailcall[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRTablePatch(IRNode):
+    """Collapses the recurring 0x66xx table patch sequences."""
+
+    operations: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        return f"table_patch[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRAsciiFinalize(IRNode):
+    """Normalises helper invocations that terminate ASCII aggregation blocks."""
+
+    helper: int
+    summary: str
+
+    def describe(self) -> str:
+        return f"ascii_finalize helper=0x{self.helper:04X} source={self.summary}"
 
 
 @dataclass(frozen=True)
@@ -315,14 +402,21 @@ __all__ = [
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
+    "IRLiteralBlock",
     "IRIf",
     "IRTestSetBranch",
+    "IRFlagCheck",
     "IRLoad",
     "IRStore",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRAsciiPreamble",
+    "IRCallPreparation",
+    "IRTailcallFrame",
+    "IRTablePatch",
+    "IRAsciiFinalize",
     "IRSlot",
     "IRRaw",
     "MemSpace",

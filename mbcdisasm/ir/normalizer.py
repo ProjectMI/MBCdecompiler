@@ -11,12 +11,17 @@ from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
+    IRAsciiFinalize,
+    IRAsciiPreamble,
     IRBlock,
     IRBuildArray,
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    IRCallPreparation,
+    IRFlagCheck,
     IRLiteral,
+    IRLiteralBlock,
     IRLiteralChunk,
     IRLoad,
     IRNode,
@@ -28,6 +33,8 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRTablePatch,
+    IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
     MemSpace,
@@ -233,7 +240,14 @@ class IRNormalizer:
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
+        self._pass_literal_blocks(items)
+        self._pass_ascii_preamble(items)
+        self._pass_call_preparation(items)
+        self._pass_tailcall_frames(items)
+        self._pass_table_patches(items)
+        self._pass_ascii_finalize(items)
         self._pass_branches(items, metrics)
+        self._pass_flag_checks(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -549,6 +563,185 @@ class IRNormalizer:
             items.replace_slice(index, scan, replacement_sequence)
             index += 1
 
+    def _pass_literal_blocks(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRBuildTuple):
+                values = self._parse_literal_list(item.elements)
+                if values and self._is_literal_block(values):
+                    triplets = tuple(
+                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
+                    )
+                    items.replace_slice(index, index + 1, [IRLiteralBlock(triplets=triplets)])
+                    continue
+            if isinstance(item, IRLiteral):
+                values, end = self._collect_literal_block_literals(items, index)
+                if values:
+                    triplets = tuple(
+                        tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
+                    )
+                    items.replace_slice(index, end, [IRLiteralBlock(triplets=triplets)])
+                    continue
+            index += 1
+
+    def _pass_ascii_preamble(self, items: _ItemList) -> None:
+        index = 0
+        while index <= len(items) - 3:
+            first, second, third = items[index : index + 3]
+            if (
+                isinstance(first, RawInstruction)
+                and isinstance(second, RawInstruction)
+                and isinstance(third, RawInstruction)
+                and first.mnemonic == "op_72_23"
+                and second.mnemonic == "op_31_30"
+                and third.mnemonic == "stack_shuffle"
+                and third.operand == 0x4B08
+            ):
+                node = IRAsciiPreamble(
+                    loader_operand=first.operand,
+                    mode_operand=second.operand,
+                    shuffle_operand=third.operand,
+                )
+                items.replace_slice(index, index + 3, [node])
+                continue
+            index += 1
+
+    def _pass_call_preparation(self, items: _ItemList) -> None:
+        index = 0
+        allowed_prefix = {"stack_shuffle", "fanout"}
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or item.mnemonic != "op_4A_05":
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            start = index
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, RawInstruction):
+                    mnemonic = candidate.mnemonic
+                    if mnemonic in allowed_prefix or mnemonic.startswith("stack_teardown"):
+                        steps.insert(0, (mnemonic, candidate.operand))
+                        start = scan
+                        scan -= 1
+                        continue
+                break
+
+            if start < index:
+                items.replace_slice(start, index + 1, [IRCallPreparation(steps=tuple(steps))])
+                index = start
+                continue
+
+            index += 1
+
+    def _pass_tailcall_frames(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or item.mnemonic != "op_3D_30":
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            scan = index + 1
+            end = index + 1
+            while scan < len(items) and scan - index <= 6:
+                candidate = items[scan]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                steps.append((candidate.mnemonic, candidate.operand))
+                if candidate.mnemonic == "op_F0_4B":
+                    end = scan + 1
+                    break
+                scan += 1
+
+            if steps[-1][0] == "op_F0_4B":
+                items.replace_slice(index, end, [IRTailcallFrame(steps=tuple(steps))])
+                continue
+
+            index += 1
+
+    def _pass_table_patches(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (
+                isinstance(item, RawInstruction)
+                and item.mnemonic.startswith("op_2C_")
+                and 0x6600 <= item.operand <= 0x66FF
+            ):
+                index += 1
+                continue
+
+            operations: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            scan = index + 1
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction):
+                    if (
+                        candidate.mnemonic.startswith("op_2C_")
+                        and 0x6600 <= candidate.operand <= 0x66FF
+                    ):
+                        operations.append((candidate.mnemonic, candidate.operand))
+                        scan += 1
+                        continue
+                    if candidate.mnemonic in {"fanout", "stack_teardown_4", "stack_teardown_5"}:
+                        operations.append((candidate.mnemonic, candidate.operand))
+                        scan += 1
+                        continue
+                break
+
+            items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
+            index += 1
+
+    def _pass_ascii_finalize(self, items: _ItemList) -> None:
+        index = 0
+        ascii_helpers = {0xF172, 0x7223, 0x3D30}
+        while index < len(items):
+            item = items[index]
+            if not (
+                isinstance(item, RawInstruction)
+                and item.mnemonic == "call_helpers"
+                and item.operand in ascii_helpers
+            ):
+                index += 1
+                continue
+
+            summary = ""
+            if index > 0:
+                previous = items[index - 1]
+                if isinstance(previous, IRLiteralChunk):
+                    summary = previous.describe()
+                elif isinstance(previous, IRLiteral):
+                    summary = previous.describe()
+                elif isinstance(previous, IRAsciiPreamble):
+                    summary = previous.describe()
+            node = IRAsciiFinalize(helper=item.operand, summary=summary or "ascii")
+            items.replace_slice(index, index + 1, [node])
+            index += 1
+
+    def _pass_flag_checks(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRIf):
+                flag = self._flag_literal_value(item.condition)
+                if flag is not None:
+                    node = IRFlagCheck(
+                        flag=flag,
+                        then_target=item.then_target,
+                        else_target=item.else_target,
+                    )
+                    items.replace_slice(index, index + 1, [node])
+                    index += 1
+                    continue
+            index += 1
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
         if isinstance(item, IRLiteral):
@@ -568,6 +761,55 @@ class IRNormalizer:
     @staticmethod
     def _literal_repr(node: IRLiteral) -> str:
         return node.describe()
+
+    def _parse_literal_list(self, elements: Sequence[str]) -> Tuple[int, ...]:
+        values: List[int] = []
+        for text in elements:
+            value = self._parse_literal_text(text)
+            if value is None:
+                return tuple()
+            values.append(value)
+        return tuple(values)
+
+    @staticmethod
+    def _parse_literal_text(text: str) -> Optional[int]:
+        if text.startswith("lit(0x") and text.endswith(")"):
+            try:
+                return int(text[4:-1], 16)
+            except ValueError:
+                return None
+        return None
+
+    def _collect_literal_block_literals(
+        self, items: _ItemList, start: int
+    ) -> Tuple[Tuple[int, ...], int]:
+        values: List[int] = []
+        index = start
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRLiteral):
+                values.append(item.value)
+                index += 1
+                continue
+            break
+        sequence = tuple(values)
+        if sequence and self._is_literal_block(sequence):
+            return sequence, index
+        return tuple(), start
+
+    @staticmethod
+    def _is_literal_block(values: Sequence[int]) -> bool:
+        if not values or len(values) % 3:
+            return False
+        for pos in range(0, len(values), 3):
+            chunk = values[pos : pos + 3]
+            if len(chunk) < 3:
+                return False
+            if chunk[0] != 0x6704 or chunk[1] != 0x0067:
+                return False
+            if chunk[2] not in {0x0400, 0x0110}:
+                return False
+        return True
 
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -703,6 +945,17 @@ class IRNormalizer:
         else:
             space = MemSpace.CONST
         return IRSlot(space=space, index=operand)
+
+    @staticmethod
+    def _flag_literal_value(text: str) -> Optional[int]:
+        if text.startswith("lit(0x") and text.endswith(")"):
+            try:
+                value = int(text[4:-1], 16)
+            except ValueError:
+                return None
+            if value in {0x0166, 0x0266}:
+                return value
+        return None
 
     # ------------------------------------------------------------------
     # annotation helpers
