@@ -51,6 +51,32 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
+_NON_CONDITION_NODE_TYPES = (
+    IRAsciiFinalize,
+    IRAsciiHeader,
+    IRAsciiPreamble,
+    IRBuildArray,
+    IRBuildMap,
+    IRBuildTuple,
+    IRCallPreparation,
+    IRLiteralBlock,
+    IRStackDrop,
+    IRTailcallFrame,
+    IRTablePatch,
+)
+
+
+_CONDITION_INSTRUCTION_KINDS = {
+    InstructionKind.TEST,
+    InstructionKind.CALL,
+    InstructionKind.TAILCALL,
+    InstructionKind.ARITHMETIC,
+    InstructionKind.LOGICAL,
+    InstructionKind.BITWISE,
+    InstructionKind.REDUCE,
+}
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -921,7 +947,12 @@ class IRNormalizer:
             if scan < len(items) and isinstance(items[scan], IRIf):
                 candidate = items[scan]
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                call_description = item.describe()
+                if (
+                    item.tail
+                    and candidate.condition
+                    in {first_chunk, "stack_top", call_description}
+                ):
                     branch = candidate
                     scan += 1
 
@@ -1153,28 +1184,72 @@ class IRNormalizer:
 
     def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1
+        fallback: Optional[str] = None
         while scan >= 0:
             candidate = items[scan]
+
+            if isinstance(candidate, IRNode) and isinstance(candidate, _NON_CONDITION_NODE_TYPES):
+                scan -= 1
+                continue
+
+            text: Optional[str] = None
+
             if isinstance(candidate, RawInstruction):
-                if candidate.pushes_value():
-                    if skip_literals and candidate.mnemonic == "push_literal":
-                        scan -= 1
-                        continue
-                    return self._describe_value(candidate)
-                if skip_literals:
-                    return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
+                if candidate.event.kind is InstructionKind.TEST:
+                    text = candidate.describe_source()
+                elif candidate.pushes_value():
+                    text = self._describe_value(candidate)
+                elif candidate.event.kind in _CONDITION_INSTRUCTION_KINDS:
+                    text = candidate.describe_source()
+                elif skip_literals:
+                    text = self._describe_value(candidate)
+            elif isinstance(candidate, IRStackDuplicate):
+                text = candidate.value
+            elif isinstance(candidate, IRNode):
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    text = describe()
+
+            if text is None:
                 scan -= 1
                 continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
+
+            if self._is_literal_condition(text):
+                if (
+                    not skip_literals
+                    and fallback is None
+                    and text.startswith(("ascii(", "ascii_finalize"))
+                ):
+                    fallback = text
                 scan -= 1
                 continue
-            if isinstance(candidate, IRStackDuplicate):
-                return candidate.value
-            if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
-            scan -= 1
+
+            return text
+
+        if fallback is not None:
+            return fallback
+
         return "stack_top"
+
+    @staticmethod
+    def _is_literal_condition(text: str) -> bool:
+        prefixes = (
+            "lit(",
+            "literal_block[",
+            "tuple([",
+            "array([",
+            "map([",
+            "ascii(",
+            "ascii_finalize",
+            "ascii_preamble",
+            "ascii_wrapper_call",
+            "prep_call_args[",
+            "prep_tailcall[",
+            "table_patch[",
+            "drop ",
+            "dup ",
+        )
+        return text.startswith(prefixes)
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
