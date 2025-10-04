@@ -30,6 +30,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "literal",
             "stack_push": 1,
         },
+        "literal_marker": {
+            "opcodes": ["00:38"],
+            "name": "literal_marker",
+            "category": "literal_marker",
+        },
         "reduce_pair": {
             "opcodes": ["04:00"],
             "name": "reduce_pair",
@@ -237,3 +242,27 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
+
+
+def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        InstructionWord(0, int.from_bytes(b"A\x00B\x00", "big")),
+        InstructionWord(4, int.from_bytes(b"\x00C\x00D", "big")),
+        build_word(8, 0x00, 0x38, 0x6704),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
+    assert "lit(0x6704)" in descriptions

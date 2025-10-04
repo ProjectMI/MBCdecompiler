@@ -51,6 +51,14 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
+LITERAL_MARKER_HINTS: Dict[int, str] = {
+    0x0067: "literal_hint",
+    0x6704: "literal_hint",
+    0x0400: "literal_hint",
+    0x0110: "literal_hint",
+}
+
+
 @dataclass(frozen=True)
 class RawInstruction:
     """Wrapper that couples a profile with stack tracking details."""
@@ -242,6 +250,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -348,6 +357,14 @@ class IRNormalizer:
 
         if profile.is_literal_marker():
             self._annotation_offsets.add(instruction.offset)
+            hint = LITERAL_MARKER_HINTS.get(instruction.operand)
+            if hint is not None:
+                return IRLiteral(
+                    value=instruction.operand,
+                    mode=profile.mode,
+                    source=hint,
+                    annotations=instruction.annotations,
+                )
             return None
 
         if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
@@ -401,6 +418,39 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_ascii_runs(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            start = index
+            data_parts: List[bytes] = []
+            annotations: List[str] = []
+
+            while index < len(items):
+                candidate = items[index]
+                if isinstance(candidate, IRLiteralChunk):
+                    data_parts.append(candidate.data)
+                    annotations.extend(candidate.annotations)
+                    index += 1
+                    continue
+
+                break
+
+            if not data_parts:
+                index += 1
+                continue
+
+            if len(data_parts) <= 1:
+                index = start + 1
+                continue
+
+            chunk = IRLiteralChunk(
+                data=b"".join(data_parts),
+                source="ascii_run",
+                annotations=tuple(annotations),
+            )
+            items.replace_slice(start, index, [chunk])
+            index = start + 1
 
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int
@@ -908,6 +958,19 @@ class IRNormalizer:
             index += 1
         if len(chunks) >= 2:
             items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(chunks))])
+            return
+
+        if len(chunks) == 1:
+            literal = items[0]
+            if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
+                if len(literal.data) % 4 == 0:
+                    parts = []
+                    for pos in range(0, len(literal.data), 4):
+                        segment = literal.data[pos : pos + 4]
+                        piece = IRLiteralChunk(data=segment, source=literal.source)
+                        parts.append(piece.describe())
+                    if len(parts) >= 2:
+                        items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
 
     def _pass_call_return_templates(self, items: _ItemList) -> None:
         index = 0
