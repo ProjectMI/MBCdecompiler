@@ -29,6 +29,7 @@ from .model import (
     IRLiteralChunk,
     IRLoad,
     IRNode,
+    IRPredicateAssign,
     IRProgram,
     IRRaw,
     IRReturn,
@@ -37,6 +38,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRStackValueAssign,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -131,6 +133,7 @@ class IRNormalizer:
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
+        self._stack_name_counters: Dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -246,6 +249,7 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
+        self._stack_name_counters.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -262,12 +266,14 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_branches(items, metrics)
+        self._pass_branch_predicates(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
+        self._verify_branch_conditions(items)
 
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
@@ -917,13 +923,41 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            stack_value_node: Optional[IRStackValueAssign] = None
+            predicate_node: Optional[IRPredicateAssign] = None
             branch: Optional[IRIf] = None
-            if scan < len(items) and isinstance(items[scan], IRIf):
-                candidate = items[scan]
+            branch_index = scan
+            if branch_index < len(items) and isinstance(items[branch_index], IRStackValueAssign):
+                stack_value_node = items[branch_index]
+                branch_index += 1
+            if branch_index < len(items) and isinstance(items[branch_index], IRPredicateAssign):
+                predicate_node = items[branch_index]
+                branch_index += 1
+            if branch_index < len(items) and isinstance(items[branch_index], IRIf):
+                candidate = items[branch_index]
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                cond_matches = candidate.condition in {first_chunk, "stack_top"}
+                if not cond_matches and predicate_node is not None:
+                    if (
+                        predicate_node.name == candidate.condition
+                        and predicate_node.operands
+                    ):
+                        operand = predicate_node.operands[0]
+                        cond_matches = operand == first_chunk
+                        if (
+                            not cond_matches
+                            and stack_value_node is not None
+                            and operand == stack_value_node.name
+                        ):
+                            cond_matches = stack_value_node.value == first_chunk
+                if cond_matches and item.tail:
                     branch = candidate
-                    scan += 1
+                else:
+                    stack_value_node = None
+                    predicate_node = None
+            else:
+                stack_value_node = None
+                predicate_node = None
 
             ascii_tuple = tuple(ascii_chunks)
             if branch is not None:
@@ -935,7 +969,12 @@ class IRNormalizer:
                     then_target=branch.then_target,
                     else_target=branch.else_target,
                 )
-                items.replace_slice(index, scan, [node])
+                replacement: List[IRNode] = [node]
+                if predicate_node is not None:
+                    if stack_value_node is not None:
+                        replacement.insert(0, stack_value_node)
+                    replacement.insert(len(replacement) - 1, predicate_node)
+                items.replace_slice(index, branch_index + 1, replacement)
                 continue
 
             node = IRAsciiWrapperCall(
@@ -1084,12 +1123,239 @@ class IRNormalizer:
                     condition=self._describe_condition(items, index),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    source_offset=item.offset,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
                 continue
 
             index += 1
+
+    def _pass_branch_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRIf):
+                index += 1
+                continue
+
+            if not self._condition_requires_fix(item.condition):
+                index += 1
+                continue
+
+            predicate_name, branch_index = self._ensure_branch_predicate(items, index, item)
+            branch = items[branch_index]
+            rewritten = IRIf(
+                condition=predicate_name,
+                then_target=branch.then_target,
+                else_target=branch.else_target,
+                source_offset=branch.source_offset,
+            )
+            items.replace_slice(branch_index, branch_index + 1, [rewritten])
+            index = branch_index + 1
+
+    @staticmethod
+    def _condition_requires_fix(condition: str) -> bool:
+        if not condition:
+            return True
+        lowered = condition.lower()
+        if lowered.startswith(("pred@", "test@", "cmp@", "bool@")):
+            return False
+        if condition.startswith("slot("):
+            return False
+        invalid_prefixes = (
+            "lit(",
+            "tuple(",
+            "array(",
+            "map(",
+            "ascii(",
+            "literal_block",
+            "dup ",
+        )
+        if condition == "stack_top":
+            return True
+        return condition.startswith(invalid_prefixes)
+
+    @staticmethod
+    def _make_predicate_name(branch: IRIf) -> str:
+        return IRNormalizer._make_predicate_name_for_offset(branch.source_offset)
+
+    @staticmethod
+    def _make_predicate_name_for_offset(offset: Optional[int]) -> str:
+        if offset is None:
+            return "pred@unknown"
+        return f"pred@0x{offset:04X}"
+
+    def _make_stack_value_name(self, offset: Optional[int]) -> str:
+        if offset is None:
+            key = -1
+            base = "stack@unknown"
+        else:
+            key = offset
+            base = f"stack@0x{offset:04X}"
+        counter = self._stack_name_counters.get(key, 0)
+        self._stack_name_counters[key] = counter + 1
+        if counter:
+            return f"{base}#{counter}"
+        return base
+
+    def _ensure_branch_predicate(
+        self, items: _ItemList, branch_index: int, branch: IRIf
+    ) -> Tuple[str, int]:
+        adjacent = self._predicate_adjacent_to_branch(items, branch_index)
+        if adjacent is not None:
+            return adjacent.name, branch_index
+
+        test_index, operator = self._find_test_instruction(items, branch_index)
+        if test_index is not None and operator is not None:
+            predicate_name, inserted = self._materialise_test_instruction(
+                items, test_index, operator
+            )
+            if test_index < branch_index:
+                branch_index += inserted
+            return predicate_name, branch_index
+
+        predicate_name, inserted = self._synthesise_truthy_predicate(
+            items, branch_index, branch
+        )
+        branch_index += inserted
+        return predicate_name, branch_index
+
+    def _predicate_adjacent_to_branch(
+        self, items: _ItemList, branch_index: int
+    ) -> Optional[IRPredicateAssign]:
+        if branch_index > 0:
+            previous = items[branch_index - 1]
+            if isinstance(previous, IRPredicateAssign):
+                return previous
+        if branch_index > 1:
+            stack_candidate = items[branch_index - 1]
+            predicate_candidate = items[branch_index - 2]
+            if isinstance(stack_candidate, IRStackValueAssign) and isinstance(
+                predicate_candidate, IRPredicateAssign
+            ):
+                return predicate_candidate
+        return None
+
+    def _find_test_instruction(
+        self, items: _ItemList, branch_index: int
+    ) -> Tuple[Optional[int], Optional[str]]:
+        limit = max(0, branch_index - 12)
+        scan = branch_index - 1
+        while scan >= limit:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                operator = self._classify_predicate_instruction(candidate)
+                if operator is not None:
+                    return scan, operator
+            scan -= 1
+        return None, None
+
+    def _classify_predicate_instruction(self, instruction: RawInstruction) -> Optional[str]:
+        mnemonic = instruction.mnemonic.lower()
+        if mnemonic == "test_branch":
+            return "test"
+        if mnemonic == "testset_branch":
+            return "testset"
+        if "test" in mnemonic:
+            return "test"
+        summary = (instruction.profile.summary or "").lower()
+        if "compare" in summary or "cmp" in mnemonic:
+            return "compare"
+        return None
+
+    def _materialise_test_instruction(
+        self, items: _ItemList, index: int, operator: str
+    ) -> Tuple[str, int]:
+        instruction = items[index]
+        assert isinstance(instruction, RawInstruction)
+        predicate_name = self._make_predicate_name_for_offset(instruction.offset)
+
+        insert_at = index + 1
+        inserted = 0
+
+        if operator == "testset":
+            if (
+                insert_at < len(items)
+                and isinstance(items[insert_at], IRPredicateAssign)
+                and items[insert_at].name == predicate_name
+            ):
+                return predicate_name, inserted
+            assignment = IRPredicateAssign(
+                name=predicate_name,
+                operator=operator,
+                operands=(self._format_testset_var(instruction),),
+                source_offset=instruction.offset,
+                synthetic=False,
+            )
+            items.insert(insert_at, assignment)
+            inserted += 1
+            return predicate_name, inserted
+
+        value = self._describe_stack_top(items, index)
+        stack_name = self._make_stack_value_name(instruction.offset)
+        stack_node = IRStackValueAssign(
+            name=stack_name,
+            value=value,
+            source_offset=instruction.offset,
+            synthetic=False,
+        )
+        predicate_node = IRPredicateAssign(
+            name=predicate_name,
+            operator=operator,
+            operands=(stack_name,),
+            source_offset=instruction.offset,
+            synthetic=False,
+        )
+
+        if insert_at < len(items) and isinstance(items[insert_at], IRStackValueAssign):
+            existing_stack = items[insert_at]
+            if existing_stack.name == stack_name:
+                insert_at += 1
+                if (
+                    insert_at < len(items)
+                    and isinstance(items[insert_at], IRPredicateAssign)
+                    and items[insert_at].name == predicate_name
+                ):
+                    return predicate_name, inserted
+
+        items.insert(insert_at, stack_node)
+        items.insert(insert_at + 1, predicate_node)
+        inserted += 2
+        return predicate_name, inserted
+
+    def _synthesise_truthy_predicate(
+        self, items: _ItemList, index: int, branch: IRIf
+    ) -> Tuple[str, int]:
+        predicate_name = self._make_predicate_name(branch)
+        value = self._describe_stack_top(items, index)
+        stack_name = self._make_stack_value_name(branch.source_offset)
+        stack_node = IRStackValueAssign(
+            name=stack_name,
+            value=value,
+            source_offset=branch.source_offset,
+            synthetic=True,
+        )
+        predicate_node = IRPredicateAssign(
+            name=predicate_name,
+            operator="truthy",
+            operands=(stack_name,),
+            source_offset=branch.source_offset,
+            synthetic=True,
+        )
+        items.insert(index, stack_node)
+        items.insert(index + 1, predicate_node)
+        return predicate_name, 2
+
+    def _verify_branch_conditions(self, items: _ItemList) -> None:
+        problems: List[str] = []
+        for node in items:
+            if isinstance(node, IRIf) and self._condition_requires_fix(node.condition):
+                location = f"0x{node.source_offset:04X}" if node.source_offset is not None else "unknown"
+                problems.append(f"invalid predicate {node.condition} at {location}")
+        if problems:
+            details = "; ".join(problems)
+            raise ValueError(f"IR branch predicate verification failed: {details}")
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
