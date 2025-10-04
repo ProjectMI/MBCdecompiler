@@ -52,7 +52,6 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 _NON_CONDITION_NODE_TYPES = (
-    IRAsciiFinalize,
     IRAsciiHeader,
     IRAsciiPreamble,
     IRBuildArray,
@@ -1184,7 +1183,7 @@ class IRNormalizer:
 
     def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1
-        fallback: Optional[str] = None
+        literal_candidate: Optional[str] = None
         while scan >= 0:
             candidate = items[scan]
 
@@ -1215,19 +1214,15 @@ class IRNormalizer:
                 continue
 
             if self._is_literal_condition(text):
-                if (
-                    not skip_literals
-                    and fallback is None
-                    and text.startswith(("ascii(", "ascii_finalize"))
-                ):
-                    fallback = text
+                if not skip_literals and literal_candidate is None:
+                    literal_candidate = text
                 scan -= 1
                 continue
 
             return text
 
-        if fallback is not None:
-            return fallback
+        if literal_candidate is not None:
+            return literal_candidate
 
         return "stack_top"
 
@@ -1240,9 +1235,6 @@ class IRNormalizer:
             "array([",
             "map([",
             "ascii(",
-            "ascii_finalize",
-            "ascii_preamble",
-            "ascii_wrapper_call",
             "prep_call_args[",
             "prep_tailcall[",
             "table_patch[",
