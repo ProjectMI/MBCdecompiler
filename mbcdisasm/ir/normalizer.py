@@ -1172,9 +1172,50 @@ class IRNormalizer:
             if isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             if isinstance(candidate, IRNode):
-                return getattr(candidate, "describe", lambda: "expr()")()
+                materialised = self._materialise_tail_expression(items, scan)
+                return getattr(materialised, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
+
+    def _materialise_tail_expression(
+        self, items: _ItemList, index: int
+    ) -> Union[IRNode, RawInstruction]:
+        """Ensure nodes used as expressions are not marked as tail calls.
+
+        Some helper sequences end in ``tail`` calls even though the VM continues
+        execution and subsequently branches on the produced value.  Marking the
+        call as a tail terminator in those cases breaks the logical CFG because
+        the current block appears to finish at the call.  When such nodes are
+        used as part of a conditional expression we rewrite them into regular
+        calls so that later passes see a proper value-producing instruction.
+        """
+
+        node = items[index]
+        replacement: Optional[IRNode] = None
+
+        if isinstance(node, IRCall) and node.tail:
+            replacement = IRCall(target=node.target, args=node.args, tail=False)
+        elif isinstance(node, IRAsciiWrapperCall) and node.tail:
+            replacement = IRAsciiWrapperCall(
+                target=node.target,
+                args=node.args,
+                ascii_chunks=node.ascii_chunks,
+                tail=False,
+            )
+        elif isinstance(node, IRCallReturn) and node.tail:
+            replacement = IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=False,
+                returns=node.returns,
+                varargs=node.varargs,
+            )
+
+        if replacement is None:
+            return node
+
+        items.replace_slice(index, index + 1, [replacement])
+        return replacement
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
