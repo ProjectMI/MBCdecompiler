@@ -193,6 +193,39 @@ class IRTailcallAscii(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCompare(IRNode):
+    """Boolean comparison of two stack values."""
+
+    result: str
+    left: str
+    right: str
+    operator: str
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        suffix = ""
+        if self.annotations:
+            suffix = " " + ", ".join(self.annotations)
+        return f"cmp {self.result}={self.left} {self.operator} {self.right}{suffix}"
+
+
+@dataclass(frozen=True)
+class IRTest(IRNode):
+    """Unary boolean test applied to a stack value."""
+
+    result: str
+    value: str
+    operator: str
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        suffix = ""
+        if self.annotations:
+            suffix = " " + ", ".join(self.annotations)
+        return f"test {self.result}={self.operator}({self.value}){suffix}"
+
+
+@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
@@ -497,6 +530,8 @@ __all__ = [
     "IRLiteralBlock",
     "IRAsciiWrapperCall",
     "IRTailcallAscii",
+    "IRCompare",
+    "IRTest",
     "IRIf",
     "IRTestSetBranch",
     "IRFlagCheck",

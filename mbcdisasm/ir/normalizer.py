@@ -19,6 +19,7 @@ from .model import (
     IRBuildArray,
     IRBuildMap,
     IRBuildTuple,
+    IRCompare,
     IRCall,
     IRCallPreparation,
     IRCallReturn,
@@ -30,6 +31,7 @@ from .model import (
     IRLoad,
     IRNode,
     IRProgram,
+    IRTest,
     IRRaw,
     IRReturn,
     IRSegment,
@@ -205,7 +207,11 @@ class IRNormalizer:
         raw_instructions: List[RawInstruction] = []
         stack_names: List[str] = []
         next_ssa = 0
-        forced_push_kinds = {InstructionKind.REDUCE}
+        forced_push_kinds = {
+            InstructionKind.REDUCE,
+            InstructionKind.TEST,
+            InstructionKind.LOGICAL,
+        }
         for index, (profile, event) in enumerate(zip(executable, events)):
             notes = tuple(annotations.get(index, ()))
             pops = len(event.popped_types)
@@ -290,6 +296,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_assign_ssa_names(items)
+        self._pass_boolean_ops(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -1137,6 +1144,71 @@ class IRNormalizer:
             if isinstance(item, RawInstruction) and item.ssa_values:
                 self._record_ssa(item, item.ssa_values)
 
+    def _pass_boolean_ops(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            ssa_values = self._ssa_bindings.get(id(item), item.ssa_values)
+            if not ssa_values:
+                index += 1
+                continue
+
+            pushes = len(ssa_values)
+            delta = item.event.delta
+            pops = pushes - delta
+            if pops < 0:
+                pops = 0
+
+            classification = self._classify_boolean_instruction(item, pops)
+            if classification is None:
+                index += 1
+                continue
+
+            operands = self._collect_stack_values(items, index, pops)
+            category, operator = classification
+            result_name = self._ssa_value(item)
+            if result_name is None and item.ssa_values:
+                result_name = item.ssa_values[-1]
+
+            replacement: Optional[IRNode]
+            replacement = None
+
+            if category == "compare":
+                if len(operands) < 2 or result_name is None:
+                    index += 1
+                    continue
+                left = operands[-2]
+                right = operands[-1]
+                replacement = IRCompare(
+                    result=result_name,
+                    left=left,
+                    right=right,
+                    operator=operator,
+                    annotations=item.annotations,
+                )
+            elif category == "test":
+                value = operands[-1] if operands else "stack_top"
+                if result_name is None:
+                    index += 1
+                    continue
+                replacement = IRTest(
+                    result=result_name,
+                    value=value,
+                    operator=operator,
+                    annotations=item.annotations,
+                )
+
+            if replacement is None:
+                index += 1
+                continue
+
+            self._transfer_ssa(item, replacement)
+            items.replace_slice(index, index + 1, [replacement])
+
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -1145,8 +1217,20 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            predicate_result: Optional[str] = None
+            predicate = self._find_predicate_node(items, index)
+            if predicate is not None:
+                predicate_index, predicate_node = predicate
+                predicate_result = getattr(predicate_node, "result", None)
+                removed = self._cleanup_predicate_gap(items, predicate_index, index)
+                if removed:
+                    index -= removed
+                    item = items[index]
+
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                expr = predicate_result or self._describe_condition(
+                    items, index, skip_literals=True
+                )
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
@@ -1158,8 +1242,9 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                condition = predicate_result or self._describe_condition(items, index)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1168,6 +1253,147 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _classify_boolean_instruction(
+        self, instruction: RawInstruction, operand_count: int
+    ) -> Optional[Tuple[str, str]]:
+        kind = instruction.profile.kind
+        mnemonic = instruction.mnemonic.lower()
+        summary = (instruction.profile.summary or "").lower()
+
+        if kind is InstructionKind.BRANCH or kind is InstructionKind.TERMINATOR:
+            return None
+
+        operator = self._boolean_operator_tag(instruction)
+
+        if kind is InstructionKind.TEST:
+            return ("test", operator)
+
+        if kind is InstructionKind.LOGICAL:
+            compare_tokens = ("compare", "cmp")
+            if operand_count >= 2 or any(token in mnemonic for token in compare_tokens):
+                return ("compare", operator)
+            return ("test", operator)
+
+        compare_tokens = ("compare", "cmp", "eq", "lt", "gt", "le", "ge", "ne")
+        if any(token in mnemonic for token in compare_tokens):
+            return ("compare", operator)
+        if any(token in summary for token in ("compare", "cmp", "=", "<", ">", "срав")):
+            return ("compare", operator)
+        if "test" in mnemonic or "test" in summary:
+            return ("test", operator)
+
+        return None
+
+    @staticmethod
+    def _boolean_operator_tag(instruction: RawInstruction) -> str:
+        mnemonic = instruction.mnemonic.lower()
+        summary = (instruction.profile.summary or "").lower()
+
+        for prefix in ("compare_", "logical_", "test_"):
+            if mnemonic.startswith(prefix):
+                trimmed = mnemonic[len(prefix) :]
+                if trimmed:
+                    return trimmed
+        if summary:
+            first = summary.split()[0]
+            if first:
+                return first
+        return mnemonic
+
+    def _collect_stack_values(self, items: _ItemList, index: int, count: int) -> List[str]:
+        if count <= 0:
+            return []
+
+        values: List[str] = []
+        usage: Dict[int, int] = {}
+        scan = index - 1
+
+        while scan >= 0 and len(values) < count:
+            candidate = items[scan]
+            candidate_id = id(candidate)
+            names = self._ssa_bindings.get(candidate_id)
+            if names is None and isinstance(candidate, RawInstruction):
+                names = candidate.ssa_values if candidate.ssa_values else None
+            if names:
+                sequence = list(names)
+                used = usage.get(candidate_id, 0)
+                total = len(sequence)
+                while used < total and len(values) < count:
+                    position = total - 1 - used
+                    values.append(sequence[position])
+                    used += 1
+                usage[candidate_id] = used
+                scan -= 1
+                continue
+
+            fallback: Optional[str] = None
+            if isinstance(candidate, IRStackDuplicate):
+                fallback = candidate.value
+            elif isinstance(candidate, IRLiteral):
+                fallback = candidate.describe()
+            elif isinstance(candidate, IRLiteralChunk):
+                fallback = candidate.describe()
+            elif isinstance(candidate, RawInstruction) and candidate.pushes_value():
+                fallback = self._describe_value(candidate)
+            elif isinstance(candidate, IRNode):
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    fallback = describe()
+
+            if fallback is not None:
+                values.append(fallback)
+                usage[candidate_id] = usage.get(candidate_id, 0) + 1
+
+            scan -= 1
+
+        values.reverse()
+        if len(values) > count:
+            values = values[-count:]
+        return values
+
+    def _find_predicate_node(
+        self, items: _ItemList, branch_index: int
+    ) -> Optional[Tuple[int, IRNode]]:
+        scan = branch_index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, (IRCompare, IRTest)):
+                return scan, candidate
+            if isinstance(candidate, RawInstruction) and candidate.pushes_value():
+                break
+            if isinstance(candidate, IRLiteral):
+                break
+            if isinstance(candidate, IRLiteralChunk):
+                break
+            scan -= 1
+        return None
+
+    def _cleanup_predicate_gap(
+        self, items: _ItemList, predicate_index: int, branch_index: int
+    ) -> int:
+        removed = 0
+        pos = branch_index - 1
+        while pos > predicate_index:
+            candidate = items[pos]
+            if isinstance(candidate, RawInstruction):
+                if self._is_annotation_only(candidate):
+                    items.pop(pos)
+                    removed += 1
+                    pos -= 1
+                    continue
+                if (
+                    not candidate.pushes_value()
+                    and candidate.event.delta == 0
+                    and not candidate.event.popped_types
+                    and not candidate.event.pushed_types
+                ):
+                    items.pop(pos)
+                    removed += 1
+                    pos -= 1
+                    continue
+            pos -= 1
+        return removed
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0

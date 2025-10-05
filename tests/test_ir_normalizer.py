@@ -4,7 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRIf, IRTestSetBranch
+from mbcdisasm.ir.model import IRCompare, IRIf, IRTest, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -59,15 +59,31 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "call_dispatch",
             "stack_delta": -1,
         },
+        "compare_eq": {
+            "opcodes": ["0x80:0x00"],
+            "name": "compare_eq",
+            "category": "logic",
+            "summary": "logic compare equals",
+            "stack_delta": -1,
+        },
         "branch_eq": {
             "opcodes": ["0x23:0x00"],
             "name": "branch_eq",
             "category": "branch_eq",
+            "control_flow": "branch",
         },
         "testset_branch": {
             "opcodes": ["0x27:0x00"],
             "name": "testset_branch",
             "category": "testset_branch",
+            "control_flow": "branch",
+        },
+        "test_truth": {
+            "opcodes": ["0x81:0x00"],
+            "name": "test_truth",
+            "category": "test_truth",
+            "summary": "Проверка истинности",
+            "stack_delta": 0,
         },
         "indirect_access": {
             "opcodes": ["0x69:0x01"],
@@ -239,6 +255,55 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         if isinstance(node, IRTestSetBranch)
     ]
     assert testset_nodes and all(node.expr.startswith("ssa") for node in testset_nodes)
+
+
+def test_normalizer_extracts_boolean_predicates(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x00, 0x00, 0x0002),
+        build_word(8, 0x80, 0x00, 0x0000),
+        build_word(12, 0x23, 0x00, 0x0018),
+        build_word(16, 0x00, 0x00, 0x0003),
+        build_word(20, 0x81, 0x00, 0x0000),
+        build_word(24, 0x27, 0x00, 0x001C),
+        build_word(28, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    blocks = program.segments[0].blocks
+    assert len(blocks) >= 2
+
+    first_block = blocks[0]
+    second_block = blocks[1]
+
+    compare_nodes = [node for node in first_block.nodes if isinstance(node, IRCompare)]
+    assert compare_nodes, "compare node should be present"
+    compare = compare_nodes[0]
+    assert compare.left.startswith("ssa")
+    assert compare.right.startswith("ssa")
+
+    branch_nodes = [node for node in first_block.nodes if isinstance(node, IRIf)]
+    assert branch_nodes, "if node should be present"
+    assert branch_nodes[0].condition == compare.result
+
+    test_nodes = [node for node in second_block.nodes if isinstance(node, IRTest)]
+    assert test_nodes, "test node should be present"
+    test_node = test_nodes[0]
+    assert test_node.value.startswith("ssa")
+
+    testset_nodes = [
+        node for node in second_block.nodes if isinstance(node, IRTestSetBranch)
+    ]
+    assert testset_nodes, "testset branch should be present"
+    assert testset_nodes[0].expr == test_node.result
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
