@@ -556,29 +556,54 @@ class IRNormalizer:
     def _collapse_tail_return(self, items: _ItemList, call_index: int, metrics: NormalizerMetrics) -> None:
         index = call_index + 1
         collected_cleanup: List[IRStackEffect] = []
+        removal_indices: List[int] = []
+        return_index: Optional[int] = None
         while index < len(items):
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
-                count, varargs = self._resolve_return_signature(items, index)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-                if varargs and not values:
-                    values = ("ret*",)
-                items.replace_slice(
-                    index,
-                    index + 1,
-                    [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
-                )
-                metrics.returns += 1
-                return
-            if isinstance(item, RawInstruction) and item.profile.kind in {
-                InstructionKind.STACK_TEARDOWN,
-                InstructionKind.META,
-            }:
-                if item.profile.kind is InstructionKind.STACK_TEARDOWN:
-                    collected_cleanup.append(self._call_cleanup_effect(item))
-                items.pop(index)
+                return_index = index
+                break
+            if isinstance(item, RawInstruction) and self._is_call_cleanup_instruction(item):
+                collected_cleanup.append(self._call_cleanup_effect(item))
+                removal_indices.append(index)
+                index += 1
+                continue
+            if isinstance(item, IRCallCleanup):
+                collected_cleanup.extend(item.steps)
+                removal_indices.append(index)
+                index += 1
+                continue
+            if isinstance(item, RawInstruction) and item.profile.kind is InstructionKind.META:
+                removal_indices.append(index)
+                index += 1
+                continue
+            if self._is_stack_noise(item):
+                index += 1
                 continue
             break
+
+        if return_index is None:
+            return
+
+        for pos in reversed(removal_indices):
+            removed = items.pop(pos)
+            if pos < return_index:
+                return_index -= 1
+            if isinstance(removed, IRCallCleanup):
+                continue
+
+        instruction = items[return_index]
+        assert isinstance(instruction, RawInstruction)
+        count, varargs = self._resolve_return_signature(items, return_index)
+        values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+        if varargs and not values:
+            values = ("ret*",)
+        items.replace_slice(
+            return_index,
+            return_index + 1,
+            [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
+        )
+        metrics.returns += 1
 
     def _resolve_return_signature(self, items: _ItemList, index: int) -> Tuple[int, bool]:
         instruction = items[index]
@@ -832,25 +857,34 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            start = index
-            steps: List[Tuple[str, int]] = []
             scan = index - 1
+            step_indices: List[int] = []
+            steps: List[Tuple[str, int]] = []
             while scan >= 0:
                 candidate = items[scan]
                 if isinstance(candidate, IRCallPreparation):
+                    step_indices.insert(0, scan)
                     steps = list(candidate.steps) + steps
-                    start = scan
-                    break
+                    scan -= 1
+                    continue
                 if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
+                    step_indices.insert(0, scan)
                     steps.insert(0, self._call_preparation_step(candidate))
-                    start = scan
+                    scan -= 1
+                    continue
+                if self._is_stack_noise(candidate):
                     scan -= 1
                     continue
                 break
 
-            if steps:
-                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
-                index = start + 2
+            if steps and step_indices:
+                insert_at = step_indices[0]
+                removed_count = len(step_indices)
+                for pos in reversed(step_indices):
+                    items.pop(pos)
+                node = IRCallPreparation(steps=tuple(steps))
+                items.insert(insert_at, node)
+                index = index - removed_count + 2
                 continue
 
             index += 1
@@ -859,19 +893,33 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
+            if isinstance(item, IRCallCleanup):
+                index += 1
+                continue
             if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
                 index += 1
                 continue
 
             steps: List[IRStackEffect] = []
-            start = index
-            end = index
+            removal_indices: List[int] = []
             scan = index
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
                     steps.append(self._call_cleanup_effect(candidate))
-                    end = scan + 1
+                    removal_indices.append(scan)
+                    scan += 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
+                    steps.extend(candidate.steps)
+                    removal_indices.append(scan)
+                    scan += 1
+                    continue
+                if isinstance(candidate, RawInstruction) and candidate.profile.kind is InstructionKind.META:
+                    removal_indices.append(scan)
+                    scan += 1
+                    continue
+                if self._is_stack_noise(candidate):
                     scan += 1
                     continue
                 break
@@ -880,37 +928,46 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+            insertion_index = removal_indices[0]
+            for pos in reversed(removal_indices):
+                removed = items.pop(pos)
+                if pos < scan:
+                    scan -= 1
+                if isinstance(removed, IRCallCleanup):
+                    continue
+
+            node = IRCallCleanup(steps=tuple(steps))
+            items.insert(insertion_index, node)
+
+            prev_index = insertion_index - 1
+            while prev_index >= 0 and self._is_stack_noise(items[prev_index]):
                 prev_index -= 1
 
-            if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-                index = prev_index + 2
-                continue
-
-            next_index = end
-            while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
+            next_index = insertion_index + 1
+            while next_index < len(items) and self._is_stack_noise(items[next_index]):
                 next_index += 1
 
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
                 return_node = items[next_index]
-                assert isinstance(return_node, IRReturn)
-                combined = return_node.cleanup + tuple(steps)
+                combined = return_node.cleanup + node.steps
                 updated = IRReturn(
                     values=return_node.values,
                     varargs=return_node.varargs,
                     cleanup=combined,
                 )
                 self._transfer_ssa(return_node, updated)
-                items.replace_slice(start, end, [])
-                next_index -= len(steps)
+                items.pop(insertion_index)
+                if insertion_index < next_index:
+                    next_index -= 1
                 items.replace_slice(next_index, next_index + 1, [updated])
                 index = next_index + 1
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            if prev_index >= 0 and isinstance(items[prev_index], IRCall):
+                index = prev_index + 2
+                continue
+
+            index = insertion_index + 1
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1134,10 +1191,14 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
+                while offset < len(items) and self._is_stack_noise(items[offset]):
+                    offset += 1
                 cleanup_steps: Tuple[IRStackEffect, ...] = tuple()
                 if offset < len(items) and isinstance(items[offset], IRCallCleanup):
                     cleanup_steps = items[offset].steps
                     offset += 1
+                    while offset < len(items) and self._is_stack_noise(items[offset]):
+                        offset += 1
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
                     node = IRCallReturn(
@@ -1159,6 +1220,16 @@ class IRNormalizer:
         if mnemonic in CALL_CLEANUP_MNEMONICS:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+
+    def _is_stack_noise(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, (IRLiteral, IRLiteralChunk, IRLiteralBlock, IRAsciiHeader, IRAsciiFinalize, IRAsciiPreamble)):
+            return True
+        if isinstance(item, RawInstruction):
+            if self._is_annotation_only(item):
+                return True
+            if item.profile.kind is InstructionKind.META:
+                return True
+        return False
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
