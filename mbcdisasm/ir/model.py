@@ -34,6 +34,32 @@ class IRSlot:
 
 
 @dataclass(frozen=True)
+class MemRef:
+    """Symbolic memory reference resolved from indirect access prefixes."""
+
+    region: str
+    bank: Optional[int] = None
+    page: Optional[int] = None
+    offset: Optional[int] = None
+    symbol: Optional[str] = None
+
+    def describe(self) -> str:
+        parts = []
+        if self.symbol:
+            parts.append(f"symbol={self.symbol}")
+        if self.region:
+            parts.append(f"region={self.region}")
+        if self.bank is not None:
+            parts.append(f"bank=0x{self.bank:04X}")
+        if self.page is not None:
+            parts.append(f"page=0x{self.page:02X}")
+        if self.offset is not None:
+            parts.append(f"off=0x{self.offset:04X}")
+        inner = ", ".join(parts)
+        return f"mem[{inner}]" if inner else "mem[]"
+
+
+@dataclass(frozen=True)
 class IRNode:
     """Base class for IR nodes.
 
@@ -319,8 +345,14 @@ class IRIndirectLoad(IRNode):
     offset: int
     target: str
     base_slot: Optional[IRSlot] = None
+    ref: Optional["MemRef"] = None
 
     def describe(self) -> str:
+        if self.ref is not None:
+            location = self.ref.describe()
+            suffix = f" via {self.base}" if self.base and self.base != "stack" else ""
+            return f"load {location}{suffix} -> {self.target}"
+
         prefix = self.base
         if self.base_slot is not None:
             slot = f"{self.base_slot.space.name.lower()}[0x{self.base_slot.index:04X}]"
@@ -339,8 +371,14 @@ class IRIndirectStore(IRNode):
     value: str
     offset: int
     base_slot: Optional[IRSlot] = None
+    ref: Optional["MemRef"] = None
 
     def describe(self) -> str:
+        if self.ref is not None:
+            location = self.ref.describe()
+            suffix = f" via {self.base}" if self.base and self.base != "stack" else ""
+            return f"store {self.value} -> {location}{suffix}"
+
         prefix = self.base
         if self.base_slot is not None:
             slot = f"{self.base_slot.space.name.lower()}[0x{self.base_slot.index:04X}]"

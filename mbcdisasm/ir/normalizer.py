@@ -47,6 +47,7 @@ from .model import (
     IRIf,
     IRIndirectLoad,
     IRIndirectStore,
+    MemRef,
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
@@ -144,7 +145,7 @@ class IRNormalizer:
     _SSA_PREFIX = {
         SSAValueKind.UNKNOWN: "ssa",
         SSAValueKind.INTEGER: "int",
-        SSAValueKind.ADDRESS: "addr",
+        SSAValueKind.ADDRESS: "ptr",
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
@@ -164,6 +165,14 @@ class IRNormalizer:
         self._ssa_types: Dict[str, SSAValueKind] = {}
         self._ssa_aliases: Dict[str, str] = {}
         self._ssa_counters: Dict[str, int] = defaultdict(int)
+        self._pointer_regions: Dict[str, str] = {}
+        self._memref_symbols: Dict[
+            Tuple[str, Optional[int], Optional[int], Optional[int]], str
+        ] = {}
+        self._memref_usage: Dict[
+            Tuple[str, Optional[int], Optional[int], Optional[int]], int
+        ] = defaultdict(int)
+        self._memref_counters: Dict[str, int] = defaultdict(int)
 
     # ------------------------------------------------------------------
     # public entry points
@@ -422,6 +431,11 @@ class IRNormalizer:
     def _render_ssa(self, name: str) -> str:
         kind = self._ssa_types.get(name, SSAValueKind.UNKNOWN)
         prefix = self._SSA_PREFIX.get(kind, "ssa")
+        if kind is SSAValueKind.ADDRESS:
+            region = self._pointer_regions.get(name)
+            if region:
+                clean_region = region.replace(" ", "_")
+                prefix = f"{prefix}_{clean_region}"
         alias = self._ssa_aliases.get(name)
         if alias and alias.startswith(prefix):
             return alias
@@ -443,6 +457,14 @@ class IRNormalizer:
         if current is None or self._SSA_PRIORITY.get(kind, 0) > self._SSA_PRIORITY.get(current, 0):
             self._ssa_types[name] = kind
             self._ssa_aliases.pop(name, None)
+
+    def _note_pointer_region(self, name: Optional[str], region: Optional[str]) -> None:
+        if not name or not region:
+            return
+        if self._pointer_regions.get(name) == region:
+            return
+        self._pointer_regions[name] = region
+        self._ssa_aliases.pop(name, None)
 
     def _map_stack_type(self, value_type: StackValueType) -> SSAValueKind:
         if value_type is StackValueType.SLOT:
@@ -468,6 +490,151 @@ class IRNormalizer:
                         break
             scan -= 1
         return sources
+
+    # ------------------------------------------------------------------
+    # indirect access helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_raw_constant(instruction: RawInstruction) -> Optional[int]:
+        mnemonic = instruction.mnemonic
+        if not mnemonic.startswith("op_"):
+            return None
+        parts = mnemonic.split("_")[1:]
+        if len(parts) < 2:
+            return None
+        try:
+            return int("".join(parts[:2]), 16)
+        except ValueError:
+            return None
+
+    def _extract_memref_prefix(
+        self,
+        items: _ItemList,
+        index: int,
+        *,
+        base_name: Optional[str],
+        base_slot: Optional[IRSlot],
+        offset_hint: Optional[int],
+    ) -> Tuple[Optional[MemRef], Optional[Tuple[int, int]]]:
+        consumed: List[int] = []
+        values: List[int] = []
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if not isinstance(candidate, RawInstruction):
+                break
+            if candidate.event.delta != 0 or candidate.event.pushed_types:
+                break
+            constant = self._decode_raw_constant(candidate)
+            if constant is None:
+                break
+            consumed.append(scan)
+            values.append(constant)
+            scan -= 1
+
+        if not values:
+            return None, None
+
+        values.reverse()
+        memref = self._build_memref(
+            values,
+            base_slot=base_slot,
+            base_name=base_name,
+            offset_hint=offset_hint,
+        )
+        if memref is None:
+            return None, None
+
+        start = min(consumed)
+        end = max(consumed) + 1
+        return memref, (start, end)
+
+    def _build_memref(
+        self,
+        values: Sequence[int],
+        *,
+        base_slot: Optional[IRSlot],
+        base_name: Optional[str],
+        offset_hint: Optional[int],
+    ) -> Optional[MemRef]:
+        bank: Optional[int] = None
+        page: Optional[int] = None
+        offset: Optional[int] = offset_hint
+
+        for value in reversed(values):
+            if offset is None and value <= 0x00FF:
+                offset = value
+                continue
+            if bank is None:
+                bank = value
+                continue
+            if page is None and value <= 0x00FF:
+                page = value
+
+        if bank is None and page is None and offset is None:
+            return None
+
+        region = self._select_mem_region(base_slot, bank, page)
+        symbol = self._intern_mem_symbol(region, bank, page, offset)
+        self._note_pointer_region(base_name, region)
+        return MemRef(region=region, bank=bank, page=page, offset=offset, symbol=symbol)
+
+    @staticmethod
+    def _select_mem_region(
+        base_slot: Optional[IRSlot], bank: Optional[int], page: Optional[int]
+    ) -> str:
+        if base_slot is not None:
+            mapping = {
+                MemSpace.FRAME: "frame",
+                MemSpace.GLOBAL: "global",
+                MemSpace.CONST: "const",
+            }
+            region = mapping.get(base_slot.space)
+            if region:
+                return region
+        if page is not None:
+            return "page"
+        if bank is not None:
+            return "bank"
+        return "mem"
+
+    def _intern_mem_symbol(
+        self,
+        region: str,
+        bank: Optional[int],
+        page: Optional[int],
+        offset: Optional[int],
+    ) -> str:
+        key = (region, bank, page, offset)
+        self._memref_usage[key] += 1
+        existing = self._memref_symbols.get(key)
+        if existing:
+            return existing
+
+        prefix = region[:1].upper() if region else "M"
+        parts = [prefix]
+        if bank is not None:
+            parts.append(f"B{bank:04X}")
+        if page is not None:
+            parts.append(f"P{page:02X}")
+        if offset is not None:
+            parts.append(f"O{offset:04X}")
+
+        if len(parts) == 1:
+            parts.append(str(self._memref_counters[prefix]))
+            self._memref_counters[prefix] += 1
+
+        symbol = "_".join(parts)
+        self._memref_symbols[key] = symbol
+        return symbol
+
+    def _discard_items(self, items: _ItemList, start: int, end: int) -> None:
+        if start >= end:
+            return
+        stale = [items[pos] for pos in range(start, end)]
+        for entry in stale:
+            self._ssa_bindings.pop(id(entry), None)
+        items.replace_slice(start, end, [])
 
     # ------------------------------------------------------------------
     # individual pass implementations
@@ -1409,13 +1576,20 @@ class IRNormalizer:
             if kind in {InstructionKind.INDIRECT_LOAD, InstructionKind.INDIRECT}:
                 base_sources = self._stack_sources(items, index, 1)
                 base_slot: Optional[IRSlot] = None
-                base_alias = "stack"
+                base_name: Optional[str] = None
                 if base_sources:
                     base_name, base_node = base_sources[0]
                     self._promote_ssa_kind(base_name, SSAValueKind.ADDRESS)
-                    base_alias = self._render_ssa(base_name)
                     if isinstance(base_node, IRLoad):
                         base_slot = base_node.slot
+                memref, prefix_range = self._extract_memref_prefix(
+                    items,
+                    index,
+                    base_name=base_name,
+                    base_slot=base_slot,
+                    offset_hint=item.operand,
+                )
+                base_alias = self._render_ssa(base_name) if base_name else "stack"
                 target_name = item.ssa_values[0] if item.ssa_values else None
                 target_alias = self._render_ssa(target_name) if target_name else "stack"
                 node = IRIndirectLoad(
@@ -1423,10 +1597,17 @@ class IRNormalizer:
                     offset=item.operand,
                     target=target_alias,
                     base_slot=base_slot,
+                    ref=memref,
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
+                if prefix_range:
+                    start, end = prefix_range
+                    self._discard_items(items, start, end)
+                    index = start
+                else:
+                    index += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
                 base_sources = self._stack_sources(items, index, 2)
@@ -1440,6 +1621,13 @@ class IRNormalizer:
                 base_slot = base_node.slot if isinstance(base_node, IRLoad) else None
                 if base_name:
                     self._promote_ssa_kind(base_name, SSAValueKind.ADDRESS)
+                memref, prefix_range = self._extract_memref_prefix(
+                    items,
+                    index,
+                    base_name=base_name,
+                    base_slot=base_slot,
+                    offset_hint=item.operand,
+                )
                 base_alias = self._render_ssa(base_name) if base_name else "stack"
                 value_alias = self._render_ssa(value_name) if value_name else "stack"
                 node = IRIndirectStore(
@@ -1447,9 +1635,16 @@ class IRNormalizer:
                     value=value_alias,
                     offset=item.operand,
                     base_slot=base_slot,
+                    ref=memref,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1
+                if prefix_range:
+                    start, end = prefix_range
+                    self._discard_items(items, start, end)
+                    index = start
+                else:
+                    index += 1
                 continue
 
             index += 1
