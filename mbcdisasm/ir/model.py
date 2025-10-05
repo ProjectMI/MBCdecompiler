@@ -15,12 +15,22 @@ class MemSpace(Enum):
     CONST = auto()
 
 
+class ValueKind(Enum):
+    """Lightweight value classification propagated through the IR."""
+
+    UNKNOWN = "unknown"
+    NUMBER = "number"
+    ADDRESS = "address"
+    BOOLEAN = "boolean"
+
+
 @dataclass(frozen=True)
 class IRSlot:
     """Address of a VM slot used by :class:`IRLoad` and :class:`IRStore`."""
 
     space: MemSpace
     index: int
+    symbol: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -96,8 +106,18 @@ class IRLiteral(IRNode):
     mode: int
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
+    value_kind: ValueKind = ValueKind.NUMBER
 
     def describe(self) -> str:
+        if self.value_kind is ValueKind.ADDRESS:
+            label = self.symbol or f"0x{self.value:04X}"
+            return f"addr({label})"
+        if self.value_kind is ValueKind.BOOLEAN:
+            state = "true" if self.value else "false"
+            return f"bool({state})"
+        if self.symbol:
+            return self.symbol
         return f"lit(0x{self.value:04X})"
 
 
@@ -287,7 +307,8 @@ class IRLoad(IRNode):
     target: str = "stack"
 
     def describe(self) -> str:
-        return f"load {self.slot.space.name.lower()}[{self.slot.index}] -> {self.target}"
+        label = self.slot.symbol or f"0x{self.slot.index:04X}"
+        return f"load {self.slot.space.name.lower()}[{label}] -> {self.target}"
 
 
 @dataclass(frozen=True)
@@ -298,7 +319,32 @@ class IRStore(IRNode):
     value: str = "stack"
 
     def describe(self) -> str:
-        return f"store {self.value} -> {self.slot.space.name.lower()}[{self.slot.index}]"
+        label = self.slot.symbol or f"0x{self.slot.index:04X}"
+        return f"store {self.value} -> {self.slot.space.name.lower()}[{label}]"
+
+
+@dataclass(frozen=True)
+class IRIndirectLoad(IRNode):
+    """Load a value via an indirect address stored on the stack."""
+
+    base: str
+    offset: int
+    target: str
+
+    def describe(self) -> str:
+        return f"indirect_load base={self.base} off=0x{self.offset:04X} -> {self.target}"
+
+
+@dataclass(frozen=True)
+class IRIndirectStore(IRNode):
+    """Store a value via an indirect address stored on the stack."""
+
+    base: str
+    offset: int
+    value: str
+
+    def describe(self) -> str:
+        return f"indirect_store {self.value} -> {self.base}+0x{self.offset:04X}"
 
 
 @dataclass(frozen=True)
@@ -549,6 +595,8 @@ __all__ = [
     "IRFunctionPrologue",
     "IRLoad",
     "IRStore",
+    "IRIndirectLoad",
+    "IRIndirectStore",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRAsciiHeader",
@@ -563,5 +611,6 @@ __all__ = [
     "IRSlot",
     "IRRaw",
     "MemSpace",
+    "ValueKind",
     "NormalizerMetrics",
 ]

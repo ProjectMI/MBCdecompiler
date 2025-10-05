@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
-from ..analyzer.stack import StackEvent, StackTracker
+from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
@@ -37,6 +37,8 @@ from .model import (
     IRSlot,
     IRStackEffect,
     IRStore,
+    IRIndirectLoad,
+    IRIndirectStore,
     IRStackDuplicate,
     IRStackDrop,
     IRTailcallAscii,
@@ -46,6 +48,7 @@ from .model import (
     IRIf,
     MemSpace,
     NormalizerMetrics,
+    ValueKind,
 )
 
 
@@ -140,6 +143,12 @@ class IRNormalizer:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
         self._ssa_bindings: Dict[int, Tuple[str, ...]] = {}
+        self._ssa_value_kinds: Dict[str, ValueKind] = {}
+        self._ssa_output_kinds: Dict[int, List[ValueKind]] = {}
+        self._ssa_origins: Dict[str, Tuple[int, int]] = {}
+        self._ssa_inputs: Dict[int, Tuple[str, ...]] = {}
+        self._ssa_symbols: Dict[str, str] = {}
+        self._memory_symbols: Dict[Tuple[MemSpace, int], str] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -209,35 +218,58 @@ class IRNormalizer:
         tracker = StackTracker()
         events = tracker.process_sequence(executable)
 
+        self._ssa_value_kinds.clear()
+        self._ssa_output_kinds.clear()
+        self._ssa_origins.clear()
+        self._ssa_inputs.clear()
+        self._ssa_symbols.clear()
+
         raw_instructions: List[RawInstruction] = []
         stack_names: List[str] = []
+        stack_types: List[StackValueType] = []
         next_ssa = 0
         forced_push_kinds = {InstructionKind.REDUCE}
         for index, (profile, event) in enumerate(zip(executable, events)):
             notes = tuple(annotations.get(index, ()))
             pops = len(event.popped_types)
+            consumed: Tuple[str, ...] = tuple()
             if pops:
+                consumed_slice = stack_names[-pops:]
                 del stack_names[-pops:]
+                del stack_types[-pops:]
+                consumed = tuple(reversed(consumed_slice))
+                for name, stack_type in zip(consumed, event.popped_types):
+                    kind_hint = self._kind_from_stack_type(stack_type)
+                    self._update_ssa_kind(name, kind_hint)
+                if consumed and profile.kind is InstructionKind.TEST:
+                    for name in consumed:
+                        self._update_ssa_kind(name, ValueKind.BOOLEAN)
             pushes = len(event.pushed_types)
             if pushes == 0 and profile.kind in forced_push_kinds:
                 baseline = max(event.depth_before - pops, 0)
                 inferred = event.depth_after - baseline
                 pushes = max(inferred, 1)
             pushed_names: List[str] = []
-            for _ in range(pushes):
+            pushed_types: List[StackValueType] = list(event.pushed_types)
+            if pushes > len(pushed_types):
+                pushed_types.extend([StackValueType.UNKNOWN] * (pushes - len(pushed_types)))
+            for idx in range(pushes):
                 name = f"ssa{next_ssa}"
                 next_ssa += 1
                 pushed_names.append(name)
-            if pushed_names:
-                stack_names.extend(pushed_names)
-            raw_instructions.append(
-                RawInstruction(
-                    profile=profile,
-                    event=event,
-                    annotations=notes,
-                    ssa_values=tuple(pushed_names),
-                )
+                stack_names.append(name)
+                stack_types.append(pushed_types[idx])
+                self._update_ssa_kind(name, self._kind_from_stack_type(pushed_types[idx]))
+            raw = RawInstruction(
+                profile=profile,
+                event=event,
+                annotations=notes,
+                ssa_values=tuple(pushed_names),
             )
+            raw_instructions.append(raw)
+            self._register_ssa_output(raw, pushed_names)
+            if consumed:
+                self._ssa_inputs[id(raw)] = consumed
 
         blocks: List[RawBlock] = []
         current: List[RawInstruction] = []
@@ -337,6 +369,16 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # SSA helpers
     # ------------------------------------------------------------------
+    def _register_ssa_output(
+        self, owner: Union[RawInstruction, IRNode], names: Sequence[str]
+    ) -> None:
+        if not names:
+            return
+        kinds = [self._ssa_value_kinds.get(name, ValueKind.UNKNOWN) for name in names]
+        self._ssa_output_kinds[id(owner)] = list(kinds)
+        for index, name in enumerate(names):
+            self._ssa_origins[name] = (id(owner), index)
+
     def _record_ssa(self, item: Union[RawInstruction, IRNode], values: Sequence[str]) -> None:
         if values:
             self._ssa_bindings[id(item)] = tuple(values)
@@ -354,6 +396,14 @@ class IRNormalizer:
         values = self._ssa_bindings.get(id(source), values)
         if values:
             self._record_ssa(target, values)
+            kinds = self._ssa_output_kinds.pop(id(source), None)
+            if kinds is None:
+                kinds = [self._ssa_value_kinds.get(name, ValueKind.UNKNOWN) for name in values]
+            self._ssa_output_kinds[id(target)] = list(kinds)
+            for index, name in enumerate(values):
+                self._ssa_origins[name] = (id(target), index)
+        else:
+            self._ssa_output_kinds.pop(id(source), None)
         self._ssa_bindings.pop(id(source), None)
 
     def _ssa_value(self, item: Union[RawInstruction, IRNode], index: int = -1) -> Optional[str]:
@@ -365,6 +415,54 @@ class IRNormalizer:
         if 0 <= index < len(values):
             return values[index]
         return None
+
+    def _ssa_output_kind(self, item: Union[RawInstruction, IRNode], index: int = 0) -> ValueKind:
+        kinds = self._ssa_output_kinds.get(id(item))
+        if not kinds:
+            return ValueKind.UNKNOWN
+        if index < 0:
+            index += len(kinds)
+        if 0 <= index < len(kinds):
+            return kinds[index]
+        return ValueKind.UNKNOWN
+
+    def _update_ssa_kind(self, name: str, hint: ValueKind) -> None:
+        if not name or hint is ValueKind.UNKNOWN:
+            return
+        current = self._ssa_value_kinds.get(name, ValueKind.UNKNOWN)
+        merged = self._merge_value_kind(current, hint)
+        if merged is current:
+            return
+        self._ssa_value_kinds[name] = merged
+        owner_info = self._ssa_origins.get(name)
+        if owner_info is None:
+            return
+        owner_id, index = owner_info
+        kinds = self._ssa_output_kinds.get(owner_id)
+        if kinds and 0 <= index < len(kinds):
+            kinds[index] = merged
+
+    @staticmethod
+    def _merge_value_kind(current: ValueKind, hint: ValueKind) -> ValueKind:
+        if hint is ValueKind.UNKNOWN:
+            return current
+        if current is ValueKind.UNKNOWN:
+            return hint
+        if current is hint:
+            return current
+        if current is ValueKind.NUMBER and hint in {ValueKind.ADDRESS, ValueKind.BOOLEAN}:
+            return hint
+        return current
+
+    @staticmethod
+    def _kind_from_stack_type(value: StackValueType) -> ValueKind:
+        if value is StackValueType.SLOT:
+            return ValueKind.ADDRESS
+        if value is StackValueType.NUMBER:
+            return ValueKind.NUMBER
+        if value is StackValueType.IDENTIFIER:
+            return ValueKind.NUMBER
+        return ValueKind.UNKNOWN
 
     # ------------------------------------------------------------------
     # individual pass implementations
@@ -416,8 +514,12 @@ class IRNormalizer:
 
             if mnemonic == "op_03_66":
                 slot = self._classify_slot(item.operand)
-                node = IRLoad(slot=slot)
+                target = item.ssa_values[0] if item.ssa_values else "stack"
+                node = IRLoad(slot=slot, target=target)
                 self._transfer_ssa(item, node)
+                if item.ssa_values and slot.symbol:
+                    for name in item.ssa_values:
+                        self._ssa_symbols[name] = slot.symbol
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
                 continue
@@ -431,11 +533,15 @@ class IRNormalizer:
             self._annotation_offsets.add(instruction.offset)
             hint = LITERAL_MARKER_HINTS.get(instruction.operand)
             if hint is not None:
+                value_kind = self._ssa_output_kind(instruction)
+                if value_kind is ValueKind.UNKNOWN:
+                    value_kind = ValueKind.NUMBER
                 return IRLiteral(
                     value=instruction.operand,
                     mode=profile.mode,
                     source=hint,
                     annotations=instruction.annotations,
+                    value_kind=value_kind,
                 )
             return None
 
@@ -450,12 +556,25 @@ class IRNormalizer:
             )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
-            return IRLiteral(
+            value_kind = self._ssa_output_kind(instruction)
+            if value_kind is ValueKind.UNKNOWN:
+                value_kind = ValueKind.NUMBER
+            symbol = None
+            if value_kind is ValueKind.ADDRESS:
+                slot = self._classify_slot(instruction.operand)
+                symbol = slot.symbol
+            literal = IRLiteral(
                 value=instruction.operand,
                 mode=profile.mode,
                 source=profile.mnemonic,
                 annotations=instruction.annotations,
+                symbol=symbol,
+                value_kind=value_kind,
             )
+            if symbol:
+                for name in instruction.ssa_values:
+                    self._ssa_symbols[name] = symbol
+            return literal
 
         return None
 
@@ -1303,16 +1422,20 @@ class IRNormalizer:
                 continue
 
             kind = item.event.kind
+            inputs = self._ssa_inputs.get(id(item), tuple())
+            base_name = inputs[0] if inputs else None
+            base_display = self._format_indirect_base(base_name, items, index)
             if kind in {InstructionKind.INDIRECT_LOAD, InstructionKind.INDIRECT}:
-                slot = self._classify_slot(item.operand)
-                node = IRLoad(slot=slot)
+                target = item.ssa_values[0] if item.ssa_values else "stack"
+                node = IRIndirectLoad(base=base_display, offset=item.operand, target=target)
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
-                slot = self._classify_slot(item.operand)
-                node = IRStore(slot=slot)
+                value_name = inputs[1] if len(inputs) > 1 else None
+                value_display = self._format_indirect_value(value_name, items, index)
+                node = IRIndirectStore(base=base_display, offset=item.operand, value=value_display)
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1
                 continue
@@ -1353,6 +1476,20 @@ class IRNormalizer:
                     return describe()
             scan -= 1
         return "stack_top"
+
+    def _format_indirect_base(
+        self, base_name: Optional[str], items: _ItemList, index: int
+    ) -> str:
+        if base_name:
+            return self._ssa_symbols.get(base_name, base_name)
+        return self._describe_stack_top(items, index)
+
+    def _format_indirect_value(
+        self, value_name: Optional[str], items: _ItemList, index: int
+    ) -> str:
+        if value_name:
+            return self._ssa_symbols.get(value_name, value_name)
+        return self._describe_stack_top(items, index)
 
     def _describe_value(self, instruction: RawInstruction) -> str:
         mapped = self._ssa_value(instruction)
@@ -1425,15 +1562,28 @@ class IRNormalizer:
     def _fallthrough_target(instruction: RawInstruction) -> int:
         return instruction.offset + 4
 
-    @staticmethod
-    def _classify_slot(operand: int) -> IRSlot:
+    def _classify_slot(self, operand: int) -> IRSlot:
         if operand < 0x1000:
             space = MemSpace.FRAME
         elif operand < 0x8000:
             space = MemSpace.GLOBAL
         else:
             space = MemSpace.CONST
-        return IRSlot(space=space, index=operand)
+        symbol = self._resolve_memory_symbol(space, operand)
+        return IRSlot(space=space, index=operand, symbol=symbol)
+
+    def _resolve_memory_symbol(self, space: MemSpace, index: int) -> str:
+        key = (space, index)
+        symbol = self._memory_symbols.get(key)
+        if symbol is None:
+            prefix = {
+                MemSpace.FRAME: "frame",
+                MemSpace.GLOBAL: "global",
+                MemSpace.CONST: "const",
+            }[space]
+            symbol = f"{prefix}_{index:04X}"
+            self._memory_symbols[key] = symbol
+        return symbol
 
     @staticmethod
     def _flag_literal_value(text: str) -> Optional[int]:

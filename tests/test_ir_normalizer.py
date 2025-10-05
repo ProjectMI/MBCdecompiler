@@ -244,8 +244,10 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         text.startswith("testset") or text.startswith("function_prologue")
         for text in descriptions
     )
-    assert any(text.startswith("load") for text in descriptions)
-    assert any(text.startswith("store") for text in descriptions)
+    assert any(text.startswith("indirect_load") for text in descriptions)
+    assert any(text.startswith("load") or text.startswith("indirect_load") for text in descriptions)
+    assert any(text.startswith("store") or text.startswith("indirect_store") for text in descriptions)
+    assert any("addr(" in text for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
