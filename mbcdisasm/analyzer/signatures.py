@@ -23,6 +23,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
 
+from ..constants import RET_MASK
 from .instruction_profile import InstructionKind, InstructionProfile
 from .stack import StackSummary
 
@@ -601,7 +602,7 @@ class MarkerFenceReduceSignature(SignatureRule):
             return None
         if labels[1] != "01:90":
             return None
-        if labels[2] != "5E:29" or operands[2] != 0x2910:
+        if labels[2] != "5E:29" or operands[2] != RET_MASK:
             return None
         if labels[3] != "ED:4D" or operands[3] != 0x4D0E:
             return None

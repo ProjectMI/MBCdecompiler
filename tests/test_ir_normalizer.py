@@ -5,6 +5,7 @@ from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
 from mbcdisasm.ir.model import (
+    IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
     IRIf,
@@ -72,6 +73,13 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x10:0xE8"],
             "name": "call_helpers",
             "category": "call_helpers",
+        },
+        "fanout": {
+            "opcodes": ["0x10:0x08"],
+            "name": "fanout",
+            "control_flow": "fallthrough",
+            "operand_role": "flags",
+            "operand_aliases": {"0x2C02": "FANOUT_FLAGS"},
         },
         "branch_eq": {
             "opcodes": ["0x23:0x00"],
@@ -330,6 +338,33 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
 
+def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [build_word(0, 0x10, 0x08, 0x2C02)]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRCallCleanup)
+    assert len(node.steps) == 1
+    step = node.steps[0]
+    assert isinstance(step, IRStackEffect)
+    assert step.mnemonic == "fanout"
+    assert step.operand_role == "flags"
+    assert step.operand_alias == "FANOUT_FLAGS"
+    rendered = step.describe()
+    assert rendered == "fanout(flags=FANOUT_FLAGS(0x2C02))"
+
+    cleanup_rendered = node.describe()
+    assert "fanout(flags=FANOUT_FLAGS(0x2C02))" in cleanup_rendered
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

@@ -24,6 +24,7 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
+from ..constants import OPERAND_ALIASES
 
 # ---------------------------------------------------------------------------
 # Heuristic opcode helpers
@@ -207,6 +208,36 @@ class InstructionProfile:
             return True
 
         return False
+        
+    def operand_role(self) -> Optional[str]:
+        """Return a descriptive label for the operand, if provided."""
+
+        role = self.traits.get("operand_role")
+        if isinstance(role, str) and role:
+            return role
+        return None
+
+    def operand_alias(self) -> Optional[str]:
+        """Return a named alias for the operand when one is known."""
+
+        operand = self.operand
+
+        raw_mapping = self.traits.get("operand_aliases")
+        if isinstance(raw_mapping, Mapping):
+            alias = raw_mapping.get(operand)
+            if alias is not None:
+                return str(alias)
+
+        raw_mapping = self.traits.get("operand_names")
+        if isinstance(raw_mapping, Mapping):
+            alias = raw_mapping.get(operand)
+            if alias is not None:
+                return str(alias)
+
+        alias = OPERAND_ALIASES.get(operand)
+        if alias is not None:
+            return alias
+        return None
 
     def estimated_stack_delta(self) -> StackEffectHint:
         """Return the stack hint adjusted by heuristics."""
