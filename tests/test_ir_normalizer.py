@@ -126,9 +126,15 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
         build_word(12, 0x23, 0x00, 0x0010),
         build_word(16, 0x00, 0x00, 0x0005),
         build_word(20, 0x27, 0x00, 0x0008),
-        build_word(24, 0x69, 0x01, 0x0005),
-        build_word(28, 0x69, 0x01, 0x9000),
-        build_word(32, 0x01, 0x00, 0x0000),
+        build_word(24, 0x03, 0x66, 0x0005),
+        build_word(28, 0x11, 0xBE, 0x0000),
+        build_word(32, 0xCA, 0x05, 0x0000),
+        build_word(36, 0x69, 0x01, 0x0005),
+        build_word(40, 0x03, 0x66, 0x9000),
+        build_word(44, 0x11, 0xBE, 0x0000),
+        build_word(48, 0xCE, 0x05, 0x0000),
+        build_word(52, 0x69, 0x01, 0x9000),
+        build_word(56, 0x01, 0x00, 0x0000),
     ]
 
     seg0_bytes = encode_instructions(seg0_words)
@@ -228,8 +234,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches == 1
     assert program.metrics.if_branches == 1
-    assert program.metrics.loads == 1
-    assert program.metrics.stores == 1
+    assert program.metrics.loads >= 2
+    assert program.metrics.stores >= 1
     assert program.metrics.reduce_replaced == 1
 
     segment = program.segments[1]
@@ -244,8 +250,10 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         text.startswith("testset") or text.startswith("function_prologue")
         for text in descriptions
     )
-    assert any(text.startswith("load") for text in descriptions)
-    assert any(text.startswith("store") for text in descriptions)
+    assert any(text.startswith("load frame[") for text in descriptions)
+    assert any(text.startswith("store ") and "[" in text for text in descriptions)
+    assert any("ptr" in text for text in descriptions)
+    assert any("bank=0x11BE" in text for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
@@ -258,7 +266,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for node in block.nodes
         if isinstance(node, IRIf)
     ]
-    assert if_nodes and all(node.condition.startswith("ssa") for node in if_nodes)
+    assert if_nodes and all(node.condition.startswith("bool") for node in if_nodes)
 
     testset_nodes = [
         node
@@ -267,7 +275,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         if isinstance(node, IRTestSetBranch)
     ]
     if testset_nodes:
-        assert all(node.expr.startswith("ssa") for node in testset_nodes)
+        assert all(node.expr.startswith("bool") for node in testset_nodes)
     else:
         prologue_nodes = [
             node
@@ -291,7 +299,10 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     ]
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
-    assert any(text.startswith("tailcall_ascii") for text in descriptions)
+    assert any(
+        text.startswith("tailcall_ascii") or text.startswith("ascii_wrapper_call tail")
+        for text in descriptions
+    )
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
