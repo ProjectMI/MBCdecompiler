@@ -5,6 +5,7 @@ from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
 from mbcdisasm.ir.model import (
+    IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
     IRIf,
@@ -438,3 +439,63 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert call_return.tail
     assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
     assert call_return.cleanup[-1].pops == 4
+
+
+def test_normalizer_cleanup_ignores_ascii_spacers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x0100),  # call_dispatch
+        build_ascii_word(4, "NOIS"),  # inline ascii spacer
+        build_word(8, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert any(isinstance(node, IRCallCleanup) for node in block.nodes)
+    assert any(
+        getattr(node, "describe", lambda: "")().startswith("ascii_wrapper_call")
+        for node in block.nodes
+    )
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
+        for node in block.nodes
+    )
+
+
+def test_normalizer_merges_teardown_with_literal_noise(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x0300),  # call_dispatch
+        build_word(4, 0x00, 0x00, 0x0001),  # push_literal spacer
+        build_word(8, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(12, 0x00, 0x00, 0x0002),  # push_literal spacer
+        build_word(16, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(20, 0x30, 0x00, 0x0001),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
+    assert [step.mnemonic for step in cleanup.steps] == ["stack_teardown", "stack_teardown"]
+    assert [step.pops for step in cleanup.steps] == [4, 4]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
+        for node in block.nodes
+    )

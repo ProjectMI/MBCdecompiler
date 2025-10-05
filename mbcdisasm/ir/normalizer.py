@@ -832,25 +832,48 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            start = index
             steps: List[Tuple[str, int]] = []
+            slice_start = index
             scan = index - 1
             while scan >= 0:
                 candidate = items[scan]
                 if isinstance(candidate, IRCallPreparation):
                     steps = list(candidate.steps) + steps
-                    start = scan
+                    slice_start = scan
                     break
                 if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
                     steps.insert(0, self._call_preparation_step(candidate))
-                    start = scan
+                    slice_start = scan
+                    scan -= 1
+                    continue
+                if self._is_call_preparation_spacer(candidate):
+                    slice_start = scan
                     scan -= 1
                     continue
                 break
 
             if steps:
-                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
-                index = start + 2
+                prep_node = IRCallPreparation(steps=tuple(steps))
+                segment = list(items[slice_start:index])
+                inserted = False
+                replacement: List[Union[RawInstruction, IRNode]] = []
+                for element in segment:
+                    if isinstance(element, IRCallPreparation) or (
+                        isinstance(element, RawInstruction)
+                        and self._is_call_preparation_instruction(element)
+                    ):
+                        if not inserted:
+                            replacement.append(prep_node)
+                            inserted = True
+                        continue
+                    replacement.append(element)
+                if not inserted:
+                    replacement.insert(0, prep_node)
+                items.replace_slice(slice_start, index, replacement)
+                for pos, entry in enumerate(items):
+                    if entry is item:
+                        index = pos + 1
+                        break
                 continue
 
             index += 1
@@ -863,54 +886,73 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            steps: List[IRStackEffect] = []
-            start = index
-            end = index
+            cleanup_indices: List[int] = []
             scan = index
+            end = index
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
-                    steps.append(self._call_cleanup_effect(candidate))
+                    cleanup_indices.append(scan)
                     end = scan + 1
+                    scan += 1
+                    continue
+                if self._is_cleanup_spacer(candidate):
                     scan += 1
                     continue
                 break
 
-            if not steps:
+            if not cleanup_indices:
                 index += 1
                 continue
 
-            prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+            steps = [self._call_cleanup_effect(items[pos]) for pos in cleanup_indices]
+            slice_start = index
+            slice_end = end
+            segment = list(items[slice_start:slice_end])
+            inserted = False
+            replacement: List[Union[RawInstruction, IRNode]] = []
+            for element in segment:
+                if isinstance(element, RawInstruction) and self._is_call_cleanup_instruction(element):
+                    if not inserted:
+                        replacement.append(IRCallCleanup(steps=tuple(steps)))
+                        inserted = True
+                    continue
+                replacement.append(element)
+            if not inserted:
+                replacement.insert(0, IRCallCleanup(steps=tuple(steps)))
+            items.replace_slice(slice_start, slice_end, replacement)
+
+            cleanup_index = slice_start
+            cleanup_node = items[cleanup_index]
+            assert isinstance(cleanup_node, IRCallCleanup)
+
+            prev_index = cleanup_index - 1
+            while prev_index >= 0 and self._is_cleanup_spacer(items[prev_index]):
                 prev_index -= 1
 
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
                 index = prev_index + 2
                 continue
 
-            next_index = end
-            while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
+            next_index = cleanup_index + 1
+            while next_index < len(items) and self._is_cleanup_spacer(items[next_index]):
                 next_index += 1
 
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
                 return_node = items[next_index]
-                assert isinstance(return_node, IRReturn)
-                combined = return_node.cleanup + tuple(steps)
+                combined = cleanup_node.steps + return_node.cleanup
                 updated = IRReturn(
                     values=return_node.values,
                     varargs=return_node.varargs,
                     cleanup=combined,
                 )
                 self._transfer_ssa(return_node, updated)
-                items.replace_slice(start, end, [])
-                next_index -= len(steps)
                 items.replace_slice(next_index, next_index + 1, [updated])
-                index = next_index + 1
+                items.pop(cleanup_index)
+                index = cleanup_index
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            index = cleanup_index + 1
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1177,6 +1219,26 @@ class IRNormalizer:
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
+
+    def _is_call_preparation_spacer(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, (IRLiteralChunk, IRAsciiPreamble, IRAsciiHeader, IRAsciiFinalize)):
+            return True
+        if isinstance(item, RawInstruction):
+            if self._is_annotation_only(item):
+                return True
+            if item.profile.kind is InstructionKind.META:
+                return True
+        return False
+
+    def _is_cleanup_spacer(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, (IRLiteral, IRLiteralChunk, IRCallPreparation, IRAsciiPreamble, IRAsciiHeader, IRAsciiFinalize)):
+            return True
+        if isinstance(item, RawInstruction):
+            if self._is_annotation_only(item):
+                return True
+            if item.profile.kind is InstructionKind.META:
+                return True
+        return False
 
     def _call_cleanup_effect(self, instruction: RawInstruction) -> IRStackEffect:
         mnemonic = instruction.mnemonic
