@@ -48,19 +48,44 @@ class IRCall(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStackEffect:
+    """Canonical representation of stack shuffles and teardowns."""
+
+    mnemonic: str
+    operand: int = 0
+    pops: int = 0
+
+    def describe(self) -> str:
+        details = []
+        if self.pops:
+            details.append(f"pop={self.pops}")
+        if self.operand or self.mnemonic not in {"stack_teardown"}:
+            details.append(f"operand=0x{self.operand:04X}")
+        if not details:
+            return self.mnemonic
+        inner = ", ".join(details)
+        return f"{self.mnemonic}({inner})"
+
+
+@dataclass(frozen=True)
 class IRReturn(IRNode):
     """Return from the current routine."""
 
     values: Tuple[str, ...]
     varargs: bool = False
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
+        cleanup = ""
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            cleanup = f" cleanup=[{rendered}]"
         if self.varargs:
             if self.values:
-                return f"return varargs({', '.join(self.values)})"
-            return "return varargs"
+                return f"return varargs({', '.join(self.values)}){cleanup}"
+            return f"return varargs{cleanup}"
         values = ", ".join(self.values)
-        return f"return [{values}]"
+        return f"return [{values}]{cleanup}"
 
 
 @dataclass(frozen=True)
@@ -316,6 +341,22 @@ class IRCallPreparation(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCallCleanup(IRNode):
+    """Helper sequence that discharges temporary call frames or return values."""
+
+    steps: Tuple[IRStackEffect, ...]
+    pops: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "pops", sum(step.pops for step in self.steps))
+
+    def describe(self) -> str:
+        rendered = ", ".join(step.describe() for step in self.steps)
+        suffix = f" pop={self.pops}" if self.pops else ""
+        return f"cleanup_call[{rendered}]{suffix}"
+
+
+@dataclass(frozen=True)
 class IRTailcallFrame(IRNode):
     """Canonical frame setup that precedes the VM tailcall helpers."""
 
@@ -378,6 +419,7 @@ class IRCallReturn(IRNode):
     tail: bool
     returns: Tuple[str, ...]
     varargs: bool = False
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -385,7 +427,11 @@ class IRCallReturn(IRNode):
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]"
+        cleanup = ""
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            cleanup = f" cleanup=[{rendered}]"
+        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
 
 
 @dataclass(frozen=True)
