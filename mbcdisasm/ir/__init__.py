@@ -33,6 +33,7 @@ from .model import (
     IRIf,
     IRFunctionPrologue,
     MemSpace,
+    MemRef,
     NormalizerMetrics,
 )
 from .normalizer import IRNormalizer
@@ -72,5 +73,6 @@ __all__ = [
     "IRSlot",
     "IRRaw",
     "MemSpace",
+    "MemRef",
     "NormalizerMetrics",
 ]

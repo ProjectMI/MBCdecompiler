@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
-from ..analyzer.stack import StackEvent, StackTracker
+from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
@@ -44,7 +45,11 @@ from .model import (
     IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
+    IRIndirectLoad,
+    IRIndirectStore,
     MemSpace,
+    MemRef,
+    SSAValueKind,
     NormalizerMetrics,
 )
 
@@ -74,6 +79,7 @@ class RawInstruction:
     event: StackEvent
     annotations: Tuple[str, ...]
     ssa_values: Tuple[str, ...]
+    ssa_kinds: Tuple[SSAValueKind, ...]
 
     @property
     def mnemonic(self) -> str:
@@ -136,10 +142,31 @@ class _ItemList:
 class IRNormalizer:
     """Drive the multi-pass IR normalisation pipeline."""
 
+    _SSA_PREFIX = {
+        SSAValueKind.UNKNOWN: "ssa",
+        SSAValueKind.INTEGER: "int",
+        SSAValueKind.ADDRESS: "ptr",
+        SSAValueKind.BOOLEAN: "bool",
+        SSAValueKind.IDENTIFIER: "id",
+    }
+
+    _SSA_PRIORITY = {
+        SSAValueKind.UNKNOWN: 0,
+        SSAValueKind.INTEGER: 1,
+        SSAValueKind.IDENTIFIER: 1,
+        SSAValueKind.ADDRESS: 2,
+        SSAValueKind.BOOLEAN: 3,
+    }
+
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
         self._ssa_bindings: Dict[int, Tuple[str, ...]] = {}
+        self._ssa_types: Dict[str, SSAValueKind] = {}
+        self._ssa_aliases: Dict[str, str] = {}
+        self._ssa_counters: Dict[str, int] = defaultdict(int)
+        self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
+        self._memref_counters: Dict[str, int] = defaultdict(int)
 
     # ------------------------------------------------------------------
     # public entry points
@@ -224,10 +251,16 @@ class IRNormalizer:
                 inferred = event.depth_after - baseline
                 pushes = max(inferred, 1)
             pushed_names: List[str] = []
+            pushed_kinds: List[SSAValueKind] = []
             for _ in range(pushes):
                 name = f"ssa{next_ssa}"
                 next_ssa += 1
                 pushed_names.append(name)
+            if event.pushed_types:
+                for value_type in event.pushed_types[:pushes]:
+                    pushed_kinds.append(self._map_stack_type(value_type))
+            while len(pushed_kinds) < len(pushed_names):
+                pushed_kinds.append(SSAValueKind.UNKNOWN)
             if pushed_names:
                 stack_names.extend(pushed_names)
             raw_instructions.append(
@@ -236,6 +269,7 @@ class IRNormalizer:
                     event=event,
                     annotations=notes,
                     ssa_values=tuple(pushed_names),
+                    ssa_kinds=tuple(pushed_kinds),
                 )
             )
 
@@ -281,6 +315,9 @@ class IRNormalizer:
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
         self._ssa_bindings.clear()
+        self._ssa_types.clear()
+        self._ssa_aliases.clear()
+        self._ssa_counters.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -337,9 +374,19 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # SSA helpers
     # ------------------------------------------------------------------
-    def _record_ssa(self, item: Union[RawInstruction, IRNode], values: Sequence[str]) -> None:
+    def _record_ssa(
+        self,
+        item: Union[RawInstruction, IRNode],
+        values: Sequence[str],
+        *,
+        kinds: Optional[Sequence[SSAValueKind]] = None,
+    ) -> None:
         if values:
-            self._ssa_bindings[id(item)] = tuple(values)
+            stored = tuple(values)
+            self._ssa_bindings[id(item)] = stored
+            if kinds:
+                for name, kind in zip(stored, kinds):
+                    self._set_ssa_kind(name, kind)
         else:
             self._ssa_bindings.pop(id(item), None)
 
@@ -356,15 +403,74 @@ class IRNormalizer:
             self._record_ssa(target, values)
         self._ssa_bindings.pop(id(source), None)
 
-    def _ssa_value(self, item: Union[RawInstruction, IRNode], index: int = -1) -> Optional[str]:
+    def _ssa_value(
+        self,
+        item: Union[RawInstruction, IRNode],
+        index: int = -1,
+        *,
+        raw: bool = False,
+    ) -> Optional[str]:
         values = self._ssa_bindings.get(id(item))
         if not values:
             return None
         if index < 0:
             index += len(values)
-        if 0 <= index < len(values):
-            return values[index]
-        return None
+        if not (0 <= index < len(values)):
+            return None
+        name = values[index]
+        if raw:
+            return name
+        return self._render_ssa(name)
+
+    def _render_ssa(self, name: str) -> str:
+        kind = self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+        prefix = self._SSA_PREFIX.get(kind, "ssa")
+        alias = self._ssa_aliases.get(name)
+        if alias:
+            return alias
+        alias = f"{prefix}{self._ssa_counters[prefix]}"
+        self._ssa_counters[prefix] += 1
+        self._ssa_aliases[name] = alias
+        return alias
+
+    def _set_ssa_kind(self, name: str, kind: SSAValueKind) -> None:
+        current = self._ssa_types.get(name)
+        if current is None or self._SSA_PRIORITY.get(kind, 0) > self._SSA_PRIORITY.get(current, 0):
+            self._ssa_types[name] = kind
+            self._ssa_aliases.pop(name, None)
+
+    def _promote_ssa_kind(self, name: Optional[str], kind: SSAValueKind) -> None:
+        if not name:
+            return
+        current = self._ssa_types.get(name)
+        if current is None or self._SSA_PRIORITY.get(kind, 0) > self._SSA_PRIORITY.get(current, 0):
+            self._ssa_types[name] = kind
+            self._ssa_aliases.pop(name, None)
+
+    def _map_stack_type(self, value_type: StackValueType) -> SSAValueKind:
+        if value_type is StackValueType.SLOT:
+            return SSAValueKind.ADDRESS
+        if value_type is StackValueType.NUMBER:
+            return SSAValueKind.INTEGER
+        if value_type is StackValueType.IDENTIFIER:
+            return SSAValueKind.IDENTIFIER
+        return SSAValueKind.UNKNOWN
+
+    def _stack_sources(
+        self, items: _ItemList, index: int, count: int
+    ) -> List[Tuple[str, Union[RawInstruction, IRNode]]]:
+        sources: List[Tuple[str, Union[RawInstruction, IRNode]]] = []
+        scan = index - 1
+        while scan >= 0 and len(sources) < count:
+            candidate = items[scan]
+            values = self._ssa_bindings.get(id(candidate))
+            if values:
+                for name in reversed(values):
+                    sources.append((name, candidate))
+                    if len(sources) == count:
+                        break
+            scan -= 1
+        return sources
 
     # ------------------------------------------------------------------
     # individual pass implementations
@@ -1260,7 +1366,7 @@ class IRNormalizer:
     def _pass_assign_ssa_names(self, items: _ItemList) -> None:
         for item in items:
             if isinstance(item, RawInstruction) and item.ssa_values:
-                self._record_ssa(item, item.ssa_values)
+                self._record_ssa(item, item.ssa_values, kinds=item.ssa_kinds)
 
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -1304,15 +1410,76 @@ class IRNormalizer:
 
             kind = item.event.kind
             if kind in {InstructionKind.INDIRECT_LOAD, InstructionKind.INDIRECT}:
-                slot = self._classify_slot(item.operand)
-                node = IRLoad(slot=slot)
+                base_sources = self._stack_sources(items, index, 1)
+                base_slot: Optional[IRSlot] = None
+                base_name: Optional[str] = None
+                base_node: Optional[Union[RawInstruction, IRNode]] = None
+                if base_sources:
+                    base_name, base_node = base_sources[0]
+                    self._promote_ssa_kind(base_name, SSAValueKind.ADDRESS)
+                    if isinstance(base_node, IRLoad):
+                        base_slot = base_node.slot
+                memref: Optional[MemRef] = None
+                prefix = self._collect_memref_prefix(items, index, base_slot)
+                if prefix is not None:
+                    start, memref = prefix
+                    if start < index:
+                        items.replace_slice(start, index, [])
+                        index = start
+                        item = items[index]
+                        kind = item.event.kind
+                if memref is not None and base_name:
+                    alias = memref.symbol or memref.region
+                    if alias:
+                        self._ssa_aliases[base_name] = alias
+                base_alias = self._render_ssa(base_name) if base_name else "stack"
+                target_name = item.ssa_values[0] if item.ssa_values else None
+                target_alias = self._render_ssa(target_name) if target_name else "stack"
+                node = IRIndirectLoad(
+                    base=base_alias,
+                    offset=item.operand,
+                    target=target_alias,
+                    base_slot=base_slot,
+                    memref=memref,
+                )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
-                slot = self._classify_slot(item.operand)
-                node = IRStore(slot=slot)
+                base_sources = self._stack_sources(items, index, 2)
+                if base_sources:
+                    base_name, base_node = base_sources[0]
+                    value_name = base_sources[1][0] if len(base_sources) > 1 else None
+                else:
+                    base_name = None
+                    base_node = None
+                    value_name = None
+                base_slot = base_node.slot if isinstance(base_node, IRLoad) else None
+                memref: Optional[MemRef] = None
+                prefix = self._collect_memref_prefix(items, index, base_slot)
+                if prefix is not None:
+                    start, memref = prefix
+                    if start < index:
+                        items.replace_slice(start, index, [])
+                        index = start
+                        item = items[index]
+                        kind = item.event.kind
+                if base_name:
+                    self._promote_ssa_kind(base_name, SSAValueKind.ADDRESS)
+                    if memref is not None:
+                        alias = memref.symbol or memref.region
+                        if alias:
+                            self._ssa_aliases[base_name] = alias
+                base_alias = self._render_ssa(base_name) if base_name else "stack"
+                value_alias = self._render_ssa(value_name) if value_name else "stack"
+                node = IRIndirectStore(
+                    base=base_alias,
+                    value=value_alias,
+                    offset=item.operand,
+                    base_slot=base_slot,
+                    memref=memref,
+                )
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1
                 continue
@@ -1322,6 +1489,110 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    def _collect_memref_prefix(
+        self, items: _ItemList, index: int, base_slot: Optional[IRSlot]
+    ) -> Optional[Tuple[int, MemRef]]:
+        prefix: List[RawInstruction] = []
+        start = index
+        scan = index - 1
+        while scan >= 0 and len(prefix) < 4:
+            candidate = items[scan]
+            if not isinstance(candidate, RawInstruction):
+                break
+            if not self._looks_like_memref_prefix(candidate):
+                break
+            prefix.append(candidate)
+            start = scan
+            scan -= 1
+        if not prefix:
+            return None
+        prefix.reverse()
+        memref = self._build_memref(prefix, base_slot)
+        if memref is None:
+            return None
+        return start, memref
+
+    def _looks_like_memref_prefix(self, instruction: RawInstruction) -> bool:
+        profile = instruction.profile
+        if profile.kind is not InstructionKind.UNKNOWN:
+            return False
+        if not profile.mnemonic.startswith("op_"):
+            return False
+        if profile.word.opcode == 0x69:
+            return False
+        if instruction.event.delta != 0:
+            return False
+        return True
+
+    def _build_memref(
+        self, prefix: Sequence[RawInstruction], base_slot: Optional[IRSlot]
+    ) -> Optional[MemRef]:
+        if not prefix:
+            return None
+        values = [self._memref_value(item) for item in prefix]
+        if not values:
+            return None
+        offset = values[-1]
+        bank = values[-2] if len(values) >= 2 else None
+        page = values[-3] if len(values) >= 3 else None
+        region = self._memref_region(base_slot, bank, page)
+        symbol = self._symbolise_memref(region, bank, page, offset)
+        return MemRef(region=region, bank=bank, page=page, offset=offset, symbol=symbol)
+
+    def _memref_region(
+        self, base_slot: Optional[IRSlot], bank: Optional[int], page: Optional[int]
+    ) -> str:
+        inferred_page = page
+        if inferred_page is None and bank is not None:
+            inferred_page = (bank >> 8) & 0xFF
+        if inferred_page is not None:
+            return f"page_{inferred_page:02X}"
+        if bank is not None:
+            return f"bank_{bank:04X}"
+        if base_slot is not None:
+            if base_slot.space is MemSpace.GLOBAL:
+                return "global"
+            if base_slot.space is MemSpace.CONST:
+                return "const"
+            if base_slot.space is MemSpace.FRAME:
+                return "frame"
+        return "mem"
+
+    def _symbolise_memref(
+        self,
+        region: str,
+        bank: Optional[int],
+        page: Optional[int],
+        offset: Optional[int],
+    ) -> Optional[str]:
+        key = (region, bank, page, offset)
+        cached = self._memref_symbols.get(key)
+        if cached is not None:
+            return cached
+        inferred_page = page
+        if inferred_page is None and bank is not None:
+            inferred_page = (bank >> 8) & 0xFF
+        parts: List[str] = []
+        if inferred_page is not None:
+            parts.append(f"P{inferred_page:02X}")
+        if bank is not None:
+            parts.append(f"B{bank & 0xFF:02X}")
+        if offset is not None:
+            parts.append(f"O{offset & 0xFFFF:04X}")
+        if not parts:
+            parts.append(f"{self._memref_counters[region]:02d}")
+        symbol = f"{region.upper()}_{'_'.join(parts)}"
+        self._memref_counters[region] += 1
+        self._memref_symbols[key] = symbol
+        return symbol
+
+    @staticmethod
+    def _memref_value(instruction: RawInstruction) -> int:
+        word = instruction.profile.word
+        if word.operand:
+            return word.operand & 0xFFFF
+        return ((word.opcode & 0xFF) << 8) | (word.mode & 0xFF)
+
     def _describe_stack_top(self, items: _ItemList, index: int) -> str:
         scan = index - 1
         while scan >= 0:
@@ -1377,42 +1648,52 @@ class IRNormalizer:
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
                     if skip_literals and candidate.mnemonic == "push_literal":
-                        mapped = self._ssa_value(candidate)
+                        mapped = self._ssa_value(candidate, raw=True)
                         if mapped is not None:
-                            return mapped
+                            self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                            return self._render_ssa(mapped)
                         scan -= 1
                         continue
-                    mapped = self._ssa_value(candidate)
+                    mapped = self._ssa_value(candidate, raw=True)
                     if mapped is not None:
-                        return mapped
+                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                        return self._render_ssa(mapped)
                     return self._describe_value(candidate)
                 if skip_literals:
-                    mapped = self._ssa_value(candidate)
+                    mapped = self._ssa_value(candidate, raw=True)
                     if mapped is not None:
-                        return mapped
+                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                        return self._render_ssa(mapped)
                     return self._describe_value(candidate)
             if isinstance(candidate, IRLiteral):
-                mapped = self._ssa_value(candidate)
+                mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    return mapped
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped)
                 if skip_literals:
                     scan -= 1
                     continue
                 return candidate.describe()
             if isinstance(candidate, IRLiteralChunk):
-                mapped = self._ssa_value(candidate)
+                mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    return mapped
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped)
                 if skip_literals:
                     scan -= 1
                     continue
                 return candidate.describe()
             if isinstance(candidate, IRStackDuplicate):
+                mapped = self._ssa_value(candidate, raw=True)
+                if mapped is not None:
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped)
                 return candidate.value
             if isinstance(candidate, IRNode):
-                mapped = self._ssa_value(candidate)
+                mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    return mapped
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped)
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
