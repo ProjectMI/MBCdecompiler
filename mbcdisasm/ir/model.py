@@ -15,6 +15,16 @@ class MemSpace(Enum):
     CONST = auto()
 
 
+class SSAValueKind(Enum):
+    """Lightweight annotation attached to SSA values."""
+
+    UNKNOWN = auto()
+    INTEGER = auto()
+    ADDRESS = auto()
+    BOOLEAN = auto()
+    IDENTIFIER = auto()
+
+
 @dataclass(frozen=True)
 class IRSlot:
     """Address of a VM slot used by :class:`IRLoad` and :class:`IRStore`."""
@@ -302,6 +312,46 @@ class IRStore(IRNode):
 
 
 @dataclass(frozen=True)
+class IRIndirectLoad(IRNode):
+    """Read a value through an indirect slot pointer."""
+
+    base: str
+    offset: int
+    target: str
+    base_slot: Optional[IRSlot] = None
+
+    def describe(self) -> str:
+        prefix = self.base
+        if self.base_slot is not None:
+            slot = f"{self.base_slot.space.name.lower()}[0x{self.base_slot.index:04X}]"
+            if self.base:
+                prefix = f"{slot} ({self.base})"
+            else:
+                prefix = slot
+        return f"indirect_load base={prefix} offset=0x{self.offset:04X} -> {self.target}"
+
+
+@dataclass(frozen=True)
+class IRIndirectStore(IRNode):
+    """Write a value through an indirect slot pointer."""
+
+    base: str
+    value: str
+    offset: int
+    base_slot: Optional[IRSlot] = None
+
+    def describe(self) -> str:
+        prefix = self.base
+        if self.base_slot is not None:
+            slot = f"{self.base_slot.space.name.lower()}[0x{self.base_slot.index:04X}]"
+            if self.base:
+                prefix = f"{slot} ({self.base})"
+            else:
+                prefix = slot
+        return f"indirect_store {self.value} -> {prefix} offset=0x{self.offset:04X}"
+
+
+@dataclass(frozen=True)
 class IRStackDuplicate(IRNode):
     """Duplicate the value currently at the top of the VM stack."""
 
@@ -549,6 +599,8 @@ __all__ = [
     "IRFunctionPrologue",
     "IRLoad",
     "IRStore",
+    "IRIndirectLoad",
+    "IRIndirectStore",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRAsciiHeader",
@@ -563,5 +615,6 @@ __all__ = [
     "IRSlot",
     "IRRaw",
     "MemSpace",
+    "SSAValueKind",
     "NormalizerMetrics",
 ]
