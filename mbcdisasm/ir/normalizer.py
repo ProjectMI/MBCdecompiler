@@ -20,6 +20,7 @@ from .model import (
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
     IRFlagCheck,
@@ -49,6 +50,11 @@ from .model import (
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
+
+
+CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
+CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "stack_shuffle", "fanout"}
+CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -286,6 +292,7 @@ class IRNormalizer:
         self._pass_literal_block_reducers(items, metrics)
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
+        self._pass_call_cleanup(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
@@ -811,7 +818,7 @@ class IRNormalizer:
 
     def _pass_call_preparation(self, items: _ItemList) -> None:
         index = 0
-        allowed_prefix = {"stack_shuffle", "fanout"}
+        allowed_prefix = CALL_PREPARATION_PREFIXES
         while index < len(items):
             item = items[index]
             if not isinstance(item, RawInstruction) or item.mnemonic != "op_4A_05":
@@ -841,6 +848,41 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_call_cleanup(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = []
+            end = index
+            scan = index
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                    steps.append((candidate.mnemonic, candidate.operand))
+                    end = scan + 1
+                    scan += 1
+                    continue
+                break
+
+            if not steps:
+                index += 1
+                continue
+
+            prev_index = index - 1
+            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+                prev_index -= 1
+
+            if prev_index >= 0 and isinstance(items[prev_index], IRCall):
+                items.replace_slice(index, end, [IRCallCleanup(steps=tuple(steps))])
+                index = prev_index + 2
+                continue
+
+            index = end
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1050,18 +1092,31 @@ class IRNormalizer:
         while index < len(items) - 1:
             call = items[index]
             if isinstance(call, IRCall):
-                nxt = items[index + 1]
-                if isinstance(nxt, IRReturn):
+                offset = index + 1
+                cleanup_steps: Tuple[Tuple[str, int], ...] = tuple()
+                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
+                    cleanup_steps = items[offset].steps
+                    offset += 1
+                if offset < len(items) and isinstance(items[offset], IRReturn):
                     node = IRCallReturn(
                         target=call.target,
                         args=call.args,
                         tail=call.tail,
-                        returns=nxt.values,
-                        varargs=nxt.varargs,
+                        returns=items[offset].values,
+                        varargs=items[offset].varargs,
+                        cleanup=cleanup_steps,
                     )
-                    items.replace_slice(index, index + 2, [node])
+                    end = offset + 1
+                    items.replace_slice(index, end, [node])
                     continue
             index += 1
+
+    @staticmethod
+    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic in CALL_CLEANUP_MNEMONICS:
+            return True
+        return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]

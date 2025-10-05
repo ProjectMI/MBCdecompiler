@@ -316,6 +316,17 @@ class IRCallPreparation(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCallCleanup(IRNode):
+    """Helper sequence that discharges temporary call frames or return values."""
+
+    steps: Tuple[Tuple[str, int], ...]
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"cleanup_call[{rendered}]"
+
+
+@dataclass(frozen=True)
 class IRTailcallFrame(IRNode):
     """Canonical frame setup that precedes the VM tailcall helpers."""
 
@@ -378,6 +389,7 @@ class IRCallReturn(IRNode):
     tail: bool
     returns: Tuple[str, ...]
     varargs: bool = False
+    cleanup: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -385,7 +397,11 @@ class IRCallReturn(IRNode):
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]"
+        cleanup = ""
+        if self.cleanup:
+            rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.cleanup)
+            cleanup = f" cleanup=[{rendered}]"
+        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
 
 
 @dataclass(frozen=True)
