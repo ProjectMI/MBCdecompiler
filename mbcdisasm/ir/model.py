@@ -54,13 +54,30 @@ class IRStackEffect:
     mnemonic: str
     operand: int = 0
     pops: int = 0
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
 
     def describe(self) -> str:
         details = []
         if self.pops:
             details.append(f"pop={self.pops}")
-        if self.operand or self.mnemonic not in {"stack_teardown"}:
-            details.append(f"operand=0x{self.operand:04X}")
+        include_operand = bool(self.operand_role or self.operand_alias)
+        if not include_operand:
+            include_operand = bool(self.operand) or self.mnemonic not in {"stack_teardown"}
+        if include_operand:
+            hex_value = f"0x{self.operand:04X}"
+            alias = self.operand_alias
+            if alias:
+                alias_text = str(alias)
+                if alias_text.upper().startswith("0X"):
+                    alias_text = alias_text.upper()
+                value = alias_text if alias_text == hex_value else f"{alias_text}({hex_value})"
+            else:
+                value = hex_value
+            if self.operand_role:
+                details.append(f"{self.operand_role}={value}")
+            else:
+                details.append(f"operand={value}")
         if not details:
             return self.mnemonic
         inner = ", ".join(details)
@@ -440,13 +457,34 @@ class IRRaw(IRNode):
 
     mnemonic: str
     operand: int
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         note = ""
         if self.annotations:
             note = " " + ", ".join(self.annotations)
-        return f"raw {self.mnemonic} operand=0x{self.operand:04X}{note}"
+        hex_value = f"0x{self.operand:04X}"
+        alias = self.operand_alias
+        if alias:
+            alias_text = str(alias)
+            if alias_text.upper().startswith("0X"):
+                alias_text = alias_text.upper()
+            value = alias_text if alias_text == hex_value else f"{alias_text}({hex_value})"
+        else:
+            value = hex_value
+
+        if self.operand_role:
+            detail = f"{self.operand_role}={value}"
+        else:
+            detail = f"operand={value}"
+
+        if self.mnemonic.startswith("op_"):
+            rendered = f"raw {self.mnemonic} {detail}"
+        else:
+            rendered = f"{self.mnemonic}({detail})"
+        return f"{rendered}{note}"
 
 
 @dataclass(frozen=True)

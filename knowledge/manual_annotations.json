@@ -60,6 +60,18 @@
       "10:E8"
     ]
   },
+  "fanout": {
+    "control_flow": "fallthrough",
+    "summary": "Фан-аут тестовых обёрток по флагам",
+    "opcodes": [
+      "10:08"
+    ],
+    "operand_role": "flags",
+    "operand_aliases": {
+      "0x2C02": "FANOUT_FLAGS",
+      "0x2C03": "FANOUT_FLAGS"
+    }
+  },
   "call_dispatch": {
     "control_flow": "call",
     "summary": "Основной вызов функции",

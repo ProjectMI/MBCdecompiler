@@ -70,6 +70,16 @@ class OpcodeInfo:
             }
         }
 
+        normalized_aliases = None
+        for alias_key in ("operand_aliases", "operand_names"):
+            raw_aliases = attributes.get(alias_key)
+            if isinstance(raw_aliases, Mapping):
+                normalized_aliases = _normalize_operand_aliases(raw_aliases)
+                attributes[alias_key] = normalized_aliases
+                break
+        if normalized_aliases is not None:
+            attributes.setdefault("operand_aliases", normalized_aliases)
+
         return cls(
             mnemonic=mnemonic,
             summary=summary,
@@ -194,6 +204,46 @@ def _parse_component(component: str) -> int:
         return int(token, 16)
 
     return int(token, 10)
+
+
+def _normalize_operand_aliases(aliases: Mapping[Any, Any]) -> Dict[int, str]:
+    """Convert mapping keys from JSON into integer operand values."""
+
+    normalized: Dict[int, str] = {}
+    for key, value in aliases.items():
+        operand = _parse_operand_value(key)
+        if operand is None:
+            continue
+        normalized[operand] = str(value)
+    return normalized
+
+
+def _parse_operand_value(key: Any) -> Optional[int]:
+    """Interpret ``key`` as a hexadecimal or decimal operand value."""
+
+    if isinstance(key, int):
+        return key & 0xFFFF
+
+    if isinstance(key, str):
+        token = key.strip()
+        if not token:
+            return None
+        if token.lower().startswith("0x"):
+            try:
+                return int(token, 16) & 0xFFFF
+            except ValueError:
+                return None
+        if any(ch in string.hexdigits[10:] for ch in token):
+            try:
+                return int(token, 16) & 0xFFFF
+            except ValueError:
+                return None
+        try:
+            return int(token, 10) & 0xFFFF
+        except ValueError:
+            return None
+
+    return None
 
 
 def _normalize_label(label: str) -> Optional[str]:

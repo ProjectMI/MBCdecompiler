@@ -8,6 +8,7 @@ from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker
 from ..instruction import read_instructions
+from ..constants import CALL_SHUFFLE_STANDARD
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
@@ -320,6 +321,8 @@ class IRNormalizer:
                     IRRaw(
                         mnemonic=item.mnemonic,
                         operand=item.operand,
+                        operand_role=item.profile.operand_role(),
+                        operand_alias=item.profile.operand_alias(),
                         annotations=item.annotations,
                     )
                 )
@@ -813,7 +816,7 @@ class IRNormalizer:
                 and first.mnemonic == "op_72_23"
                 and second.mnemonic == "op_31_30"
                 and third.mnemonic == "stack_shuffle"
-                and third.operand == 0x4B08
+                and third.operand == CALL_SHUFFLE_STANDARD
             ):
                 node = IRAsciiPreamble(
                     loader_operand=first.operand,
@@ -1186,7 +1189,13 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
-        return IRStackEffect(mnemonic=mnemonic, operand=operand, pops=pops)
+        return IRStackEffect(
+            mnemonic=mnemonic,
+            operand=operand,
+            pops=pops,
+            operand_role=instruction.profile.operand_role(),
+            operand_alias=instruction.profile.operand_alias(),
+        )
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
