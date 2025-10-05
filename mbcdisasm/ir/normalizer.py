@@ -118,6 +118,9 @@ class _ItemList:
     def __getitem__(self, index: int) -> Union[RawInstruction, IRNode]:
         return self._items[index]
 
+    def index_of(self, value: Union[RawInstruction, IRNode]) -> int:
+        return self._items.index(value)
+
     def replace_slice(
         self, start: int, end: int, replacement: Sequence[Union[RawInstruction, IRNode]]
     ) -> None:
@@ -832,85 +835,89 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            start = index
+            call_index = items.index_of(item)
             steps: List[Tuple[str, int]] = []
-            scan = index - 1
+            consumed: List[int] = []
+            scan = call_index - 1
             while scan >= 0:
                 candidate = items[scan]
                 if isinstance(candidate, IRCallPreparation):
                     steps = list(candidate.steps) + steps
-                    start = scan
-                    break
-                if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
-                    steps.insert(0, self._call_preparation_step(candidate))
-                    start = scan
+                    consumed.append(scan)
+                    scan -= 1
+                    continue
+                if isinstance(candidate, RawInstruction):
+                    if self._is_call_preparation_instruction(candidate):
+                        steps.insert(0, self._call_preparation_step(candidate))
+                        consumed.append(scan)
+                        scan -= 1
+                        continue
+                    if self._is_call_context_noise(candidate):
+                        scan -= 1
+                        continue
+                elif self._is_call_context_noise(candidate):
                     scan -= 1
                     continue
                 break
 
             if steps:
-                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
-                index = start + 2
+                insertion_index = call_index
+                if consumed:
+                    insertion_index = min(consumed)
+                for pos in sorted(consumed, reverse=True):
+                    items.pop(pos)
+                    if pos < call_index:
+                        call_index -= 1
+                    if pos < insertion_index:
+                        insertion_index -= 1
+                node = IRCallPreparation(steps=tuple(steps))
+                items.insert(insertion_index, node)
+                call_index = items.index_of(item)
+                index = call_index + 1
                 continue
 
-            index += 1
+            index = call_index + 1
 
     def _pass_call_cleanup(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
-                index += 1
-                continue
-
-            steps: List[IRStackEffect] = []
-            start = index
-            end = index
-            scan = index
-            while scan < len(items):
-                candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
-                    steps.append(self._call_cleanup_effect(candidate))
-                    end = scan + 1
-                    scan += 1
+            if isinstance(item, IRCall):
+                call_index = items.index_of(item)
+                steps, consumed = self._collect_cleanup_forward(items, call_index + 1)
+                if steps:
+                    for pos in sorted(consumed, reverse=True):
+                        items.pop(pos)
+                        if pos < call_index:
+                            call_index -= 1
+                    cleanup_node = IRCallCleanup(steps=tuple(steps))
+                    items.insert(call_index + 1, cleanup_node)
+                    index = items.index_of(cleanup_node) + 1
                     continue
-                break
-
-            if not steps:
-                index += 1
+                index = call_index + 1
                 continue
 
-            prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
-                prev_index -= 1
-
-            if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-                index = prev_index + 2
+            if isinstance(item, IRReturn):
+                return_index = items.index_of(item)
+                steps, consumed = self._collect_cleanup_backward(items, return_index - 1)
+                if steps:
+                    for pos in sorted(consumed, reverse=True):
+                        items.pop(pos)
+                        if pos < return_index:
+                            return_index -= 1
+                    updated = IRReturn(
+                        values=item.values,
+                        varargs=item.varargs,
+                        cleanup=tuple(steps) + item.cleanup,
+                    )
+                    self._transfer_ssa(item, updated)
+                    items.replace_slice(return_index, return_index + 1, [updated])
+                    index = return_index + 1
+                    continue
+                index = return_index + 1
                 continue
 
-            next_index = end
-            while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
-                next_index += 1
-
-            if next_index < len(items) and isinstance(items[next_index], IRReturn):
-                return_node = items[next_index]
-                assert isinstance(return_node, IRReturn)
-                combined = return_node.cleanup + tuple(steps)
-                updated = IRReturn(
-                    values=return_node.values,
-                    varargs=return_node.varargs,
-                    cleanup=combined,
-                )
-                self._transfer_ssa(return_node, updated)
-                items.replace_slice(start, end, [])
-                next_index -= len(steps)
-                items.replace_slice(next_index, next_index + 1, [updated])
-                index = next_index + 1
-                continue
-
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            index += 1
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1160,6 +1167,32 @@ class IRNormalizer:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
 
+    def _is_call_context_noise(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(
+            item,
+            (
+                IRLiteral,
+                IRLiteralChunk,
+                IRAsciiHeader,
+                IRAsciiPreamble,
+                IRAsciiWrapperCall,
+                IRAsciiFinalize,
+                IRLoad,
+                IRStackDuplicate,
+                IRStackDrop,
+            ),
+        ):
+            return True
+        if isinstance(item, RawInstruction):
+            kind = item.profile.kind
+            if kind is InstructionKind.LITERAL:
+                return True
+            if item.profile.is_literal_marker() or item.mnemonic in ANNOTATION_MNEMONICS:
+                return True
+            if kind is InstructionKind.INDIRECT_LOAD:
+                return True
+        return False
+
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
         mnemonic = instruction.mnemonic
@@ -1187,6 +1220,63 @@ class IRNormalizer:
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
         return IRStackEffect(mnemonic=mnemonic, operand=operand, pops=pops)
+
+    def _collect_cleanup_forward(
+        self, items: _ItemList, start: int
+    ) -> Tuple[List[IRStackEffect], List[int]]:
+        steps: List[IRStackEffect] = []
+        consumed: List[int] = []
+        index = start
+        while index < len(items):
+            candidate = items[index]
+            if isinstance(candidate, IRCallCleanup):
+                steps.extend(candidate.steps)
+                consumed.append(index)
+                index += 1
+                continue
+            if isinstance(candidate, RawInstruction):
+                if self._is_call_cleanup_instruction(candidate):
+                    steps.append(self._call_cleanup_effect(candidate))
+                    consumed.append(index)
+                    index += 1
+                    continue
+                if self._is_call_context_noise(candidate):
+                    index += 1
+                    continue
+            elif self._is_call_context_noise(candidate):
+                index += 1
+                continue
+            break
+        return steps, consumed
+
+    def _collect_cleanup_backward(
+        self, items: _ItemList, start: int
+    ) -> Tuple[List[IRStackEffect], List[int]]:
+        steps: List[IRStackEffect] = []
+        consumed: List[int] = []
+        index = start
+        while index >= 0:
+            candidate = items[index]
+            if isinstance(candidate, IRCallCleanup):
+                steps = list(candidate.steps) + steps
+                consumed.append(index)
+                index -= 1
+                continue
+            if isinstance(candidate, RawInstruction):
+                if self._is_call_cleanup_instruction(candidate):
+                    steps.insert(0, self._call_cleanup_effect(candidate))
+                    consumed.append(index)
+                    index -= 1
+                    continue
+                if self._is_call_context_noise(candidate):
+                    index -= 1
+                    continue
+            elif self._is_call_context_noise(candidate):
+                index -= 1
+                continue
+            break
+        consumed.sort()
+        return steps, consumed
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
