@@ -24,6 +24,7 @@ from .model import (
     IRCallPreparation,
     IRCallReturn,
     IRFlagCheck,
+    IRFunctionEpilogue,
     IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
@@ -293,6 +294,7 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
+        self._pass_return_epilogues(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
@@ -840,10 +842,49 @@ class IRNormalizer:
                         start = scan
                         scan -= 1
                         continue
+                if isinstance(candidate, IRCallPreparation):
+                    steps = list(candidate.steps) + steps
+                    start = scan
+                    scan -= 1
+                    continue
                 break
 
             if start < index:
                 items.replace_slice(start, index + 1, [IRCallPreparation(steps=tuple(steps))])
+                index = start
+                continue
+
+            index += 1
+
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = []
+            start = index
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRCallPreparation):
+                    steps = list(candidate.steps) + steps
+                    start = scan
+                    scan -= 1
+                    continue
+                if isinstance(candidate, RawInstruction) and candidate.mnemonic in allowed_prefix:
+                    steps.insert(0, (candidate.mnemonic, candidate.operand))
+                    start = scan
+                    scan -= 1
+                    continue
+                break
+
+            if steps and start < index:
+                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
                 index = start
                 continue
 
@@ -858,12 +899,15 @@ class IRNormalizer:
                 continue
 
             steps: List[Tuple[str, int]] = []
+            popped = 0
             end = index
             scan = index
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
                     steps.append((candidate.mnemonic, candidate.operand))
+                    if candidate.profile.kind is InstructionKind.STACK_TEARDOWN:
+                        popped -= candidate.event.delta
                     end = scan + 1
                     scan += 1
                     continue
@@ -878,11 +922,62 @@ class IRNormalizer:
                 prev_index -= 1
 
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(index, end, [IRCallCleanup(steps=tuple(steps))])
+                items.replace_slice(
+                    index,
+                    end,
+                    [IRCallCleanup(steps=tuple(steps), popped=popped)],
+                )
                 index = prev_index + 2
                 continue
 
             index = end
+
+    def _pass_return_epilogues(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (isinstance(item, RawInstruction) and item.mnemonic.startswith("stack_teardown")):
+                index += 1
+                continue
+
+            start = index
+            steps: List[Tuple[str, int]] = []
+            popped = 0
+            while index < len(items):
+                candidate = items[index]
+                if isinstance(candidate, RawInstruction) and candidate.mnemonic.startswith("stack_teardown"):
+                    steps.append((candidate.mnemonic, candidate.operand))
+                    if candidate.profile.kind is InstructionKind.STACK_TEARDOWN:
+                        popped -= candidate.event.delta
+                    index += 1
+                    continue
+                break
+
+            if not steps:
+                continue
+
+            scan = index
+            while scan < len(items) and isinstance(items[scan], (IRLiteral, IRLiteralChunk)):
+                scan += 1
+
+            attached = False
+            if scan < len(items) and isinstance(items[scan], IRReturn):
+                return_node = items[scan]
+                assert isinstance(return_node, IRReturn)
+                updated = IRReturn(
+                    values=return_node.values,
+                    varargs=return_node.varargs,
+                    epilogue=return_node.epilogue + tuple(steps),
+                    epilogue_popped=return_node.epilogue_popped + popped,
+                )
+                items.replace_slice(start, scan + 1, [updated])
+                index = start + 1
+                attached = True
+
+            if not attached:
+                node = IRFunctionEpilogue(popped=popped, steps=tuple(steps))
+                items.replace_slice(start, index, [node])
+                index = start + 1
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1094,8 +1189,10 @@ class IRNormalizer:
             if isinstance(call, IRCall):
                 offset = index + 1
                 cleanup_steps: Tuple[Tuple[str, int], ...] = tuple()
+                cleanup_popped = 0
                 if offset < len(items) and isinstance(items[offset], IRCallCleanup):
                     cleanup_steps = items[offset].steps
+                    cleanup_popped = items[offset].popped
                     offset += 1
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     node = IRCallReturn(
@@ -1105,6 +1202,9 @@ class IRNormalizer:
                         returns=items[offset].values,
                         varargs=items[offset].varargs,
                         cleanup=cleanup_steps,
+                        cleanup_popped=cleanup_popped,
+                        epilogue=items[offset].epilogue,
+                        epilogue_popped=items[offset].epilogue_popped,
                     )
                     end = offset + 1
                     items.replace_slice(index, end, [node])

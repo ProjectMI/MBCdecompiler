@@ -53,14 +53,24 @@ class IRReturn(IRNode):
 
     values: Tuple[str, ...]
     varargs: bool = False
+    epilogue: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+    epilogue_popped: int = 0
 
     def describe(self) -> str:
         if self.varargs:
             if self.values:
-                return f"return varargs({', '.join(self.values)})"
-            return "return varargs"
-        values = ", ".join(self.values)
-        return f"return [{values}]"
+                base = f"return varargs({', '.join(self.values)})"
+            else:
+                base = "return varargs"
+        else:
+            values = ", ".join(self.values)
+            base = f"return [{values}]"
+        if self.epilogue:
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.epilogue
+            )
+            base += f" epilogue(pop={self.epilogue_popped} [{rendered}])"
+        return base
 
 
 @dataclass(frozen=True)
@@ -320,10 +330,25 @@ class IRCallCleanup(IRNode):
     """Helper sequence that discharges temporary call frames or return values."""
 
     steps: Tuple[Tuple[str, int], ...]
+    popped: int = 0
 
     def describe(self) -> str:
         rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        if self.popped:
+            return f"cleanup_call pop={self.popped} [{rendered}]"
         return f"cleanup_call[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRFunctionEpilogue(IRNode):
+    """Function epilogue that releases stack space prior to returning."""
+
+    popped: int
+    steps: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"function_epilogue pop={self.popped} [{rendered}]"
 
 
 @dataclass(frozen=True)
@@ -390,6 +415,9 @@ class IRCallReturn(IRNode):
     returns: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+    cleanup_popped: int = 0
+    epilogue: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+    epilogue_popped: int = 0
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -397,11 +425,18 @@ class IRCallReturn(IRNode):
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
-        cleanup = ""
+        suffix = ""
         if self.cleanup:
-            rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.cleanup)
-            cleanup = f" cleanup=[{rendered}]"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.cleanup
+            )
+            suffix += f" cleanup(pop={self.cleanup_popped} [{rendered}])"
+        if self.epilogue:
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.epilogue
+            )
+            suffix += f" epilogue(pop={self.epilogue_popped} [{rendered}])"
+        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{suffix}"
 
 
 @dataclass(frozen=True)

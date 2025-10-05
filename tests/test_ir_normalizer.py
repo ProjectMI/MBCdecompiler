@@ -4,7 +4,15 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRCallPreparation, IRCallReturn, IRIf, IRTestSetBranch, IRRaw
+from mbcdisasm.ir.model import (
+    IRCallPreparation,
+    IRCallReturn,
+    IRFunctionEpilogue,
+    IRIf,
+    IRReturn,
+    IRTestSetBranch,
+    IRRaw,
+)
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -83,6 +91,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+            "stack_delta": -1,
         },
         "stack_teardown_4": {
             "opcodes": ["0x01:0xF0"],
@@ -332,10 +341,101 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
         ("op_32_29", 0x1000),
         ("stack_teardown_4", 0x0000),
     )
+    assert call_return.cleanup_popped == 4
+    assert call_return.epilogue == tuple()
+    assert call_return.epilogue_popped == 0
     assert call_return.target == 0x1234
 
     assert not any(
         isinstance(node, IRRaw)
         and node.mnemonic in {"op_4A_05", "op_32_29", "stack_teardown_4"}
+        for node in block.nodes
+    )
+
+
+def test_normalizer_inlines_stack_shuffle_without_helper(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x66, 0x15, 0x4B08),
+        build_word(4, 0x28, 0x00, 0x1111),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
+    assert prep.steps == (("stack_shuffle", 0x4B08),)
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.cleanup == tuple()
+    assert call_return.epilogue == tuple()
+
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
+    )
+
+
+def test_normalizer_attaches_teardown_epilogue_to_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x01, 0x00, 0x0000),
+        build_word(4, 0x01, 0xF0, 0x0000),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    return_node = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert return_node.epilogue == (
+        ("stack_teardown_1", 0x0000),
+        ("stack_teardown_4", 0x0000),
+    )
+    assert return_node.epilogue_popped == 5
+
+
+def test_normalizer_emits_function_epilogue_for_unattached_teardown(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x01, 0xF0, 0x0000),
+        build_word(4, 0x01, 0x00, 0x0000),
+        build_word(8, 0x2B, 0x00, 0x2222),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    epilogue = next(node for node in block.nodes if isinstance(node, IRFunctionEpilogue))
+    assert epilogue.steps == (
+        ("stack_teardown_4", 0x0000),
+        ("stack_teardown_1", 0x0000),
+    )
+    assert epilogue.popped == 5
+
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"stack_teardown_4", "stack_teardown_1"}
         for node in block.nodes
     )
