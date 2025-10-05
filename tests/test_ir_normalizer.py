@@ -13,6 +13,8 @@ from mbcdisasm.ir.model import (
     IRStackEffect,
     IRTestSetBranch,
     IRRaw,
+    IRLiteral,
+    IRLoad,
 )
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
@@ -414,6 +416,34 @@ def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
         for node in block.nodes
     )
+
+
+def test_normalizer_symbolises_indirect_addresses(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x2810),  # push_literal
+        build_word(4, 0x69, 0x01, 0x2800),  # indirect_access
+        build_word(8, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    literal = next(node for node in block.nodes if isinstance(node, IRLiteral))
+    load = next(node for node in block.nodes if isinstance(node, IRLoad))
+
+    assert literal.symbol == "global[0x2800]+0x10"
+    assert "global[0x2800]+0x10" in literal.describe()
+    assert load.address == "global[0x2800]+0x10"
+    assert load.target.startswith("ssa")
+    assert "via global[0x2800]+0x10" in load.describe()
 
 
 def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:

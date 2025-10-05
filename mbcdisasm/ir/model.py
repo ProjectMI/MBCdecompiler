@@ -96,8 +96,11 @@ class IRLiteral(IRNode):
     mode: int
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
+        if self.symbol:
+            return f"lit({self.symbol}=0x{self.value:04X})"
         return f"lit(0x{self.value:04X})"
 
 
@@ -285,9 +288,13 @@ class IRLoad(IRNode):
 
     slot: IRSlot
     target: str = "stack"
+    address: Optional[str] = None
 
     def describe(self) -> str:
-        return f"load {self.slot.space.name.lower()}[{self.slot.index}] -> {self.target}"
+        location = f"{self.slot.space.name.lower()}[0x{self.slot.index:04X}]"
+        if self.address:
+            location += f" via {self.address}"
+        return f"load {location} -> {self.target}"
 
 
 @dataclass(frozen=True)
@@ -296,9 +303,13 @@ class IRStore(IRNode):
 
     slot: IRSlot
     value: str = "stack"
+    address: Optional[str] = None
 
     def describe(self) -> str:
-        return f"store {self.value} -> {self.slot.space.name.lower()}[{self.slot.index}]"
+        location = f"{self.slot.space.name.lower()}[0x{self.slot.index:04X}]"
+        if self.address:
+            location += f" via {self.address}"
+        return f"store {self.value} -> {location}"
 
 
 @dataclass(frozen=True)
