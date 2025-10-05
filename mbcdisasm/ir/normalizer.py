@@ -832,25 +832,33 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            start = index
             steps: List[Tuple[str, int]] = []
+            removal_indices: List[int] = []
             scan = index - 1
             while scan >= 0:
                 candidate = items[scan]
                 if isinstance(candidate, IRCallPreparation):
                     steps = list(candidate.steps) + steps
-                    start = scan
-                    break
+                    removal_indices.append(scan)
+                    scan -= 1
+                    continue
                 if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
                     steps.insert(0, self._call_preparation_step(candidate))
-                    start = scan
+                    removal_indices.append(scan)
+                    scan -= 1
+                    continue
+                if self._is_call_padding_node(candidate):
                     scan -= 1
                     continue
                 break
 
             if steps:
-                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
-                index = start + 2
+                for pos in sorted(removal_indices, reverse=True):
+                    items.pop(pos)
+                    if pos < index:
+                        index -= 1
+                items.insert(index, IRCallPreparation(steps=tuple(steps)))
+                index += 2
                 continue
 
             index += 1
@@ -864,14 +872,21 @@ class IRNormalizer:
                 continue
 
             steps: List[IRStackEffect] = []
-            start = index
-            end = index
+            removal_indices: List[int] = []
             scan = index
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
                     steps.append(self._call_cleanup_effect(candidate))
-                    end = scan + 1
+                    removal_indices.append(scan)
+                    scan += 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
+                    steps.extend(candidate.steps)
+                    removal_indices.append(scan)
+                    scan += 1
+                    continue
+                if self._is_call_padding_node(candidate):
                     scan += 1
                     continue
                 break
@@ -880,37 +895,47 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+            for pos in sorted(removal_indices, reverse=True):
+                items.pop(pos)
+                if pos < index:
+                    index -= 1
+
+            cleanup_index = index
+            cleanup_node = IRCallCleanup(steps=tuple(steps))
+            items.insert(cleanup_index, cleanup_node)
+
+            prev_index = cleanup_index - 1
+            while prev_index >= 0 and self._is_call_padding_node(items[prev_index]):
                 prev_index -= 1
 
+            attached_to_call = False
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-                index = prev_index + 2
-                continue
+                attached_to_call = True
 
-            next_index = end
-            while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
+            next_index = cleanup_index + 1
+            while next_index < len(items) and self._is_call_padding_node(items[next_index]):
                 next_index += 1
 
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
                 return_node = items[next_index]
-                assert isinstance(return_node, IRReturn)
-                combined = return_node.cleanup + tuple(steps)
+                combined = return_node.cleanup + cleanup_node.steps
                 updated = IRReturn(
                     values=return_node.values,
                     varargs=return_node.varargs,
                     cleanup=combined,
                 )
                 self._transfer_ssa(return_node, updated)
-                items.replace_slice(start, end, [])
-                next_index -= len(steps)
+                items.pop(cleanup_index)
+                if next_index > cleanup_index:
+                    next_index -= 1
                 items.replace_slice(next_index, next_index + 1, [updated])
                 index = next_index + 1
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            if attached_to_call:
+                index = prev_index + 2
+            else:
+                index = cleanup_index + 1
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1159,6 +1184,13 @@ class IRNormalizer:
         if mnemonic in CALL_CLEANUP_MNEMONICS:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+
+    def _is_call_padding_node(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, (IRLiteral, IRLiteralChunk, IRLoad)):
+            return True
+        if isinstance(item, RawInstruction) and self._is_annotation_only(item):
+            return True
+        return False
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
