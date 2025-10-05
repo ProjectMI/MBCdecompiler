@@ -208,6 +208,34 @@ class IRIf(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCompare(IRNode):
+    """Explicit comparison producing a boolean predicate."""
+
+    result: str
+    operator: str
+    lhs: str
+    rhs: str
+
+    def describe(self) -> str:
+        return (
+            f"compare {self.result}={self.operator}({self.lhs}, {self.rhs})"
+        )
+
+
+@dataclass(frozen=True)
+class IRTest(IRNode):
+    """Logical or unary test operation producing a predicate."""
+
+    result: str
+    operator: str
+    operands: Tuple[str, ...]
+
+    def describe(self) -> str:
+        rendered = ", ".join(self.operands)
+        return f"test {self.result}={self.operator}([{rendered}])"
+
+
+@dataclass(frozen=True)
 class IRTestSetBranch(IRNode):
     """Branch that stores the predicate before testing it."""
 
@@ -501,6 +529,8 @@ __all__ = [
     "IRTestSetBranch",
     "IRFlagCheck",
     "IRFunctionPrologue",
+    "IRCompare",
+    "IRTest",
     "IRLoad",
     "IRStore",
     "IRStackDuplicate",

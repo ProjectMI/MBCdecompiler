@@ -4,7 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRIf, IRTestSetBranch
+from mbcdisasm.ir.model import IRCompare, IRIf, IRTest, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -78,6 +78,29 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+        },
+        "compare_eq": {
+            "opcodes": ["0x50:0x00"],
+            "name": "logical_compare_eq",
+            "category": "logical_compare",
+            "summary": "Logical compare two values",
+            "stack_push": 1,
+            "stack_pop": 2,
+        },
+        "logical_not": {
+            "opcodes": ["0x51:0x00"],
+            "name": "logical_not",
+            "category": "logical_not",
+            "summary": "Logical not",
+            "stack_push": 1,
+            "stack_pop": 1,
+        },
+        "test_slot": {
+            "opcodes": ["0x52:0x00"],
+            "name": "test_slot",
+            "category": "test_slot",
+            "summary": "Test VM slot",
+            "stack_push": 1,
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -190,6 +213,26 @@ def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBas
     return container, knowledge
 
 
+def build_predicate_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x00, 0x00, 0x0002),
+        build_word(8, 0x50, 0x00, 0x0000),
+        build_word(12, 0x51, 0x00, 0x0000),
+        build_word(16, 0x23, 0x00, 0x1100),
+        build_word(20, 0x52, 0x00, 0x1000),
+        build_word(24, 0x23, 0x00, 0xF100),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+    return container, knowledge
+
+
 def test_normalizer_builds_ir(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
@@ -239,6 +282,34 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         if isinstance(node, IRTestSetBranch)
     ]
     assert testset_nodes and all(node.expr.startswith("ssa") for node in testset_nodes)
+
+
+def test_normalizer_extracts_predicates(tmp_path: Path) -> None:
+    container, knowledge = build_predicate_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    blocks = program.segments[0].blocks
+    compare_nodes = [
+        node for block in blocks for node in block.nodes if isinstance(node, IRCompare)
+    ]
+    assert compare_nodes
+    compare = compare_nodes[0]
+    assert compare.lhs.startswith("ssa")
+    assert compare.rhs.startswith("ssa")
+    assert compare.result.startswith("ssa")
+
+    test_nodes = [node for block in blocks for node in block.nodes if isinstance(node, IRTest)]
+    operators = {node.operator: node for node in test_nodes}
+    assert "logical_not" in operators
+    assert operators["logical_not"].operands == (compare.result,)
+    assert "test_slot" in operators
+    assert operators["test_slot"].operands == ("slot(0x1000)",)
+
+    branch_nodes = [node for block in blocks for node in block.nodes if isinstance(node, IRIf)]
+    assert len(branch_nodes) == 2
+    assert branch_nodes[0].condition == operators["logical_not"].result
+    assert branch_nodes[1].condition == operators["test_slot"].result
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:

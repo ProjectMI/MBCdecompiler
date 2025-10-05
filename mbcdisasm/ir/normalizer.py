@@ -22,6 +22,7 @@ from .model import (
     IRCall,
     IRCallPreparation,
     IRCallReturn,
+    IRCompare,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
@@ -37,6 +38,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRTest,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -205,7 +207,11 @@ class IRNormalizer:
         raw_instructions: List[RawInstruction] = []
         stack_names: List[str] = []
         next_ssa = 0
-        forced_push_kinds = {InstructionKind.REDUCE}
+        forced_push_kinds = {
+            InstructionKind.REDUCE,
+            InstructionKind.LOGICAL,
+            InstructionKind.TEST,
+        }
         for index, (profile, event) in enumerate(zip(executable, events)):
             notes = tuple(annotations.get(index, ()))
             pops = len(event.popped_types)
@@ -290,6 +296,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_assign_ssa_names(items)
+        self._pass_predicates(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -1137,6 +1144,76 @@ class IRNormalizer:
             if isinstance(item, RawInstruction) and item.ssa_values:
                 self._record_ssa(item, item.ssa_values)
 
+    def _pass_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            node = self._predicate_from_instruction(items, index, item)
+            if node is None:
+                index += 1
+                continue
+
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            continue
+
+    def _predicate_from_instruction(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> Optional[IRNode]:
+        profile = instruction.profile
+        mnemonic = profile.mnemonic.lower()
+        category = (profile.category or "").lower()
+        if "branch" in mnemonic or "branch" in category:
+            return None
+        is_compare = self._profile_is_compare(profile)
+        if not is_compare and profile.kind not in {InstructionKind.TEST, InstructionKind.LOGICAL}:
+            return None
+
+        result = self._ssa_value(instruction)
+        if result is None:
+            return None
+
+        pop_count = len(instruction.event.popped_types)
+        if is_compare:
+            pop_count = max(pop_count, 2)
+        elif profile.kind is InstructionKind.LOGICAL and pop_count == 0:
+            pop_count = 1
+        operands = self._collect_operands(items, index, pop_count)
+
+        if is_compare:
+            if len(operands) < 2:
+                # Fall back to describing the instruction when inputs are unclear.
+                fallback = instruction.describe_source()
+                if not operands:
+                    operands = [fallback, fallback]
+                elif len(operands) == 1:
+                    operands = [operands[0], fallback]
+            lhs, rhs = operands[-2:]
+            return IRCompare(
+                result=result,
+                operator=instruction.mnemonic,
+                lhs=lhs,
+                rhs=rhs,
+            )
+
+        if profile.kind is InstructionKind.LOGICAL and not operands:
+            operands = [instruction.describe_source()]
+
+        if profile.kind is InstructionKind.TEST and not operands:
+            operand = self._format_test_operand(instruction)
+            if operand:
+                operands = [operand]
+
+        return IRTest(
+            result=result,
+            operator=instruction.mnemonic,
+            operands=tuple(operands),
+        )
+
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -1146,7 +1223,11 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                predicate = self._find_predicate_node(items, index, skip_literals=True)
+                if predicate is not None:
+                    expr = predicate.result
+                else:
+                    expr = self._describe_condition(items, index, skip_literals=True)
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
@@ -1158,8 +1239,13 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                predicate = self._find_predicate_node(items, index)
+                if predicate is not None:
+                    condition = predicate.result
+                else:
+                    condition = self._describe_condition(items, index)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1168,6 +1254,23 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _find_predicate_node(
+        self, items: _ItemList, index: int, *, skip_literals: bool = False
+    ) -> Optional[IRNode]:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, (IRCompare, IRTest)):
+                return candidate
+            if skip_literals and isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                scan -= 1
+                continue
+            if skip_literals and isinstance(candidate, RawInstruction) and candidate.mnemonic == "push_literal":
+                scan -= 1
+                continue
+            scan -= 1
+        return None
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -1197,6 +1300,43 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    def _collect_operands(self, items: _ItemList, index: int, count: int) -> List[str]:
+        if count <= 0:
+            return []
+        operands: List[str] = []
+        remaining = count
+        scan = index - 1
+        while scan >= 0 and remaining > 0:
+            candidate = items[scan]
+            values = self._candidate_values(candidate)
+            if values:
+                for value in reversed(values):
+                    operands.append(value)
+                    remaining -= 1
+                    if remaining == 0:
+                        break
+            scan -= 1
+        operands.reverse()
+        return operands
+
+    def _candidate_values(self, candidate: Union[RawInstruction, IRNode]) -> List[str]:
+        values: Sequence[str] = self._ssa_bindings.get(id(candidate), tuple())
+        if not values and isinstance(candidate, RawInstruction):
+            values = candidate.ssa_values
+        if values:
+            return list(values)
+        if isinstance(candidate, IRLiteral):
+            return [candidate.describe()]
+        if isinstance(candidate, IRLiteralChunk):
+            return [candidate.describe()]
+        if isinstance(candidate, IRStackDuplicate):
+            return [candidate.value]
+        if isinstance(candidate, IRNode):
+            describe = getattr(candidate, "describe", None)
+            if callable(describe):
+                return [describe()]
+        return []
+
     def _describe_stack_top(self, items: _ItemList, index: int) -> str:
         scan = index - 1
         while scan >= 0:
@@ -1352,6 +1492,38 @@ class IRNormalizer:
     def _format_testset_var(instruction: RawInstruction) -> str:
         operand = instruction.operand
         return f"slot(0x{operand:04X})"
+
+    @staticmethod
+    def _format_test_operand(instruction: RawInstruction) -> Optional[str]:
+        operand = instruction.operand
+        if operand is None:
+            return None
+        mnemonic = instruction.mnemonic.lower()
+        category = (instruction.profile.category or "").lower()
+        if "slot" in mnemonic or "slot" in category:
+            return f"slot(0x{operand:04X})"
+        if operand:
+            return f"0x{operand:04X}"
+        return None
+
+    @staticmethod
+    def _profile_is_compare(profile: InstructionProfile) -> bool:
+        tokens = [
+            profile.mnemonic.lower(),
+            (profile.summary or "").lower(),
+            (profile.category or "").lower(),
+        ]
+        for token in tokens:
+            if not token:
+                continue
+            if "branch" in token or "jump" in token:
+                continue
+            if any(
+                keyword in token
+                for keyword in {"compare", "cmp", "equals", "equal", "less", "greater", "lt", "gt", "ne"}
+            ):
+                return True
+        return False
 
 
 __all__ = ["IRNormalizer", "RawInstruction", "RawBlock"]
