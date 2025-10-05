@@ -461,15 +461,22 @@ class IRNormalizer:
 
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
-                args, start = self._collect_call_arguments(items, index)
+                args, start, prep_steps = self._collect_call_arguments(items, index)
                 call = IRCall(target=item.operand, args=tuple(args), tail=mnemonic == "tailcall_dispatch")
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
-                items.replace_slice(start, index + 1, [call])
+
+                replacement: List[Union[RawInstruction, IRNode]] = []
+                if prep_steps:
+                    replacement.append(IRCallPreparation(steps=tuple(prep_steps)))
+                replacement.append(call)
+
+                items.replace_slice(start, index + 1, replacement)
+                call_position = start + len(replacement) - 1
                 index = start
                 if call.tail:
-                    self._collapse_tail_return(items, index, metrics)
+                    self._collapse_tail_return(items, call_position, metrics)
                 continue
 
             if mnemonic == "return_values":
@@ -518,8 +525,9 @@ class IRNormalizer:
 
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int
-    ) -> Tuple[List[str], int]:
+    ) -> Tuple[List[str], int, Tuple[Tuple[str, int], ...]]:
         args: List[str] = []
+        prep_steps: List[Tuple[str, int]] = []
         start = call_index
         scan = call_index - 1
         while scan >= 0:
@@ -527,23 +535,29 @@ class IRNormalizer:
             if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
                 name = self._ssa_value(candidate)
                 args.append(name or candidate.describe())
+                start = scan
                 scan -= 1
                 continue
             if isinstance(candidate, IRStackDuplicate):
                 args.append(candidate.value)
+                start = scan
                 scan -= 1
                 continue
             if isinstance(candidate, RawInstruction):
-                if candidate.pushes_value():
-                    args.append(self._describe_value(candidate))
+                if self._is_call_prologue_step(candidate):
+                    prep_steps.append((candidate.mnemonic, candidate.operand))
+                    start = scan
                     scan -= 1
                     continue
-                break
-            else:
-                break
+                if candidate.pushes_value():
+                    args.append(self._describe_value(candidate))
+                    start = scan
+                    scan -= 1
+                    continue
+            break
         args.reverse()
-        start = scan + 1
-        return args, start
+        prep_steps.reverse()
+        return args, start, tuple(prep_steps)
 
     def _collapse_tail_return(self, items: _ItemList, call_index: int, metrics: NormalizerMetrics) -> None:
         index = call_index + 1
@@ -1244,6 +1258,40 @@ class IRNormalizer:
         if instruction.profile.kind is InstructionKind.LITERAL:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
+
+    def _is_call_prologue_step(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic.lower()
+        if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
+            return False
+        if "call_helper" in mnemonic:
+            return True
+        if "call" in mnemonic and "dispatch" not in mnemonic and "tail" not in mnemonic:
+            return True
+        summary = (instruction.profile.summary or "").lower()
+        if "helper" in summary and "call" in summary:
+            return True
+        label = instruction.profile.label.upper()
+        if instruction.mnemonic.startswith("op_") and (
+            label.startswith("16:") or label.startswith("10:")
+        ):
+            return True
+        if mnemonic.startswith("stack_teardown"):
+            return True
+        if "fanout" in mnemonic:
+            return True
+        if self._is_stack_shuffle_instruction(instruction):
+            return True
+        return False
+
+    @staticmethod
+    def _is_stack_shuffle_instruction(instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic.lower()
+        if "stack_shuffle" in mnemonic:
+            return True
+        label = instruction.profile.label.upper()
+        if label.startswith("66:"):
+            return True
+        return False
 
     def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1

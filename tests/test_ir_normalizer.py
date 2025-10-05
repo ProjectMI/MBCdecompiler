@@ -4,7 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRIf, IRTestSetBranch
+from mbcdisasm.ir.model import IRCallPreparation, IRCallReturn, IRIf, IRRaw, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -52,6 +52,19 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x30:0x00"],
             "name": "return_values",
             "category": "return_values",
+        },
+        "call_helper_setup": {
+            "opcodes": ["0x16:0x00"],
+            "name": "call_helper",
+            "category": "call_helper",
+            "summary": "Call helper prologue",
+            "stack_delta": 0,
+        },
+        "stack_shuffle": {
+            "opcodes": ["0x66:0x20"],
+            "name": "stack_shuffle",
+            "category": "stack_shuffle",
+            "stack_delta": 0,
         },
         "call_dispatch": {
             "opcodes": ["0x28:0x00"],
@@ -283,3 +296,38 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_groups_call_prologue(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0007),
+        build_word(4, 0x16, 0x00, 0x0000),
+        build_word(8, 0x66, 0x20, 0x0000),
+        build_word(12, 0x28, 0x00, 0x1234),
+        build_word(16, 0x30, 0x00, 0x0001),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    prep_nodes = [node for node in block.nodes if isinstance(node, IRCallPreparation)]
+    call_nodes = [node for node in block.nodes if isinstance(node, IRCallReturn)]
+    assert prep_nodes, "call preparation should be recognised"
+    assert call_nodes, "call/return template should be built"
+
+    prep_desc = prep_nodes[0].describe()
+    assert "call_helper" in prep_desc
+    assert "stack_shuffle" in prep_desc
+
+    call_node = call_nodes[0]
+    assert call_node.args
+    assert call_node.args[0].startswith("ssa") or call_node.args[0].startswith("lit(")
+
+    assert not any(isinstance(node, IRRaw) for node in block.nodes)

@@ -271,6 +271,36 @@ def infer_stack_effect(
         # Markers carry metadata but should not occupy stack slots.
         pushed = [StackValueType.MARKER]
 
+    top_type = prior_types[-1] if prior_types else StackValueType.UNKNOWN
+
+    if profile.mnemonic == "op_01_66":
+        hint = StackEffectHint(nominal=-1, minimum=-1, maximum=-1, confidence=max(0.8, hint.confidence))
+        kind_override = InstructionKind.STACK_TEARDOWN
+        if top_type is not StackValueType.MARKER:
+            popped = [top_type]
+        else:
+            popped = []
+
+    elif profile.mnemonic == "op_02_66":
+        hint = StackEffectHint(nominal=1, minimum=1, maximum=1, confidence=max(0.85, hint.confidence))
+        kind_override = InstructionKind.STACK_COPY
+        duplicate_type = top_type if top_type is not StackValueType.UNKNOWN else StackValueType.UNKNOWN
+        pushed = [duplicate_type]
+
+    elif profile.mnemonic == "op_03_66":
+        hint = StackEffectHint(nominal=1, minimum=1, maximum=1, confidence=max(0.85, hint.confidence))
+        if not pushed:
+            pushed = [StackValueType.NUMBER]
+
+    elif _looks_like_stack_shuffle(profile):
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=max(0.8, hint.confidence))
+        kind_override = InstructionKind.STACK_COPY
+
+    if _looks_like_call_helper(profile):
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=max(0.75, hint.confidence))
+        if kind_override is None:
+            kind_override = InstructionKind.META
+
     if _is_indirect_candidate(profile):
         variant = classify_indirect_variant(profiles, index, prior_types)
         if variant is IndirectVariant.STORE:
@@ -331,6 +361,33 @@ def _is_indirect_candidate(profile: InstructionProfile) -> bool:
     if "indirect" in mnemonic:
         return True
     return profile.label.startswith("69:")
+
+
+def _looks_like_stack_shuffle(profile: InstructionProfile) -> bool:
+    mnemonic = profile.mnemonic.lower()
+    if "stack_shuffle" in mnemonic:
+        return True
+    label = profile.label.upper()
+    if label.startswith("66:"):
+        return True
+    return False
+
+
+def _looks_like_call_helper(profile: InstructionProfile) -> bool:
+    mnemonic = profile.mnemonic.lower()
+    if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
+        return False
+    if "call_helper" in mnemonic:
+        return True
+    if "call" in mnemonic and "dispatch" not in mnemonic and "tail" not in mnemonic:
+        return True
+    summary = (profile.summary or "").lower()
+    if "helper" in summary and "call" in summary:
+        return True
+    label = profile.label.upper()
+    if mnemonic.startswith("op_") and (label.startswith("16:") or label.startswith("10:")):
+        return True
+    return False
 
 
 def classify_indirect_variant(
