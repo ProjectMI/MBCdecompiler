@@ -20,9 +20,11 @@ from .model import (
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
     IRFlagCheck,
+    IRFunctionEpilogue,
     IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
@@ -49,6 +51,11 @@ from .model import (
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
+
+
+CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
+CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "stack_shuffle", "fanout"}
+CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -286,6 +293,8 @@ class IRNormalizer:
         self._pass_literal_block_reducers(items, metrics)
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
+        self._pass_call_cleanup(items)
+        self._pass_function_epilogues(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
@@ -811,7 +820,7 @@ class IRNormalizer:
 
     def _pass_call_preparation(self, items: _ItemList) -> None:
         index = 0
-        allowed_prefix = {"stack_shuffle", "fanout"}
+        allowed_prefix = CALL_PREPARATION_PREFIXES
         while index < len(items):
             item = items[index]
             if not isinstance(item, RawInstruction) or item.mnemonic != "op_4A_05":
@@ -838,6 +847,114 @@ class IRNormalizer:
             if start < index:
                 items.replace_slice(start, index + 1, [IRCallPreparation(steps=tuple(steps))])
                 index = start
+                continue
+
+            index += 1
+
+        index = 0
+        prefixes = tuple(CALL_PREPARATION_PREFIXES)
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+            if index > 0 and isinstance(items[index - 1], IRCallPreparation):
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = []
+            start = index
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction):
+                    mnemonic = candidate.mnemonic
+                    if mnemonic.startswith(prefixes):
+                        steps.insert(0, (mnemonic, candidate.operand))
+                        start = scan
+                        scan -= 1
+                        continue
+                break
+
+            if steps:
+                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
+                index = start + 2
+                continue
+
+            index += 1
+
+    def _pass_call_cleanup(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = []
+            popped = 0
+            end = index
+            scan = index
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                    steps.append((candidate.mnemonic, candidate.operand))
+                    if candidate.event.delta < 0:
+                        popped += -candidate.event.delta
+                    end = scan + 1
+                    scan += 1
+                    continue
+                break
+
+            if not steps:
+                index += 1
+                continue
+
+            prev_index = index - 1
+            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+                prev_index -= 1
+
+            if prev_index >= 0 and isinstance(items[prev_index], IRCall):
+                items.replace_slice(
+                    index,
+                    end,
+                    [IRCallCleanup(steps=tuple(steps), popped=popped)],
+                )
+                index = prev_index + 2
+                continue
+
+            index = end
+
+    def _pass_function_epilogues(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRReturn):
+                index += 1
+                continue
+
+            steps: List[Tuple[str, int]] = []
+            popped = 0
+            start = index
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and (
+                    candidate.profile.kind is InstructionKind.STACK_TEARDOWN
+                    or candidate.mnemonic.startswith("stack_teardown")
+                ):
+                    steps.insert(0, (candidate.mnemonic, candidate.operand))
+                    if candidate.event.delta < 0:
+                        popped += -candidate.event.delta
+                    start = scan
+                    scan -= 1
+                    continue
+                break
+
+            if steps:
+                node = IRFunctionEpilogue(popped=popped, steps=tuple(steps))
+                items.replace_slice(start, index, [node])
+                index = start + 2
                 continue
 
             index += 1
@@ -949,20 +1066,25 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if isinstance(item, IRTestSetBranch):
-                if index == 0 or all(
-                    isinstance(items[pos], IRAsciiHeader) for pos in range(index)
-                ):
-                    if item.var.startswith("slot("):
-                        node = IRFunctionPrologue(
-                            var=item.var,
-                            expr=item.expr,
-                            then_target=item.then_target,
-                            else_target=item.else_target,
-                        )
-                        items.replace_slice(index, index + 1, [node])
-                        index += 1
-                        continue
+            if (
+                isinstance(item, IRTestSetBranch)
+                and item.var.startswith("slot(")
+                and (
+                    item.expr.startswith("slot(")
+                    or item.expr == "stack_top"
+                    or item.expr.startswith("ssa")
+                )
+            ):
+                if self._is_function_entry_prefix(items, index):
+                    node = IRFunctionPrologue(
+                        var=item.var,
+                        expr=item.expr,
+                        then_target=item.then_target,
+                        else_target=item.else_target,
+                    )
+                    items.replace_slice(index, index + 1, [node])
+                    index += 1
+                    continue
             index += 1
 
     def _pass_ascii_wrappers(self, items: _ItemList) -> None:
@@ -1050,18 +1172,48 @@ class IRNormalizer:
         while index < len(items) - 1:
             call = items[index]
             if isinstance(call, IRCall):
-                nxt = items[index + 1]
-                if isinstance(nxt, IRReturn):
+                offset = index + 1
+                cleanup_node: Optional[IRCallCleanup] = None
+                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
+                    cleanup_node = items[offset]
+                    offset += 1
+                if offset < len(items) and isinstance(items[offset], IRReturn):
                     node = IRCallReturn(
                         target=call.target,
                         args=call.args,
                         tail=call.tail,
-                        returns=nxt.values,
-                        varargs=nxt.varargs,
+                        returns=items[offset].values,
+                        varargs=items[offset].varargs,
+                        cleanup=cleanup_node,
                     )
-                    items.replace_slice(index, index + 2, [node])
+                    end = offset + 1
+                    items.replace_slice(index, end, [node])
                     continue
             index += 1
+
+    @staticmethod
+    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic in CALL_CLEANUP_MNEMONICS:
+            return True
+        return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+
+    @staticmethod
+    def _is_function_entry_prefix(items: _ItemList, index: int) -> bool:
+        if index == 0:
+            return True
+
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, (IRAsciiHeader, IRAsciiPreamble, IRLiteralChunk)):
+                scan -= 1
+                continue
+            if isinstance(candidate, (IRLiteral, IRCallPreparation)):
+                scan -= 1
+                continue
+            return False
+        return True
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]

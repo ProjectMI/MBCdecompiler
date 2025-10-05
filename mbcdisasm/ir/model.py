@@ -316,6 +316,19 @@ class IRCallPreparation(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCallCleanup(IRNode):
+    """Helper sequence that discharges temporary call frames or return values."""
+
+    steps: Tuple[Tuple[str, int], ...]
+    popped: int = 0
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        details = f" pop={self.popped}" if self.popped else ""
+        return f"cleanup_call{details}[{rendered}]"
+
+
+@dataclass(frozen=True)
 class IRTailcallFrame(IRNode):
     """Canonical frame setup that precedes the VM tailcall helpers."""
 
@@ -378,6 +391,7 @@ class IRCallReturn(IRNode):
     tail: bool
     returns: Tuple[str, ...]
     varargs: bool = False
+    cleanup: Optional[IRCallCleanup] = None
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -385,7 +399,26 @@ class IRCallReturn(IRNode):
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]"
+        cleanup = ""
+        if self.cleanup is not None and self.cleanup.steps:
+            rendered = ", ".join(
+                f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.cleanup.steps
+            )
+            suffix = f" pop={self.cleanup.popped}" if self.cleanup.popped else ""
+            cleanup = f" cleanup{suffix}=[{rendered}]"
+        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
+
+
+@dataclass(frozen=True)
+class IRFunctionEpilogue(IRNode):
+    """Grouped stack teardown that precedes a return."""
+
+    popped: int
+    steps: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        return f"function_epilogue pop={self.popped} steps=[{rendered}]"
 
 
 @dataclass(frozen=True)
