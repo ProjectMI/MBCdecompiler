@@ -4,7 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRIf, IRTestSetBranch
+from mbcdisasm.ir.model import IRCompare, IRIf, IRLogical, IRTest, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -78,6 +78,27 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+        },
+        "compare_eq": {
+            "opcodes": ["0x50:0x00"],
+            "name": "compare_eq",
+            "category": "compare",
+            "stack_pop": 2,
+            "stack_push": 1,
+        },
+        "logic_and": {
+            "opcodes": ["0x51:0x00"],
+            "name": "logic_and",
+            "category": "logical",
+            "stack_pop": 2,
+            "stack_push": 1,
+        },
+        "test_boolean": {
+            "opcodes": ["0x52:0x00"],
+            "name": "test_boolean",
+            "category": "test_predicate",
+            "stack_pop": 1,
+            "stack_push": 1,
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -260,6 +281,52 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("call_return") for text in descriptions)
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
 
+
+def test_normalizer_extracts_predicate_nodes(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x00, 0x00, 0x0002),
+        build_word(8, 0x50, 0x00, 0x0000),
+        build_word(12, 0x23, 0x00, 0x0010),
+        build_word(16, 0x00, 0x00, 0x0003),
+        build_word(20, 0x00, 0x00, 0x0004),
+        build_word(24, 0x51, 0x00, 0x0000),
+        build_word(28, 0x23, 0x00, 0x0020),
+        build_word(32, 0x00, 0x00, 0x0005),
+        build_word(36, 0x52, 0x00, 0x0000),
+        build_word(40, 0x27, 0x00, 0x0008),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    nodes = [
+        node
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    ]
+
+    compare_nodes = [node for node in nodes if isinstance(node, IRCompare)]
+    logical_nodes = [node for node in nodes if isinstance(node, IRLogical)]
+    test_nodes = [node for node in nodes if isinstance(node, IRTest)]
+    branch_nodes = [node for node in nodes if isinstance(node, IRIf)]
+    testset_nodes = [node for node in nodes if isinstance(node, IRTestSetBranch)]
+
+    assert compare_nodes and compare_nodes[0].operands == ("ssa1", "ssa0")
+    assert logical_nodes and logical_nodes[0].operands == ("ssa4", "ssa3")
+    assert test_nodes and len(test_nodes[0].operands) == 1
+    assert test_nodes[0].operands[0].startswith("ssa")
+
+    branch_conditions = {branch.condition for branch in branch_nodes}
+    assert compare_nodes[0].result in branch_conditions
+    assert logical_nodes[0].result.startswith("ssa")
+    assert testset_nodes and testset_nodes[0].expr == test_nodes[0].result
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

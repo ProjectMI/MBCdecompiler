@@ -34,6 +34,45 @@ class IRNode:
 
 
 @dataclass(frozen=True)
+class IRCompare(IRNode):
+    """Boolean compare operation producing a predicate value."""
+
+    result: str
+    operator: str
+    operands: Tuple[str, ...]
+
+    def describe(self) -> str:
+        args = ", ".join(self.operands)
+        return f"{self.result} = compare.{self.operator}({args})"
+
+
+@dataclass(frozen=True)
+class IRLogical(IRNode):
+    """Logical boolean operation (for example AND/OR)."""
+
+    result: str
+    operator: str
+    operands: Tuple[str, ...]
+
+    def describe(self) -> str:
+        args = ", ".join(self.operands)
+        return f"{self.result} = logical.{self.operator}({args})"
+
+
+@dataclass(frozen=True)
+class IRTest(IRNode):
+    """Unary boolean test producing a predicate value."""
+
+    result: str
+    operator: str
+    operands: Tuple[str, ...]
+
+    def describe(self) -> str:
+        args = ", ".join(self.operands)
+        return f"{self.result} = test.{self.operator}({args})"
+
+
+@dataclass(frozen=True)
 class IRCall(IRNode):
     """Invocation of another routine."""
 
@@ -491,6 +530,7 @@ __all__ = [
     "IRBlock",
     "IRCall",
     "IRReturn",
+    "IRCompare",
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
@@ -509,6 +549,8 @@ __all__ = [
     "IRCallReturn",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRLogical",
+    "IRTest",
     "IRAsciiPreamble",
     "IRCallPreparation",
     "IRTailcallFrame",

@@ -22,11 +22,13 @@ from .model import (
     IRCall,
     IRCallPreparation,
     IRCallReturn,
+    IRCompare,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRLogical,
     IRLoad,
     IRNode,
     IRProgram,
@@ -37,6 +39,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRTest,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -67,6 +70,7 @@ class RawInstruction:
     event: StackEvent
     annotations: Tuple[str, ...]
     ssa_values: Tuple[str, ...]
+    inputs: Tuple[str, ...] = tuple()
 
     @property
     def mnemonic(self) -> str:
@@ -205,17 +209,38 @@ class IRNormalizer:
         raw_instructions: List[RawInstruction] = []
         stack_names: List[str] = []
         next_ssa = 0
-        forced_push_kinds = {InstructionKind.REDUCE}
+        forced_push_kinds = {InstructionKind.REDUCE, InstructionKind.TEST, InstructionKind.LOGICAL}
         for index, (profile, event) in enumerate(zip(executable, events)):
             notes = tuple(annotations.get(index, ()))
             pops = len(event.popped_types)
-            if pops:
-                del stack_names[-pops:]
+            if pops == 0 and profile.info and profile.info.stack_pop is not None:
+                pops = int(profile.info.stack_pop)
+            category = (profile.category or "").lower()
+            mnemonic_lower = profile.mnemonic.lower()
+            predicate_like = "compare" in category or "compare" in mnemonic_lower or mnemonic_lower.startswith("cmp")
+            forced = profile.kind in forced_push_kinds or predicate_like
             pushes = len(event.pushed_types)
-            if pushes == 0 and profile.kind in forced_push_kinds:
+            if pushes == 0 and profile.info and profile.info.stack_push is not None:
+                pushes = int(profile.info.stack_push)
+            if pushes == 0 and forced:
                 baseline = max(event.depth_before - pops, 0)
                 inferred = event.depth_after - baseline
-                pushes = max(inferred, 1)
+                declared = int(profile.info.stack_push) if profile.info and profile.info.stack_push is not None else 0
+                pushes = max(inferred, declared, 1)
+            if pops == 0 and forced and pushes:
+                declared_pop = int(profile.info.stack_pop) if profile.info and profile.info.stack_pop is not None else 0
+                inferred_pops = pushes - event.delta
+                pops = max(int(inferred_pops), declared_pop, 0)
+            consumed: List[str] = []
+            if pops:
+                available = stack_names[-min(pops, len(stack_names)) :]
+                if available:
+                    consumed.extend(reversed(available))
+                    del stack_names[-len(available) :]
+                deficit = pops - len(available)
+                for missing in range(deficit):
+                    slot = event.depth_before - len(available) - missing - 1
+                    consumed.append(f"stack[{max(slot, 0)}]")
             pushed_names: List[str] = []
             for _ in range(pushes):
                 name = f"ssa{next_ssa}"
@@ -229,6 +254,7 @@ class IRNormalizer:
                     event=event,
                     annotations=notes,
                     ssa_values=tuple(pushed_names),
+                    inputs=tuple(consumed),
                 )
             )
 
@@ -290,6 +316,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_assign_ssa_names(items)
+        self._pass_predicates(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -1137,6 +1164,80 @@ class IRNormalizer:
             if isinstance(item, RawInstruction) and item.ssa_values:
                 self._record_ssa(item, item.ssa_values)
 
+    def _pass_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if item.mnemonic == "testset_branch":
+                index += 1
+                continue
+
+            result = self._ssa_value(item)
+            if not result:
+                index += 1
+                continue
+
+            operands = item.inputs or tuple()
+            mnemonic = item.mnemonic
+            node: Optional[IRNode] = None
+            kind = item.profile.kind
+
+            if self._is_comparison_instruction(item):
+                node = IRCompare(result=result, operator=mnemonic, operands=tuple(operands))
+            elif kind is InstructionKind.TEST:
+                node = IRTest(result=result, operator=mnemonic, operands=tuple(operands))
+            elif kind is InstructionKind.LOGICAL:
+                node = IRLogical(result=result, operator=mnemonic, operands=tuple(operands))
+
+            if node is None:
+                index += 1
+                continue
+
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            continue
+
+    def _is_comparison_instruction(self, instruction: RawInstruction) -> bool:
+        profile = instruction.profile
+        category = (profile.category or "").lower()
+        if "compare" in category or category.startswith("cmp"):
+            return True
+        mnemonic = instruction.mnemonic.lower()
+        if mnemonic.startswith("cmp") or "compare" in mnemonic:
+            return True
+        summary = (profile.summary or "").lower()
+        if "compare" in summary or summary.startswith("cmp"):
+            return True
+        return False
+
+    def _predicate_for_branch(self, items: _ItemList, index: int) -> Tuple[Optional[str], List[int]]:
+        cleanup: List[int] = []
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRRaw):
+                values = self._ssa_bindings.get(id(candidate))
+                if values:
+                    break
+                cleanup.append(scan)
+                scan -= 1
+                continue
+            if isinstance(candidate, (IRCompare, IRLogical, IRTest)):
+                return candidate.result, cleanup
+            if isinstance(candidate, RawInstruction):
+                if candidate.pushes_value():
+                    break
+            elif isinstance(candidate, IRNode):
+                mapped = self._ssa_value(candidate)
+                if mapped:
+                    break
+            scan -= 1
+        return None, []
+
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -1146,23 +1247,36 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                predicate, cleanup = self._predicate_for_branch(items, index)
+                expr = predicate or self._describe_condition(items, index, skip_literals=True)
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
+                if predicate:
+                    for remove_index in sorted(cleanup):
+                        items.pop(remove_index)
+                        if remove_index < index:
+                            index -= 1
                 items.replace_slice(index, index + 1, [node])
                 metrics.testset_branches += 1
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                predicate, cleanup = self._predicate_for_branch(items, index)
+                condition = predicate or self._describe_condition(items, index)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
+                if predicate:
+                    for remove_index in sorted(cleanup):
+                        items.pop(remove_index)
+                        if remove_index < index:
+                            index -= 1
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
                 continue
