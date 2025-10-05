@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
-from ..analyzer.stack import StackEvent, StackTracker
+from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
@@ -28,6 +29,7 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRAddressRef,
     IRLoad,
     IRNode,
     IRProgram,
@@ -53,6 +55,15 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
+class ValueKind(Enum):
+    """Lightweight type lattice for SSA values."""
+
+    UNKNOWN = auto()
+    INTEGER = auto()
+    ADDRESS = auto()
+    BOOLEAN = auto()
+
+
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
 CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "stack_shuffle", "fanout"}
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
@@ -74,6 +85,7 @@ class RawInstruction:
     event: StackEvent
     annotations: Tuple[str, ...]
     ssa_values: Tuple[str, ...]
+    ssa_inputs: Tuple[str, ...]
 
     @property
     def mnemonic(self) -> str:
@@ -140,6 +152,9 @@ class IRNormalizer:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
         self._ssa_bindings: Dict[int, Tuple[str, ...]] = {}
+        self._ssa_definitions: Dict[str, Union[RawInstruction, IRNode]] = {}
+        self._ssa_types: Dict[str, ValueKind] = {}
+        self._ssa_symbols: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -216,7 +231,9 @@ class IRNormalizer:
         for index, (profile, event) in enumerate(zip(executable, events)):
             notes = tuple(annotations.get(index, ()))
             pops = len(event.popped_types)
+            consumed: Tuple[str, ...] = tuple()
             if pops:
+                consumed = tuple(stack_names[-pops:]) if stack_names else tuple()
                 del stack_names[-pops:]
             pushes = len(event.pushed_types)
             if pushes == 0 and profile.kind in forced_push_kinds:
@@ -236,6 +253,7 @@ class IRNormalizer:
                     event=event,
                     annotations=notes,
                     ssa_values=tuple(pushed_names),
+                    ssa_inputs=consumed,
                 )
             )
 
@@ -281,6 +299,9 @@ class IRNormalizer:
     def _normalise_block(self, block: RawBlock) -> Tuple[IRBlock, NormalizerMetrics]:
         self._annotation_offsets.clear()
         self._ssa_bindings.clear()
+        self._ssa_definitions.clear()
+        self._ssa_types.clear()
+        self._ssa_symbols.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -338,10 +359,17 @@ class IRNormalizer:
     # SSA helpers
     # ------------------------------------------------------------------
     def _record_ssa(self, item: Union[RawInstruction, IRNode], values: Sequence[str]) -> None:
+        previous = self._ssa_bindings.pop(id(item), None)
+        if previous:
+            for name in previous:
+                if self._ssa_definitions.get(name) is item:
+                    del self._ssa_definitions[name]
         if values:
-            self._ssa_bindings[id(item)] = tuple(values)
-        else:
-            self._ssa_bindings.pop(id(item), None)
+            canonical = tuple(values)
+            self._ssa_bindings[id(item)] = canonical
+            for name in canonical:
+                self._ssa_definitions[name] = item
+                self._ssa_types.setdefault(name, ValueKind.UNKNOWN)
 
     def _transfer_ssa(
         self,
@@ -353,6 +381,9 @@ class IRNormalizer:
             values = source.ssa_values
         values = self._ssa_bindings.get(id(source), values)
         if values:
+            for name in values:
+                if self._ssa_definitions.get(name) is source:
+                    del self._ssa_definitions[name]
             self._record_ssa(target, values)
         self._ssa_bindings.pop(id(source), None)
 
@@ -365,6 +396,122 @@ class IRNormalizer:
         if 0 <= index < len(values):
             return values[index]
         return None
+
+    def _mark_ssa_type(self, name: Optional[str], kind: ValueKind) -> None:
+        if not name:
+            return
+        current = self._ssa_types.get(name)
+        if current is kind:
+            return
+        if current not in {None, ValueKind.UNKNOWN} and current is not kind:
+            if ValueKind.ADDRESS in {current, kind}:
+                self._ssa_types[name] = ValueKind.ADDRESS
+            return
+        self._ssa_types[name] = kind
+        source = self._ssa_definitions.get(name)
+        if kind is ValueKind.ADDRESS and isinstance(source, IRStackDuplicate):
+            alias = source.value if isinstance(source.value, str) else None
+            if alias:
+                self._mark_ssa_type(alias, kind)
+
+    def _pointer_operand(self, instruction: RawInstruction) -> Optional[str]:
+        if not instruction.ssa_inputs:
+            return None
+        popped = instruction.event.popped_types
+        if not popped:
+            return instruction.ssa_inputs[-1]
+        for index, value_type in enumerate(popped):
+            if value_type is StackValueType.SLOT and index < len(instruction.ssa_inputs):
+                return instruction.ssa_inputs[index]
+        return instruction.ssa_inputs[-1]
+
+    def _resolve_pointer_slot(
+        self,
+        items: _ItemList,
+        name: Optional[str],
+        *,
+        seen: Optional[Set[str]] = None,
+    ) -> Tuple[Optional[IRSlot], Optional[IRLiteral], Optional[str]]:
+        if not name:
+            return None, None, None
+        if seen is None:
+            seen = set()
+        if name in seen:
+            return None, None, None
+        seen.add(name)
+        cached = self._ssa_symbols.get(name)
+        source = self._ssa_definitions.get(name)
+        if source is None:
+            if cached:
+                return None, None, cached
+            return None, None, None
+        if isinstance(source, IRLiteral):
+            slot = self._classify_slot(source.value)
+            label = self._format_slot_symbol(slot)
+            self._ssa_symbols[name] = label
+            self._mark_ssa_type(name, ValueKind.ADDRESS)
+            self._annotate_literal(items, source, label)
+            return slot, source, label
+        if isinstance(source, IRLoad):
+            if source.address is not None:
+                slot = source.address.base
+                label = source.address.symbol or self._format_slot_symbol(slot)
+            else:
+                slot = source.slot
+                label = self._format_slot_symbol(slot)
+            self._ssa_symbols[name] = label
+            self._mark_ssa_type(name, ValueKind.ADDRESS)
+            return slot, None, label
+        if isinstance(source, IRStackDuplicate):
+            alias = source.value if isinstance(source.value, str) else None
+            slot, literal, label = self._resolve_pointer_slot(items, alias, seen=seen)
+            if label:
+                self._ssa_symbols[name] = label
+            if slot is not None:
+                self._mark_ssa_type(name, ValueKind.ADDRESS)
+            return slot, literal, label
+        if isinstance(source, RawInstruction):
+            if StackValueType.SLOT in source.event.pushed_types:
+                slot = self._classify_slot(source.operand)
+                label = self._format_slot_symbol(slot)
+                self._ssa_symbols[name] = label
+                self._mark_ssa_type(name, ValueKind.ADDRESS)
+                return slot, None, label
+        if cached:
+            return None, None, cached
+        return None, None, None
+
+    def _annotate_literal(
+        self, items: _ItemList, literal: Optional[IRLiteral], annotation: str
+    ) -> None:
+        if literal is None or not annotation:
+            return
+        if annotation in literal.annotations:
+            return
+        index = self._find_item_index(items, literal)
+        if index is None:
+            return
+        updated = IRLiteral(
+            value=literal.value,
+            mode=literal.mode,
+            source=literal.source,
+            annotations=literal.annotations + (annotation,),
+        )
+        self._transfer_ssa(literal, updated)
+        items.replace_slice(index, index + 1, [updated])
+
+    @staticmethod
+    def _find_item_index(
+        items: _ItemList, target: Union[RawInstruction, IRNode]
+    ) -> Optional[int]:
+        for index, candidate in enumerate(items):
+            if candidate is target:
+                return index
+        return None
+
+    @staticmethod
+    def _format_slot_symbol(slot: IRSlot) -> str:
+        return f"{slot.space.name.lower()}[0x{slot.index:04X}]"
 
     # ------------------------------------------------------------------
     # individual pass implementations
@@ -1304,15 +1451,55 @@ class IRNormalizer:
 
             kind = item.event.kind
             if kind in {InstructionKind.INDIRECT_LOAD, InstructionKind.INDIRECT}:
-                slot = self._classify_slot(item.operand)
-                node = IRLoad(slot=slot)
+                pointer_name = self._pointer_operand(item)
+                slot: Optional[IRSlot] = None
+                symbol: Optional[str] = None
+                if pointer_name:
+                    slot, _, symbol = self._resolve_pointer_slot(items, pointer_name)
+                    self._mark_ssa_type(pointer_name, ValueKind.ADDRESS)
+                    symbol = symbol or self._ssa_symbols.get(pointer_name)
+                if slot is not None:
+                    if symbol is None:
+                        symbol = self._format_slot_symbol(slot)
+                    if pointer_name and symbol:
+                        self._ssa_symbols.setdefault(pointer_name, symbol)
+                    address = IRAddressRef(
+                        base=slot,
+                        offset=item.operand,
+                        symbol=symbol,
+                        pointer=pointer_name,
+                    )
+                    node = IRLoad(slot=slot, address=address)
+                else:
+                    slot = self._classify_slot(item.operand)
+                    node = IRLoad(slot=slot)
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
-                slot = self._classify_slot(item.operand)
-                node = IRStore(slot=slot)
+                pointer_name = self._pointer_operand(item)
+                slot: Optional[IRSlot] = None
+                symbol: Optional[str] = None
+                if pointer_name:
+                    slot, _, symbol = self._resolve_pointer_slot(items, pointer_name)
+                    self._mark_ssa_type(pointer_name, ValueKind.ADDRESS)
+                    symbol = symbol or self._ssa_symbols.get(pointer_name)
+                if slot is not None:
+                    if symbol is None:
+                        symbol = self._format_slot_symbol(slot)
+                    if pointer_name and symbol:
+                        self._ssa_symbols.setdefault(pointer_name, symbol)
+                    address = IRAddressRef(
+                        base=slot,
+                        offset=item.operand,
+                        symbol=symbol,
+                        pointer=pointer_name,
+                    )
+                    node = IRStore(slot=slot, address=address)
+                else:
+                    slot = self._classify_slot(item.operand)
+                    node = IRStore(slot=slot)
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1
                 continue

@@ -12,6 +12,10 @@ from mbcdisasm.ir.model import (
     IRFunctionPrologue,
     IRStackEffect,
     IRTestSetBranch,
+    IRLoad,
+    IRStore,
+    IRLiteral,
+    MemSpace,
     IRRaw,
 )
 from mbcdisasm.mbc import Segment
@@ -319,7 +323,7 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
-    assert "lit(0x6704)" in descriptions
+    assert any(text.startswith("lit(0x6704)") for text in descriptions)
 
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
@@ -414,6 +418,51 @@ def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
         for node in block.nodes
     )
+
+
+def test_normalizer_symbolises_indirect_addresses(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x2910),  # pointer literal for load
+        build_word(4, 0x69, 0x01, 0x0005),  # indirect load
+        build_word(8, 0x00, 0x00, 0x6C01),  # pointer literal for store
+        build_word(12, 0x00, 0x00, 0x0003),  # value to store
+        build_word(16, 0x69, 0x01, 0x0008),  # indirect store
+        build_word(20, 0x01, 0xF0, 0x0000),  # stack teardown marks store variant
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    literals = [node for node in block.nodes if isinstance(node, IRLiteral)]
+    assert any("global[0x2910]" in literal.describe() for literal in literals)
+    assert any("global[0x6C01]" in literal.describe() for literal in literals)
+
+    load = next(node for node in block.nodes if isinstance(node, IRLoad))
+    assert load.address is not None
+    assert load.address.base.space is MemSpace.GLOBAL
+    assert load.address.base.index == 0x2910
+    assert load.address.offset == 0x0005
+    assert load.address.symbol == "global[0x2910]"
+    assert load.address.pointer is not None
+    assert load.describe().startswith("load indirect base=global[0x2910] off=0x0005")
+
+    store = next(node for node in block.nodes if isinstance(node, IRStore))
+    assert store.address is not None
+    assert store.address.base.space is MemSpace.GLOBAL
+    assert store.address.base.index == 0x6C01
+    assert store.address.symbol == "global[0x6C01]"
+    assert store.address.offset == 0x0008
+    description = store.describe()
+    assert description.startswith("store ")
+    assert "indirect base=global[0x6C01]" in description
 
 
 def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:

@@ -98,7 +98,31 @@ class IRLiteral(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        return f"lit(0x{self.value:04X})"
+        note = f"lit(0x{self.value:04X})"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
+class IRAddressRef:
+    """Describe a resolved indirect address."""
+
+    base: IRSlot
+    offset: int = 0
+    symbol: Optional[str] = None
+    pointer: Optional[str] = None
+
+    def base_label(self) -> str:
+        if self.symbol:
+            return self.symbol
+        return f"{self.base.space.name.lower()}[0x{self.base.index:04X}]"
+
+    def describe(self) -> str:
+        base = self.base_label()
+        if self.offset:
+            return f"{base}+0x{self.offset:04X}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -285,9 +309,15 @@ class IRLoad(IRNode):
 
     slot: IRSlot
     target: str = "stack"
+    address: Optional[IRAddressRef] = None
 
     def describe(self) -> str:
-        return f"load {self.slot.space.name.lower()}[{self.slot.index}] -> {self.target}"
+        if self.address is not None:
+            base = self.address.base_label()
+            offset = f" off=0x{self.address.offset:04X}" if self.address.offset else ""
+            pointer = f" ptr={self.address.pointer}" if self.address.pointer else ""
+            return f"load indirect base={base}{offset}{pointer} -> {self.target}"
+        return f"load {self.slot.space.name.lower()}[0x{self.slot.index:04X}] -> {self.target}"
 
 
 @dataclass(frozen=True)
@@ -296,9 +326,15 @@ class IRStore(IRNode):
 
     slot: IRSlot
     value: str = "stack"
+    address: Optional[IRAddressRef] = None
 
     def describe(self) -> str:
-        return f"store {self.value} -> {self.slot.space.name.lower()}[{self.slot.index}]"
+        if self.address is not None:
+            base = self.address.base_label()
+            offset = f" off=0x{self.address.offset:04X}" if self.address.offset else ""
+            pointer = f" ptr={self.address.pointer}" if self.address.pointer else ""
+            return f"store {self.value} -> indirect base={base}{offset}{pointer}"
+        return f"store {self.value} -> {self.slot.space.name.lower()}[0x{self.slot.index:04X}]"
 
 
 @dataclass(frozen=True)
@@ -547,6 +583,7 @@ __all__ = [
     "IRTestSetBranch",
     "IRFlagCheck",
     "IRFunctionPrologue",
+    "IRAddressRef",
     "IRLoad",
     "IRStore",
     "IRStackDuplicate",
