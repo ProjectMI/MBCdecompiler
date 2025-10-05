@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
-from ..analyzer.stack import StackEvent, StackTracker
+from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
@@ -66,6 +66,7 @@ class RawInstruction:
     profile: InstructionProfile
     event: StackEvent
     annotations: Tuple[str, ...]
+    ssa_outputs: Tuple[str, ...] = tuple()
 
     @property
     def mnemonic(self) -> str:
@@ -84,6 +85,11 @@ class RawInstruction:
 
     def describe_source(self) -> str:
         return f"{self.profile.label}@0x{self.offset:06X}"
+
+    def ssa_top(self) -> Optional[str]:
+        if self.ssa_outputs:
+            return self.ssa_outputs[-1]
+        return None
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,8 @@ class IRNormalizer:
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
         self._annotation_offsets: Set[int] = set()
+        self._ssa_nodes: Dict[IRNode, Tuple[str, ...]] = {}
+        self._ssa_sources: Dict[str, Union[RawInstruction, IRNode]] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -261,6 +269,7 @@ class IRNormalizer:
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
+        self._pass_assign_ssa(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -461,7 +470,8 @@ class IRNormalizer:
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
-                args.append(candidate.describe())
+                ssa = self._ssa_value(candidate)
+                args.append(ssa or candidate.describe())
                 scan -= 1
                 continue
             if isinstance(candidate, IRStackDuplicate):
@@ -858,6 +868,97 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [node])
             index += 1
 
+    def _pass_assign_ssa(self, items: _ItemList) -> None:
+        """Assign SSA identifiers to stack-producing instructions and nodes."""
+
+        self._ssa_nodes.clear()
+        self._ssa_sources.clear()
+        stack: List[str] = []
+        counter = 0
+
+        def next_name() -> str:
+            nonlocal counter
+            counter += 1
+            return f"ssa_{counter}"
+
+        def pop_stack(count: int) -> None:
+            if count <= 0 or not stack:
+                return
+            del stack[-min(count, len(stack)) :]
+
+        def assign(item: Union[RawInstruction, IRNode], count: int) -> Tuple[str, ...]:
+            if count <= 0:
+                if isinstance(item, RawInstruction):
+                    object.__setattr__(item, "ssa_outputs", tuple())
+                return tuple()
+            names = tuple(next_name() for _ in range(count))
+            stack.extend(names)
+            if isinstance(item, RawInstruction):
+                object.__setattr__(item, "ssa_outputs", names)
+            else:
+                self._ssa_nodes[item] = names
+            for name in names:
+                self._ssa_sources[name] = item
+            return names
+
+        for item in items:
+            if isinstance(item, RawInstruction):
+                popped = sum(
+                    1 for value in item.event.popped_types if value is not StackValueType.MARKER
+                )
+                pop_stack(popped)
+                pushes = sum(
+                    1 for value in item.event.pushed_types if value is not StackValueType.MARKER
+                )
+                assign(item, pushes)
+                continue
+
+            if isinstance(item, IRStackDuplicate):
+                if stack:
+                    top = stack[-1]
+                    for _ in range(max(1, item.copies - 1)):
+                        stack.append(top)
+                continue
+
+            if isinstance(item, IRStackDrop):
+                pop_stack(1)
+                continue
+
+            if isinstance(item, (IRLiteral, IRLiteralChunk, IRBuildArray, IRBuildTuple, IRBuildMap)):
+                assign(item, 1)
+                continue
+
+            if isinstance(item, IRLiteralBlock):
+                assign(item, 1)
+                continue
+
+            if isinstance(item, IRCall):
+                pop_stack(len(item.args))
+                if item.tail:
+                    continue
+                assign(item, 1)
+                continue
+
+            if isinstance(item, IRReturn):
+                pop_stack(len(item.values))
+                continue
+
+            if isinstance(item, IRStore):
+                pop_stack(1)
+                continue
+
+            if isinstance(item, IRLoad):
+                assign(item, 1)
+                continue
+
+            if isinstance(item, IRCallReturn):
+                pop_stack(len(item.args))
+                pop_stack(len(item.returns))
+                if not item.tail:
+                    assign(item, len(item.returns))
+                continue
+
+
     def _pass_flag_checks(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -921,7 +1022,15 @@ class IRNormalizer:
             if scan < len(items) and isinstance(items[scan], IRIf):
                 candidate = items[scan]
                 first_chunk = ascii_chunks[0]
-                if candidate.condition in {first_chunk, "stack_top"} and item.tail:
+                condition = candidate.condition
+                if (
+                    condition in {first_chunk, "stack_top"}
+                    or (
+                        isinstance(condition, str)
+                        and condition.startswith("ssa_")
+                        and self._ssa_matches_literal(condition, first_chunk)
+                    )
+                ) and item.tail:
                     branch = candidate
                     scan += 1
 
@@ -1126,19 +1235,43 @@ class IRNormalizer:
                 if candidate.pushes_value():
                     return self._describe_value(candidate)
             elif isinstance(candidate, IRLiteral):
-                return candidate.describe()
+                ssa = self._ssa_value(candidate)
+                return ssa or candidate.describe()
             elif isinstance(candidate, IRLiteralChunk):
-                return candidate.describe()
+                ssa = self._ssa_value(candidate)
+                return ssa or candidate.describe()
             elif isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             elif isinstance(candidate, IRNode):
+                ssa = self._ssa_value(candidate)
+                if ssa:
+                    return ssa
                 describe = getattr(candidate, "describe", None)
                 if callable(describe):
                     return describe()
             scan -= 1
         return "stack_top"
 
+    def _ssa_value(self, item: Union[RawInstruction, IRNode]) -> Optional[str]:
+        if isinstance(item, RawInstruction):
+            return item.ssa_top()
+        values = self._ssa_nodes.get(item)
+        if values:
+            return values[-1]
+        return None
+
+    def _ssa_matches_literal(self, name: str, literal: str) -> bool:
+        source = self._ssa_sources.get(name)
+        if source is None:
+            return False
+        if isinstance(source, (IRLiteral, IRLiteralChunk)):
+            return source.describe() == literal
+        return False
+
     def _describe_value(self, instruction: RawInstruction) -> str:
+        ssa = instruction.ssa_top()
+        if ssa:
+            return ssa
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         if mnemonic == "push_literal":
@@ -1158,20 +1291,39 @@ class IRNormalizer:
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
                     if skip_literals and candidate.mnemonic == "push_literal":
+                        ssa = candidate.ssa_top()
+                        if ssa:
+                            return ssa
                         scan -= 1
                         continue
                     return self._describe_value(candidate)
                 if skip_literals:
+                    ssa = candidate.ssa_top()
+                    if ssa:
+                        return ssa
                     return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral) and skip_literals:
-                scan -= 1
-                continue
-            if isinstance(candidate, IRLiteralChunk) and skip_literals:
-                scan -= 1
-                continue
+            if isinstance(candidate, IRLiteral):
+                ssa = self._ssa_value(candidate)
+                if ssa:
+                    return ssa
+                if skip_literals:
+                    scan -= 1
+                    continue
+                return candidate.describe()
+            if isinstance(candidate, IRLiteralChunk):
+                ssa = self._ssa_value(candidate)
+                if ssa:
+                    return ssa
+                if skip_literals:
+                    scan -= 1
+                    continue
+                return candidate.describe()
             if isinstance(candidate, IRStackDuplicate):
                 return candidate.value
             if isinstance(candidate, IRNode):
+                ssa = self._ssa_value(candidate)
+                if ssa:
+                    return ssa
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"

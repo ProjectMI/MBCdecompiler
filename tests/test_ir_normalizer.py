@@ -4,6 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir.model import IRIf, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -198,6 +199,28 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
     assert program.metrics.literals == 5
+
+
+def test_branch_nodes_use_ssa_names(tmp_path: Path) -> None:
+    container, knowledge = build_container(tmp_path)
+    program = IRNormalizer(knowledge).normalise_container(container)
+
+    ir_if: IRIf | None = None
+    testset: IRTestSetBranch | None = None
+
+    for segment in program.segments:
+        for block in segment.blocks:
+            for node in block.nodes:
+                if isinstance(node, IRIf) and ir_if is None:
+                    ir_if = node
+                if isinstance(node, IRTestSetBranch) and testset is None:
+                    testset = node
+
+    assert ir_if is not None
+    assert ir_if.condition.startswith("ssa_")
+
+    assert testset is not None
+    assert testset.expr.startswith("ssa_")
     assert program.metrics.literal_chunks == 0
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches == 1
