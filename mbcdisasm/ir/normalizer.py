@@ -37,6 +37,8 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRStackShuffle,
+    IRStackTeardown,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -414,6 +416,25 @@ class IRNormalizer:
                 metrics.loads += 1
                 continue
 
+            if mnemonic == "stack_shuffle":
+                event = item.event
+                node = IRStackShuffle(
+                    operand=item.operand,
+                    delta=event.delta,
+                    popped=len(event.popped_types),
+                    pushed=len(event.pushed_types),
+                )
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            if mnemonic.startswith("stack_teardown"):
+                node = IRStackTeardown(
+                    count=self._parse_stack_teardown_count(mnemonic),
+                    operand=item.operand,
+                )
+                items.replace_slice(index, index + 1, [node])
+                continue
+
             index += 1
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
@@ -623,6 +644,16 @@ class IRNormalizer:
             return total
         return None
 
+    @staticmethod
+    def _parse_stack_teardown_count(mnemonic: str) -> int:
+        parts = mnemonic.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            try:
+                return int(parts[1])
+            except ValueError:
+                return 0
+        return 0
+
     def _pass_aggregates(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -811,14 +842,14 @@ class IRNormalizer:
 
     def _pass_call_preparation(self, items: _ItemList) -> None:
         index = 0
-        allowed_prefix = {"stack_shuffle", "fanout"}
         while index < len(items):
             item = items[index]
-            if not isinstance(item, RawInstruction) or item.mnemonic != "op_4A_05":
+            step = self._call_preparation_anchor_step(item)
+            if step is None:
                 index += 1
                 continue
 
-            steps: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            steps: List[str] = [step]
             start = index
             scan = index - 1
             while scan >= 0:
@@ -826,21 +857,19 @@ class IRNormalizer:
                 if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
                     scan -= 1
                     continue
-                if isinstance(candidate, RawInstruction):
-                    mnemonic = candidate.mnemonic
-                    if mnemonic in allowed_prefix or mnemonic.startswith("stack_teardown"):
-                        steps.insert(0, (mnemonic, candidate.operand))
-                        start = scan
-                        scan -= 1
-                        continue
-                break
+                prefix_step = self._call_preparation_prefix_step(candidate)
+                if prefix_step is None:
+                    break
+                steps.insert(0, prefix_step)
+                start = scan
+                scan -= 1
 
-            if start < index:
-                items.replace_slice(start, index + 1, [IRCallPreparation(steps=tuple(steps))])
-                index = start
-                continue
-
-            index += 1
+            replaced = [items[pos] for pos in range(start, index + 1)]
+            node = IRCallPreparation(steps=tuple(steps))
+            items.replace_slice(start, index + 1, [node])
+            for original in replaced:
+                self._transfer_ssa(original, node)
+            index = start + 1
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -868,6 +897,28 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _call_preparation_anchor_step(self, item: Union[RawInstruction, IRNode]) -> Optional[str]:
+        if isinstance(item, RawInstruction) and item.mnemonic in {"op_4A_05", "call_helpers"}:
+            return f"{item.mnemonic}(0x{item.operand:04X})"
+        return None
+
+    def _call_preparation_prefix_step(self, item: Union[RawInstruction, IRNode]) -> Optional[str]:
+        if isinstance(item, RawInstruction):
+            mnemonic = item.mnemonic
+            if mnemonic == "stack_shuffle" or mnemonic == "fanout" or mnemonic.startswith("stack_teardown"):
+                return f"{mnemonic}(0x{item.operand:04X})"
+            return None
+        if isinstance(item, IRStackShuffle):
+            return f"stack_shuffle(0x{item.operand:04X})"
+        if isinstance(item, IRStackTeardown):
+            count = item.count if item.count else "?"
+            return f"stack_teardown({count})"
+        if isinstance(item, IRStackDuplicate):
+            return item.describe()
+        if isinstance(item, IRStackDrop):
+            return item.describe()
+        return None
 
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0

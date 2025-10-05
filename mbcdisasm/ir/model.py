@@ -290,6 +290,33 @@ class IRStackDuplicate(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStackShuffle(IRNode):
+    """Permutation of the stack top produced by the 0x66 helper family."""
+
+    operand: int
+    delta: int
+    popped: int
+    pushed: int
+
+    def describe(self) -> str:
+        return (
+            f"stack_shuffle operand=0x{self.operand:04X} Δ={self.delta:+d} "
+            f"popped={self.popped} pushed={self.pushed}"
+        )
+
+
+@dataclass(frozen=True)
+class IRStackTeardown(IRNode):
+    """Explicitly drops a fixed number of arguments from the stack."""
+
+    count: int
+    operand: int
+
+    def describe(self) -> str:
+        return f"stack_teardown count={self.count} operand=0x{self.operand:04X}"
+
+
+@dataclass(frozen=True)
 class IRAsciiPreamble(IRNode):
     """Helper node that replaces the common ASCII initialisation prologue."""
 
@@ -308,10 +335,10 @@ class IRAsciiPreamble(IRNode):
 class IRCallPreparation(IRNode):
     """Grouped stack permutations that prepare arguments for helper calls."""
 
-    steps: Tuple[Tuple[str, int], ...]
+    steps: Tuple[str, ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(self.steps)
         return f"prep_call_args[{rendered}]"
 
 
@@ -504,6 +531,8 @@ __all__ = [
     "IRLoad",
     "IRStore",
     "IRStackDuplicate",
+    "IRStackShuffle",
+    "IRStackTeardown",
     "IRStackDrop",
     "IRAsciiHeader",
     "IRCallReturn",
