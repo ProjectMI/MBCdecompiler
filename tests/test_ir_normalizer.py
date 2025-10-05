@@ -4,6 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir.model import IRIf, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -222,6 +223,22 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     text = renderer.render(program)
     assert "normalizer metrics" in text
     assert f"segment {segment.index}" in text
+
+    if_nodes = [
+        node
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRIf)
+    ]
+    assert if_nodes and all(node.condition.startswith("ssa") for node in if_nodes)
+
+    testset_nodes = [
+        node
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRTestSetBranch)
+    ]
+    assert testset_nodes and all(node.expr.startswith("ssa") for node in testset_nodes)
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
