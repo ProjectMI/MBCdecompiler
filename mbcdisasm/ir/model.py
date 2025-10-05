@@ -15,12 +15,52 @@ class MemSpace(Enum):
     CONST = auto()
 
 
+class SSAValueKind(Enum):
+    """Lightweight annotation attached to SSA values."""
+
+    UNKNOWN = auto()
+    INTEGER = auto()
+    ADDRESS = auto()
+    POINTER = auto()
+    BOOLEAN = auto()
+    IDENTIFIER = auto()
+
+
 @dataclass(frozen=True)
 class IRSlot:
     """Address of a VM slot used by :class:`IRLoad` and :class:`IRStore`."""
 
     space: MemSpace
     index: int
+
+
+@dataclass(frozen=True)
+class MemRef:
+    """Symbolic description of an indirect memory reference."""
+
+    region: str
+    bank: Optional[int] = None
+    base: Optional[int] = None
+    page: Optional[int] = None
+    offset: Optional[int] = None
+    symbol: Optional[str] = None
+
+    def describe(self) -> str:
+        prefix = self.symbol or self.region
+        details = []
+        if self.bank is not None:
+            details.append(f"bank=0x{self.bank:04X}")
+        if self.base is not None:
+            details.append(f"base=0x{self.base:04X}")
+        if self.page is not None:
+            details.append(f"page=0x{self.page:02X}")
+        if self.offset is not None:
+            width = 2 if self.offset <= 0xFF else 4
+            details.append(f"off=0x{self.offset:0{width}X}")
+        if not details:
+            return prefix
+        inner = ", ".join(details)
+        return f"{prefix}[{inner}]"
 
 
 @dataclass(frozen=True)
@@ -302,6 +342,54 @@ class IRStore(IRNode):
 
 
 @dataclass(frozen=True)
+class IRIndirectLoad(IRNode):
+    """Read a value through an indirect slot pointer."""
+
+    base: str
+    offset: int
+    target: str
+    base_slot: Optional[IRSlot] = None
+    ref: Optional[MemRef] = None
+
+    def describe(self) -> str:
+        if self.ref is not None:
+            return f"load {self.ref.describe()} -> {self.target}"
+
+        prefix = self.base
+        if self.base_slot is not None:
+            slot = f"{self.base_slot.space.name.lower()}[0x{self.base_slot.index:04X}]"
+            if self.base:
+                prefix = f"{slot} ({self.base})"
+            else:
+                prefix = slot
+        return f"indirect_load base={prefix} offset=0x{self.offset:04X} -> {self.target}"
+
+
+@dataclass(frozen=True)
+class IRIndirectStore(IRNode):
+    """Write a value through an indirect slot pointer."""
+
+    base: str
+    value: str
+    offset: int
+    base_slot: Optional[IRSlot] = None
+    ref: Optional[MemRef] = None
+
+    def describe(self) -> str:
+        if self.ref is not None:
+            return f"store {self.value} -> {self.ref.describe()}"
+
+        prefix = self.base
+        if self.base_slot is not None:
+            slot = f"{self.base_slot.space.name.lower()}[0x{self.base_slot.index:04X}]"
+            if self.base:
+                prefix = f"{slot} ({self.base})"
+            else:
+                prefix = slot
+        return f"indirect_store {self.value} -> {prefix} offset=0x{self.offset:04X}"
+
+
+@dataclass(frozen=True)
 class IRStackDuplicate(IRNode):
     """Duplicate the value currently at the top of the VM stack."""
 
@@ -549,6 +637,8 @@ __all__ = [
     "IRFunctionPrologue",
     "IRLoad",
     "IRStore",
+    "IRIndirectLoad",
+    "IRIndirectStore",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRAsciiHeader",
@@ -561,7 +651,9 @@ __all__ = [
     "IRTablePatch",
     "IRAsciiFinalize",
     "IRSlot",
+    "MemRef",
     "IRRaw",
     "MemSpace",
+    "SSAValueKind",
     "NormalizerMetrics",
 ]
