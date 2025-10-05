@@ -390,6 +390,34 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_call_preparation_absorbs_annotations(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x66, 0x15, 0x4B08),  # stack_shuffle
+        build_word(4, 0x00, 0x38, 0x6704),  # literal_marker spacer
+        build_word(8, 0x01, 0x00, 0x0000),  # stack_teardown_1
+        build_word(12, 0x28, 0x00, 0x0020),  # call_dispatch
+        build_word(16, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
+    assert [step[0] for step in prep.steps] == ["stack_shuffle", "stack_teardown"]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
+        for node in block.nodes
+    )
+
+
 def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -410,6 +438,64 @@ def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
     ret = next(node for node in block.nodes if isinstance(node, IRReturn))
     assert ret.cleanup and ret.cleanup[0].mnemonic == "stack_teardown"
     assert ret.cleanup[0].pops == 4
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
+        for node in block.nodes
+    )
+
+
+def test_normalizer_cleanup_skips_annotation_between_steps(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x0020),  # call_dispatch
+        build_word(4, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(8, 0x00, 0x38, 0x6704),  # literal_marker spacer
+        build_word(12, 0x01, 0x00, 0x0000),  # stack_teardown_1
+        build_word(16, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert [step.mnemonic for step in call_return.cleanup] == [
+        "stack_teardown",
+        "stack_teardown",
+    ]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
+        for node in block.nodes
+    )
+
+
+def test_normalizer_return_cleanup_handles_annotation(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(4, 0x00, 0x38, 0x6704),  # literal_marker spacer
+        build_word(8, 0x01, 0x00, 0x0000),  # stack_teardown_1
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert [step.mnemonic for step in ret.cleanup] == ["stack_teardown", "stack_teardown"]
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
         for node in block.nodes
