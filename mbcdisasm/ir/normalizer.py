@@ -20,6 +20,7 @@ from .model import (
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    IRCallHelper,
     IRCallPreparation,
     IRCallReturn,
     IRFlagCheck,
@@ -36,6 +37,8 @@ from .model import (
     IRSlot,
     IRStore,
     IRStackDuplicate,
+    IRStackPermutation,
+    IRStackTeardown,
     IRStackDrop,
     IRTailcallAscii,
     IRTablePatch,
@@ -287,8 +290,10 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_tailcall_frames(items)
+        self._pass_stack_helpers(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
+        self._pass_call_helpers(items)
         self._pass_assign_ssa_names(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
@@ -402,7 +407,7 @@ class IRNormalizer:
 
             if mnemonic == "op_01_66":
                 value = self._describe_stack_top(items, index)
-                node = IRStackDrop(value=value)
+                node = IRStackDrop(values=(value,), source=mnemonic)
                 items.replace_slice(index, index + 1, [node])
                 continue
 
@@ -842,6 +847,41 @@ class IRNormalizer:
 
             index += 1
 
+    def _pass_stack_helpers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            mnemonic = item.mnemonic
+            if mnemonic in {"stack_shuffle", "fanout"}:
+                node = IRStackPermutation(mnemonic=mnemonic, operand=item.operand)
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            if (
+                item.profile.kind is InstructionKind.STACK_TEARDOWN
+                or mnemonic.startswith("stack_teardown")
+            ):
+                drop = -item.event.delta
+                if drop <= 0:
+                    hint = item.profile.stack_hint
+                    if hint.nominal < 0:
+                        drop = -hint.nominal
+                    elif hint.minimum < 0:
+                        drop = -hint.minimum
+                    else:
+                        drop = 1
+                top_hint = self._describe_stack_top(items, index) if drop else ""
+                node = IRStackTeardown(source=mnemonic, count=drop, top_hint=top_hint)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            index += 1
+
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -927,6 +967,26 @@ class IRNormalizer:
             node = IRAsciiFinalize(helper=item.operand, summary=summary or "ascii")
             items.replace_slice(index, index + 1, [node])
             index += 1
+
+    def _pass_call_helpers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (
+                isinstance(item, RawInstruction)
+                and item.mnemonic == "call_helpers"
+            ):
+                index += 1
+                continue
+
+            summary = item.profile.summary or ""
+            node = IRCallHelper(
+                label=item.profile.label,
+                operand=item.operand,
+                summary=summary,
+            )
+            items.replace_slice(index, index + 1, [node])
+            continue
 
     def _pass_flag_checks(self, items: _ItemList) -> None:
         index = 0

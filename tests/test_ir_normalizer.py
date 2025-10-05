@@ -79,6 +79,16 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "stack_teardown_1",
             "category": "stack_teardown",
         },
+        "stack_shuffle": {
+            "opcodes": ["0x66:0x15"],
+            "name": "stack_shuffle",
+            "category": "stack_shuffle",
+        },
+        "call_helpers": {
+            "opcodes": ["0x10:0x00"],
+            "name": "call_helpers",
+            "category": "call_helpers",
+        },
     }
     manual_path = path / "manual_annotations.json"
     manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
@@ -104,6 +114,8 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
         build_word(24, 0x69, 0x01, 0x0005),
         build_word(28, 0x69, 0x01, 0x9000),
         build_word(32, 0x01, 0x00, 0x0000),
+        build_word(36, 0x66, 0x15, 0x4B08),
+        build_word(40, 0x10, 0x00, 0x00F0),
     ]
 
     seg0_bytes = encode_instructions(seg0_words)
@@ -218,6 +230,9 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert any(text.startswith("testset") for text in descriptions)
     assert any(text.startswith("load") for text in descriptions)
     assert any(text.startswith("store") for text in descriptions)
+    assert any(text.startswith("stack_perm") for text in descriptions)
+    assert any(text.startswith("teardown stack_teardown_1") for text in descriptions)
+    assert any(text.startswith("call_helper") for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)

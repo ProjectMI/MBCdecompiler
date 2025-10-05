@@ -316,6 +316,19 @@ class IRCallPreparation(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCallHelper(IRNode):
+    """Explicit representation of helper opcodes used during call scaffolding."""
+
+    label: str
+    operand: int
+    summary: str = ""
+
+    def describe(self) -> str:
+        suffix = f" summary={self.summary}" if self.summary else ""
+        return f"call_helper {self.label} operand=0x{self.operand:04X}{suffix}"
+
+
+@dataclass(frozen=True)
 class IRTailcallFrame(IRNode):
     """Canonical frame setup that precedes the VM tailcall helpers."""
 
@@ -352,10 +365,44 @@ class IRAsciiFinalize(IRNode):
 class IRStackDrop(IRNode):
     """Discard the value currently residing at the top of the VM stack."""
 
-    value: str
+    values: Tuple[str, ...]
+    source: str = "stack_drop"
 
     def describe(self) -> str:
-        return f"drop {self.value}"
+        if not self.values:
+            return f"drop via {self.source}"
+        if len(self.values) == 1:
+            return f"drop {self.values[0]}"
+        rendered = ", ".join(self.values)
+        return f"drop[{rendered}] via {self.source}"
+
+    @property
+    def value(self) -> str:
+        return self.values[0] if self.values else "stack"
+
+
+@dataclass(frozen=True)
+class IRStackPermutation(IRNode):
+    """Describe stack shuffle/fanout helpers with explicit IR nodes."""
+
+    mnemonic: str
+    operand: int
+
+    def describe(self) -> str:
+        return f"stack_perm {self.mnemonic}(0x{self.operand:04X})"
+
+
+@dataclass(frozen=True)
+class IRStackTeardown(IRNode):
+    """Summarise stack teardown helpers that drop multiple values at once."""
+
+    source: str
+    count: int
+    top_hint: str = ""
+
+    def describe(self) -> str:
+        suffix = f" top={self.top_hint}" if self.top_hint else ""
+        return f"teardown {self.source} count={self.count}{suffix}"
 
 
 @dataclass(frozen=True)
