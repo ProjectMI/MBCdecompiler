@@ -224,6 +224,44 @@ class IRTestSetBranch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCompare(IRNode):
+    """Boolean comparison between two operands."""
+
+    result: str
+    operation: str
+    left: str
+    right: str
+
+    def describe(self) -> str:
+        return f"{self.result} = {self.left} {self.operation} {self.right}"
+
+
+@dataclass(frozen=True)
+class IRLogical(IRNode):
+    """Logical combination of one or more operands."""
+
+    result: str
+    operation: str
+    operands: Tuple[str, ...]
+
+    def describe(self) -> str:
+        joined = ", ".join(self.operands)
+        return f"{self.result} = {self.operation}({joined})"
+
+
+@dataclass(frozen=True)
+class IRTest(IRNode):
+    """Unary boolean test applied to a single operand."""
+
+    result: str
+    operation: str
+    operand: str
+
+    def describe(self) -> str:
+        return f"{self.result} = {self.operation}({self.operand})"
+
+
+@dataclass(frozen=True)
 class IRFlagCheck(IRNode):
     """Specialised branch that tests one of the global VM flags."""
 
@@ -499,6 +537,9 @@ __all__ = [
     "IRTailcallAscii",
     "IRIf",
     "IRTestSetBranch",
+    "IRCompare",
+    "IRLogical",
+    "IRTest",
     "IRFlagCheck",
     "IRFunctionPrologue",
     "IRLoad",

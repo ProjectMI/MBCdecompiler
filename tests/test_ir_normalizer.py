@@ -4,7 +4,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRIf, IRTestSetBranch
+from mbcdisasm.ir.model import IRCompare, IRIf, IRLogical, IRTest, IRTestSetBranch
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -64,6 +64,32 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "branch_eq",
             "category": "branch_eq",
         },
+        "compare_eq": {
+            "opcodes": ["0x80:0x00"],
+            "name": "compare_eq",
+            "summary": "boolean compare eq",
+            "category": "compare_eq",
+            "stack_pop": 2,
+            "stack_push": 1,
+            "comparison": "eq",
+        },
+        "logical_and": {
+            "opcodes": ["0x81:0x00"],
+            "name": "logical_and",
+            "category": "logical_and",
+            "stack_pop": 2,
+            "stack_push": 1,
+            "logical_op": "and",
+        },
+        "boolean_test": {
+            "opcodes": ["0x82:0x00"],
+            "name": "boolean_test",
+            "summary": "test branch helper",
+            "category": "boolean_test",
+            "stack_pop": 1,
+            "stack_push": 1,
+            "test_op": "not",
+        },
         "testset_branch": {
             "opcodes": ["0x27:0x00"],
             "name": "testset_branch",
@@ -100,10 +126,19 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
         build_word(8, 0x04, 0x00, 0x0000),
         build_word(12, 0x23, 0x00, 0x0010),
         build_word(16, 0x00, 0x00, 0x0005),
-        build_word(20, 0x27, 0x00, 0x0008),
-        build_word(24, 0x69, 0x01, 0x0005),
-        build_word(28, 0x69, 0x01, 0x9000),
-        build_word(32, 0x01, 0x00, 0x0000),
+        build_word(20, 0x82, 0x00, 0x0000),
+        build_word(24, 0x27, 0x00, 0x0008),
+        build_word(28, 0x00, 0x00, 0x0006),
+        build_word(32, 0x00, 0x00, 0x0007),
+        build_word(36, 0x81, 0x00, 0x0000),
+        build_word(40, 0x23, 0x00, 0x8888),
+        build_word(44, 0x00, 0x00, 0x0008),
+        build_word(48, 0x00, 0x00, 0x0009),
+        build_word(52, 0x80, 0x00, 0x0000),
+        build_word(56, 0x23, 0x00, 0x0018),
+        build_word(60, 0x69, 0x01, 0x0005),
+        build_word(64, 0x69, 0x01, 0x9000),
+        build_word(68, 0x01, 0x00, 0x0000),
     ]
 
     seg0_bytes = encode_instructions(seg0_words)
@@ -198,11 +233,11 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.calls == 1
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
-    assert program.metrics.literals == 5
+    assert program.metrics.literals == 9
     assert program.metrics.literal_chunks == 0
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches == 1
-    assert program.metrics.if_branches == 1
+    assert program.metrics.if_branches == 3
     assert program.metrics.loads == 1
     assert program.metrics.stores == 1
     assert program.metrics.reduce_replaced == 1
@@ -239,6 +274,39 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         if isinstance(node, IRTestSetBranch)
     ]
     assert testset_nodes and all(node.expr.startswith("ssa") for node in testset_nodes)
+
+    compare_nodes = [
+        node
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRCompare)
+    ]
+    assert compare_nodes and all(node.result.startswith("ssa") for node in compare_nodes)
+
+    logical_nodes = [
+        node
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRLogical)
+    ]
+    assert logical_nodes and all(node.result.startswith("ssa") for node in logical_nodes)
+
+    test_nodes = [
+        node
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRTest)
+    ]
+    assert test_nodes and all(node.result.startswith("ssa") for node in test_nodes)
+
+    compare_results = {node.result for node in compare_nodes}
+    assert any(node.condition in compare_results for node in if_nodes)
+
+    logical_results = {node.result for node in logical_nodes}
+    assert any(node.condition in logical_results for node in if_nodes)
+
+    test_results = {node.result for node in test_nodes}
+    assert all(node.expr in test_results for node in testset_nodes)
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:

@@ -22,11 +22,13 @@ from .model import (
     IRCall,
     IRCallPreparation,
     IRCallReturn,
+    IRCompare,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRLogical,
     IRLoad,
     IRNode,
     IRProgram,
@@ -37,6 +39,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRTest,
     IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
@@ -57,6 +60,23 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0400: "literal_hint",
     0x0110: "literal_hint",
 }
+
+
+def _tokenize(text: str) -> Set[str]:
+    """Split ``text`` into lowercase alphanumeric tokens."""
+
+    tokens: Set[str] = set()
+    current: List[str] = []
+    for char in text:
+        if char.isalnum():
+            current.append(char)
+            continue
+        if current:
+            tokens.add("".join(current))
+            current.clear()
+    if current:
+        tokens.add("".join(current))
+    return tokens
 
 
 @dataclass(frozen=True)
@@ -205,7 +225,7 @@ class IRNormalizer:
         raw_instructions: List[RawInstruction] = []
         stack_names: List[str] = []
         next_ssa = 0
-        forced_push_kinds = {InstructionKind.REDUCE}
+        forced_push_kinds = {InstructionKind.REDUCE, InstructionKind.LOGICAL, InstructionKind.TEST}
         for index, (profile, event) in enumerate(zip(executable, events)):
             notes = tuple(annotations.get(index, ()))
             pops = len(event.popped_types)
@@ -290,6 +310,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_assign_ssa_names(items)
+        self._pass_boolean_predicates(items)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -1137,6 +1158,50 @@ class IRNormalizer:
             if isinstance(item, RawInstruction) and item.ssa_values:
                 self._record_ssa(item, item.ssa_values)
 
+    def _pass_boolean_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            profile = item.profile
+            if profile.kind is InstructionKind.BRANCH:
+                index += 1
+                continue
+            if item.mnemonic == "testset_branch":
+                index += 1
+                continue
+            node: Optional[IRNode] = None
+
+            operator = self._comparison_operator(profile)
+            if operator is not None:
+                operands = self._collect_operands(items, index, max(len(item.event.popped_types), 2))
+                left, right = self._pad_operands(operands, 2)
+                result = self._boolean_result_name(item)
+                node = IRCompare(result=result, operation=operator, left=left, right=right)
+            elif profile.kind is InstructionKind.LOGICAL:
+                operand_count = max(len(item.event.popped_types), 2)
+                operands = self._collect_operands(items, index, operand_count)
+                result = self._boolean_result_name(item)
+                logical_op = self._logical_operator(profile)
+                node = IRLogical(result=result, operation=logical_op, operands=operands)
+            elif profile.kind is InstructionKind.TEST:
+                operand_count = max(len(item.event.popped_types), 1)
+                operands = self._collect_operands(items, index, operand_count)
+                operand = operands[-1] if operands else "stack_top"
+                result = self._boolean_result_name(item)
+                operation = self._test_operation(profile)
+                node = IRTest(result=result, operation=operation, operand=operand)
+
+            if node is not None:
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            index += 1
+
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -1146,7 +1211,9 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                expr = self._predicate_result(items, index)
+                if expr is None:
+                    expr = self._describe_condition(items, index, skip_literals=True)
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
@@ -1158,8 +1225,11 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                condition = self._predicate_result(items, index)
+                if condition is None:
+                    condition = self._describe_condition(items, index)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
@@ -1291,6 +1361,171 @@ class IRNormalizer:
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
+
+    def _predicate_result(self, items: _ItemList, index: int) -> Optional[str]:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, (IRCompare, IRLogical, IRTest)):
+                if candidate.result:
+                    return candidate.result
+                mapped = self._ssa_value(candidate)
+                if mapped is not None:
+                    return mapped
+            scan -= 1
+        return None
+
+    def _boolean_result_name(self, instruction: RawInstruction) -> str:
+        mapped = self._ssa_value(instruction)
+        if mapped is not None:
+            return mapped
+        if instruction.ssa_values:
+            return instruction.ssa_values[-1]
+        return self._describe_value(instruction)
+
+    def _collect_operands(
+        self, items: _ItemList, index: int, count: int
+    ) -> Tuple[str, ...]:
+        values: List[str] = []
+        consumed: Dict[int, int] = {}
+        scan = index - 1
+
+        while scan >= 0 and len(values) < count:
+            candidate = items[scan]
+            identifier = id(candidate)
+            names: Sequence[str] = ()
+
+            if isinstance(candidate, RawInstruction):
+                names = self._ssa_bindings.get(identifier, candidate.ssa_values)
+            else:
+                names = self._ssa_bindings.get(identifier, ())
+
+            if names:
+                used = consumed.get(identifier, 0)
+                if used < len(names):
+                    values.append(names[-1 - used])
+                    consumed[identifier] = used + 1
+                    scan -= 1
+                    continue
+
+            fallback = self._describe_candidate_value(candidate)
+            if fallback is not None:
+                values.append(fallback)
+
+            scan -= 1
+
+        while len(values) < count:
+            values.append("stack_top")
+
+        values.reverse()
+        return tuple(values)
+
+    def _describe_candidate_value(
+        self, candidate: Union[RawInstruction, IRNode]
+    ) -> Optional[str]:
+        if isinstance(candidate, RawInstruction):
+            if candidate.pushes_value():
+                return self._describe_value(candidate)
+            mapped = self._ssa_value(candidate)
+            if mapped is not None:
+                return mapped
+            return None
+        if isinstance(candidate, IRLiteral):
+            mapped = self._ssa_value(candidate)
+            if mapped is not None:
+                return mapped
+            return candidate.describe()
+        if isinstance(candidate, IRLiteralChunk):
+            mapped = self._ssa_value(candidate)
+            if mapped is not None:
+                return mapped
+            return candidate.describe()
+        if isinstance(candidate, IRStackDuplicate):
+            return candidate.value
+        if isinstance(candidate, IRLogical):
+            if candidate.result:
+                return candidate.result
+        if isinstance(candidate, IRCompare):
+            if candidate.result:
+                return candidate.result
+        if isinstance(candidate, IRTest):
+            if candidate.result:
+                return candidate.result
+        if isinstance(candidate, IRNode):
+            mapped = self._ssa_value(candidate)
+            if mapped is not None:
+                return mapped
+            describe = getattr(candidate, "describe", None)
+            if callable(describe):
+                return describe()
+        return None
+
+    @staticmethod
+    def _pad_operands(operands: Sequence[str], size: int) -> Tuple[str, ...]:
+        padded = list(operands[:size])
+        while len(padded) < size:
+            padded.append("stack_top")
+        return tuple(padded)
+
+    @staticmethod
+    def _comparison_operator(profile: InstructionProfile) -> Optional[str]:
+        mapping = {
+            "eq": "==",
+            "ne": "!=",
+            "lt": "<",
+            "le": "<=",
+            "gt": ">",
+            "ge": ">=",
+        }
+
+        trait = profile.traits.get("comparison") if profile.traits else None
+        if isinstance(trait, str):
+            normalized = trait.lower()
+            if normalized in mapping:
+                return mapping[normalized]
+
+        for source in (profile.mnemonic, profile.summary, profile.category):
+            if not source:
+                continue
+            lowered = source.lower()
+            tokens = _tokenize(lowered)
+            for key, symbol in mapping.items():
+                if key in tokens:
+                    return symbol
+            if "compare" in tokens:
+                return "cmp"
+        return None
+
+    @staticmethod
+    def _logical_operator(profile: InstructionProfile) -> str:
+        if profile.traits:
+            value = profile.traits.get("logical_op")
+            if isinstance(value, str) and value:
+                return value
+        for source in (profile.mnemonic, profile.summary, profile.category):
+            if not source:
+                continue
+            tokens = _tokenize(source.lower())
+            for token in ("and", "or", "xor", "not"):
+                if token in tokens:
+                    return token
+        return profile.mnemonic
+
+    @staticmethod
+    def _test_operation(profile: InstructionProfile) -> str:
+        if profile.traits:
+            value = profile.traits.get("test_op") or profile.traits.get("test")
+            if isinstance(value, str) and value:
+                return value
+        for source in (profile.mnemonic, profile.summary, profile.category):
+            if not source:
+                continue
+            tokens = _tokenize(source.lower())
+            if "not" in tokens:
+                return "not"
+            if "test" in tokens:
+                return "test"
+        return profile.mnemonic
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
