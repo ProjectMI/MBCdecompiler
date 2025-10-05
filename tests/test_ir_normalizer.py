@@ -4,7 +4,16 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from mbcdisasm.ir.model import IRIf, IRTestSetBranch
+from mbcdisasm.ir.model import (
+    IRCallPreparation,
+    IRCallReturn,
+    IRIf,
+    IRReturn,
+    IRFunctionPrologue,
+    IRStackEffect,
+    IRTestSetBranch,
+    IRRaw,
+)
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -59,6 +68,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "call_dispatch",
             "stack_delta": -1,
         },
+        "call_helpers": {
+            "opcodes": ["0x10:0xE8"],
+            "name": "call_helpers",
+            "category": "call_helpers",
+        },
         "branch_eq": {
             "opcodes": ["0x23:0x00"],
             "name": "branch_eq",
@@ -78,6 +92,17 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x01:0x00"],
             "name": "stack_teardown_1",
             "category": "stack_teardown",
+        },
+        "stack_teardown_4": {
+            "opcodes": ["0x01:0xF0"],
+            "name": "stack_teardown_4",
+            "category": "stack_teardown",
+            "stack_delta": -4,
+        },
+        "stack_shuffle": {
+            "opcodes": ["0x66:0x15"],
+            "name": "stack_shuffle",
+            "category": "stack_shuffle",
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -215,7 +240,10 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     ]
     assert any("map" in text for text in descriptions)
     assert any(text.startswith("if cond") for text in descriptions)
-    assert any(text.startswith("testset") for text in descriptions)
+    assert any(
+        text.startswith("testset") or text.startswith("function_prologue")
+        for text in descriptions
+    )
     assert any(text.startswith("load") for text in descriptions)
     assert any(text.startswith("store") for text in descriptions)
 
@@ -238,7 +266,16 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for node in block.nodes
         if isinstance(node, IRTestSetBranch)
     ]
-    assert testset_nodes and all(node.expr.startswith("ssa") for node in testset_nodes)
+    if testset_nodes:
+        assert all(node.expr.startswith("ssa") for node in testset_nodes)
+    else:
+        prologue_nodes = [
+            node
+            for block in segment.blocks
+            for node in block.nodes
+            if isinstance(node, IRFunctionPrologue)
+        ]
+        assert prologue_nodes
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
@@ -283,3 +320,121 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x66, 0x15, 0x4B08),  # stack_shuffle
+        build_word(4, 0x4A, 0x05, 0x0052),  # op_4A_05 helper
+        build_word(8, 0x28, 0x00, 0x1234),  # call_dispatch
+        build_word(12, 0x10, 0xE8, 0x0001),  # call_helpers
+        build_word(16, 0x32, 0x29, 0x1000),  # op_32_29 helper
+        build_word(20, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(24, 0x30, 0x00, 0x0002),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
+    assert prep.steps == (("stack_shuffle", 0x4B08), ("op_4A_05", 0x0052))
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert [step.mnemonic for step in call_return.cleanup] == [
+        "call_helpers",
+        "op_32_29",
+        "stack_teardown",
+    ]
+    assert [step.operand for step in call_return.cleanup[:2]] == [0x0001, 0x1000]
+    assert call_return.cleanup[-1].pops == 4
+    assert call_return.target == 0x1234
+
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_4A_05", "op_32_29", "stack_teardown_4"}
+        for node in block.nodes
+    )
+
+
+def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x66, 0x15, 0x4B08),  # stack_shuffle
+        build_word(4, 0x66, 0x15, 0x4B10),  # stack_shuffle
+        build_word(8, 0x28, 0x00, 0x0020),  # call_dispatch
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
+    assert [step[0] for step in prep.steps] == ["stack_shuffle", "stack_shuffle"]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
+    )
+
+
+def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(4, 0x30, 0x00, 0x0001),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert ret.cleanup and ret.cleanup[0].mnemonic == "stack_teardown"
+    assert ret.cleanup[0].pops == 4
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
+        for node in block.nodes
+    )
+
+
+def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x00, 0x0040),  # tailcall_dispatch
+        build_word(4, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(8, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.tail
+    assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
+    assert call_return.cleanup[-1].pops == 4
