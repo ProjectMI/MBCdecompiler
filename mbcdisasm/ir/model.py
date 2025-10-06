@@ -80,11 +80,34 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    arity: Optional[int] = None
+    shuffle: Tuple[int, ...] = field(default_factory=tuple)
+    setup: Tuple["IRStackEffect", ...] = field(default_factory=tuple)
+    cleanup_mask: Optional[int] = None
+    cleanup: Tuple["IRStackEffect", ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
-        return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        target = f"0x{self.target:04X}"
+        if self.symbol:
+            target = f"{self.symbol}({target})"
+        parts = [f"call{suffix} target={target} args=[{args}]"]
+        if self.arity is not None:
+            parts.append(f"arity={self.arity}")
+        if self.shuffle:
+            shuffle = ", ".join(f"0x{value:04X}" for value in self.shuffle)
+            parts.append(f"shuffle=[{shuffle}]")
+        if self.setup:
+            rendered = ", ".join(step.describe() for step in self.setup)
+            parts.append(f"setup=[{rendered}]")
+        if self.cleanup_mask is not None:
+            parts.append(f"cleanup_mask=0x{self.cleanup_mask:04X}")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            parts.append(f"cleanup=[{rendered}]")
+        return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -435,33 +458,6 @@ class IRAsciiPreamble(IRNode):
 
 
 @dataclass(frozen=True)
-class IRCallPreparation(IRNode):
-    """Grouped stack permutations that prepare arguments for helper calls."""
-
-    steps: Tuple[Tuple[str, int], ...]
-
-    def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
-        return f"prep_call_args[{rendered}]"
-
-
-@dataclass(frozen=True)
-class IRCallCleanup(IRNode):
-    """Helper sequence that discharges temporary call frames or return values."""
-
-    steps: Tuple[IRStackEffect, ...]
-    pops: int = field(init=False)
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "pops", sum(step.pops for step in self.steps))
-
-    def describe(self) -> str:
-        rendered = ", ".join(step.describe() for step in self.steps)
-        suffix = f" pop={self.pops}" if self.pops else ""
-        return f"cleanup_call[{rendered}]{suffix}"
-
-
-@dataclass(frozen=True)
 class IRTailcallFrame(IRNode):
     """Canonical frame setup that precedes the VM tailcall helpers."""
 
@@ -524,7 +520,12 @@ class IRCallReturn(IRNode):
     tail: bool
     returns: Tuple[str, ...]
     varargs: bool = False
+    arity: Optional[int] = None
+    shuffle: Tuple[int, ...] = field(default_factory=tuple)
+    setup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    cleanup_mask: Optional[int] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -532,11 +533,24 @@ class IRCallReturn(IRNode):
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
-        cleanup = ""
+        target = f"0x{self.target:04X}"
+        if self.symbol:
+            target = f"{self.symbol}({target})"
+        parts = [f"{prefix} target={target} args=[{args}] returns=[{ret}]"]
+        if self.arity is not None:
+            parts.append(f"arity={self.arity}")
+        if self.shuffle:
+            shuffle = ", ".join(f"0x{value:04X}" for value in self.shuffle)
+            parts.append(f"shuffle=[{shuffle}]")
+        if self.setup:
+            rendered = ", ".join(step.describe() for step in self.setup)
+            parts.append(f"setup=[{rendered}]")
+        if self.cleanup_mask is not None:
+            parts.append(f"cleanup_mask=0x{self.cleanup_mask:04X}")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
-            cleanup = f" cleanup=[{rendered}]"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
+            parts.append(f"cleanup=[{rendered}]")
+        return " ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -684,7 +698,6 @@ __all__ = [
     "IRLiteral",
     "IRLiteralChunk",
     "IRAsciiPreamble",
-    "IRCallPreparation",
     "IRTailcallFrame",
     "IRTablePatch",
     "IRAsciiFinalize",

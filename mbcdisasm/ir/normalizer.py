@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..constants import CALL_SHUFFLE_STANDARD
+from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
@@ -22,8 +22,6 @@ from .model import (
     IRBuildMap,
     IRBuildTuple,
     IRCall,
-    IRCallCleanup,
-    IRCallPreparation,
     IRCallReturn,
     IRFlagCheck,
     IRFunctionPrologue,
@@ -60,7 +58,17 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
-CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "stack_shuffle", "fanout"}
+CALL_CLEANUP_MNEMONICS = {
+    "call_helpers",
+    "call_cleanup_mask",
+    "call_frame_bridge",
+    "tail_frame_marker",
+    "op_32_29",
+    "op_52_05",
+    "op_05_00",
+    "stack_shuffle",
+    "fanout",
+}
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 
 
@@ -344,6 +352,7 @@ class IRNormalizer:
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
+        self._pass_return_cleanup(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
 
@@ -582,7 +591,13 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
-                call = IRCall(target=item.operand, args=tuple(args), tail=mnemonic == "tailcall_dispatch")
+                symbol = self.knowledge.call_target_symbol(item.operand)
+                call = IRCall(
+                    target=item.operand,
+                    args=tuple(args),
+                    tail=mnemonic == "tailcall_dispatch",
+                    symbol=symbol,
+                )
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
@@ -664,6 +679,23 @@ class IRNormalizer:
         args.reverse()
         start = scan + 1
         return args, start
+
+    def _rebuild_call(self, call: IRCall, **updates: object) -> IRCall:
+        data = {
+            "target": call.target,
+            "args": call.args,
+            "tail": call.tail,
+            "arity": call.arity,
+            "shuffle": call.shuffle,
+            "setup": call.setup,
+            "cleanup_mask": call.cleanup_mask,
+            "cleanup": call.cleanup,
+            "symbol": call.symbol,
+        }
+        data.update(updates)
+        rebuilt = IRCall(**data)
+        self._transfer_ssa(call, rebuilt)
+        return rebuilt
 
     def _collapse_tail_return(self, items: _ItemList, call_index: int, metrics: NormalizerMetrics) -> None:
         index = call_index + 1
@@ -944,30 +976,95 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            start = index
-            steps: List[Tuple[str, int]] = []
+            call = item
             scan = index - 1
+            start = index
+            shuffle: List[int] = list(call.shuffle)
+            setup: List[IRStackEffect] = list(call.setup)
+            arity = call.arity
+
             while scan >= 0:
                 candidate = items[scan]
-                if isinstance(candidate, IRCallPreparation):
-                    steps = list(candidate.steps) + steps
-                    start = scan
+                if not isinstance(candidate, RawInstruction):
                     break
-                if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
-                    steps.insert(0, self._call_preparation_step(candidate))
-                    start = scan
-                    scan -= 1
-                    continue
-                break
+                if not self._is_call_preparation_instruction(candidate):
+                    break
 
-            if steps:
-                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
-                index = start + 2
+                start = scan
+                if candidate.mnemonic == "stack_shuffle":
+                    shuffle.insert(0, candidate.operand)
+                elif candidate.mnemonic in {"op_4A_05", "call_setup_arity"}:
+                    arity = self._call_arity(candidate.operand, arity)
+                else:
+                    setup.insert(0, self._call_cleanup_effect(candidate))
+                scan -= 1
                 continue
+
+            if start < index:
+                for position in range(start, index):
+                    removed = items[position]
+                    self._ssa_bindings.pop(id(removed), None)
+                items.replace_slice(start, index, [])
+                index = start
+                call = items[index]
+                assert isinstance(call, IRCall)
+
+            if (arity != call.arity) or (tuple(shuffle) != call.shuffle) or (tuple(setup) != call.setup):
+                updated = self._rebuild_call(
+                    call,
+                    arity=arity,
+                    shuffle=tuple(shuffle),
+                    setup=tuple(setup),
+                )
+                items.replace_slice(index, index + 1, [updated])
 
             index += 1
 
     def _pass_call_cleanup(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+
+            call = item
+            scan = index + 1
+            while scan < len(items) and isinstance(items[scan], (IRLiteral, IRLiteralChunk)):
+                scan += 1
+
+            end = scan
+            cleanup_steps: List[IRStackEffect] = []
+            cleanup_mask = call.cleanup_mask
+
+            while end < len(items):
+                candidate = items[end]
+                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                    effect = self._call_cleanup_effect(candidate)
+                    cleanup_steps.append(effect)
+                    if effect.mnemonic == "call_helpers":
+                        cleanup_mask = effect.operand
+                    end += 1
+                    continue
+                break
+
+            if cleanup_steps:
+                for position in range(scan, end):
+                    removed = items[position]
+                    self._ssa_bindings.pop(id(removed), None)
+                items.replace_slice(scan, end, [])
+                tail = call.tail or (cleanup_mask == RET_MASK)
+                updated = self._rebuild_call(
+                    call,
+                    cleanup=call.cleanup + tuple(cleanup_steps),
+                    cleanup_mask=cleanup_mask,
+                    tail=tail,
+                )
+                items.replace_slice(index, index + 1, [updated])
+
+            index += 1
+
+    def _pass_return_cleanup(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
@@ -977,13 +1074,11 @@ class IRNormalizer:
 
             steps: List[IRStackEffect] = []
             start = index
-            end = index
             scan = index
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
                     steps.append(self._call_cleanup_effect(candidate))
-                    end = scan + 1
                     scan += 1
                     continue
                 break
@@ -992,22 +1087,12 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
-                prev_index -= 1
-
-            if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-                index = prev_index + 2
-                continue
-
-            next_index = end
+            next_index = scan
             while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
                 next_index += 1
 
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
                 return_node = items[next_index]
-                assert isinstance(return_node, IRReturn)
                 combined = return_node.cleanup + tuple(steps)
                 updated = IRReturn(
                     values=return_node.values,
@@ -1015,14 +1100,16 @@ class IRNormalizer:
                     cleanup=combined,
                 )
                 self._transfer_ssa(return_node, updated)
-                items.replace_slice(start, end, [])
-                next_index -= len(steps)
-                items.replace_slice(next_index, next_index + 1, [updated])
-                index = next_index + 1
+                for position in range(start, scan):
+                    removed = items[position]
+                    self._ssa_bindings.pop(id(removed), None)
+                items.replace_slice(start, scan, [])
+                adjusted = next_index - (scan - start)
+                items.replace_slice(adjusted, adjusted + 1, [updated])
+                index = adjusted + 1
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            index = scan
 
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
@@ -1155,8 +1242,6 @@ class IRNormalizer:
                 IRAsciiHeader,
                 IRLiteralChunk,
                 IRLiteral,
-                IRCallPreparation,
-                IRCallCleanup,
             ),
         )
 
@@ -1246,9 +1331,7 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = tuple()
-                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = items[offset].steps
+                while offset < len(items) and isinstance(items[offset], (IRLiteral, IRLiteralChunk)):
                     offset += 1
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
@@ -1258,8 +1341,15 @@ class IRNormalizer:
                         tail=call.tail,
                         returns=return_node.values,
                         varargs=return_node.varargs,
-                        cleanup=cleanup_steps + return_node.cleanup,
+                        arity=call.arity,
+                        shuffle=call.shuffle,
+                        setup=call.setup,
+                        cleanup_mask=call.cleanup_mask,
+                        cleanup=call.cleanup + return_node.cleanup,
+                        symbol=call.symbol,
                     )
+                    self._transfer_ssa(call, node)
+                    self._transfer_ssa(return_node, node)
                     end = offset + 1
                     items.replace_slice(index, end, [node])
                     continue
@@ -1284,7 +1374,7 @@ class IRNormalizer:
     @staticmethod
     def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
-        if mnemonic == "op_4A_05":
+        if mnemonic in {"op_4A_05", "call_setup_arity"}:
             return True
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             return True
@@ -1305,6 +1395,13 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=instruction.profile.operand_alias(),
         )
+
+    @staticmethod
+    def _call_arity(operand: int, current: Optional[int]) -> Optional[int]:
+        value = operand & 0x0F
+        if value or current is None:
+            return value
+        return current
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]

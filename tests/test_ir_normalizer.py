@@ -5,13 +5,10 @@ from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
 from mbcdisasm.ir.model import (
-    IRCallCleanup,
-    IRCallPreparation,
     IRCallReturn,
     IRIf,
     IRReturn,
     IRFunctionPrologue,
-    IRStackEffect,
     IRTestSetBranch,
     IRRaw,
 )
@@ -73,6 +70,47 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x10:0xE8"],
             "name": "call_helpers",
             "category": "call_helpers",
+        },
+        "call_setup_arity": {
+            "opcodes": ["0x4A:0x05"],
+            "name": "call_setup_arity",
+            "category": "call_helpers",
+            "stack_delta": 0,
+        },
+        "call_cleanup_mask": {
+            "opcodes": ["0x32:0x29"],
+            "name": "call_cleanup_mask",
+            "category": "call_helpers",
+            "stack_delta": 0,
+        },
+        "call_frame_bridge": {
+            "opcodes": ["0x5E:0x29"],
+            "name": "call_frame_bridge",
+            "category": "call_helpers",
+            "stack_delta": 0,
+        },
+        "tail_frame_marker": {
+            "opcodes": ["0xF0:0x4B"],
+            "name": "tail_frame_marker",
+            "category": "call_helpers",
+            "stack_delta": 0,
+        },
+        "stack_shuffle_alt": {
+            "opcodes": ["0x66:0x1B"],
+            "name": "stack_shuffle_alt",
+            "category": "stack_shuffle",
+            "stack_delta": 0,
+        },
+        "indirect_access_ext": {
+            "opcodes": ["0x69:0x10"],
+            "name": "indirect_access_ext",
+            "category": "indirect_access",
+        },
+        "page_register": {
+            "opcodes": ["0x6C:0x01"],
+            "name": "page_register",
+            "category": "meta",
+            "stack_delta": 0,
         },
         "fanout": {
             "opcodes": ["0x10:0x08"],
@@ -353,18 +391,9 @@ def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
 
     assert len(block.nodes) == 1
     node = block.nodes[0]
-    assert isinstance(node, IRCallCleanup)
-    assert len(node.steps) == 1
-    step = node.steps[0]
-    assert isinstance(step, IRStackEffect)
-    assert step.mnemonic == "fanout"
-    assert step.operand_role == "flags"
-    assert step.operand_alias == "FANOUT_FLAGS"
-    rendered = step.describe()
-    assert rendered == "fanout(flags=FANOUT_FLAGS(0x2C02))"
-
-    cleanup_rendered = node.describe()
-    assert "fanout(flags=FANOUT_FLAGS(0x2C02))" in cleanup_rendered
+    assert isinstance(node, IRRaw)
+    rendered = node.describe()
+    assert "fanout(flags=FANOUT_FLAGS(0x2C02))" in rendered
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -388,13 +417,13 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
-    assert prep.steps == (("stack_shuffle", 0x4B08), ("op_4A_05", 0x0052))
-
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.arity == 0x2
+    assert call_return.shuffle == (0x4B08,)
+    assert call_return.cleanup_mask == 0x0001
     assert [step.mnemonic for step in call_return.cleanup] == [
         "call_helpers",
-        "op_32_29",
+        "call_cleanup_mask",
         "stack_teardown",
     ]
     assert [step.operand for step in call_return.cleanup[:2]] == [0x0001, 0x1000]
@@ -427,8 +456,8 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
-    assert [step[0] for step in prep.steps] == ["stack_shuffle", "stack_shuffle"]
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.shuffle == (0x4B08, 0x4B10)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
     )
@@ -482,3 +511,27 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert call_return.tail
     assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
     assert call_return.cleanup[-1].pops == 4
+
+
+def test_normalizer_uses_address_symbol_for_tail(tmp_path: Path) -> None:
+    write_manual(tmp_path)
+    address_table = {"0x0040": "tail_helper"}
+    (tmp_path / "address_table.json").write_text(json.dumps(address_table), "utf-8")
+    knowledge = KnowledgeBase.load(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x00, 0x0040),  # tailcall_dispatch
+        build_word(4, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.symbol == "tail_helper"

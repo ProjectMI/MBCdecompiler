@@ -120,10 +120,15 @@ class KnowledgeBase:
         *,
         wildcards: Optional[Mapping[int, OpcodeInfo]] = None,
         by_name: Optional[Mapping[str, OpcodeInfo]] = None,
+        address_symbols: Optional[Mapping[int, str]] = None,
     ) -> None:
         self._annotations: Dict[str, OpcodeInfo] = dict(annotations)
         self._wildcards: Dict[int, OpcodeInfo] = dict(wildcards or {})
         self._by_name: Dict[str, OpcodeInfo] = dict(by_name or {})
+        self._address_symbols: Dict[int, str] = {
+            int(address): name
+            for address, name in (address_symbols or {}).items()
+        }
 
     @classmethod
     def load(cls, manual_path: Path) -> "KnowledgeBase":
@@ -169,7 +174,27 @@ class KnowledgeBase:
                 wildcard_specs[opcode_value] = entry
 
         wildcard_annotations = _materialise_wildcards(wildcard_specs, by_name)
-        return cls(annotations, wildcards=wildcard_annotations, by_name=by_name)
+
+        address_symbols: Dict[int, str] = {}
+        address_table_path = resolved.parent / "address_table.json"
+        if address_table_path.exists():
+            address_data = json.loads(address_table_path.read_text("utf-8"))
+            if isinstance(address_data, Mapping):
+                for key, value in address_data.items():
+                    if not isinstance(value, str):
+                        continue
+                    try:
+                        address = int(str(key), 0)
+                    except ValueError:
+                        continue
+                    address_symbols[address] = value
+
+        return cls(
+            annotations,
+            wildcards=wildcard_annotations,
+            by_name=by_name,
+            address_symbols=address_symbols,
+        )
 
     def lookup(self, label: str) -> Optional[OpcodeInfo]:
         """Return manual information for the requested opcode label."""
@@ -188,6 +213,11 @@ class KnowledgeBase:
         """Return an annotation by the entry name used in the JSON file."""
 
         return self._by_name.get(name)
+
+    def call_target_symbol(self, address: int) -> Optional[str]:
+        """Resolve ``address`` to a symbolic helper name if known."""
+
+        return self._address_symbols.get(address)
 
 
 def _parse_component(component: str) -> int:

@@ -60,7 +60,47 @@
       "10:E8"
     ]
   },
-    "fanout": {
+  "call_setup_arity": {
+    "summary": "Фиксация числа аргументов для helper-вызова",
+    "category": "call_helpers",
+    "opcodes": [
+      "4A:05"
+    ],
+    "stack_delta": 0
+  },
+  "call_cleanup_mask": {
+    "summary": "Постобработка масок возврата",
+    "category": "call_helpers",
+    "opcodes": [
+      "32:29"
+    ],
+    "stack_delta": 0
+  },
+  "call_frame_bridge": {
+    "summary": "Промежуточный helper для хвостовых вызовов",
+    "category": "call_helpers",
+    "opcodes": [
+      "5E:29"
+    ],
+    "stack_delta": 0
+  },
+  "tail_frame_marker": {
+    "summary": "Метка завершения подготовки хвостового вызова",
+    "category": "call_helpers",
+    "opcodes": [
+      "F0:4B"
+    ],
+    "stack_delta": 0
+  },
+  "page_register": {
+    "summary": "Команда работы со страничным регистром",
+    "category": "meta",
+    "opcodes": [
+      "6C:01"
+    ],
+    "stack_delta": 0
+  },
+  "fanout": {
     "control_flow": "fallthrough",
     "summary": "Фан-аут тестовых обёрток по флагам",
     "opcodes": [
@@ -279,6 +319,15 @@
       "66:20",
       "66:75"
     ]
+  },
+  "stack_shuffle_alt": {
+    "control_flow": "fallthrough",
+    "summary": "Альтернативная форма перестановки аргументов",
+    "category": "stack_shuffle",
+    "opcodes": [
+      "66:1B"
+    ],
+    "stack_delta": 0
   },
   "indirect_access": {
     "control_flow": "fallthrough",
