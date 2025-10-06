@@ -14,9 +14,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Iterable, List, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, StackEffectHint
+
+
+CALL_HELPER_LABELS = {
+    "10:E8",
+    "16:00",
+    "16:01",
+    "16:02",
+    "16:04",
+    "16:AC",
+}
+
+
+TAIL_MASK_LABELS = {
+    "29:10",
+    "32:29",
+    "52:05",
+    "5E:29",
+    "70:29",
+    "0B:29",
+    "06:66",
+    "F0:4B",
+    "6C:01",
+    "4A:05",
+    "05:00",
+}
+
+
+ZERO_STACK_MNEMONICS = {"fanout", "stack_shuffle", "call_helpers"}
 
 
 class StackValueType(Enum):
@@ -294,6 +322,14 @@ def infer_stack_effect(
             popped = [StackValueType.SLOT]
             pushed = [StackValueType.NUMBER]
 
+    override = _stack_convention_override(profile)
+    if override is not None:
+        hint = override.hint
+        popped = list(override.popped)
+        pushed = list(override.pushed)
+        if override.kind is not None:
+            kind_override = override.kind
+
     return StackEffectDetails(
         hint=hint,
         popped=tuple(popped),
@@ -318,6 +354,35 @@ def _default_push_types(profile: InstructionProfile) -> Tuple[StackValueType, ..
     }:
         return (StackValueType.NUMBER,)
     return tuple()
+
+
+def _stack_convention_override(profile: InstructionProfile) -> Optional[StackEffectDetails]:
+    mnemonic = profile.mnemonic
+    label = profile.label.upper()
+
+    if mnemonic in ZERO_STACK_MNEMONICS or label in CALL_HELPER_LABELS or label in TAIL_MASK_LABELS:
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.9)
+        return StackEffectDetails(hint=hint)
+
+    count = _stack_teardown_count(mnemonic, profile.operand)
+    if count is not None and count >= 0:
+        hint = StackEffectHint(nominal=-count, minimum=-count, maximum=-count, confidence=0.95)
+        popped = tuple(StackValueType.UNKNOWN for _ in range(count))
+        return StackEffectDetails(hint=hint, popped=popped)
+
+    return None
+
+
+def _stack_teardown_count(mnemonic: str, operand: int) -> Optional[int]:
+    if mnemonic.startswith("stack_teardown_"):
+        suffix = mnemonic.rsplit("_", 1)[-1]
+        try:
+            return int(suffix)
+        except ValueError:
+            return None
+    if mnemonic == "stack_teardown" and operand:
+        return operand & 0xFF
+    return None
 
 
 def _is_indirect_candidate(profile: InstructionProfile) -> bool:
@@ -394,3 +459,4 @@ def contains_literal_push(profiles: Iterable[InstructionProfile]) -> bool:
         InstructionKind.TABLE_LOOKUP,
     }
     return any(profile.kind in literal_like for profile in profiles)
+
