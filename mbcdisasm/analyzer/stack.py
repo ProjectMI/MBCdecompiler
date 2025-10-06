@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Iterable, List, Sequence, Tuple
 
+from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
 from .instruction_profile import InstructionKind, InstructionProfile, StackEffectHint
 
 
@@ -294,6 +295,16 @@ def infer_stack_effect(
             popped = [StackValueType.SLOT]
             pushed = [StackValueType.NUMBER]
 
+    hint, popped, pushed, kind_override = _apply_wrapper_overrides(
+        profiles,
+        index,
+        profile,
+        hint,
+        popped,
+        pushed,
+        kind_override,
+    )
+
     return StackEffectDetails(
         hint=hint,
         popped=tuple(popped),
@@ -331,6 +342,137 @@ def _is_indirect_candidate(profile: InstructionProfile) -> bool:
     if "indirect" in mnemonic:
         return True
     return profile.label.startswith("69:")
+
+
+# Known stack shuffle operands associated with call wrappers.  The constants are
+# derived from the helper call metadata and the normaliser's cleanup rules.
+_CALL_SHUFFLE_VARIANTS = {CALL_SHUFFLE_STANDARD, 0x3032, 0x7223}
+
+# Opcodes that participate in the helper/tailcall wrapper but do not modify the
+# stack height.  They typically handle book-keeping tasks such as masking or
+# pointer updates and therefore can be modelled as stack-neutral operations with
+# high confidence once recognised.
+_WRAPPER_META_OPS = {
+    (0x4A, 0x05),  # op_4A_05 helper dispatch
+    (0x32, 0x29),  # op_32_29 cleanup helper
+    (0x52, 0x05),  # op_52_05 ascii helpers
+    (0x70, 0x29),  # mask propagation helpers
+    (0x0B, 0x29),  # alternate mask helpers
+    (0x06, 0x66),  # shuffle/mask adapters
+}
+
+# Modes frequently observed for the ``call_helpers`` opcodes.  The manual
+# annotation database historically used decimal labels for these instructions
+# which made the automated lookup brittle.  The tracker therefore recognises
+# them heuristically based on the opcode/mode pair.
+_CALL_HELPER_MODES = {0x00, 0x01, 0x02, 0x04, 0x64, 0x84, 0xAC, 0xD0, 0xE8}
+
+
+def _apply_wrapper_overrides(
+    profiles: Sequence[InstructionProfile],
+    index: int,
+    profile: InstructionProfile,
+    hint: StackEffectHint,
+    popped: List[StackValueType],
+    pushed: List[StackValueType],
+    kind_override: InstructionKind | None,
+) -> Tuple[StackEffectHint, List[StackValueType], List[StackValueType], InstructionKind | None]:
+    """Inject deterministic stack behaviour for helper wrappers."""
+
+    opcode = profile.opcode
+    mode = profile.mode
+    operand = profile.operand
+    original_kind = profile.kind
+
+    # Tail dispatchers that merely shuttle the return mask are stack neutral.
+    if opcode == 0x29 and mode == 0x10 and operand == RET_MASK:
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.9)
+        kind_override = InstructionKind.TAILCALL
+        return hint, popped, pushed, kind_override
+
+    # Dedicated helper entrypoints (opcode 0x10/0x16) behave like a ``call``
+    # instruction in the IR but do not change the evaluation stack.  Boost the
+    # confidence so that downstream passes can treat them as reliable anchors.
+    if (
+        opcode in {0x10, 0x16}
+        and mode in _CALL_HELPER_MODES
+        and original_kind in {InstructionKind.UNKNOWN, InstructionKind.CALL, InstructionKind.META}
+    ):
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.85)
+        kind_override = InstructionKind.CALL
+        return hint, popped, pushed, kind_override
+
+    # The primary call dispatch instruction (0x28) similarly leaves the stack
+    # unchanged – the helpers clean up afterwards.  Mark it as a high-confidence
+    # call so that the pipeline classifier can rely on it when segmenting
+    # blocks.
+    if opcode == 0x28:
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.85)
+        kind_override = InstructionKind.CALL
+        return hint, popped, pushed, kind_override
+
+    if opcode == 0x30 and hint.confidence < 0.75:
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.85)
+        kind_override = InstructionKind.RETURN
+        return hint, popped, pushed, kind_override
+
+    # Recognise the canonical stack shuffles used before helper calls.  These
+    # are pure permutations of the current frame and therefore stack neutral.
+    if opcode == 0x66 and operand in _CALL_SHUFFLE_VARIANTS:
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.9)
+        kind_override = InstructionKind.STACK_COPY
+        return hint, popped, pushed, kind_override
+
+    # Stack teardown helpers encode the arity in their mnemonic (e.g.
+    # ``stack_teardown_4``).  Parse the suffix to obtain a deterministic stack
+    # delta and emit the matching number of ``UNKNOWN`` pops so that the tracker
+    # can keep the virtual stack depth accurate.
+    if opcode == 0x01:
+        count = _teardown_count(profile)
+        if count:
+            hint = StackEffectHint(nominal=-count, minimum=-count, maximum=-count, confidence=0.9)
+            popped = [StackValueType.UNKNOWN] * count
+            pushed = []
+            kind_override = InstructionKind.STACK_TEARDOWN
+            return hint, popped, pushed, kind_override
+
+    # Miscellaneous helper wrappers that only update metadata.
+    if (opcode, mode) in _WRAPPER_META_OPS and _has_wrapper_context(profiles, index):
+        hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.85)
+        if kind_override is None or kind_override is InstructionKind.UNKNOWN:
+            kind_override = InstructionKind.META
+        return hint, popped, pushed, kind_override
+
+    return hint, popped, pushed, kind_override
+
+
+def _has_wrapper_context(profiles: Sequence[InstructionProfile], index: int) -> bool:
+    """Return ``True`` if nearby instructions resemble call/tail wrappers."""
+
+    total = len(profiles)
+    for offset in range(1, 4):
+        prev = index - offset
+        if prev >= 0 and profiles[prev].opcode in {0x10, 0x16, 0x28, 0x29, 0x66}:
+            return True
+        nxt = index + offset
+        if nxt < total and profiles[nxt].opcode in {0x10, 0x16, 0x28, 0x29, 0x66, 0x01}:
+            return True
+    return False
+
+
+def _teardown_count(profile: InstructionProfile) -> int:
+    """Extract the number of slots cleared by a stack teardown helper."""
+
+    name = profile.mnemonic.lower()
+    if "stack_teardown" not in name:
+        return 0
+    parts = name.rsplit("_", 1)
+    if len(parts) != 2:
+        return 0
+    suffix = parts[1]
+    if not suffix.isdigit():
+        return 0
+    return int(suffix)
 
 
 def classify_indirect_variant(
