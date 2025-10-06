@@ -132,6 +132,7 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x1234": "test_helper_1234",
         "0x0020": "call_helper_20",
         "0x0072": "tail_helper_72",
+        "0xF04B": "page_flags_helper",
     }
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
     call_signatures = {
@@ -158,7 +159,21 @@ def write_manual(path: Path) -> KnowledgeBase:
                 },
                 {"kind": "testset"},
             ],
-        }
+        },
+        "0xF04B": {
+            "arity": 2,
+            "prelude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_6C_01",
+                    "operand": "0xFC03",
+                    "effect": {
+                        "mnemonic": "page_flags_setup",
+                        "operand": "0xFC03",
+                    },
+                }
+            ],
+        },
     }
     (path / "call_signatures.json").write_text(json.dumps(call_signatures, indent=2), "utf-8")
     return KnowledgeBase.load(manual_path)
@@ -561,3 +576,64 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert call_return.tail
     assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
     assert call_return.cleanup[-1].pops == 4
+
+
+def test_call_helpers_page_prelude_is_absorbed(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x6C, 0x01, 0xFC03),  # op_6C_01
+        build_word(4, 0x00, 0x00, 0x1400),  # literal argument
+        build_word(8, 0x00, 0x00, 0x5E29),  # literal argument
+        build_word(12, 0x10, 0xE8, 0xF04B),  # call_helpers dispatch
+        build_word(16, 0x30, 0x00, 0x0001),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert all(not isinstance(node, IRRaw) for node in block.nodes)
+    assert len(block.nodes) == 1
+    call_return = block.nodes[0]
+    assert isinstance(call_return, IRCallReturn)
+    assert call_return.target == 0xF04B
+    assert call_return.cleanup
+    setup = call_return.cleanup[0]
+    assert setup.mnemonic == "page_flags_setup"
+    assert setup.operand == 0xFC03
+
+
+def test_return_mask_merges_into_call_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),  # literal argument
+        build_word(4, 0x28, 0x00, 0x0020),  # call_dispatch
+        build_word(8, 0x29, 0x10, 0x2910),  # return mask
+        build_word(12, 0x30, 0x00, 0x0001),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    call_return = block.nodes[0]
+    assert isinstance(call_return, IRCallReturn)
+    assert call_return.target == 0x0020
+    assert call_return.tail
+    assert call_return.cleanup_mask == 0x2910
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_29_10" for node in block.nodes
+    )

@@ -601,6 +601,24 @@ class IRNormalizer:
                     self._collapse_tail_return(items, index, metrics)
                 continue
 
+            if mnemonic == "call_helpers":
+                if index > 0 and isinstance(items[index - 1], IRCall):
+                    index += 1
+                    continue
+
+                args, start = self._collect_call_arguments(items, index)
+                symbol = self.knowledge.lookup_address(item.operand)
+                call = IRCall(
+                    target=item.operand,
+                    args=tuple(args),
+                    tail=False,
+                    symbol=symbol,
+                )
+                metrics.calls += 1
+                items.replace_slice(start, index + 1, [call])
+                index = start
+                continue
+
             if mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
@@ -1347,27 +1365,45 @@ class IRNormalizer:
         while index < len(items) - 1:
             call = items[index]
             if isinstance(call, IRCall):
-                offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
-                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = cleanup_steps + items[offset].steps
-                    offset += 1
-                if offset < len(items) and isinstance(items[offset], IRReturn):
-                    return_node = items[offset]
+                cleanup_steps: List[IRStackEffect] = list(call.cleanup)
+                cleanup_mask = call.cleanup_mask
+                tail = call.tail
+                scan = index + 1
+
+                while scan < len(items):
+                    candidate = items[scan]
+                    if isinstance(candidate, IRCallCleanup):
+                        cleanup_steps.extend(candidate.steps)
+                        scan += 1
+                        continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and candidate.mnemonic == "op_29_10"
+                    ):
+                        if cleanup_mask is None:
+                            cleanup_mask = candidate.operand
+                        tail = True
+                        scan += 1
+                        continue
+                    break
+
+                if scan < len(items) and isinstance(items[scan], IRReturn):
+                    return_node = items[scan]
                     node = IRCallReturn(
                         target=call.target,
                         args=call.args,
-                        tail=call.tail,
+                        tail=tail,
                         returns=return_node.values,
                         varargs=return_node.varargs,
-                        cleanup=cleanup_steps + return_node.cleanup,
+                        cleanup=tuple(cleanup_steps + list(return_node.cleanup)),
                         arity=call.arity,
                         shuffle=call.shuffle,
-                        cleanup_mask=call.cleanup_mask,
+                        cleanup_mask=cleanup_mask,
                         symbol=call.symbol,
                         predicate=call.predicate,
                     )
-                    end = offset + 1
+                    end = scan + 1
+                    self._transfer_ssa(call, node)
                     items.replace_slice(index, end, [node])
                     continue
             index += 1

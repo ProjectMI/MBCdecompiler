@@ -34,5 +34,16 @@
       },
       {"kind": "testset", "optional": true}
     ]
+  },
+  "0xF04B": {
+    "arity": 2,
+    "prelude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_6C_01",
+        "operand": "0xFC03",
+        "effect": {"mnemonic": "page_flags_setup", "operand": "0xFC03"}
+      }
+    ]
   }
 }
