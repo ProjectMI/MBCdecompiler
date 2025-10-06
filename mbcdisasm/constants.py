@@ -38,8 +38,13 @@ OPERAND_ALIASES: Dict[int, str] = {
 # nybble in the runtime stream is frequently repurposed for sub-banks.  To keep
 # the output stable we normalise the value before applying the alias.
 MEMORY_BANK_ALIASES = {
-    0x4B10: "sys.helper",
+    0x1010: "chat.registry",
+    0x2C00: "chat.flags",
     0x3D30: "io.helpers",
+    0x4B10: "sys.helper",
+    0x4B40: "sys.chat",
+    0x5030: "chat.queue",
+    0xC430: "chat.script",
 }
 
 # Frequently accessed pages get a shorter alias to make the rendered memory

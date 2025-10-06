@@ -85,10 +85,24 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
+IO_HANDSHAKE_MNEMONICS = {"op_3D_30", "op_3E_30", "op_31_30"}
 IO_READ_MNEMONICS = {"op_10_38"}
-IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
+IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48", "op_10_3C"}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
-IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_MNEMONICS = {
+    "op_01_3D",
+    "op_F1_3D",
+    "op_29_10",
+    "op_38_00",
+    "op_3C_00",
+    "op_4B_19",
+    "op_4C_00",
+    "op_4C_31",
+    "op_69_10",
+    "stack_shuffle",
+    "tailcall_dispatch",
+    "indirect_access",
+}
 
 
 @dataclass(frozen=True)
@@ -346,6 +360,7 @@ class IRNormalizer:
 
         self._pass_literals(items, metrics)
         self._pass_ascii_runs(items, metrics)
+        self._pass_io_operations(items)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -354,7 +369,6 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
-        self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
@@ -1060,7 +1074,7 @@ class IRNormalizer:
             item = items[index]
             if not (
                 isinstance(item, RawInstruction)
-                and item.mnemonic == "op_3D_30"
+                and item.mnemonic in IO_HANDSHAKE_MNEMONICS
                 and item.operand == IO_SLOT
             ):
                 index += 1
@@ -1090,7 +1104,7 @@ class IRNormalizer:
         for direction in (-1, 1):
             scan = handshake_index + direction
             steps = 0
-            while 0 <= scan < len(items) and steps < 6:
+            while 0 <= scan < len(items) and steps < 8:
                 node = items[scan]
                 if isinstance(node, RawInstruction):
                     if node.mnemonic in IO_BRIDGE_MNEMONICS:
@@ -1132,7 +1146,8 @@ class IRNormalizer:
                 return node.value
             if isinstance(node, RawInstruction):
                 if node.mnemonic in IO_BRIDGE_MNEMONICS or (
-                    node.mnemonic == "op_3D_30" and node.operand == IO_SLOT
+                    node.mnemonic in IO_HANDSHAKE_MNEMONICS
+                    and node.operand == IO_SLOT
                 ):
                     scan -= 1
                     steps += 1

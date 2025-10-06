@@ -497,6 +497,19 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
         build_word(16, 0x3D, 0x30, IO_SLOT),
         build_word(20, 0x10, 0x38, IO_SLOT),
         build_word(24, 0x30, 0x00, 0x0000),
+        build_word(28, 0x00, 0x00, 0x0166),
+        build_word(32, 0x10, 0x3C, 0x0000),
+        build_word(36, 0x3E, 0x30, IO_SLOT),
+        build_word(40, 0x30, 0x00, 0x0000),
+        build_word(44, 0x3D, 0x30, IO_SLOT),
+        build_word(48, 0x38, 0x00, 0x0000),
+        build_word(52, 0x29, 0x10, 0x0001),
+        build_word(56, 0x4B, 0x19, 0x0030),
+        build_word(60, 0x69, 0x10, 0x3800),
+        build_word(64, 0x00, 0x00, 0x2C01),
+        build_word(68, 0x66, 0x3E, 0x3069),
+        build_word(72, 0x10, 0x38, 0x0000),
+        build_word(76, 0x30, 0x00, 0x0000),
     ]
 
     data = encode_instructions(words)
@@ -506,16 +519,48 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
-    block = program.segments[0].blocks[0]
+    blocks = program.segments[0].blocks
 
-    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+    descriptions = [
+        getattr(node, "describe", lambda: "")()
+        for block in blocks
+        for node in block.nodes
+    ]
 
-    assert "io.write(mask=0x2910)" in descriptions
-    assert "io.read()" in descriptions
+    assert descriptions.count("io.write(mask=0x2910)") == 1
+    assert "io.write(mask=0x0166)" in descriptions
+    assert descriptions.count("io.read()") >= 1
     assert not any(
-        isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_3D_30", "op_3E_30"}
+        for block in blocks
+        for node in block.nodes
     )
 
+
+def test_memref_aliases_cover_chat_banks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    region, alias = normalizer._memref_region(None, 0x1014, None)
+    assert region == "chat.registry"
+    assert alias is None
+
+    region, alias = normalizer._memref_region(None, 0x2C01, None)
+    assert region == "chat.flags"
+    assert alias is None
+
+    region, alias = normalizer._memref_region(None, 0x4B4F, None)
+    assert region == "sys.chat"
+    assert alias is None
+
+    region, alias = normalizer._memref_region(None, 0x5031, None)
+    assert region == "chat.queue"
+    assert alias is None
+
+    region, alias = normalizer._memref_region(None, 0xC432, None)
+    assert region == "chat.script"
+    assert alias is None
 
 def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
