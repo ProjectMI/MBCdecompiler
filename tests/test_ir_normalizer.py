@@ -149,6 +149,45 @@ def write_manual(path: Path) -> KnowledgeBase:
             "prelude": [
                 {
                     "kind": "raw",
+                    "mnemonic": "op_03_00",
+                    "operand": "0x3032",
+                    "effect": {"mnemonic": "op_03_00", "operand": "0x3032"},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_4A_05",
+                    "effect": {"mnemonic": "op_4A_05", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_00_52",
+                    "effect": {"mnemonic": "op_00_52", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_4A_05",
+                    "effect": {"mnemonic": "op_4A_05", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_03_00",
+                    "operand": "0x3032",
+                    "effect": {"mnemonic": "op_03_00", "operand": "0x3032"},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_66_1B",
+                    "operand": "0x4B08",
+                    "effect": {"mnemonic": "op_66_1B", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
                     "mnemonic": "op_F0_4B",
                     "operand": "0x4B08",
                     "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"},
@@ -169,8 +208,38 @@ def write_manual(path: Path) -> KnowledgeBase:
             "postlude": [
                 {
                     "kind": "raw",
+                    "mnemonic": "op_52_05",
+                    "effect": {"mnemonic": "op_52_05", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_32_29",
+                    "effect": {"mnemonic": "op_32_29", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_52_05",
+                    "effect": {"mnemonic": "op_52_05", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
                     "mnemonic": "op_70_29",
                     "effect": {"mnemonic": "op_70_29", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_0B_29",
+                    "effect": {"mnemonic": "op_0B_29", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_06_66",
+                    "effect": {"mnemonic": "op_06_66", "inherit_operand": True},
                     "optional": True,
                 },
             ],
@@ -412,6 +481,52 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any("call_helper_20" in text for text in descriptions)
+
+
+def test_call_signature_handles_ascii_wrapper_variant(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x04, 0x00, 0x0000),
+        build_ascii_word(4, "ID00"),
+        build_ascii_word(8, "ID01"),
+        build_word(12, 0x66, 0x1B, 0x4B08),
+        build_word(16, 0x00, 0x52, 0x0200),
+        build_word(20, 0x4A, 0x05, 0x0052),
+        build_word(24, 0x03, 0x00, 0x3032),
+        build_word(28, 0x2B, 0x00, 0x0072),
+        build_ascii_word(32, "WRAP"),
+        build_ascii_word(36, "TAIL"),
+        build_word(40, 0x52, 0x05, 0x0030),
+        build_word(44, 0x32, 0x29, 0x1000),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    call_nodes = [
+        node
+        for block in program.segments[0].blocks
+        for node in block.nodes
+        if isinstance(node, IRAsciiWrapperCall)
+    ]
+
+    assert len(call_nodes) == 1
+    call = call_nodes[0]
+    assert call.target == 0x0072
+    assert call.tail
+    assert call.shuffle == 0x4B08
+    assert call.cleanup_mask == 0x0030
+    assert any("WRAP" in chunk for chunk in call.ascii_chunks)
+    assert [step.mnemonic for step in call.cleanup] == [
+        "op_66_1B",
+        "stack_teardown",
+        "op_52_05",
+        "op_32_29",
+    ]
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
