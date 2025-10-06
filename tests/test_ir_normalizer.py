@@ -141,6 +141,37 @@ def write_manual(path: Path) -> KnowledgeBase:
             "cleanup": [
                 {"mnemonic": "stack_teardown", "pops": 1},
             ],
+            "prelude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_F0_4B",
+                    "effect": {
+                        "mnemonic": "op_F0_4B",
+                        "inherit_operand": True,
+                        "inherit_alias": True,
+                    },
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_5E_29",
+                    "effect": {
+                        "mnemonic": "op_5E_29",
+                        "inherit_operand": True,
+                        "inherit_alias": True,
+                    },
+                    "cleanup_mask": "0x2910",
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_6C_01",
+                    "effect": {
+                        "mnemonic": "op_6C_01",
+                        "inherit_operand": True,
+                        "inherit_alias": True,
+                    },
+                },
+            ],
+            "shuffle": "0x4B08",
             "shuffle_options": ["0x4B08", "0x3032"],
             "postlude": [
                 {
@@ -170,11 +201,14 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
     seg0_words = [
         build_word(0, 0x00, 0x00, 0x0001),
         build_word(4, 0x00, 0x00, 0x0002),
-        build_word(8, 0x2B, 0x00, 0x0072),
-        build_word(12, 0x29, 0x10, 0x2910),
-        build_word(16, 0x70, 0x29, 0x0001),
-        build_word(20, 0x27, 0x00, 0x0008),
-        build_word(24, 0x30, 0x00, 0x0001),
+        build_word(8, 0x6C, 0x01, 0x6C01),
+        build_word(12, 0x5E, 0x29, 0x2910),
+        build_word(16, 0xF0, 0x4B, 0x00C8),
+        build_word(20, 0x2B, 0x00, 0x0072),
+        build_word(24, 0x29, 0x10, 0x2910),
+        build_word(28, 0x70, 0x29, 0x0001),
+        build_word(32, 0x27, 0x00, 0x0008),
+        build_word(36, 0x30, 0x00, 0x0001),
     ]
     seg1_words = [
         build_word(0, 0x00, 0x00, 0x0003),
@@ -339,7 +373,10 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert contract_call.cleanup_mask == 0x2910
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
-    assert contract_call.cleanup and contract_call.cleanup[0].mnemonic == "stack_teardown"
+    assert contract_call.cleanup
+    cleanup_mnemonics = [step.mnemonic for step in contract_call.cleanup]
+    assert cleanup_mnemonics[:3] == ["op_6C_01", "op_5E_29", "op_F0_4B"]
+    assert "stack_teardown" in cleanup_mnemonics
 
     if_nodes = [
         node
@@ -513,6 +550,103 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_merges_ret_mask_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x1234),
+        build_word(4, 0x29, 0x10, 0x2910),
+        build_word(8, 0x30, 0x00, 0x0001),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRCallReturn)
+    assert node.cleanup_mask == 0x2910
+    assert node.target == 0x1234
+    assert not node.tail
+
+
+def test_call_signature_canonicalises_shuffle(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x66, 0x15, 0x3032),
+        build_word(4, 0x6C, 0x01, 0x6C01),
+        build_word(8, 0x5E, 0x29, 0x2910),
+        build_word(12, 0xF0, 0x4B, 0x00C8),
+        build_word(16, 0x28, 0x00, 0x0072),
+        build_word(20, 0x29, 0x10, 0x2910),
+        build_word(24, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.target == 0x0072
+    assert call_return.shuffle == 0x4B08
+    assert call_return.cleanup_mask == 0x2910
+
+
+def test_call_predicate_lifted_without_signature(tmp_path: Path) -> None:
+    manual = {
+        "call_dispatch": {
+            "opcodes": ["0x28:0x00"],
+            "name": "call_dispatch",
+            "category": "call_dispatch",
+            "stack_delta": 1,
+        },
+        "testset_branch": {
+            "opcodes": ["0x27:0x00"],
+            "name": "testset_branch",
+            "category": "testset_branch",
+        },
+    }
+    manual_path = tmp_path / "manual.json"
+    manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
+
+    knowledge = KnowledgeBase.load(manual_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x2000),
+        build_word(4, 0x27, 0x00, 0x0006),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 2
+    call_node = block.nodes[0]
+    testset_node = block.nodes[1]
+    assert isinstance(call_node, IRCall)
+    assert isinstance(testset_node, IRTestSetBranch)
+    assert call_node.predicate is not None
+    assert call_node.predicate.kind == "testset"
+    assert testset_node.expr.startswith("bool")
+
+
 def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -558,6 +692,6 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert call_return.tail
+    assert not call_return.tail
     assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
     assert call_return.cleanup[-1].pops == 4

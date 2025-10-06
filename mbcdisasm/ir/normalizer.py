@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
@@ -348,6 +348,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_call_return_templates(items)
+        self._pass_call_predicates(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -595,6 +596,7 @@ class IRNormalizer:
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
+                self._transfer_ssa(item, call)
                 items.replace_slice(start, index + 1, [call])
                 index = start
                 if call.tail:
@@ -1348,28 +1350,177 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
-                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = cleanup_steps + items[offset].steps
-                    offset += 1
+                cleanup_steps: List[IRStackEffect] = list(call.cleanup)
+                cleanup_mask = call.cleanup_mask
+                intervening = False
+
+                while offset < len(items):
+                    candidate = items[offset]
+                    if isinstance(candidate, IRCallCleanup):
+                        cleanup_steps.extend(candidate.steps)
+                        items.pop(offset)
+                        intervening = True
+                        continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and candidate.mnemonic == "op_29_10"
+                        and candidate.operand == RET_MASK
+                    ):
+                        cleanup_mask = RET_MASK
+                        items.pop(offset)
+                        intervening = True
+                        continue
+                    break
+
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
+                    combined_cleanup = tuple(cleanup_steps) + return_node.cleanup
+                    tail = call.tail
+                    if intervening or return_node.cleanup:
+                        tail = False
                     node = IRCallReturn(
                         target=call.target,
                         args=call.args,
-                        tail=call.tail,
+                        tail=tail,
                         returns=return_node.values,
                         varargs=return_node.varargs,
-                        cleanup=cleanup_steps + return_node.cleanup,
+                        cleanup=combined_cleanup,
                         arity=call.arity,
                         shuffle=call.shuffle,
-                        cleanup_mask=call.cleanup_mask,
+                        cleanup_mask=cleanup_mask,
                         symbol=call.symbol,
                         predicate=call.predicate,
                     )
+                    self._transfer_ssa(call, node)
                     end = offset + 1
                     items.replace_slice(index, end, [node])
                     continue
+            index += 1
+
+    def _pass_call_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items) - 1:
+            node = items[index]
+            if not isinstance(
+                node,
+                (IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii),
+            ):
+                index += 1
+                continue
+
+            if getattr(node, "predicate", None) is not None:
+                index += 1
+                continue
+
+            names = self._ssa_bindings.get(id(node))
+            if not names:
+                synthetic = f"auto_ssa_{len(self._ssa_aliases)}"
+                self._record_ssa(node, (synthetic,))
+                names = (synthetic,)
+
+            alias_map: Dict[str, str] = {}
+            for name in names:
+                alias = self._ssa_aliases.get(name)
+                if alias is None:
+                    alias = self._render_ssa(name)
+                alias_map[name] = alias
+            aliases = set(alias_map.values())
+
+            follower = items[index + 1]
+            predicate: Optional[CallPredicate] = None
+            alias_target: Optional[str] = None
+            matched_name: Optional[str] = None
+
+            if isinstance(follower, IRIf):
+                alias_target = follower.condition
+                if alias_target in aliases:
+                    matched_name = next(
+                        name for name, alias in alias_map.items() if alias == alias_target
+                    )
+                    predicate = CallPredicate(
+                        kind="if",
+                        expr=alias_target,
+                        then_target=follower.then_target,
+                        else_target=follower.else_target,
+                    )
+                elif alias_target == node.describe() and alias_map:
+                    matched_name, alias_target = next(iter(alias_map.items()))
+                    updated_if = replace(follower, condition=alias_target)
+                    items.replace_slice(index + 1, index + 2, [updated_if])
+                    follower = updated_if
+                    predicate = CallPredicate(
+                        kind="if",
+                        expr=alias_target,
+                        then_target=follower.then_target,
+                        else_target=follower.else_target,
+                    )
+            elif isinstance(follower, IRTestSetBranch):
+                alias_target = follower.expr
+                if alias_target in aliases:
+                    matched_name = next(
+                        name for name, alias in alias_map.items() if alias == alias_target
+                    )
+                    predicate = CallPredicate(
+                        kind="testset",
+                        var=follower.var,
+                        expr=alias_target,
+                        then_target=follower.then_target,
+                        else_target=follower.else_target,
+                    )
+                elif alias_target == node.describe() and alias_map:
+                    matched_name, alias_target = next(iter(alias_map.items()))
+                    updated_testset = replace(follower, expr=alias_target)
+                    items.replace_slice(index + 1, index + 2, [updated_testset])
+                    follower = updated_testset
+                    predicate = CallPredicate(
+                        kind="testset",
+                        var=follower.var,
+                        expr=alias_target,
+                        then_target=follower.then_target,
+                        else_target=follower.else_target,
+                    )
+
+            if predicate is None:
+                index += 1
+                continue
+
+            if matched_name is None:
+                for name, alias in alias_map.items():
+                    if alias == alias_target:
+                        matched_name = name
+                        break
+
+            if matched_name is not None:
+                self._promote_ssa_kind(matched_name, SSAValueKind.BOOLEAN)
+                canonical_alias = self._render_ssa(matched_name)
+                if isinstance(follower, IRIf) and follower.condition != canonical_alias:
+                    follower = replace(follower, condition=canonical_alias)
+                    items.replace_slice(index + 1, index + 2, [follower])
+                elif (
+                    isinstance(follower, IRTestSetBranch)
+                    and follower.expr != canonical_alias
+                ):
+                    follower = replace(follower, expr=canonical_alias)
+                    items.replace_slice(index + 1, index + 2, [follower])
+                if predicate.kind == "if":
+                    predicate = CallPredicate(
+                        kind="if",
+                        expr=canonical_alias,
+                        then_target=predicate.then_target,
+                        else_target=predicate.else_target,
+                    )
+                elif predicate.kind == "testset":
+                    predicate = CallPredicate(
+                        kind="testset",
+                        var=predicate.var,
+                        expr=canonical_alias,
+                        then_target=predicate.then_target,
+                        else_target=predicate.else_target,
+                    )
+
+            updated = replace(node, predicate=predicate)
+            self._transfer_ssa(node, updated)
+            items.replace_slice(index, index + 1, [updated])
             index += 1
 
     def _pass_call_contracts(self, items: _ItemList) -> None:
@@ -1422,8 +1573,11 @@ class IRNormalizer:
         if signature.shuffle is not None:
             shuffle = signature.shuffle
         elif signature.shuffle_options:
+            canonical_shuffle = signature.shuffle_options[0]
             if shuffle is None or shuffle not in signature.shuffle_options:
-                shuffle = signature.shuffle_options[0]
+                shuffle = canonical_shuffle
+            else:
+                shuffle = canonical_shuffle
 
         prefix_effects: List[IRStackEffect] = []
         suffix_effects: List[IRStackEffect] = []

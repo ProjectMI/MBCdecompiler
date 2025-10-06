@@ -5,6 +5,37 @@
     "cleanup": [
       {"mnemonic": "stack_teardown", "pops": 1}
     ],
+    "prelude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_F0_4B",
+        "effect": {
+          "mnemonic": "op_F0_4B",
+          "inherit_operand": true,
+          "inherit_alias": true
+        }
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_5E_29",
+        "effect": {
+          "mnemonic": "op_5E_29",
+          "inherit_operand": true,
+          "inherit_alias": true
+        },
+        "cleanup_mask": "0x2910"
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_6C_01",
+        "effect": {
+          "mnemonic": "op_6C_01",
+          "inherit_operand": true,
+          "inherit_alias": true
+        }
+      }
+    ],
+    "shuffle": "0x4B08",
     "shuffle_options": ["0x4B08", "0x3032", "0x7223"],
     "postlude": [
       {
