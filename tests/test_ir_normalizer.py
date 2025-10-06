@@ -9,6 +9,7 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRTailcallReturn,
     IRAsciiWrapperCall,
     IRTailcallAscii,
     IRIf,
@@ -17,7 +18,9 @@ from mbcdisasm.ir.model import (
     IRStackEffect,
     IRTestSetBranch,
     IRRaw,
+    IRConditionMask,
 )
+from mbcdisasm.constants import RET_MASK
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -343,6 +346,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
                 IRCallReturn,
                 IRAsciiWrapperCall,
                 IRTailcallAscii,
+                IRTailcallReturn,
             ),
         )
     ]
@@ -461,6 +465,47 @@ def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
 
     cleanup_rendered = node.describe()
     assert "fanout(flags=FANOUT_FLAGS(0x2C02))" in cleanup_rendered
+
+
+def test_condition_mask_from_fanout(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [build_word(0, 0x10, 0x08, RET_MASK)]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRConditionMask)
+    assert node.source == "fanout"
+    assert node.mask == RET_MASK
+
+
+def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [build_word(0, 0x29, 0x10, RET_MASK)]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRConditionMask)
+    assert node.source == "op_29_10"
+    assert node.mask == RET_MASK
+
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -608,7 +653,7 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert not call_return.tail
-    assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
-    assert call_return.cleanup[-1].pops == 4
+    tail_bundle = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
+    assert tail_bundle.tail
+    assert tail_bundle.cleanup and tail_bundle.cleanup[-1].mnemonic == "stack_teardown"
+    assert tail_bundle.cleanup[-1].pops == 4
