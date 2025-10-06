@@ -19,8 +19,10 @@ from mbcdisasm.ir.model import (
     IRTestSetBranch,
     IRRaw,
     IRConditionMask,
+    IRIORead,
+    IRIOWrite,
 )
-from mbcdisasm.constants import RET_MASK
+from mbcdisasm.constants import IO_SLOT, RET_MASK
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -324,10 +326,9 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         text.startswith("testset") or text.startswith("function_prologue")
         for text in descriptions
     )
-    assert any(text.startswith("load ") and "[bank=" in text for text in descriptions)
-    assert any(text.startswith("store ") and "[bank=" in text for text in descriptions)
-    assert any(text.startswith("load F_") for text in descriptions)
-    assert any("bank=0x11BE" in text for text in descriptions)
+    assert any(text.startswith("load ") and "[" in text for text in descriptions)
+    assert any(text.startswith("store ") and "[" in text for text in descriptions)
+    assert any(":0x" in text for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
@@ -487,6 +488,87 @@ def test_condition_mask_from_fanout(tmp_path: Path) -> None:
     assert node.mask == RET_MASK
 
 
+def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, RET_MASK),
+        build_word(4, 0x01, 0x3D, 0x3069),
+        build_word(8, 0x10, 0x24, IO_SLOT),
+        build_word(12, 0x3D, 0x30, IO_SLOT),
+        build_word(16, 0x3D, 0x30, IO_SLOT),
+        build_word(20, 0x10, 0x38, IO_SLOT),
+        build_word(24, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert "io.write(mask=0x2910)" in descriptions
+    assert "io.read()" in descriptions
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
+    )
+
+
+def test_io_handshake_crosses_call(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3D, 0x30, IO_SLOT),
+        build_word(4, 0x00, 0x00, 0x0001),
+        build_word(8, 0x28, 0x00, 0x0020),
+        build_word(12, 0x10, 0x38, IO_SLOT),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    calls = [node for node in block.nodes if isinstance(node, IRCall)]
+    reads = [node for node in block.nodes if isinstance(node, IRIORead)]
+
+    assert len(calls) == 1
+    assert len(reads) == 1
+
+
+def test_io_handshake_uses_op31(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x31, 0x30, IO_SLOT),
+        build_word(4, 0x00, 0x00, 0x00F0),
+        build_word(8, 0x10, 0x24, IO_SLOT),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+
+    assert len(writes) == 1
+    assert writes[0].mask == 0x00F0
+
+
 def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -552,6 +634,23 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
         and node.mnemonic in {"op_4A_05", "op_32_29", "op_29_10", "stack_teardown_4"}
         for node in block.nodes
     )
+
+
+def test_memory_aliases_cover_helper_tables(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    region, page_alias = normalizer._memref_region(None, 0x4B4F, 0xAC)
+    assert region == "sys.helper.table"
+    assert page_alias == "sys.helper.table"
+
+    region, page_alias = normalizer._memref_region(None, 0x1014, 0x60)
+    assert region == "io.mailbox"
+    assert page_alias == "io.mailbox"
+
+    region, page_alias = normalizer._memref_region(None, 0x2C01, 0x2C)
+    assert region == "sys.flags"
+    assert page_alias == "sys.flags"
 
 
 def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:

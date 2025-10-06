@@ -6,7 +6,14 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
+from ..constants import (
+    CALL_SHUFFLE_STANDARD,
+    IO_PORT_NAME,
+    IO_SLOT,
+    MEMORY_BANK_ALIASES,
+    MEMORY_PAGE_ALIASES,
+    RET_MASK,
+)
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
@@ -52,6 +59,8 @@ from .model import (
     IRIf,
     IRIndirectLoad,
     IRIndirectStore,
+    IRIORead,
+    IRIOWrite,
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
@@ -74,6 +83,23 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0400: "literal_hint",
     0x0110: "literal_hint",
 }
+
+
+IO_READ_MNEMONICS = {"op_10_38"}
+IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
+IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
+IO_HANDSHAKE_MNEMONICS = {"op_3D_30", "op_31_30"}
+IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_NODE_TYPES = (
+    IRLiteral,
+    IRLiteralChunk,
+    IRCall,
+    IRLoad,
+    IRStore,
+    IRIndirectLoad,
+    IRIndirectStore,
+    IRTablePatch,
+)
 
 
 @dataclass(frozen=True)
@@ -339,6 +365,7 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
+        self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
@@ -1037,6 +1064,118 @@ class IRNormalizer:
 
             items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
             index = start + 1
+
+    def _pass_io_operations(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not self._is_io_handshake(item):
+                index += 1
+                continue
+
+            candidate_index = self._find_io_candidate(items, index)
+            if candidate_index is None:
+                index += 1
+                continue
+
+            candidate = items[candidate_index]
+            assert isinstance(candidate, RawInstruction)
+
+            node = self._build_io_node(items, candidate_index, candidate)
+            if node is None:
+                index += 1
+                continue
+
+            self._transfer_ssa(candidate, node)
+            self._transfer_ssa(item, node)
+            new_index = min(index, candidate_index)
+            if index <= candidate_index:
+                items.replace_slice(candidate_index, candidate_index + 1, [node])
+                items.replace_slice(index, index + 1, [])
+            else:
+                items.replace_slice(index, index + 1, [])
+                items.replace_slice(candidate_index, candidate_index + 1, [node])
+            index = new_index
+
+    def _find_io_candidate(self, items: _ItemList, handshake_index: int) -> Optional[int]:
+        for direction in (-1, 1):
+            scan = handshake_index + direction
+            steps = 0
+            while 0 <= scan < len(items) and steps < 12:
+                node = items[scan]
+                if isinstance(node, RawInstruction):
+                    if self._is_io_handshake(node) or node.mnemonic in IO_BRIDGE_MNEMONICS:
+                        scan += direction
+                        steps += 1
+                        continue
+                    if (
+                        node.mnemonic.startswith("op_10_")
+                        and node.operand in IO_ACCEPTED_OPERANDS
+                    ):
+                        return scan
+                    break
+                if self._is_io_bridge_node(node):
+                    scan += direction
+                    steps += 1
+                    continue
+                break
+        return None
+
+    def _build_io_node(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> Optional[IRNode]:
+        mnemonic = instruction.mnemonic
+        if mnemonic in IO_READ_MNEMONICS:
+            return IRIORead(port=IO_PORT_NAME)
+        if mnemonic in IO_WRITE_MNEMONICS:
+            mask = self._io_mask_value(items, index)
+            if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
+                mask = instruction.operand
+            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
+        return None
+
+    def _io_mask_value(self, items: _ItemList, index: int) -> Optional[int]:
+        scan = index - 1
+        steps = 0
+        while scan >= 0 and steps < 8:
+            node = items[scan]
+            if isinstance(node, IRLiteral):
+                return node.value
+            if isinstance(node, RawInstruction):
+                if (
+                    node.mnemonic in IO_BRIDGE_MNEMONICS
+                    or self._is_io_handshake(node)
+                ):
+                    scan -= 1
+                    steps += 1
+                    continue
+                if node.mnemonic.startswith("op_10_"):
+                    break
+            elif isinstance(node, IRLiteralChunk):
+                scan -= 1
+                steps += 1
+                continue
+            elif self._is_io_bridge_node(node):
+                scan -= 1
+                steps += 1
+                continue
+            else:
+                break
+            scan -= 1
+            steps += 1
+        return None
+
+    @staticmethod
+    def _is_io_handshake(item: Union[RawInstruction, IRNode]) -> bool:
+        return (
+            isinstance(item, RawInstruction)
+            and item.mnemonic in IO_HANDSHAKE_MNEMONICS
+            and item.operand == IO_SLOT
+        )
+
+    @staticmethod
+    def _is_io_bridge_node(node: Union[RawInstruction, IRNode]) -> bool:
+        return isinstance(node, IO_BRIDGE_NODE_TYPES)
 
     def _pass_call_conventions(self, items: _ItemList) -> None:
         index = 0
@@ -2404,7 +2543,7 @@ class IRNormalizer:
         base_value = components[1][1] if len(components) > 1 else None
         page = instruction.operand >> 8
         offset = instruction.operand & 0xFF
-        region = self._memref_region(base_slot, bank)
+        region, page_alias = self._memref_region(base_slot, bank, page)
         symbol = self._memref_symbol(region, bank, page, offset)
         memref = MemRef(
             region=region,
@@ -2413,6 +2552,7 @@ class IRNormalizer:
             page=page,
             offset=offset,
             symbol=symbol,
+            page_alias=page_alias,
         )
 
         if base_name and symbol:
@@ -2442,16 +2582,39 @@ class IRNormalizer:
             return None
         return (high << 8) | low
 
-    def _memref_region(self, base_slot: Optional[IRSlot], bank: Optional[int]) -> str:
+    def _memref_region(
+        self, base_slot: Optional[IRSlot], bank: Optional[int], page: Optional[int]
+    ) -> Tuple[str, Optional[str]]:
         if base_slot is not None:
-            return base_slot.space.name.lower()
+            return base_slot.space.name.lower(), None
         if bank is None:
-            return "mem"
+            return "mem", None
+
+        normalized = bank & 0xFFF0
+        alias = MEMORY_BANK_ALIASES.get(normalized)
+        page_alias = self._memref_page_alias(normalized, page)
+        if alias is not None:
+            return alias, page_alias
+
         label = self._memref_regions.get(bank)
         if label is None:
             label = f"bank_{bank:04X}"
             self._memref_regions[bank] = label
-        return label
+        return label, page_alias
+
+    def _memref_page_alias(
+        self, bank: Optional[int], page: Optional[int]
+    ) -> Optional[str]:
+        if page is None:
+            return None
+        if bank is not None:
+            alias = MEMORY_PAGE_ALIASES.get((bank, page))
+            if alias is not None:
+                return alias
+            alias = MEMORY_PAGE_ALIASES.get((bank & 0xFFF0, page))
+            if alias is not None:
+                return alias
+        return MEMORY_PAGE_ALIASES.get((None, page))
 
     def _memref_symbol(
         self, region: str, bank: Optional[int], page: Optional[int], offset: Optional[int]
