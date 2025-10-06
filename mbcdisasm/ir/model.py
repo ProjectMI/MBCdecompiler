@@ -64,8 +64,6 @@ class MemRef:
             details.append(f"bank=0x{self.bank:04X}")
 
         rendered = prefix if not details else f"{prefix}[{', '.join(details)}]"
-        if self.symbol and self.symbol != rendered:
-            return f"{self.symbol}({rendered})"
         return rendered
 
     def _format_location(self) -> Optional[str]:
@@ -487,10 +485,14 @@ class IRIndirectLoad(IRNode):
     target: str
     base_slot: Optional[IRSlot] = None
     ref: Optional[MemRef] = None
+    pointer: Optional[str] = None
+    offset_source: Optional[str] = None
 
     def describe(self) -> str:
         if self.ref is not None:
-            return f"load {self.ref.describe()} -> {self.target}"
+            ptr = self.pointer or self.base
+            offset = self.offset_source or f"0x{self.offset:04X}"
+            return f"load {self.ref.describe()} ptr={ptr} offset={offset} -> {self.target}"
 
         prefix = self.base
         if self.base_slot is not None:
@@ -499,7 +501,9 @@ class IRIndirectLoad(IRNode):
                 prefix = f"{slot} ({self.base})"
             else:
                 prefix = slot
-        return f"indirect_load base={prefix} offset=0x{self.offset:04X} -> {self.target}"
+        ptr = self.pointer or prefix
+        offset = self.offset_source or f"0x{self.offset:04X}"
+        return f"indirect_load ptr={ptr} offset={offset} -> {self.target}"
 
 
 @dataclass(frozen=True)
@@ -511,10 +515,14 @@ class IRIndirectStore(IRNode):
     offset: int
     base_slot: Optional[IRSlot] = None
     ref: Optional[MemRef] = None
+    pointer: Optional[str] = None
+    offset_source: Optional[str] = None
 
     def describe(self) -> str:
         if self.ref is not None:
-            return f"store {self.value} -> {self.ref.describe()}"
+            ptr = self.pointer or self.base
+            offset = self.offset_source or f"0x{self.offset:04X}"
+            return f"store {self.value} -> {self.ref.describe()} ptr={ptr} offset={offset}"
 
         prefix = self.base
         if self.base_slot is not None:
@@ -523,7 +531,9 @@ class IRIndirectStore(IRNode):
                 prefix = f"{slot} ({self.base})"
             else:
                 prefix = slot
-        return f"indirect_store {self.value} -> {prefix} offset=0x{self.offset:04X}"
+        ptr = self.pointer or prefix
+        offset = self.offset_source or f"0x{self.offset:04X}"
+        return f"indirect_store {self.value} -> ptr={ptr} offset={offset}"
 
 
 @dataclass(frozen=True)
@@ -546,9 +556,7 @@ class IRIOWrite(IRNode):
     port: str = IO_PORT_NAME
 
     def describe(self) -> str:
-        details = []
-        if self.port != IO_PORT_NAME:
-            details.append(f"port={self.port}")
+        details = [f"port={self.port}"]
         if self.mask is not None:
             details.append(f"mask=0x{self.mask:04X}")
         if details:

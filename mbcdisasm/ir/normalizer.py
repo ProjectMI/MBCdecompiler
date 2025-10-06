@@ -76,6 +76,9 @@ CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "s
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
 
+TAILCALL_HELPERS = {0x0072, 0x003D, 0x00F0}
+TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
+
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
@@ -366,9 +369,9 @@ class IRNormalizer:
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
-        self._pass_call_return_templates(items)
         self._pass_condition_masks(items)
         self._pass_call_predicates(items)
+        self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -874,29 +877,14 @@ class IRNormalizer:
     ) -> Optional[IRLiteralBlock]:
         if not values:
             return None
-        if self._is_literal_block(values):
-            triplets = tuple(
-                tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
-            )
-            return IRLiteralBlock(
-                triplets=triplets, reducer=reducer, reducer_operand=operand
-            )
 
-        if len(values) < 6:
+        normalized = self._normalize_literal_block(values)
+        if normalized is None:
             return None
 
-        trip_count = len(values) // 3
-        if trip_count < 2:
-            return None
-
-        triplets = [tuple(values[pos : pos + 3]) for pos in range(0, trip_count * 3, 3)]
-        prefix = triplets[0][:2]
-        if not all(chunk[:2] == prefix for chunk in triplets):
-            return None
-
-        tail = tuple(values[trip_count * 3 :])
+        triplets, tail = normalized
         return IRLiteralBlock(
-            triplets=tuple(triplets),
+            triplets=triplets,
             reducer=reducer,
             reducer_operand=operand,
             tail=tail,
@@ -1021,6 +1009,8 @@ class IRNormalizer:
             if not steps:
                 index += 1
                 continue
+
+            steps = self._coalesce_epilogue_steps(steps)
 
             prev_index = start - 1
             while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
@@ -1402,6 +1392,13 @@ class IRNormalizer:
                     scan += 1
 
             ascii_tuple = tuple(ascii_chunks)
+            tail_flag = item.tail
+            if (
+                not tail_flag
+                and item.target in {0x0072}
+                and item.shuffle == CALL_SHUFFLE_STANDARD
+            ):
+                tail_flag = True
             if branch is not None:
                 node = IRTailcallAscii(
                     target=item.target,
@@ -1423,7 +1420,7 @@ class IRNormalizer:
                 target=item.target,
                 args=item.args,
                 ascii_chunks=ascii_tuple,
-                tail=item.tail,
+                tail=tail_flag,
                 arity=item.arity,
                 shuffle=item.shuffle,
                 cleanup_mask=item.cleanup_mask,
@@ -1483,6 +1480,33 @@ class IRNormalizer:
                     ):
                         cleanup_steps.append(self._call_cleanup_effect(candidate))
                         cleanup_mask = RET_MASK
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and call.target in TAILCALL_HELPERS
+                        and candidate.mnemonic in TAILCALL_POSTLUDE
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if isinstance(candidate, IRConditionMask):
+                        effect = IRStackEffect(
+                            mnemonic=candidate.source,
+                            operand=candidate.mask,
+                            operand_role="mask",
+                        )
+                        cleanup_steps.append(effect)
+                        cleanup_mask = candidate.mask
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        call.target in TAILCALL_HELPERS
+                        and isinstance(candidate, (IRTestSetBranch, IRIf))
+                    ):
                         offset += 1
                         consumed += 1
                         continue
@@ -2148,6 +2172,39 @@ class IRNormalizer:
         )
 
     @staticmethod
+    def _coalesce_epilogue_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:
+        if not steps:
+            return list(steps)
+
+        combined: List[IRStackEffect] = []
+        index = 0
+        while index < len(steps):
+            step = steps[index]
+            next_step = steps[index + 1] if index + 1 < len(steps) else None
+            if (
+                step.mnemonic == "op_52_05"
+                and next_step is not None
+                and next_step.mnemonic == "op_32_29"
+                and step.operand == next_step.operand
+            ):
+                operand_role = step.operand_role or next_step.operand_role
+                operand_alias = step.operand_alias or next_step.operand_alias
+                combined.append(
+                    IRStackEffect(
+                        mnemonic="epilogue",
+                        operand=step.operand,
+                        pops=step.pops + next_step.pops,
+                        operand_role=operand_role,
+                        operand_alias=operand_alias,
+                    )
+                )
+                index += 2
+                continue
+            combined.append(step)
+            index += 1
+        return combined
+
+    @staticmethod
     def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
         if len(cleanup.steps) != 1:
             return None
@@ -2172,7 +2229,7 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("op_52_05", "op_32_29", "fanout"):
+        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand
@@ -2234,18 +2291,58 @@ class IRNormalizer:
         return tuple(), start
 
     @staticmethod
-    def _is_literal_block(values: Sequence[int]) -> bool:
-        if not values or len(values) % 3:
+    def _is_literal_block(self, values: Sequence[int]) -> bool:
+        normalized = self._normalize_literal_block(values)
+        if normalized is None:
             return False
-        for pos in range(0, len(values), 3):
-            chunk = values[pos : pos + 3]
-            if len(chunk) < 3:
-                return False
-            if chunk[0] != 0x6704 or chunk[1] != 0x0067:
-                return False
-            if chunk[2] not in {0x0400, 0x0110}:
-                return False
-        return True
+        _, tail = normalized
+        return not tail
+
+    def _normalize_literal_block(
+        self, values: Sequence[int]
+    ) -> Optional[Tuple[Tuple[Tuple[int, int, int], ...], Tuple[int, ...]]]:
+        if len(values) < 3:
+            return None
+
+        triplets: List[Tuple[int, int, int]] = []
+        pos = 0
+        while pos + 2 < len(values):
+            chunk = tuple(values[pos : pos + 3])
+            normalized = self._normalize_literal_triplet(chunk)
+            if normalized is None:
+                break
+            triplets.append(normalized)
+            pos += 3
+
+        if not triplets:
+            return None
+
+        tail = tuple(values[pos:])
+        return tuple(triplets), tail
+
+    def _normalize_literal_triplet(
+        self, chunk: Tuple[int, int, int]
+    ) -> Optional[Tuple[int, int, int]]:
+        if len(chunk) != 3:
+            return None
+
+        marker_values = {0x0400, 0x0110}
+        has_hint = 0x0067 in chunk
+        marker = next((value for value in chunk if value in marker_values), None)
+        if not has_hint or marker is None:
+            return None
+
+        anchor_candidates = [
+            value for value in chunk if value not in {marker, 0x0067}
+        ]
+        if len(anchor_candidates) != 1:
+            return None
+
+        anchor = anchor_candidates[0]
+        if anchor not in {0x6704, 0x0000}:
+            return None
+
+        return (0x0067, marker, anchor)
 
     def _pass_assign_ssa_names(self, items: _ItemList) -> None:
         for item in items:
@@ -2309,12 +2406,14 @@ class IRNormalizer:
                 memref, index = self._collect_memref(items, index, base_slot, base_name, item)
                 if base_name is not None:
                     base_alias = self._render_ssa(base_name)
+                pointer_alias = base_alias
                 node = IRIndirectLoad(
                     base=base_alias,
                     offset=item.operand,
                     target=target_alias,
                     base_slot=base_slot,
                     ref=memref,
+                    pointer=pointer_alias,
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
@@ -2337,12 +2436,14 @@ class IRNormalizer:
                 memref, index = self._collect_memref(items, index, base_slot, base_name, item)
                 if base_name:
                     base_alias = self._render_ssa(base_name)
+                pointer_alias = base_alias
                 node = IRIndirectStore(
                     base=base_alias,
                     value=value_alias,
                     offset=item.operand,
                     base_slot=base_slot,
                     ref=memref,
+                    pointer=pointer_alias,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1

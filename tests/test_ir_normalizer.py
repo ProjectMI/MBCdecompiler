@@ -355,6 +355,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             contract_call = node
             break
     assert contract_call is not None
+    assert isinstance(contract_call, IRTailcallReturn)
     assert contract_call.cleanup_mask == 0x2910
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
@@ -363,6 +364,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         "op_5E_29",
         "op_F0_4B",
         "stack_teardown",
+        "op_29_10",
+        "op_70_29",
     ]
 
     if_nodes = [
@@ -510,7 +513,7 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "io.write(mask=0x2910)" in descriptions
+    assert "io.write(port=io.port_6910, mask=0x2910)" in descriptions
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
