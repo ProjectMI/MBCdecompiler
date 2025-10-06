@@ -35,6 +35,8 @@ from .model import (
     IRIf,
     IRFunctionPrologue,
     IRConditionMask,
+    IRIORead,
+    IRIOWrite,
     MemSpace,
     NormalizerMetrics,
 )
@@ -68,6 +70,8 @@ __all__ = [
     "IRCallCleanup",
     "IRLoad",
     "IRStore",
+    "IRIORead",
+    "IRIOWrite",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRStackEffect",
