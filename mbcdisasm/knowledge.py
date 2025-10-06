@@ -120,10 +120,12 @@ class KnowledgeBase:
         *,
         wildcards: Optional[Mapping[int, OpcodeInfo]] = None,
         by_name: Optional[Mapping[str, OpcodeInfo]] = None,
+        addresses: Optional[Mapping[int, str]] = None,
     ) -> None:
         self._annotations: Dict[str, OpcodeInfo] = dict(annotations)
         self._wildcards: Dict[int, OpcodeInfo] = dict(wildcards or {})
         self._by_name: Dict[str, OpcodeInfo] = dict(by_name or {})
+        self._addresses: Dict[int, str] = dict(addresses or {})
 
     @classmethod
     def load(cls, manual_path: Path) -> "KnowledgeBase":
@@ -141,6 +143,7 @@ class KnowledgeBase:
         annotations: Dict[str, OpcodeInfo] = {}
         by_name: Dict[str, OpcodeInfo] = {}
         wildcard_specs: Dict[int, Mapping[str, Any]] = {}
+        address_table: Dict[int, str] = {}
 
         if isinstance(data, dict):
             for key, entry in data.items():
@@ -169,7 +172,17 @@ class KnowledgeBase:
                 wildcard_specs[opcode_value] = entry
 
         wildcard_annotations = _materialise_wildcards(wildcard_specs, by_name)
-        return cls(annotations, wildcards=wildcard_annotations, by_name=by_name)
+
+        table_path = resolved.with_name("address_table.json")
+        if table_path.exists():
+            address_table = _load_address_table(table_path)
+
+        return cls(
+            annotations,
+            wildcards=wildcard_annotations,
+            by_name=by_name,
+            addresses=address_table,
+        )
 
     def lookup(self, label: str) -> Optional[OpcodeInfo]:
         """Return manual information for the requested opcode label."""
@@ -188,6 +201,11 @@ class KnowledgeBase:
         """Return an annotation by the entry name used in the JSON file."""
 
         return self._by_name.get(name)
+
+    def lookup_address(self, address: int) -> Optional[str]:
+        """Resolve ``address`` to a symbolic name if it is known."""
+
+        return self._addresses.get(int(address) & 0xFFFF)
 
 
 def _parse_component(component: str) -> int:
@@ -333,3 +351,54 @@ def _materialise_wildcards(
         info = OpcodeInfo.from_json(mnemonic, entry)
         resolved[opcode] = info
     return resolved
+
+
+def _load_address_table(table_path: Path) -> Dict[int, str]:
+    """Load a ``address`` → ``symbol`` mapping from ``table_path``."""
+
+    try:
+        raw = json.loads(table_path.read_text("utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(raw, Mapping):
+        return {}
+
+    table: Dict[int, str] = {}
+    for key, value in raw.items():
+        symbol = str(value).strip()
+        if not symbol:
+            continue
+        parsed = _parse_operand_value(key)
+        if parsed is None:
+            continue
+        table[parsed] = symbol
+    return table
+
+
+def _parse_operand_value(key: Any) -> Optional[int]:
+    """Interpret ``key`` as a hexadecimal or decimal operand value."""
+
+    if isinstance(key, int):
+        return key & 0xFFFF
+
+    if isinstance(key, str):
+        token = key.strip()
+        if not token:
+            return None
+        if token.lower().startswith("0x"):
+            try:
+                return int(token, 16) & 0xFFFF
+            except ValueError:
+                return None
+        if any(ch in string.hexdigits[10:] for ch in token):
+            try:
+                return int(token, 16) & 0xFFFF
+            except ValueError:
+                return None
+        try:
+            return int(token, 10) & 0xFFFF
+        except ValueError:
+            return None
+
+    return None

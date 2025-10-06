@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..constants import CALL_SHUFFLE_STANDARD
+from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
@@ -335,6 +335,7 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
+        self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
@@ -582,7 +583,13 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
-                call = IRCall(target=item.operand, args=tuple(args), tail=mnemonic == "tailcall_dispatch")
+                symbol = self.knowledge.lookup_address(item.operand)
+                call = IRCall(
+                    target=item.operand,
+                    args=tuple(args),
+                    tail=mnemonic == "tailcall_dispatch",
+                    symbol=symbol,
+                )
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
@@ -1024,6 +1031,89 @@ class IRNormalizer:
             items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
             index = start + 1
 
+    def _pass_call_conventions(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+
+            shuffle = item.shuffle
+            arity = item.arity
+            cleanup_mask = item.cleanup_mask
+            cleanup_steps = item.cleanup
+
+            consumed: List[int] = []
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, IRCallPreparation):
+                    for mnemonic, operand in candidate.steps:
+                        if mnemonic == "stack_shuffle":
+                            shuffle = operand
+                    consumed.append(scan)
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRLiteral) and arity is None:
+                    decoded = self._decode_call_arity(candidate.value)
+                    if decoded is not None:
+                        arity = decoded
+                        consumed.append(scan)
+                        scan -= 1
+                        continue
+                if isinstance(candidate, IRCallCleanup):
+                    shuffle_operand = self._extract_call_shuffle(candidate)
+                    if shuffle_operand is not None:
+                        shuffle = shuffle_operand
+                        consumed.append(scan)
+                        scan -= 1
+                        continue
+                break
+
+            post_index = index + 1
+            while post_index < len(items) and isinstance(items[post_index], IRLiteralChunk):
+                post_index += 1
+
+            cleanup_index: Optional[int] = None
+            if post_index < len(items) and isinstance(items[post_index], IRCallCleanup):
+                cleanup_index = post_index
+                cleanup_node = items[cleanup_index]
+                cleanup_steps = cleanup_steps + cleanup_node.steps
+                if cleanup_mask is None:
+                    cleanup_mask = self._extract_cleanup_mask(cleanup_node.steps)
+
+            if cleanup_index is not None:
+                items.pop(cleanup_index)
+                if cleanup_index < index:
+                    index -= 1
+
+            for position in sorted(consumed, reverse=True):
+                items.pop(position)
+                if position < index:
+                    index -= 1
+
+            call = items[index]
+            assert isinstance(call, IRCall)
+
+            tail = call.tail
+            if not tail and cleanup_mask == RET_MASK:
+                tail = True
+
+            updated = IRCall(
+                target=call.target,
+                args=call.args,
+                tail=tail,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                cleanup=cleanup_steps,
+                symbol=call.symbol,
+            )
+            self._transfer_ssa(call, updated)
+            items.replace_slice(index, index + 1, [updated])
+            index += 1
+
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1202,6 +1292,11 @@ class IRNormalizer:
                     condition=branch.condition,
                     then_target=branch.then_target,
                     else_target=branch.else_target,
+                    arity=item.arity,
+                    shuffle=item.shuffle,
+                    cleanup_mask=item.cleanup_mask,
+                    cleanup=item.cleanup,
+                    symbol=item.symbol,
                 )
                 items.replace_slice(index, scan, [node])
                 continue
@@ -1211,6 +1306,11 @@ class IRNormalizer:
                 args=item.args,
                 ascii_chunks=ascii_tuple,
                 tail=item.tail,
+                arity=item.arity,
+                shuffle=item.shuffle,
+                cleanup_mask=item.cleanup_mask,
+                cleanup=item.cleanup,
+                symbol=item.symbol,
             )
             end = index + 1 + len(ascii_chunks)
             items.replace_slice(index, end, [node])
@@ -1246,9 +1346,9 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = tuple()
+                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
                 if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = items[offset].steps
+                    cleanup_steps = cleanup_steps + items[offset].steps
                     offset += 1
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
@@ -1259,6 +1359,10 @@ class IRNormalizer:
                         returns=return_node.values,
                         varargs=return_node.varargs,
                         cleanup=cleanup_steps + return_node.cleanup,
+                        arity=call.arity,
+                        shuffle=call.shuffle,
+                        cleanup_mask=call.cleanup_mask,
+                        symbol=call.symbol,
                     )
                     end = offset + 1
                     items.replace_slice(index, end, [node])
@@ -1305,6 +1409,37 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=instruction.profile.operand_alias(),
         )
+
+    @staticmethod
+    def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
+        if len(cleanup.steps) != 1:
+            return None
+        step = cleanup.steps[0]
+        if step.mnemonic != "stack_shuffle":
+            return None
+        return step.operand
+
+    @staticmethod
+    def _decode_call_arity(value: int) -> Optional[int]:
+        if value <= 0:
+            return None
+        high = (value >> 8) & 0xFF
+        low = value & 0xFF
+        if high and low == 0:
+            return high
+        if high:
+            return high
+        if value <= 0x3F:
+            return value
+        return None
+
+    @staticmethod
+    def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
+        for mnemonic in ("op_52_05", "op_32_29", "fanout"):
+            for step in steps:
+                if step.mnemonic == mnemonic:
+                    return step.operand
+        return None
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]

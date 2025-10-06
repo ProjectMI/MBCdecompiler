@@ -115,6 +115,12 @@ def write_manual(path: Path) -> KnowledgeBase:
     }
     manual_path = path / "manual_annotations.json"
     manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
+    address_table = {
+        "0x1234": "test_helper_1234",
+        "0x0020": "call_helper_20",
+        "0x0072": "tail_helper_72",
+    }
+    (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
     return KnowledgeBase.load(manual_path)
 
 
@@ -312,7 +318,7 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
-    assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
+    assert any("call_helper_20" in text for text in descriptions)
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
@@ -388,9 +394,6 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
-    assert prep.steps == (("stack_shuffle", 0x4B08), ("op_4A_05", 0x0052))
-
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
     assert [step.mnemonic for step in call_return.cleanup] == [
         "call_helpers",
@@ -400,7 +403,13 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert [step.operand for step in call_return.cleanup[:2]] == [0x0001, 0x1000]
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
+    assert call_return.symbol == "test_helper_1234"
+    assert call_return.shuffle == 0x4B08
+    assert call_return.cleanup_mask == 0x1000
+    assert call_return.arity is None
 
+    assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
+    assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
     assert not any(
         isinstance(node, IRRaw)
         and node.mnemonic in {"op_4A_05", "op_32_29", "stack_teardown_4"}
@@ -427,8 +436,9 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
-    assert [step[0] for step in prep.steps] == ["stack_shuffle", "stack_shuffle"]
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.shuffle == 0x4B10
+    assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
     )

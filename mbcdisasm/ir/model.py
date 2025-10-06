@@ -80,11 +80,30 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
-        return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        details = []
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle is not None:
+            details.append(f"shuffle=0x{self.shuffle:04X}")
+        if self.cleanup_mask is not None:
+            details.append(f"mask=0x{self.cleanup_mask:04X}")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            details.append(f"cleanup=[{rendered}]")
+        extra = f" {' '.join(details)}" if details else ""
+        return f"call{suffix} target={target_repr} args=[{args}]{extra}"
 
 
 @dataclass(frozen=True)
@@ -248,11 +267,33 @@ class IRAsciiWrapperCall(IRNode):
     args: Tuple[str, ...]
     ascii_chunks: Tuple[str, ...]
     tail: bool = False
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
         ascii_repr = ", ".join(self.ascii_chunks)
         prefix = "ascii_wrapper_call tail" if self.tail else "ascii_wrapper_call"
-        return f"{prefix} target=0x{self.target:04X} ascii=[{ascii_repr}] args=[{', '.join(self.args)}]"
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        details = []
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle is not None:
+            details.append(f"shuffle=0x{self.shuffle:04X}")
+        if self.cleanup_mask is not None:
+            details.append(f"mask=0x{self.cleanup_mask:04X}")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            details.append(f"cleanup=[{rendered}]")
+        extra = f" {' '.join(details)}" if details else ""
+        return (
+            f"{prefix} target={target_repr} ascii=[{ascii_repr}] "
+            f"args=[{', '.join(self.args)}]{extra}"
+        )
 
 
 @dataclass(frozen=True)
@@ -265,12 +306,32 @@ class IRTailcallAscii(IRNode):
     condition: str
     then_target: int
     else_target: int
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
         ascii_repr = ", ".join(self.ascii_chunks)
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        details = []
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle is not None:
+            details.append(f"shuffle=0x{self.shuffle:04X}")
+        if self.cleanup_mask is not None:
+            details.append(f"mask=0x{self.cleanup_mask:04X}")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            details.append(f"cleanup=[{rendered}]")
+        extra = f" {' '.join(details)}" if details else ""
         return (
-            f"tailcall_ascii target=0x{self.target:04X} cond={self.condition} "
-            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X} ascii=[{ascii_repr}]"
+            f"tailcall_ascii target={target_repr} cond={self.condition} "
+            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X} "
+            f"ascii=[{ascii_repr}]{extra}"
         )
 
 
@@ -525,6 +586,10 @@ class IRCallReturn(IRNode):
     returns: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -536,7 +601,21 @@ class IRCallReturn(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             cleanup = f" cleanup=[{rendered}]"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        details = []
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle is not None:
+            details.append(f"shuffle=0x{self.shuffle:04X}")
+        if self.cleanup_mask is not None:
+            details.append(f"mask=0x{self.cleanup_mask:04X}")
+        extra = f" {' '.join(details)}" if details else ""
+        return (
+            f"{prefix} target={target_repr} args=[{args}] returns=[{ret}]"
+            f"{cleanup}{extra}"
+        )
 
 
 @dataclass(frozen=True)
