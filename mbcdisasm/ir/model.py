@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 
 class MemSpace(Enum):
@@ -27,6 +27,43 @@ class SSAValueKind(Enum):
 
 
 @dataclass(frozen=True)
+class ResourceRef:
+    """Stable handle referencing an entry in a resource section."""
+
+    section: str
+    name: str
+
+    def describe(self) -> str:
+        return f"{self.section}:{self.name}"
+
+
+@dataclass(frozen=True)
+class ResourceUse:
+    """Reference to a resource along with a human friendly preview."""
+
+    ref: ResourceRef
+    preview: str = ""
+
+    def describe(self) -> str:
+        if self.preview:
+            return f"{self.ref.describe()}({self.preview})"
+        return self.ref.describe()
+
+
+def _render_ascii_preview(data: bytes) -> str:
+    printable = []
+    for byte in data:
+        if 0x20 <= byte <= 0x7E:
+            printable.append(chr(byte))
+        elif byte in {0x09, 0x0A, 0x0D}:
+            printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+        else:
+            printable.append(f"\\x{byte:02x}")
+    text = "".join(printable)
+    return f"ascii({text})"
+
+
+@dataclass(frozen=True)
 class IRSlot:
     """Address of a VM slot used by :class:`IRLoad` and :class:`IRStore`."""
 
@@ -35,32 +72,58 @@ class IRSlot:
 
 
 @dataclass(frozen=True)
-class MemRef:
-    """Symbolic description of an indirect memory reference."""
+class GlobalAddress:
+    """Address pointing into the global VM address space."""
 
-    region: str
-    bank: Optional[int] = None
-    base: Optional[int] = None
+    index: int
+
+    def describe(self) -> str:
+        return f"global[0x{self.index:04X}]"
+
+
+@dataclass(frozen=True)
+class BankedAddress:
+    """Address resolved via a bank/page/offset triple."""
+
+    bank: int
     page: Optional[int] = None
     offset: Optional[int] = None
     symbol: Optional[str] = None
 
     def describe(self) -> str:
-        prefix = self.symbol or self.region
-        details = []
-        if self.bank is not None:
-            details.append(f"bank=0x{self.bank:04X}")
-        if self.base is not None:
-            details.append(f"base=0x{self.base:04X}")
+        label = self.symbol or "banked"
+        details = [f"bank=0x{self.bank:04X}"]
         if self.page is not None:
             details.append(f"page=0x{self.page:02X}")
         if self.offset is not None:
             width = 2 if self.offset <= 0xFF else 4
             details.append(f"off=0x{self.offset:0{width}X}")
-        if not details:
-            return prefix
         inner = ", ".join(details)
-        return f"{prefix}[{inner}]"
+        return f"{label}[{inner}]"
+
+
+@dataclass(frozen=True)
+class IOAddress:
+    """Address of a dedicated IO slot."""
+
+    slot: int
+
+    def describe(self) -> str:
+        return f"io_slot[0x{self.slot:04X}]"
+
+
+@dataclass(frozen=True)
+class StackPointerAddress:
+    """Address relative to a VM stack slot."""
+
+    slot: IRSlot
+
+    def describe(self) -> str:
+        return f"stack_ptr[{self.slot.space.name.lower()}[0x{self.slot.index:04X}]]"
+
+
+AddressRef = Union[GlobalAddress, BankedAddress, IOAddress, StackPointerAddress]
+AsciiChunk = Union[ResourceUse, bytes]
 
 
 @dataclass(frozen=True)
@@ -165,18 +228,14 @@ class IRLiteralChunk(IRNode):
     data: bytes
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    resource: Optional[ResourceUse] = None
 
     def describe(self) -> str:
-        printable = []
-        for byte in self.data:
-            if 0x20 <= byte <= 0x7E:
-                printable.append(chr(byte))
-            elif byte in {0x09, 0x0A, 0x0D}:
-                printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
-            else:
-                printable.append(f"\\x{byte:02x}")
-        text = "".join(printable)
-        note = f"ascii({text})"
+        if self.resource is not None:
+            preview = f" {self.resource.preview}" if self.resource.preview else ""
+            return f"ascii_chunk[{self.resource.ref.describe()}{preview}]"
+
+        note = _render_ascii_preview(self.data)
         if self.annotations:
             note += " " + ", ".join(self.annotations)
         return note
@@ -223,12 +282,17 @@ class IRLiteralBlock(IRNode):
     reducer: Optional[str] = None
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
+    resource: Optional[ResourceUse] = None
 
     def describe(self) -> str:
-        chunks = []
-        for a, b, c in self.triplets:
-            chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        base = "literal_block[" + ", ".join(chunks) + "]"
+        if self.resource is not None:
+            preview = f" {self.resource.preview}" if self.resource.preview else ""
+            base = f"literal_block[{self.resource.ref.describe()}{preview}]"
+        else:
+            chunks = []
+            for a, b, c in self.triplets:
+                chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
+            base = "literal_block[" + ", ".join(chunks) + "]"
         if self.tail:
             tail_repr = ", ".join(f"0x{value:04X}" for value in self.tail)
             base += f" tail=[{tail_repr}]"
@@ -246,11 +310,17 @@ class IRAsciiWrapperCall(IRNode):
 
     target: int
     args: Tuple[str, ...]
-    ascii_chunks: Tuple[str, ...]
+    ascii_chunks: Tuple[AsciiChunk, ...]
     tail: bool = False
 
     def describe(self) -> str:
-        ascii_repr = ", ".join(self.ascii_chunks)
+        rendered_chunks = []
+        for chunk in self.ascii_chunks:
+            if isinstance(chunk, ResourceUse):
+                rendered_chunks.append(chunk.describe())
+            else:
+                rendered_chunks.append(_render_ascii_preview(chunk))
+        ascii_repr = ", ".join(rendered_chunks)
         prefix = "ascii_wrapper_call tail" if self.tail else "ascii_wrapper_call"
         return f"{prefix} target=0x{self.target:04X} ascii=[{ascii_repr}] args=[{', '.join(self.args)}]"
 
@@ -261,13 +331,19 @@ class IRTailcallAscii(IRNode):
 
     target: int
     args: Tuple[str, ...]
-    ascii_chunks: Tuple[str, ...]
+    ascii_chunks: Tuple[AsciiChunk, ...]
     condition: str
     then_target: int
     else_target: int
 
     def describe(self) -> str:
-        ascii_repr = ", ".join(self.ascii_chunks)
+        rendered_chunks = []
+        for chunk in self.ascii_chunks:
+            if isinstance(chunk, ResourceUse):
+                rendered_chunks.append(chunk.describe())
+            else:
+                rendered_chunks.append(_render_ascii_preview(chunk))
+        ascii_repr = ", ".join(rendered_chunks)
         return (
             f"tailcall_ascii target=0x{self.target:04X} cond={self.condition} "
             f"then=0x{self.then_target:04X} else=0x{self.else_target:04X} ascii=[{ascii_repr}]"
@@ -366,11 +442,11 @@ class IRIndirectLoad(IRNode):
     offset: int
     target: str
     base_slot: Optional[IRSlot] = None
-    ref: Optional[MemRef] = None
+    address: Optional[AddressRef] = None
 
     def describe(self) -> str:
-        if self.ref is not None:
-            return f"load {self.ref.describe()} -> {self.target}"
+        if self.address is not None:
+            return f"load {self.address.describe()} -> {self.target}"
 
         prefix = self.base
         if self.base_slot is not None:
@@ -390,11 +466,11 @@ class IRIndirectStore(IRNode):
     value: str
     offset: int
     base_slot: Optional[IRSlot] = None
-    ref: Optional[MemRef] = None
+    address: Optional[AddressRef] = None
 
     def describe(self) -> str:
-        if self.ref is not None:
-            return f"store {self.value} -> {self.ref.describe()}"
+        if self.address is not None:
+            return f"store {self.value} -> {self.address.describe()}"
 
         prefix = self.base
         if self.base_slot is not None:
@@ -508,10 +584,16 @@ class IRStackDrop(IRNode):
 class IRAsciiHeader(IRNode):
     """Captures dense ASCII banners embedded at block boundaries."""
 
-    chunks: Tuple[str, ...]
+    chunks: Tuple[AsciiChunk, ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(self.chunks)
+        rendered_chunks = []
+        for chunk in self.chunks:
+            if isinstance(chunk, ResourceUse):
+                rendered_chunks.append(chunk.describe())
+            else:
+                rendered_chunks.append(_render_ascii_preview(chunk))
+        rendered = ", ".join(rendered_chunks)
         return f"ascii_header[{rendered}]"
 
 
@@ -586,6 +668,29 @@ class IRBlock:
 
 
 @dataclass(frozen=True)
+class IRResourceEntry:
+    """Concrete blob stored inside a resource section."""
+
+    ref: ResourceRef
+    kind: str
+    data: bytes
+    summary: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        summary = f" {self.summary}" if self.summary else ""
+        return f"{self.ref.describe()} kind={self.kind} size={len(self.data)}{summary}"
+
+
+@dataclass(frozen=True)
+class IRResourceSection:
+    """Logical grouping of :class:`IRResourceEntry` instances."""
+
+    name: str
+    entries: Tuple[IRResourceEntry, ...]
+
+
+@dataclass(frozen=True)
 class IRSegment:
     """Collection of IR blocks corresponding to a container segment."""
 
@@ -602,6 +707,7 @@ class IRProgram:
 
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
+    resources: Tuple[IRResourceSection, ...] = tuple()
 
 
 @dataclass
@@ -685,11 +791,21 @@ __all__ = [
     "IRLiteralChunk",
     "IRAsciiPreamble",
     "IRCallPreparation",
+    "IRCallCleanup",
     "IRTailcallFrame",
     "IRTablePatch",
     "IRAsciiFinalize",
     "IRSlot",
-    "MemRef",
+    "ResourceRef",
+    "ResourceUse",
+    "IRResourceEntry",
+    "IRResourceSection",
+    "GlobalAddress",
+    "BankedAddress",
+    "IOAddress",
+    "StackPointerAddress",
+    "AddressRef",
+    "AsciiChunk",
     "IRRaw",
     "MemSpace",
     "SSAValueKind",

@@ -335,7 +335,9 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
+    header = next(text for text in descriptions if text.startswith("ascii_header["))
+    assert "ascii(A\\x00B\\x00)" in header
+    assert "ascii(\\x00C\\x00D)" in header
     assert "lit(0x6704)" in descriptions
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:

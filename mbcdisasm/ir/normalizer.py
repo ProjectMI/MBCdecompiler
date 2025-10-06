@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
@@ -37,7 +38,15 @@ from .model import (
     IRReturn,
     IRSegment,
     IRSlot,
-    MemRef,
+    IRResourceEntry,
+    IRResourceSection,
+    ResourceRef,
+    ResourceUse,
+    GlobalAddress,
+    BankedAddress,
+    IOAddress,
+    StackPointerAddress,
+    AddressRef,
     IRStackEffect,
     IRStore,
     IRStackDuplicate,
@@ -70,6 +79,65 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0400: "literal_hint",
     0x0110: "literal_hint",
 }
+
+
+class ResourceRegistry:
+    """Accumulate literal and ASCII blobs into resource sections."""
+
+    def __init__(self) -> None:
+        self._sections: Dict[str, Dict[str, IRResourceEntry]] = defaultdict(dict)
+        self._by_key: Dict[Tuple[str, bytes, str], ResourceRef] = {}
+
+    def register(
+        self,
+        section: str,
+        data: bytes,
+        *,
+        kind: str,
+        summary: str = "",
+        annotations: Sequence[str] = (),
+        preview: Optional[str] = None,
+    ) -> ResourceUse:
+        key = (section, data, summary)
+        ref = self._by_key.get(key)
+        if ref is None:
+            digest = hashlib.sha1(section.encode("utf-8") + b"\0" + data).hexdigest()[:8]
+            base_name = f"{section}_{digest}"
+            entries = self._sections[section]
+            name = base_name
+            counter = 1
+            while name in entries:
+                counter += 1
+                name = f"{base_name}_{counter}"
+            ref = ResourceRef(section=section, name=name)
+            entries[name] = IRResourceEntry(
+                ref=ref,
+                kind=kind,
+                data=data,
+                summary=summary or None,
+                annotations=tuple(annotations),
+            )
+            self._by_key[key] = ref
+        preview_text = preview if preview is not None else self._default_preview(data)
+        return ResourceUse(ref=ref, preview=preview_text)
+
+    def as_sections(self) -> Tuple[IRResourceSection, ...]:
+        sections: List[IRResourceSection] = []
+        for name in sorted(self._sections):
+            entries_dict = self._sections[name]
+            ordered = tuple(entries_dict[key] for key in sorted(entries_dict))
+            sections.append(IRResourceSection(name=name, entries=ordered))
+        return tuple(sections)
+
+    def entry(self, ref: ResourceRef) -> IRResourceEntry:
+        return self._sections[ref.section][ref.name]
+
+    @staticmethod
+    def _default_preview(data: bytes) -> str:
+        sample = " ".join(f"{byte:02X}" for byte in data[:8])
+        if len(data) > 8:
+            sample += " …"
+        return sample
 
 
 @dataclass(frozen=True)
@@ -171,6 +239,7 @@ class IRNormalizer:
         self._memref_regions: Dict[int, str] = {}
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
+        self._resources = ResourceRegistry()
 
     # ------------------------------------------------------------------
     # public entry points
@@ -181,6 +250,7 @@ class IRNormalizer:
         *,
         segment_indices: Optional[Sequence[int]] = None,
     ) -> IRProgram:
+        self._resources = ResourceRegistry()
         segments: List[IRSegment] = []
         aggregate_metrics = NormalizerMetrics()
         selection = set(segment_indices or [])
@@ -192,7 +262,12 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
-        return IRProgram(segments=tuple(segments), metrics=aggregate_metrics)
+        resource_sections = self._resources.as_sections()
+        return IRProgram(
+            segments=tuple(segments),
+            metrics=aggregate_metrics,
+            resources=resource_sections,
+        )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
         raw_blocks = self._parse_segment(segment)
@@ -346,6 +421,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
+        self._pass_attach_resources(items)
 
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
@@ -1168,12 +1244,12 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            ascii_chunks: List[str] = []
+            ascii_chunks: List[bytes] = []
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, IRLiteralChunk):
-                    ascii_chunks.append(candidate.describe())
+                    ascii_chunks.append(candidate.data)
                     scan += 1
                     continue
                 break
@@ -1185,7 +1261,7 @@ class IRNormalizer:
             branch: Optional[IRIf] = None
             if scan < len(items) and isinstance(items[scan], IRIf):
                 candidate = items[scan]
-                first_chunk = ascii_chunks[0]
+                first_chunk = self._ascii_preview(ascii_chunks[0])
                 if (
                     candidate.condition in {first_chunk, "stack_top"}
                     or candidate.condition.startswith("ssa")
@@ -1219,10 +1295,10 @@ class IRNormalizer:
     def _pass_ascii_headers(self, items: _ItemList) -> None:
         if not items:
             return
-        chunks: List[str] = []
+        chunks: List[bytes] = []
         index = 0
         while index < len(items) and isinstance(items[index], IRLiteralChunk):
-            chunks.append(items[index].describe())
+            chunks.append(items[index].data)
             index += 1
         if len(chunks) >= 2:
             items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(chunks))])
@@ -1232,11 +1308,10 @@ class IRNormalizer:
             literal = items[0]
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
-                    parts = []
+                    parts: List[bytes] = []
                     for pos in range(0, len(literal.data), 4):
                         segment = literal.data[pos : pos + 4]
-                        piece = IRLiteralChunk(data=segment, source=literal.source)
-                        parts.append(piece.describe())
+                        parts.append(segment)
                     if len(parts) >= 2:
                         items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
 
@@ -1434,7 +1509,7 @@ class IRNormalizer:
                 target_name = item.ssa_values[0] if item.ssa_values else None
                 target_alias = self._render_ssa(target_name) if target_name else "stack"
                 base_name = base_sources[0][0] if base_sources else None
-                memref, index = self._collect_memref(items, index, base_slot, base_name, item)
+                address, index = self._collect_memref(items, index, base_slot, base_name, item)
                 if base_name is not None:
                     base_alias = self._render_ssa(base_name)
                 node = IRIndirectLoad(
@@ -1442,7 +1517,7 @@ class IRNormalizer:
                     offset=item.operand,
                     target=target_alias,
                     base_slot=base_slot,
-                    ref=memref,
+                    address=address,
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
@@ -1462,7 +1537,7 @@ class IRNormalizer:
                     self._promote_ssa_kind(base_name, SSAValueKind.POINTER)
                 base_alias = self._render_ssa(base_name) if base_name else "stack"
                 value_alias = self._render_ssa(value_name) if value_name else "stack"
-                memref, index = self._collect_memref(items, index, base_slot, base_name, item)
+                address, index = self._collect_memref(items, index, base_slot, base_name, item)
                 if base_name:
                     base_alias = self._render_ssa(base_name)
                 node = IRIndirectStore(
@@ -1470,7 +1545,7 @@ class IRNormalizer:
                     value=value_alias,
                     offset=item.operand,
                     base_slot=base_slot,
-                    ref=memref,
+                    address=address,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1
@@ -1478,9 +1553,170 @@ class IRNormalizer:
 
             index += 1
 
+    def _pass_attach_resources(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRLiteralChunk) and item.resource is None:
+                preview = self._ascii_preview(item.data)
+                resource = self._resources.register(
+                    "ascii",
+                    item.data,
+                    kind=item.source,
+                    annotations=item.annotations,
+                    preview=preview,
+                )
+                new_node = IRLiteralChunk(
+                    data=item.data,
+                    source=item.source,
+                    annotations=item.annotations,
+                    resource=resource,
+                )
+                self._transfer_ssa(item, new_node)
+                items.replace_slice(index, index + 1, [new_node])
+                index += 1
+                continue
+
+            if isinstance(item, IRLiteralBlock) and item.resource is None:
+                blob = self._literal_block_bytes(item)
+                preview = self._literal_preview(item)
+                summary = item.reducer or ""
+                resource = self._resources.register(
+                    "literal",
+                    blob,
+                    kind="literal_marker",
+                    summary=summary,
+                    preview=preview,
+                )
+                new_node = IRLiteralBlock(
+                    triplets=item.triplets,
+                    reducer=item.reducer,
+                    reducer_operand=item.reducer_operand,
+                    tail=item.tail,
+                    resource=resource,
+                )
+                self._transfer_ssa(item, new_node)
+                items.replace_slice(index, index + 1, [new_node])
+                index += 1
+                continue
+
+            if isinstance(item, IRAsciiWrapperCall):
+                converted: List[ResourceUse] = []
+                changed = False
+                for chunk in item.ascii_chunks:
+                    if isinstance(chunk, ResourceUse):
+                        converted.append(chunk)
+                        continue
+                    preview = self._ascii_preview(chunk)
+                    resource = self._resources.register(
+                        "ascii",
+                        chunk,
+                        kind="ascii_wrapper",
+                        preview=preview,
+                    )
+                    converted.append(resource)
+                    changed = True
+                if changed:
+                    new_node = IRAsciiWrapperCall(
+                        target=item.target,
+                        args=item.args,
+                        ascii_chunks=tuple(converted),
+                        tail=item.tail,
+                    )
+                    self._transfer_ssa(item, new_node)
+                    items.replace_slice(index, index + 1, [new_node])
+                    index += 1
+                    continue
+
+            if isinstance(item, IRTailcallAscii):
+                converted_tail: List[ResourceUse] = []
+                changed_tail = False
+                for chunk in item.ascii_chunks:
+                    if isinstance(chunk, ResourceUse):
+                        converted_tail.append(chunk)
+                        continue
+                    preview = self._ascii_preview(chunk)
+                    resource = self._resources.register(
+                        "ascii",
+                        chunk,
+                        kind="ascii_tailcall",
+                        preview=preview,
+                    )
+                    converted_tail.append(resource)
+                    changed_tail = True
+                if changed_tail:
+                    new_node = IRTailcallAscii(
+                        target=item.target,
+                        args=item.args,
+                        ascii_chunks=tuple(converted_tail),
+                        condition=item.condition,
+                        then_target=item.then_target,
+                        else_target=item.else_target,
+                    )
+                    self._transfer_ssa(item, new_node)
+                    items.replace_slice(index, index + 1, [new_node])
+                    index += 1
+                    continue
+
+            if isinstance(item, IRAsciiHeader):
+                converted_header: List[ResourceUse] = []
+                changed_header = False
+                for chunk in item.chunks:
+                    if isinstance(chunk, ResourceUse):
+                        converted_header.append(chunk)
+                        continue
+                    preview = self._ascii_preview(chunk)
+                    resource = self._resources.register(
+                        "ascii",
+                        chunk,
+                        kind="ascii_header",
+                        preview=preview,
+                    )
+                    converted_header.append(resource)
+                    changed_header = True
+                if changed_header:
+                    new_node = IRAsciiHeader(chunks=tuple(converted_header))
+                    self._transfer_ssa(item, new_node)
+                    items.replace_slice(index, index + 1, [new_node])
+                    index += 1
+                    continue
+
+            index += 1
+
     # ------------------------------------------------------------------
     # description helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _ascii_preview(data: bytes) -> str:
+        printable = []
+        for byte in data:
+            if 0x20 <= byte <= 0x7E:
+                printable.append(chr(byte))
+            elif byte in {0x09, 0x0A, 0x0D}:
+                printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+            else:
+                printable.append(f"\\x{byte:02X}")
+        text = "".join(printable)
+        return f"ascii({text})"
+
+    @staticmethod
+    def _literal_block_bytes(block: IRLiteralBlock) -> bytes:
+        values: List[int] = []
+        for triplet in block.triplets:
+            values.extend(triplet)
+        values.extend(block.tail)
+        return b"".join(value.to_bytes(2, "big") for value in values)
+
+    def _literal_preview(self, block: IRLiteralBlock) -> str:
+        values: List[int] = []
+        for triplet in block.triplets:
+            values.extend(triplet)
+        values.extend(block.tail)
+        preview = ", ".join(f"0x{value:04X}" for value in values[:6])
+        if len(values) > 6:
+            preview += ", …"
+        return f"literal[{preview}]"
+
     def _describe_stack_top(self, items: _ItemList, index: int) -> str:
         scan = index - 1
         while scan >= 0:
@@ -1611,7 +1847,7 @@ class IRNormalizer:
         base_slot: Optional[IRSlot],
         base_name: Optional[str],
         instruction: RawInstruction,
-    ) -> Tuple[Optional[MemRef], int]:
+    ) -> Tuple[Optional[AddressRef], int]:
         components: List[Tuple[int, int]] = []
         scan = index - 1
         while scan >= 0:
@@ -1640,24 +1876,24 @@ class IRNormalizer:
 
         components.reverse()
         bank = components[0][1] if components else None
-        base_value = components[1][1] if len(components) > 1 else None
         page = instruction.operand >> 8
         offset = instruction.operand & 0xFF
-        region = self._memref_region(base_slot, bank)
-        symbol = self._memref_symbol(region, bank, page, offset)
-        memref = MemRef(
-            region=region,
-            bank=bank,
-            base=base_value,
-            page=page,
-            offset=offset,
-            symbol=symbol,
-        )
+        address: Optional[AddressRef] = None
+        if bank is not None:
+            region = self._memref_region(base_slot, bank)
+            symbol = self._memref_symbol(region, bank, page, offset)
+            address = BankedAddress(bank=bank, page=page, offset=offset, symbol=symbol)
+        elif base_slot is not None:
+            address = StackPointerAddress(slot=base_slot)
+        elif base_name is not None:
+            address = None
 
-        if base_name and symbol:
-            self._ssa_aliases[base_name] = symbol
+        if isinstance(address, BankedAddress) and base_name and address.symbol:
+            self._ssa_aliases[base_name] = address.symbol
+        elif isinstance(address, StackPointerAddress) and base_name:
+            self._ssa_aliases[base_name] = address.describe()
 
-        return memref, index
+        return address, index
 
     @staticmethod
     def _is_memref_bridge(node: Union[RawInstruction, IRNode]) -> bool:

@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Tuple
 
-from .model import IRBlock, IRProgram, IRSegment
+from .model import IRBlock, IRProgram, IRResourceSection, IRSegment
 
 
 class IRTextRenderer:
@@ -14,6 +14,8 @@ class IRTextRenderer:
     def render(self, program: IRProgram) -> str:
         lines: List[str] = []
         lines.append("; normalizer metrics: " + program.metrics.describe())
+        if program.resources:
+            lines.extend(self._render_resources(program.resources))
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"
@@ -24,6 +26,14 @@ class IRTextRenderer:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def _render_resources(self, sections: Tuple["IRResourceSection", ...]) -> Iterable[str]:
+        yield "; resources:"
+        for section in sections:
+            yield f";   section {section.name}"
+            for entry in section.entries:
+                summary = entry.describe()
+                yield f";     {summary}"
+
     def _render_segment(self, segment: IRSegment) -> Iterable[str]:
         header = (
             f"; segment {segment.index} offset=0x{segment.start:06X} "
