@@ -19,8 +19,9 @@ from mbcdisasm.ir.model import (
     IRTestSetBranch,
     IRRaw,
     IRConditionMask,
+    IRLiteralBlock,
 )
-from mbcdisasm.constants import IO_SLOT, RET_MASK
+from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -326,7 +327,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     )
     assert any(text.startswith("load ") and "[" in text for text in descriptions)
     assert any(text.startswith("store ") and "[" in text for text in descriptions)
-    assert any(":0x" in text for text in descriptions)
+    assert any("offset=" in text for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
@@ -412,6 +413,21 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any("call_helper_20" in text for text in descriptions)
+
+
+def test_literal_block_records_stack_delta(tmp_path: Path) -> None:
+    container, knowledge = build_template_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    literal_block = next(node for node in block.nodes if isinstance(node, IRLiteralBlock))
+
+    triplets = len(literal_block.triplets)
+    tail = len(literal_block.tail)
+    expected_delta = triplets * 3 + tail - 1
+
+    assert literal_block.stack_delta == expected_delta
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
@@ -517,6 +533,50 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
     )
 
 
+def test_ascii_wrapper_tailcall_is_bundled(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x00, 0x00, 0x0002),
+        build_word(8, 0x6C, 0x01, 0x6C01),
+        build_word(12, 0x5E, 0x29, RET_MASK),
+        build_word(16, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),
+        build_word(20, 0x2B, 0x00, 0x0072),
+        build_ascii_word(24, "TAIL"),
+        build_word(28, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    tail_node = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
+
+    assert tail_node.target == 0x0072
+    assert tail_node.shuffle == CALL_SHUFFLE_STANDARD
+    assert tail_node.cleanup_mask == RET_MASK
+    assert tail_node.ascii_chunks == ("ascii(TAIL)",)
+
+
+def test_indirect_access_memref_reports_offset(tmp_path: Path) -> None:
+    container, knowledge = build_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[1].blocks[1]
+    load_node = next(node for node in block.nodes if node.__class__.__name__ == "IRIndirectLoad")
+    store_node = next(node for node in block.nodes if node.__class__.__name__ == "IRIndirectStore")
+
+    assert "offset=" in load_node.ref.describe()
+    assert "offset=" in store_node.ref.describe()
+
+
 def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -560,20 +620,19 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert [step.mnemonic for step in call_return.cleanup] == [
+    call_node = next(
+        node for node in block.nodes if isinstance(node, (IRCallReturn, IRTailcallReturn, IRCall))
+    )
+    assert [step.mnemonic for step in call_node.cleanup] == [
         "call_helpers",
         "op_32_29",
-        "op_29_10",
-        "stack_teardown",
     ]
-    assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
-    assert call_return.cleanup[-1].pops == 4
-    assert call_return.target == 0x1234
-    assert call_return.symbol == "test_helper_1234"
-    assert call_return.shuffle == 0x4B08
-    assert call_return.cleanup_mask == 0x2910
-    assert call_return.arity is None
+    assert [step.operand for step in call_node.cleanup] == [0x0001, 0x1000]
+    assert call_node.target == 0x1234
+    assert call_node.symbol == "test_helper_1234"
+    assert call_node.shuffle == 0x4B08
+    assert call_node.cleanup_mask == 0x1000
+    assert getattr(call_node, "arity", None) is None
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
@@ -582,6 +641,13 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
         and node.mnemonic in {"op_4A_05", "op_32_29", "op_29_10", "stack_teardown_4"}
         for node in block.nodes
     )
+
+    condition_mask = next(node for node in block.nodes if isinstance(node, IRConditionMask))
+    assert condition_mask.mask == RET_MASK
+
+    ret_node = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert ret_node.cleanup and ret_node.cleanup[0].mnemonic == "stack_teardown"
+    assert ret_node.cleanup[0].pops == 4
 
 
 def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
@@ -603,12 +669,45 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert call_return.shuffle == 0x4B10
+    call_node = next(
+        node
+        for node in block.nodes
+        if isinstance(node, (IRCallReturn, IRTailcallReturn, IRCall))
+    )
+    assert call_node.shuffle == 0x4B10
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
     )
+
+
+def test_call_epilogue_pair_collapses(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x1234),
+        build_word(4, 0x52, 0x05, RET_MASK),
+        build_word(8, 0x32, 0x29, RET_MASK),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_node = next(
+        node for node in block.nodes if isinstance(node, (IRCallReturn, IRTailcallReturn, IRCall))
+    )
+    cleanup = call_node.cleanup
+
+    assert cleanup
+    assert cleanup[0].mnemonic == "call_epilogue"
+    assert cleanup[0].operand == RET_MASK
 
 
 def test_normalizer_lifts_branch_predicate_from_call(tmp_path: Path) -> None:

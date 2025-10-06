@@ -705,10 +705,11 @@ class IRNormalizer:
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
+                cleanup = self._compress_cleanup_sequence(collected_cleanup)
                 items.replace_slice(
                     index,
                     index + 1,
-                    [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
+                    [IRReturn(values=values, varargs=varargs, cleanup=cleanup)],
                 )
                 metrics.returns += 1
                 return
@@ -871,6 +872,7 @@ class IRNormalizer:
         *,
         reducer: Optional[str] = None,
         operand: Optional[int] = None,
+        reducer_delta: int = 0,
     ) -> Optional[IRLiteralBlock]:
         if not values:
             return None
@@ -878,8 +880,12 @@ class IRNormalizer:
             triplets = tuple(
                 tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
             )
+            stack_delta = len(values) + reducer_delta
             return IRLiteralBlock(
-                triplets=triplets, reducer=reducer, reducer_operand=operand
+                triplets=triplets,
+                reducer=reducer,
+                reducer_operand=operand,
+                stack_delta=stack_delta,
             )
 
         if len(values) < 6:
@@ -895,11 +901,13 @@ class IRNormalizer:
             return None
 
         tail = tuple(values[trip_count * 3 :])
+        stack_delta = len(values) + reducer_delta
         return IRLiteralBlock(
             triplets=tuple(triplets),
             reducer=reducer,
             reducer_operand=operand,
             tail=tail,
+            stack_delta=stack_delta,
         )
 
     def _pass_literal_block_reducers(
@@ -912,11 +920,13 @@ class IRNormalizer:
             if isinstance(first, RawInstruction) and first.mnemonic.startswith("reduce"):
                 if isinstance(second, IRLiteralBlock):
                     if second.reducer is None:
+                        reducer_delta = first.event.delta or 0
                         updated = IRLiteralBlock(
                             triplets=second.triplets,
                             reducer=first.mnemonic,
                             reducer_operand=first.operand,
                             tail=second.tail,
+                            stack_delta=second.stack_delta + reducer_delta,
                         )
                         self._transfer_ssa(first, updated)
                         items.replace_slice(index, index + 2, [updated])
@@ -925,7 +935,10 @@ class IRNormalizer:
                 if isinstance(second, IRBuildTuple):
                     values = self._parse_literal_list(second.elements)
                     block = self._literal_block_from_values(
-                        values, reducer=first.mnemonic, operand=first.operand
+                        values,
+                        reducer=first.mnemonic,
+                        operand=first.operand,
+                        reducer_delta=first.event.delta or 0,
                     )
                     if block is not None:
                         self._transfer_ssa(first, block)
@@ -935,7 +948,10 @@ class IRNormalizer:
                 if isinstance(second, IRLiteral):
                     values, end = self._collect_literal_block_literals(items, index + 1)
                     block = self._literal_block_from_values(
-                        values, reducer=first.mnemonic, operand=first.operand
+                        values,
+                        reducer=first.mnemonic,
+                        operand=first.operand,
+                        reducer_delta=first.event.delta or 0,
                     )
                     if block is not None:
                         self._transfer_ssa(first, block)
@@ -1018,7 +1034,8 @@ class IRNormalizer:
                     continue
                 break
 
-            if not steps:
+            compressed_steps = self._compress_cleanup_sequence(steps)
+            if not compressed_steps:
                 index += 1
                 continue
 
@@ -1027,7 +1044,7 @@ class IRNormalizer:
                 prev_index -= 1
 
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
+                items.replace_slice(start, end, [IRCallCleanup(steps=compressed_steps)])
                 index = prev_index + 2
                 continue
 
@@ -1038,7 +1055,7 @@ class IRNormalizer:
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
                 return_node = items[next_index]
                 assert isinstance(return_node, IRReturn)
-                combined = return_node.cleanup + tuple(steps)
+                combined = return_node.cleanup + compressed_steps
                 updated = IRReturn(
                     values=return_node.values,
                     varargs=return_node.varargs,
@@ -1217,6 +1234,8 @@ class IRNormalizer:
             tail = call.tail
             if not tail and cleanup_mask == RET_MASK:
                 tail = True
+
+            cleanup_steps = self._compress_cleanup_sequence(cleanup_steps)
 
             updated = IRCall(
                 target=call.target,
@@ -1462,23 +1481,38 @@ class IRNormalizer:
         index = 0
         while index < len(items) - 1:
             call = items[index]
-            if isinstance(call, IRCall):
-                offset = index + 1
-                cleanup_steps: List[IRStackEffect] = list(call.cleanup)
-                cleanup_mask = call.cleanup_mask
-                base_tail = call.tail
-                consumed = 0
+            ascii_chunks: Tuple[str, ...] = tuple()
+            if isinstance(call, IRAsciiWrapperCall):
+                if not call.tail:
+                    index += 1
+                    continue
+                ascii_chunks = call.ascii_chunks
+            elif not isinstance(call, IRCall):
+                index += 1
+                continue
 
-                while offset < len(items):
-                    candidate = items[offset]
-                    if isinstance(candidate, IRCallCleanup):
-                        cleanup_steps.extend(candidate.steps)
+            offset = index + 1
+            cleanup_steps: List[IRStackEffect] = list(call.cleanup)
+            cleanup_mask = call.cleanup_mask
+            base_tail = call.tail
+            consumed = 0
+
+            while offset < len(items):
+                candidate = items[offset]
+                if isinstance(candidate, IRCallCleanup):
+                    cleanup_steps.extend(candidate.steps)
+                    offset += 1
+                    consumed += 1
+                    continue
+                if isinstance(candidate, RawInstruction):
+                    if candidate.profile.kind is InstructionKind.STACK_TEARDOWN:
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
                         offset += 1
                         consumed += 1
                         continue
                     if (
-                        isinstance(candidate, RawInstruction)
-                        and candidate.mnemonic == "op_29_10"
+                        candidate.mnemonic == "op_52_05"
+                        and cleanup_mask is None
                         and candidate.operand == RET_MASK
                     ):
                         cleanup_steps.append(self._call_cleanup_effect(candidate))
@@ -1486,56 +1520,101 @@ class IRNormalizer:
                         offset += 1
                         consumed += 1
                         continue
-                    break
+                    if (
+                        candidate.mnemonic == "op_29_10"
+                        and cleanup_mask is None
+                        and candidate.operand == RET_MASK
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        cleanup_mask = RET_MASK
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        candidate.mnemonic == "op_70_29"
+                        and cleanup_mask is not None
+                        and candidate.operand == cleanup_mask
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        candidate.mnemonic == "op_32_29"
+                        and cleanup_mask is not None
+                        and candidate.operand == cleanup_mask
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if candidate.mnemonic == "call_helpers":
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        candidate.mnemonic == "op_29_10"
+                        and cleanup_mask is None
+                        and candidate.operand != RET_MASK
+                    ):
+                        cleanup_mask = candidate.operand
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        offset += 1
+                        consumed += 1
+                        continue
+                break
 
-                tail_hint = base_tail
-                if cleanup_mask == RET_MASK:
-                    tail_hint = True
+            tail_hint = base_tail
+            if cleanup_mask == RET_MASK:
+                tail_hint = True
 
-                if offset < len(items) and isinstance(items[offset], IRReturn):
-                    return_node = items[offset]
-                    combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
-                    varargs = return_node.varargs
-                    return_count = len(return_node.values)
-                    should_bundle = tail_hint and (
-                        base_tail or (return_count == 0 and not varargs)
+            if offset < len(items) and isinstance(items[offset], IRReturn):
+                return_node = items[offset]
+                combined = cleanup_steps + list(return_node.cleanup)
+                combined_cleanup = self._compress_cleanup_sequence(combined)
+                varargs = return_node.varargs
+                return_count = len(return_node.values)
+                should_bundle = tail_hint and (
+                    base_tail or (return_count == 0 and not varargs)
+                )
+
+                if should_bundle:
+                    node = IRTailcallReturn(
+                        target=call.target,
+                        args=call.args,
+                        returns=return_count,
+                        varargs=varargs,
+                        cleanup=combined_cleanup,
+                        tail=True,
+                        arity=call.arity,
+                        shuffle=call.shuffle,
+                        cleanup_mask=cleanup_mask,
+                        symbol=call.symbol,
+                        predicate=call.predicate,
+                        ascii_chunks=ascii_chunks,
                     )
-
-                    if should_bundle:
-                        node = IRTailcallReturn(
-                            target=call.target,
-                            args=call.args,
-                            returns=return_count,
-                            varargs=varargs,
-                            cleanup=combined_cleanup,
-                            tail=True,
-                            arity=call.arity,
-                            shuffle=call.shuffle,
-                            cleanup_mask=cleanup_mask,
-                            symbol=call.symbol,
-                            predicate=call.predicate,
-                        )
-                    else:
-                        tail = base_tail and consumed == 0 and not return_node.cleanup
-                        if not tail and cleanup_mask == RET_MASK and consumed == 0 and not return_node.cleanup:
-                            tail = True
-                        node = IRCallReturn(
-                            target=call.target,
-                            args=call.args,
-                            tail=tail,
-                            returns=return_node.values,
-                            varargs=varargs,
-                            cleanup=combined_cleanup,
-                            arity=call.arity,
-                            shuffle=call.shuffle,
-                            cleanup_mask=cleanup_mask,
-                            symbol=call.symbol,
-                            predicate=call.predicate,
-                        )
-                    self._transfer_ssa(call, node)
-                    end = offset + 1
-                    items.replace_slice(index, end, [node])
-                    continue
+                else:
+                    tail = base_tail and consumed == 0 and not return_node.cleanup
+                    if not tail and cleanup_mask == RET_MASK and consumed == 0 and not return_node.cleanup:
+                        tail = True
+                    node = IRCallReturn(
+                        target=call.target,
+                        args=call.args,
+                        tail=tail,
+                        returns=return_node.values,
+                        varargs=varargs,
+                        cleanup=combined_cleanup,
+                        arity=call.arity,
+                        shuffle=call.shuffle,
+                        cleanup_mask=cleanup_mask,
+                        symbol=call.symbol,
+                        predicate=call.predicate,
+                    )
+                self._transfer_ssa(call, node)
+                end = offset + 1
+                items.replace_slice(index, end, [node])
+                continue
             index += 1
 
     def _pass_condition_masks(self, items: _ItemList) -> None:
@@ -1740,6 +1819,7 @@ class IRNormalizer:
                 cleanup_mask=node.cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+                ascii_chunks=node.ascii_chunks,
             )
 
         return node
@@ -2102,6 +2182,7 @@ class IRNormalizer:
                 cleanup_mask=cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+                ascii_chunks=node.ascii_chunks,
             )
 
         return node
@@ -2148,6 +2229,37 @@ class IRNormalizer:
         )
 
     @staticmethod
+    def _compress_cleanup_sequence(
+        steps: Sequence[IRStackEffect],
+    ) -> Tuple[IRStackEffect, ...]:
+        compressed: List[IRStackEffect] = []
+        index = 0
+        while index < len(steps):
+            step = steps[index]
+            if (
+                step.mnemonic == "op_52_05"
+                and index + 1 < len(steps)
+                and steps[index + 1].mnemonic == "op_32_29"
+                and steps[index + 1].operand == step.operand
+            ):
+                next_step = steps[index + 1]
+                alias = step.operand_alias or next_step.operand_alias
+                compressed.append(
+                    IRStackEffect(
+                        mnemonic="call_epilogue",
+                        operand=step.operand,
+                        pops=max(step.pops, next_step.pops),
+                        operand_role="mask",
+                        operand_alias=alias,
+                    )
+                )
+                index += 2
+                continue
+            compressed.append(step)
+            index += 1
+        return tuple(compressed)
+
+    @staticmethod
     def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
         if len(cleanup.steps) != 1:
             return None
@@ -2172,7 +2284,7 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("op_52_05", "op_32_29", "fanout"):
+        for mnemonic in ("call_epilogue", "op_52_05", "op_32_29", "fanout"):
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ..constants import IO_PORT_NAME, OPERAND_ALIASES
 
@@ -49,18 +49,23 @@ class MemRef:
     page_alias: Optional[str] = None
 
     def describe(self) -> str:
-        region = self.page_alias or self.region or "mem"
+        region = self.region or "mem"
         prefix = region
         if not prefix.startswith("mem") and prefix not in {"frame", "global", "const"}:
             prefix = f"mem.{prefix}"
 
-        details = []
-        location = self._format_location()
-        if location:
-            details.append(location)
+        details: List[str] = []
+        if self.page is not None:
+            if self.page_alias:
+                details.append(f"page={self.page_alias}(0x{self.page:02X})")
+            else:
+                details.append(f"page=0x{self.page:02X}")
         if self.base is not None:
-            details.append(f"base=0x{self.base:04X}")
-        if self.bank is not None and self.page_alias is None and not self._has_region_alias():
+            details.append(f"ptr=0x{self.base:04X}")
+        if self.offset is not None:
+            width = 4 if self.offset > 0xFF else 2
+            details.append(f"offset=0x{self.offset:0{width}X}")
+        if self.bank is not None and not self._has_region_alias():
             details.append(f"bank=0x{self.bank:04X}")
 
         rendered = prefix if not details else f"{prefix}[{', '.join(details)}]"
@@ -295,6 +300,7 @@ class IRLiteralBlock(IRNode):
     reducer: Optional[str] = None
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
+    stack_delta: int = 0
 
     def describe(self) -> str:
         chunks = []
@@ -304,6 +310,8 @@ class IRLiteralBlock(IRNode):
         if self.tail:
             tail_repr = ", ".join(f"0x{value:04X}" for value in self.tail)
             base += f" tail=[{tail_repr}]"
+        if self.stack_delta:
+            base += f" stackΔ={self.stack_delta:+d}"
         if self.reducer:
             operand = (
                 f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
@@ -761,6 +769,7 @@ class IRTailcallReturn(IRNode):
     cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    ascii_chunks: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"
@@ -774,6 +783,9 @@ class IRTailcallReturn(IRNode):
             details.append(f"shuffle={_format_operand(self.shuffle)}")
         if self.cleanup_mask is not None:
             details.append(f"mask={_format_operand(self.cleanup_mask)}")
+        if self.ascii_chunks:
+            ascii_repr = ", ".join(self.ascii_chunks)
+            details.append(f"ascii=[{ascii_repr}]")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
