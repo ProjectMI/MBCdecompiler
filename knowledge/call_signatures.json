@@ -1,0 +1,38 @@
+{
+  "0x0072": {
+    "arity": 2,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle_options": ["0x4B08", "0x3032", "0x7223"],
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_29_10",
+        "operand": "0x2910",
+        "cleanup_mask": "0x2910",
+        "tail": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_0B_29",
+        "effect": {"mnemonic": "op_0B_29", "inherit_operand": true},
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_06_66",
+        "effect": {"mnemonic": "op_06_66", "inherit_operand": true},
+        "optional": true
+      },
+      {"kind": "testset", "optional": true}
+    ]
+  }
+}

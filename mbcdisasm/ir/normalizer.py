@@ -6,11 +6,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..constants import CALL_SHUFFLE_STANDARD
+from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
-from ..knowledge import KnowledgeBase
+from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
     IRAsciiFinalize,
@@ -22,6 +22,7 @@ from .model import (
     IRBuildMap,
     IRBuildTuple,
     IRCall,
+    CallPredicate,
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
@@ -335,6 +336,7 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
+        self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
@@ -344,6 +346,7 @@ class IRNormalizer:
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
+        self._pass_call_contracts(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
 
@@ -582,7 +585,13 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
-                call = IRCall(target=item.operand, args=tuple(args), tail=mnemonic == "tailcall_dispatch")
+                symbol = self.knowledge.lookup_address(item.operand)
+                call = IRCall(
+                    target=item.operand,
+                    args=tuple(args),
+                    tail=mnemonic == "tailcall_dispatch",
+                    symbol=symbol,
+                )
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
@@ -1024,6 +1033,89 @@ class IRNormalizer:
             items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
             index = start + 1
 
+    def _pass_call_conventions(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall):
+                index += 1
+                continue
+
+            shuffle = item.shuffle
+            arity = item.arity
+            cleanup_mask = item.cleanup_mask
+            cleanup_steps = item.cleanup
+
+            consumed: List[int] = []
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, IRCallPreparation):
+                    for mnemonic, operand in candidate.steps:
+                        if mnemonic == "stack_shuffle":
+                            shuffle = operand
+                    consumed.append(scan)
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRLiteral) and arity is None:
+                    decoded = self._decode_call_arity(candidate.value)
+                    if decoded is not None:
+                        arity = decoded
+                        consumed.append(scan)
+                        scan -= 1
+                        continue
+                if isinstance(candidate, IRCallCleanup):
+                    shuffle_operand = self._extract_call_shuffle(candidate)
+                    if shuffle_operand is not None:
+                        shuffle = shuffle_operand
+                        consumed.append(scan)
+                        scan -= 1
+                        continue
+                break
+
+            post_index = index + 1
+            while post_index < len(items) and isinstance(items[post_index], IRLiteralChunk):
+                post_index += 1
+
+            cleanup_index: Optional[int] = None
+            if post_index < len(items) and isinstance(items[post_index], IRCallCleanup):
+                cleanup_index = post_index
+                cleanup_node = items[cleanup_index]
+                cleanup_steps = cleanup_steps + cleanup_node.steps
+                if cleanup_mask is None:
+                    cleanup_mask = self._extract_cleanup_mask(cleanup_node.steps)
+
+            if cleanup_index is not None:
+                items.pop(cleanup_index)
+                if cleanup_index < index:
+                    index -= 1
+
+            for position in sorted(consumed, reverse=True):
+                items.pop(position)
+                if position < index:
+                    index -= 1
+
+            call = items[index]
+            assert isinstance(call, IRCall)
+
+            tail = call.tail
+            if not tail and cleanup_mask == RET_MASK:
+                tail = True
+
+            updated = IRCall(
+                target=call.target,
+                args=call.args,
+                tail=tail,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                cleanup=cleanup_steps,
+                symbol=call.symbol,
+            )
+            self._transfer_ssa(call, updated)
+            items.replace_slice(index, index + 1, [updated])
+            index += 1
+
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1202,6 +1294,11 @@ class IRNormalizer:
                     condition=branch.condition,
                     then_target=branch.then_target,
                     else_target=branch.else_target,
+                    arity=item.arity,
+                    shuffle=item.shuffle,
+                    cleanup_mask=item.cleanup_mask,
+                    cleanup=item.cleanup,
+                    symbol=item.symbol,
                 )
                 items.replace_slice(index, scan, [node])
                 continue
@@ -1211,6 +1308,11 @@ class IRNormalizer:
                 args=item.args,
                 ascii_chunks=ascii_tuple,
                 tail=item.tail,
+                arity=item.arity,
+                shuffle=item.shuffle,
+                cleanup_mask=item.cleanup_mask,
+                cleanup=item.cleanup,
+                symbol=item.symbol,
             )
             end = index + 1 + len(ascii_chunks)
             items.replace_slice(index, end, [node])
@@ -1246,9 +1348,9 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = tuple()
+                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
                 if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = items[offset].steps
+                    cleanup_steps = cleanup_steps + items[offset].steps
                     offset += 1
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
@@ -1259,11 +1361,341 @@ class IRNormalizer:
                         returns=return_node.values,
                         varargs=return_node.varargs,
                         cleanup=cleanup_steps + return_node.cleanup,
+                        arity=call.arity,
+                        shuffle=call.shuffle,
+                        cleanup_mask=call.cleanup_mask,
+                        symbol=call.symbol,
+                        predicate=call.predicate,
                     )
                     end = offset + 1
                     items.replace_slice(index, end, [node])
                     continue
             index += 1
+
+    def _pass_call_contracts(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(
+                node,
+                (
+                    IRCall,
+                    IRCallReturn,
+                    IRAsciiWrapperCall,
+                    IRTailcallAscii,
+                ),
+            ):
+                index += 1
+                continue
+
+            signature = self.knowledge.call_signature(getattr(node, "target", -1))
+            if signature is None:
+                index += 1
+                continue
+
+            updated_index = self._apply_call_signature(items, index, node, signature)
+            index = updated_index + 1
+
+    def _apply_call_signature(
+        self,
+        items: _ItemList,
+        index: int,
+        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        signature: CallSignature,
+    ) -> int:
+        current_index = index
+        target = getattr(node, "target", -1)
+
+        tail = getattr(node, "tail", False)
+        arity = getattr(node, "arity", None)
+        shuffle = getattr(node, "shuffle", None)
+        cleanup_mask = getattr(node, "cleanup_mask", None)
+        predicate = getattr(node, "predicate", None)
+        existing_cleanup = list(getattr(node, "cleanup", tuple()))
+
+        if signature.tail is not None:
+            tail = signature.tail or tail
+        if signature.arity is not None:
+            arity = signature.arity
+        if signature.cleanup_mask is not None and cleanup_mask is None:
+            cleanup_mask = signature.cleanup_mask
+        if signature.shuffle is not None:
+            shuffle = signature.shuffle
+        elif signature.shuffle_options:
+            if shuffle is None or shuffle not in signature.shuffle_options:
+                shuffle = signature.shuffle_options[0]
+
+        prefix_effects: List[IRStackEffect] = []
+        suffix_effects: List[IRStackEffect] = []
+
+        for pattern in signature.prelude:
+            matched, effects, mask, tail_flag, predicate_update, consumed = self._consume_call_pattern_before(
+                items, current_index, pattern
+            )
+            if not matched:
+                if pattern.optional:
+                    continue
+            else:
+                prefix_effects = effects + prefix_effects
+                if mask is not None:
+                    cleanup_mask = mask
+                if tail_flag:
+                    tail = True
+                if predicate_update is not None:
+                    predicate = predicate_update
+                current_index -= consumed
+                continue
+            # required pattern not matched: keep scanning without consuming
+
+        node = items[current_index]
+
+        for pattern in signature.postlude:
+            matched, effects, mask, tail_flag, predicate_update = self._consume_call_pattern_after(
+                items, current_index, pattern
+            )
+            if not matched:
+                if pattern.optional:
+                    continue
+            else:
+                suffix_effects.extend(effects)
+                if mask is not None:
+                    cleanup_mask = mask
+                if tail_flag:
+                    tail = True
+                if predicate_update is not None:
+                    predicate = predicate_update
+                continue
+            # required pattern not matched: leave remaining nodes untouched
+
+        if cleanup_mask is None:
+            cleanup_mask = signature.cleanup_mask
+
+        signature_cleanup = self._convert_signature_effects(signature.cleanup)
+        combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
+
+        updated = self._rebuild_call_node(
+            node,
+            tail=tail,
+            arity=arity,
+            shuffle=shuffle,
+            cleanup_mask=cleanup_mask,
+            cleanup=combined_cleanup,
+            predicate=predicate,
+            target=target,
+            signature=signature,
+        )
+        self._transfer_ssa(node, updated)
+        items.replace_slice(current_index, current_index + 1, [updated])
+        return current_index
+
+    def _consume_call_pattern_before(
+        self,
+        items: _ItemList,
+        index: int,
+        pattern: CallSignaturePattern,
+    ) -> Tuple[bool, List[IRStackEffect], Optional[int], bool, Optional[CallPredicate], int]:
+        position = index - 1
+        if position < 0:
+            return False, [], None, False, None, 0
+
+        candidate = items[position]
+        if pattern.kind == "raw" and isinstance(candidate, RawInstruction):
+            if pattern.mnemonic and candidate.mnemonic != pattern.mnemonic:
+                return False, [], None, False, None, 0
+            if pattern.operand is not None and candidate.operand != pattern.operand:
+                return False, [], None, False, None, 0
+            effects: List[IRStackEffect] = []
+            if pattern.effect is not None:
+                effects.append(self._stack_effect_from_signature(pattern.effect, candidate))
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            predicate: Optional[CallPredicate] = None
+            items.pop(position)
+            return True, effects, cleanup_mask, tail, predicate, 1
+
+        return False, [], None, False, None, 0
+
+    def _consume_call_pattern_after(
+        self,
+        items: _ItemList,
+        index: int,
+        pattern: CallSignaturePattern,
+    ) -> Tuple[bool, List[IRStackEffect], Optional[int], bool, Optional[CallPredicate]]:
+        if index + 1 >= len(items):
+            return False, [], None, False, None
+
+        candidate = items[index + 1]
+
+        if pattern.kind == "raw" and isinstance(candidate, RawInstruction):
+            if pattern.mnemonic and candidate.mnemonic != pattern.mnemonic:
+                return False, [], None, False, None
+            if pattern.operand is not None and candidate.operand != pattern.operand:
+                return False, [], None, False, None
+            effects: List[IRStackEffect] = []
+            if pattern.effect is not None:
+                effects.append(self._stack_effect_from_signature(pattern.effect, candidate))
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            predicate: Optional[CallPredicate] = None
+            items.pop(index + 1)
+            return True, effects, cleanup_mask, tail, predicate
+
+        if pattern.kind == "testset" and isinstance(candidate, IRTestSetBranch):
+            predicate = CallPredicate(
+                kind="testset",
+                var=candidate.var,
+                expr=candidate.expr,
+                then_target=candidate.then_target,
+                else_target=candidate.else_target,
+            )
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            items.pop(index + 1)
+            return True, [], cleanup_mask, tail, predicate
+
+        if pattern.kind == "flag" and isinstance(candidate, IRFlagCheck):
+            predicate = CallPredicate(
+                kind="flag",
+                flag=candidate.flag,
+                then_target=candidate.then_target,
+                else_target=candidate.else_target,
+            )
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            items.pop(index + 1)
+            return True, [], cleanup_mask, tail, predicate
+
+        if pattern.kind == "if" and isinstance(candidate, IRIf):
+            predicate = CallPredicate(
+                kind="if",
+                expr=candidate.condition,
+                then_target=candidate.then_target,
+                else_target=candidate.else_target,
+            )
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            items.pop(index + 1)
+            return True, [], cleanup_mask, tail, predicate
+
+        return False, [], None, False, None
+
+    def _convert_signature_effects(
+        self, specs: Sequence[CallSignatureEffect]
+    ) -> List[IRStackEffect]:
+        effects: List[IRStackEffect] = []
+        for spec in specs:
+            effects.append(self._stack_effect_from_signature(spec, None))
+        return effects
+
+    def _stack_effect_from_signature(
+        self, spec: CallSignatureEffect, instruction: Optional[RawInstruction]
+    ) -> IRStackEffect:
+        operand = spec.operand
+        operand_role = spec.operand_role
+        operand_alias = spec.operand_alias
+        if instruction is not None:
+            if operand is None or spec.inherit_operand:
+                operand = instruction.operand
+            if operand_role is None:
+                operand_role = instruction.profile.operand_role()
+            if spec.inherit_alias or operand_alias is None:
+                alias = instruction.profile.operand_alias()
+                if alias is not None:
+                    operand_alias = alias
+        if operand is None:
+            operand = 0
+
+        pops = spec.pops
+        if instruction is not None and pops == 0:
+            if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
+                delta = -instruction.event.delta
+                if delta > 0:
+                    pops = delta
+
+        return IRStackEffect(
+            mnemonic=spec.mnemonic,
+            operand=operand,
+            pops=pops,
+            operand_role=operand_role,
+            operand_alias=operand_alias,
+        )
+
+    def _rebuild_call_node(
+        self,
+        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        *,
+        tail: bool,
+        arity: Optional[int],
+        shuffle: Optional[int],
+        cleanup_mask: Optional[int],
+        cleanup: Tuple[IRStackEffect, ...],
+        predicate: Optional[CallPredicate],
+        target: int,
+        signature: CallSignature,
+    ) -> Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii]:
+        if isinstance(node, IRCall):
+            return IRCall(
+                target=target,
+                args=node.args,
+                tail=tail,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                cleanup=cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRAsciiWrapperCall):
+            return IRAsciiWrapperCall(
+                target=target,
+                args=node.args,
+                ascii_chunks=node.ascii_chunks,
+                tail=tail,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                cleanup=cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRTailcallAscii):
+            return IRTailcallAscii(
+                target=target,
+                args=node.args,
+                ascii_chunks=node.ascii_chunks,
+                condition=node.condition,
+                then_target=node.then_target,
+                else_target=node.else_target,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                cleanup=cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRCallReturn):
+            returns = node.returns
+            if signature.returns is not None and not node.varargs:
+                count = max(signature.returns, 0)
+                returns = tuple(f"ret{i}" for i in range(count))
+            return IRCallReturn(
+                target=target,
+                args=node.args,
+                tail=tail,
+                returns=returns,
+                varargs=node.varargs,
+                cleanup=cleanup,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        return node
 
     @staticmethod
     def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
@@ -1305,6 +1737,37 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=instruction.profile.operand_alias(),
         )
+
+    @staticmethod
+    def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
+        if len(cleanup.steps) != 1:
+            return None
+        step = cleanup.steps[0]
+        if step.mnemonic != "stack_shuffle":
+            return None
+        return step.operand
+
+    @staticmethod
+    def _decode_call_arity(value: int) -> Optional[int]:
+        if value <= 0:
+            return None
+        high = (value >> 8) & 0xFF
+        low = value & 0xFF
+        if high and low == 0:
+            return high
+        if high:
+            return high
+        if value <= 0x3F:
+            return value
+        return None
+
+    @staticmethod
+    def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
+        for mnemonic in ("op_52_05", "op_32_29", "fanout"):
+            for step in steps:
+                if step.mnemonic == mnemonic:
+                    return step.operand
+        return None
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
