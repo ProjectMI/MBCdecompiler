@@ -149,24 +149,64 @@ def write_manual(path: Path) -> KnowledgeBase:
             "prelude": [
                 {
                     "kind": "raw",
+                    "mnemonic": "op_00_03",
+                    "operand": "0x3032",
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_05_4A",
+                    "operand": "0x0052",
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_52_00",
+                    "operand": "0x0200",
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "stack_shuffle",
+                    "operand": "0x4B08",
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
                     "mnemonic": "op_F0_4B",
                     "operand": "0x4B08",
                     "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"},
+                    "optional": True,
                 },
                 {
                     "kind": "raw",
                     "mnemonic": "op_5E_29",
                     "operand": "0x2910",
                     "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"},
+                    "optional": True,
                 },
                 {
                     "kind": "raw",
                     "mnemonic": "op_6C_01",
                     "operand": "0x6C01",
                     "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"},
+                    "optional": True,
                 },
             ],
             "postlude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_05_52",
+                    "effect": {"mnemonic": "op_05_52", "inherit_operand": True},
+                    "cleanup_mask": "0x0030",
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_32_29",
+                    "effect": {"mnemonic": "op_32_29", "inherit_operand": True},
+                    "optional": True,
+                },
                 {
                     "kind": "raw",
                     "mnemonic": "op_70_29",
@@ -436,6 +476,49 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_ascii_wrapper_allows_optional_prelude(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x04, 0x00, 0x0000),
+        build_ascii_word(4, "ABCD"),
+        build_ascii_word(8, "EFGH"),
+        build_word(12, 0x66, 0x15, 0x4B08),
+        build_word(16, 0x00, 0x52, 0x0200),
+        build_word(20, 0x4A, 0x05, 0x0052),
+        build_word(24, 0x03, 0x00, 0x3032),
+        build_word(28, 0x2B, 0x00, 0x0072),
+        build_ascii_word(32, "IJKL"),
+        build_ascii_word(36, "MNOP"),
+        build_word(40, 0x52, 0x05, 0x0030),
+        build_word(44, 0x32, 0x29, 0x1000),
+        build_word(48, 0x29, 0x10, 0x2910),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    wrapper_nodes = [
+        node for node in block.nodes if isinstance(node, IRAsciiWrapperCall)
+    ]
+    assert wrapper_nodes and len(wrapper_nodes) == 1
+
+    wrapper = wrapper_nodes[0]
+    assert wrapper.tail
+    assert wrapper.cleanup_mask == 0x0030
+    assert [effect.mnemonic for effect in wrapper.cleanup] == [
+        "stack_teardown",
+        "op_52_05",
+        "op_32_29",
+    ]
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

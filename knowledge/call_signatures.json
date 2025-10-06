@@ -10,24 +10,64 @@
     "prelude": [
       {
         "kind": "raw",
+        "mnemonic": "op_00_03",
+        "operand": "0x3032",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_05_4A",
+        "operand": "0x0052",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_52_00",
+        "operand": "0x0200",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "stack_shuffle",
+        "operand": "0x4B08",
+        "optional": true
+      },
+      {
+        "kind": "raw",
         "mnemonic": "op_F0_4B",
         "operand": "0x4B08",
-        "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"}
+        "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"},
+        "optional": true
       },
       {
         "kind": "raw",
         "mnemonic": "op_5E_29",
         "operand": "0x2910",
-        "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"}
+        "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"},
+        "optional": true
       },
       {
         "kind": "raw",
         "mnemonic": "op_6C_01",
         "operand": "0x6C01",
-        "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"}
+        "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"},
+        "optional": true
       }
     ],
     "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_05_52",
+        "effect": {"mnemonic": "op_05_52", "inherit_operand": true},
+        "cleanup_mask": "0x0030",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_32_29",
+        "effect": {"mnemonic": "op_32_29", "inherit_operand": true},
+        "optional": true
+      },
       {
         "kind": "raw",
         "mnemonic": "op_70_29",
