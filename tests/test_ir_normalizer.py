@@ -9,6 +9,7 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRLiteral,
     IRAsciiWrapperCall,
     IRTailcallAscii,
     IRIf,
@@ -73,7 +74,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": -1,
         },
         "call_helpers": {
-            "opcodes": ["0x10:0xE8"],
+            "opcodes": ["0x10:0xE8", "0x10:0x00"],
             "name": "call_helpers",
             "category": "call_helpers",
         },
@@ -513,6 +514,45 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_call_preparation_folds_page_setup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x6C, 0x01, 0xFC03),  # op_6C_01
+        build_word(4, 0x00, 0x00, 0x1400),  # literal page value
+        build_word(8, 0x00, 0x00, 0x5E29),  # literal flag value
+        build_word(12, 0x10, 0x00, 0xF04B),  # call_helpers
+        build_word(16, 0x2B, 0x00, 0x0072),  # tailcall_dispatch
+        build_word(20, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_node = next(
+        node
+        for node in block.nodes
+        if isinstance(node, (IRCall, IRCallReturn))
+    )
+    assert getattr(call_node, "target", None) == 0x0072
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_6C_01" for node in block.nodes
+    )
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "call_helpers" for node in block.nodes
+    )
+    assert not any(
+        isinstance(node, IRLiteral) and node.value in {0x1400, 0x5E29}
+        for node in block.nodes
+    )
+
+
 def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -561,3 +601,27 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert call_return.tail
     assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
     assert call_return.cleanup[-1].pops == 4
+
+
+def test_call_return_consumes_return_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x00, 0x0010),  # tailcall_dispatch
+        build_word(4, 0x10, 0x29, 0x2910),  # RET_MASK helper
+        build_word(8, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.cleanup_mask == 0x2910
+    assert call_return.cleanup and call_return.cleanup[0].operand == 0x2910
+    assert not any(isinstance(node, IRRaw) for node in block.nodes)

@@ -958,6 +958,13 @@ class IRNormalizer:
             scan = index - 1
             while scan >= 0:
                 candidate = items[scan]
+                match = self._match_call_page_setup(items, scan)
+                if match is not None:
+                    match_start, match_steps = match
+                    steps = match_steps + steps
+                    start = match_start
+                    scan = match_start - 1
+                    continue
                 if isinstance(candidate, IRCallPreparation):
                     steps = list(candidate.steps) + steps
                     start = scan
@@ -1702,6 +1709,9 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         if mnemonic in CALL_CLEANUP_MNEMONICS:
             return True
+        alias = instruction.profile.operand_alias()
+        if alias == "RET_MASK":
+            return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
 
     @staticmethod
@@ -1747,6 +1757,42 @@ class IRNormalizer:
             return None
         return step.operand
 
+    def _match_call_page_setup(
+        self, items: _ItemList, position: int
+    ) -> Optional[Tuple[int, List[Tuple[str, int]]]]:
+        if position < 0:
+            return None
+
+        helper = items[position]
+        if not isinstance(helper, RawInstruction):
+            return None
+        if helper.mnemonic != "call_helpers" or helper.operand != 0xF04B:
+            return None
+        if position < 3:
+            return None
+
+        literal_flags = items[position - 1]
+        literal_page = items[position - 2]
+        prefix = items[position - 3]
+
+        if not isinstance(literal_flags, IRLiteral):
+            return None
+        if not isinstance(literal_page, IRLiteral):
+            return None
+        if not isinstance(prefix, RawInstruction):
+            return None
+        if prefix.mnemonic != "op_6C_01":
+            return None
+
+        steps: List[Tuple[str, int]] = [
+            (prefix.mnemonic, prefix.operand),
+            ("page_literal", literal_page.value),
+            ("flag_literal", literal_flags.value),
+            (helper.mnemonic, helper.operand),
+        ]
+
+        return position - 3, steps
+
     @staticmethod
     def _decode_call_arity(value: int) -> Optional[int]:
         if value <= 0:
@@ -1767,6 +1813,9 @@ class IRNormalizer:
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand
+        for step in steps:
+            if step.operand_alias == "RET_MASK":
+                return step.operand
         return None
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
