@@ -533,6 +533,21 @@ class IRAsciiPreamble(IRNode):
 
 
 @dataclass(frozen=True)
+class IRPageFlagSetup(IRNode):
+    """Normalises the PAGE/flag preparation prefix used before helper calls."""
+
+    page_operand: int
+    page_value: int
+    flag_value: int
+
+    def describe(self) -> str:
+        return (
+            f"page_flag_setup page=0x{self.page_operand:04X} "
+            f"page_value=0x{self.page_value:04X} flag_value=0x{self.flag_value:04X}"
+        )
+
+
+@dataclass(frozen=True)
 class IRCallPreparation(IRNode):
     """Grouped stack permutations that prepare arguments for helper calls."""
 

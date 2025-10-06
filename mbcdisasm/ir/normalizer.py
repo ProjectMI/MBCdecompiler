@@ -26,6 +26,7 @@ from .model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRPageFlagSetup,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
@@ -334,6 +335,7 @@ class IRNormalizer:
         self._pass_literal_blocks(items)
         self._pass_literal_block_reducers(items, metrics)
         self._pass_ascii_preamble(items)
+        self._pass_page_flag_setup(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
         self._pass_call_conventions(items)
@@ -945,6 +947,58 @@ class IRNormalizer:
                 continue
             index += 1
 
+    def _pass_page_flag_setup(self, items: _ItemList) -> None:
+        index = 0
+        while index <= len(items) - 3:
+            first, second, third = items[index : index + 3]
+            if not (
+                isinstance(first, RawInstruction)
+                and first.mnemonic == "op_6C_01"
+                and first.operand == 0xFC03
+                and isinstance(second, IRLiteral)
+                and second.value == 0x1400
+                and isinstance(third, IRLiteral)
+                and third.value == 0x5E29
+            ):
+                index += 1
+                continue
+
+            helper_ok = False
+            if index + 3 < len(items):
+                fourth = items[index + 3]
+                if (
+                    isinstance(fourth, RawInstruction)
+                    and fourth.mnemonic == "call_helpers"
+                    and fourth.operand == 0xF04B
+                ):
+                    helper_ok = True
+                elif (
+                    isinstance(fourth, IRCallCleanup)
+                    and len(fourth.steps) == 1
+                    and fourth.steps[0].mnemonic == "call_helpers"
+                    and fourth.steps[0].operand == 0xF04B
+                ):
+                    helper_ok = True
+                elif (
+                    isinstance(fourth, IRReturn)
+                    and fourth.cleanup
+                    and fourth.cleanup[0].mnemonic == "call_helpers"
+                    and fourth.cleanup[0].operand == 0xF04B
+                ):
+                    helper_ok = True
+
+            if not helper_ok:
+                index += 1
+                continue
+
+            node = IRPageFlagSetup(
+                page_operand=first.operand,
+                page_value=second.value,
+                flag_value=third.value,
+            )
+            items.replace_slice(index, index + 3, [node])
+            index += 1
+
     def _pass_call_preparation(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1247,6 +1301,7 @@ class IRNormalizer:
                 IRAsciiHeader,
                 IRLiteralChunk,
                 IRLiteral,
+                IRPageFlagSetup,
                 IRCallPreparation,
                 IRCallCleanup,
             ),
@@ -1348,10 +1403,20 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
-                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = cleanup_steps + items[offset].steps
-                    offset += 1
+                cleanup_steps: List[IRStackEffect] = list(call.cleanup)
+                cleanup_mask = call.cleanup_mask
+                while offset < len(items):
+                    candidate = items[offset]
+                    if isinstance(candidate, RawInstruction) and self._is_return_mask_instruction(candidate):
+                        cleanup_steps.append(self._raw_to_stack_effect(candidate))
+                        cleanup_mask = candidate.operand
+                        offset += 1
+                        continue
+                    if isinstance(candidate, IRCallCleanup):
+                        cleanup_steps.extend(candidate.steps)
+                        offset += 1
+                        continue
+                    break
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
                     node = IRCallReturn(
@@ -1360,10 +1425,10 @@ class IRNormalizer:
                         tail=call.tail,
                         returns=return_node.values,
                         varargs=return_node.varargs,
-                        cleanup=cleanup_steps + return_node.cleanup,
+                        cleanup=tuple(cleanup_steps) + return_node.cleanup,
                         arity=call.arity,
                         shuffle=call.shuffle,
-                        cleanup_mask=call.cleanup_mask,
+                        cleanup_mask=cleanup_mask,
                         symbol=call.symbol,
                         predicate=call.predicate,
                     )
@@ -1737,6 +1802,18 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=instruction.profile.operand_alias(),
         )
+
+    def _raw_to_stack_effect(self, instruction: RawInstruction) -> IRStackEffect:
+        return self._call_cleanup_effect(instruction)
+
+    @staticmethod
+    def _is_return_mask_instruction(instruction: RawInstruction) -> bool:
+        alias = instruction.profile.operand_alias()
+        if alias is not None and "RET_MASK" in str(alias):
+            return True
+        if instruction.operand == RET_MASK:
+            return True
+        return False
 
     @staticmethod
     def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
