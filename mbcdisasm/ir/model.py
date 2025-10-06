@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, Tuple
 
-from ..constants import OPERAND_ALIASES
+from ..constants import IO_PORT_NAME, OPERAND_ALIASES
 
 
 class MemSpace(Enum):
@@ -46,23 +46,43 @@ class MemRef:
     page: Optional[int] = None
     offset: Optional[int] = None
     symbol: Optional[str] = None
+    page_alias: Optional[str] = None
 
     def describe(self) -> str:
-        prefix = self.symbol or self.region
+        region = self.page_alias or self.region or "mem"
+        prefix = region
+        if not prefix.startswith("mem") and prefix not in {"frame", "global", "const"}:
+            prefix = f"mem.{prefix}"
+
         details = []
-        if self.bank is not None:
-            details.append(f"bank=0x{self.bank:04X}")
+        location = self._format_location()
+        if location:
+            details.append(location)
         if self.base is not None:
             details.append(f"base=0x{self.base:04X}")
-        if self.page is not None:
-            details.append(f"page=0x{self.page:02X}")
+        if self.bank is not None and self.page_alias is None and not self._has_region_alias():
+            details.append(f"bank=0x{self.bank:04X}")
+
+        rendered = prefix if not details else f"{prefix}[{', '.join(details)}]"
+        if self.symbol and self.symbol != rendered:
+            return f"{self.symbol}({rendered})"
+        return rendered
+
+    def _format_location(self) -> Optional[str]:
+        if self.page is not None and self.offset is not None:
+            if self.page_alias:
+                combined = (self.page << 8) | (self.offset & 0xFF)
+                return f"0x{combined:04X}"
+            return f"0x{self.page:02X}:0x{self.offset:02X}"
         if self.offset is not None:
-            width = 2 if self.offset <= 0xFF else 4
-            details.append(f"off=0x{self.offset:0{width}X}")
-        if not details:
-            return prefix
-        inner = ", ".join(details)
-        return f"{prefix}[{inner}]"
+            width = 4 if self.offset > 0xFF else 2
+            return f"0x{self.offset:0{width}X}"
+        if self.page is not None:
+            return f"page=0x{self.page:02X}"
+        return None
+
+    def _has_region_alias(self) -> bool:
+        return bool(self.region and not self.region.startswith("mem"))
 
 
 @dataclass(frozen=True)
@@ -507,6 +527,36 @@ class IRIndirectStore(IRNode):
 
 
 @dataclass(frozen=True)
+class IRIORead(IRNode):
+    """Read a value from the shared IO port."""
+
+    port: str = IO_PORT_NAME
+
+    def describe(self) -> str:
+        if self.port != IO_PORT_NAME:
+            return f"io.read(port={self.port})"
+        return "io.read()"
+
+
+@dataclass(frozen=True)
+class IRIOWrite(IRNode):
+    """Write configuration bits to the shared IO port."""
+
+    mask: Optional[int] = None
+    port: str = IO_PORT_NAME
+
+    def describe(self) -> str:
+        details = []
+        if self.port != IO_PORT_NAME:
+            details.append(f"port={self.port}")
+        if self.mask is not None:
+            details.append(f"mask=0x{self.mask:04X}")
+        if details:
+            return f"io.write({', '.join(details)})"
+        return "io.write()"
+
+
+@dataclass(frozen=True)
 class IRStackDuplicate(IRNode):
     """Duplicate the value currently at the top of the VM stack."""
 
@@ -849,6 +899,8 @@ __all__ = [
     "IRStore",
     "IRIndirectLoad",
     "IRIndirectStore",
+    "IRIORead",
+    "IRIOWrite",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRAsciiHeader",
