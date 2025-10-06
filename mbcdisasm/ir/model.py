@@ -697,6 +697,57 @@ class IRRaw(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTailcallReturn(IRNode):
+    """Bundle that represents a tail call immediately followed by a return."""
+
+    target: int
+    args: Tuple[str, ...]
+    returns: int
+    varargs: bool = False
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    tail: bool = True
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    symbol: Optional[str] = None
+    predicate: Optional[CallPredicate] = None
+
+    def describe(self) -> str:
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        args = ", ".join(self.args)
+        details = [f"returns={self.returns}"]
+        if self.varargs:
+            details.append("varargs")
+        if self.shuffle is not None:
+            details.append(f"shuffle={_format_operand(self.shuffle)}")
+        if self.cleanup_mask is not None:
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            details.append(f"cleanup=[{rendered}]")
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.predicate is not None:
+            details.append(f"predicate={self.predicate.describe()}")
+        suffix = " ".join(details)
+        return f"tailcall_return target={target_repr} args=[{args}] {suffix}".rstrip()
+
+
+@dataclass(frozen=True)
+class IRConditionMask(IRNode):
+    """High level view of flag fan-out and RET_MASK terminators."""
+
+    source: str
+    mask: int
+
+    def describe(self) -> str:
+        mask_repr = _format_operand(self.mask)
+        return f"condition_mask source={self.source} mask={mask_repr}"
+
+
+@dataclass(frozen=True)
 class IRBlock:
     """Single basic block in the IR programme."""
 
@@ -782,8 +833,8 @@ __all__ = [
     "IRProgram",
     "IRSegment",
     "IRBlock",
-    "IRCall",
-    "IRReturn",
+    "IRCall", 
+    "IRReturn", 
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
@@ -802,6 +853,8 @@ __all__ = [
     "IRStackDrop",
     "IRAsciiHeader",
     "IRCallReturn",
+    "IRTailcallReturn",
+    "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
     "IRAsciiPreamble",

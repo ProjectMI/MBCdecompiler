@@ -26,6 +26,8 @@ from .model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRTailcallReturn,
+    IRConditionMask,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
@@ -349,6 +351,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_call_return_templates(items)
+        self._pass_condition_masks(items)
         self._pass_call_predicates(items)
         self._pass_indirect_access(items, metrics)
 
@@ -1352,7 +1355,7 @@ class IRNormalizer:
                 offset = index + 1
                 cleanup_steps: List[IRStackEffect] = list(call.cleanup)
                 cleanup_mask = call.cleanup_mask
-                tail = call.tail
+                base_tail = call.tail
                 consumed = 0
 
                 while offset < len(items):
@@ -1361,7 +1364,6 @@ class IRNormalizer:
                         cleanup_steps.extend(candidate.steps)
                         offset += 1
                         consumed += 1
-                        tail = False
                         continue
                     if (
                         isinstance(candidate, RawInstruction)
@@ -1372,31 +1374,73 @@ class IRNormalizer:
                         cleanup_mask = RET_MASK
                         offset += 1
                         consumed += 1
-                        tail = False
                         continue
                     break
 
+                tail_hint = base_tail
+                if cleanup_mask == RET_MASK:
+                    tail_hint = True
+
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
-                    if return_node.cleanup:
-                        tail = False
                     combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
-                    node = IRCallReturn(
-                        target=call.target,
-                        args=call.args,
-                        tail=tail and consumed == 0,
-                        returns=return_node.values,
-                        varargs=return_node.varargs,
-                        cleanup=combined_cleanup,
-                        arity=call.arity,
-                        shuffle=call.shuffle,
-                        cleanup_mask=cleanup_mask,
-                        symbol=call.symbol,
-                        predicate=call.predicate,
+                    varargs = return_node.varargs
+                    return_count = len(return_node.values)
+                    should_bundle = tail_hint and (
+                        base_tail or (return_count == 0 and not varargs)
                     )
+
+                    if should_bundle:
+                        node = IRTailcallReturn(
+                            target=call.target,
+                            args=call.args,
+                            returns=return_count,
+                            varargs=varargs,
+                            cleanup=combined_cleanup,
+                            tail=True,
+                            arity=call.arity,
+                            shuffle=call.shuffle,
+                            cleanup_mask=cleanup_mask,
+                            symbol=call.symbol,
+                            predicate=call.predicate,
+                        )
+                    else:
+                        tail = base_tail and consumed == 0 and not return_node.cleanup
+                        if not tail and cleanup_mask == RET_MASK and consumed == 0 and not return_node.cleanup:
+                            tail = True
+                        node = IRCallReturn(
+                            target=call.target,
+                            args=call.args,
+                            tail=tail,
+                            returns=return_node.values,
+                            varargs=varargs,
+                            cleanup=combined_cleanup,
+                            arity=call.arity,
+                            shuffle=call.shuffle,
+                            cleanup_mask=cleanup_mask,
+                            symbol=call.symbol,
+                            predicate=call.predicate,
+                        )
                     self._transfer_ssa(call, node)
                     end = offset + 1
                     items.replace_slice(index, end, [node])
+                    continue
+            index += 1
+
+    def _pass_condition_masks(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRCallCleanup) and len(item.steps) == 1:
+                step = item.steps[0]
+                if step.mnemonic == "fanout" and step.operand == RET_MASK:
+                    node = IRConditionMask(source="fanout", mask=step.operand)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+            if isinstance(item, RawInstruction):
+                if item.operand == RET_MASK and item.mnemonic in {"terminator", "op_29_10"}:
+                    node = IRConditionMask(source=item.mnemonic, mask=item.operand)
+                    items.replace_slice(index, index + 1, [node])
                     continue
             index += 1
 
@@ -1406,7 +1450,13 @@ class IRNormalizer:
             call = items[index]
             if not isinstance(
                 call,
-                (IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii),
+                (
+                    IRCall,
+                    IRCallReturn,
+                    IRAsciiWrapperCall,
+                    IRTailcallAscii,
+                    IRTailcallReturn,
+                ),
             ):
                 index += 1
                 continue
@@ -1450,7 +1500,7 @@ class IRNormalizer:
         scan = index + 1
         while scan < len(items):
             candidate = items[scan]
-            if isinstance(candidate, IRCallCleanup):
+            if isinstance(candidate, (IRCallCleanup, IRConditionMask)):
                 scan += 1
                 continue
             if isinstance(candidate, RawInstruction) and candidate.mnemonic in CALL_PREDICATE_SKIP_MNEMONICS:
@@ -1493,9 +1543,21 @@ class IRNormalizer:
 
     def _call_with_predicate(
         self,
-        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        node: Union[
+            IRCall,
+            IRCallReturn,
+            IRAsciiWrapperCall,
+            IRTailcallAscii,
+            IRTailcallReturn,
+        ],
         predicate: CallPredicate,
-    ) -> Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii]:
+    ) -> Union[
+        IRCall,
+        IRCallReturn,
+        IRAsciiWrapperCall,
+        IRTailcallAscii,
+        IRTailcallReturn,
+    ]:
         if isinstance(node, IRCall):
             return IRCall(
                 target=node.target,
@@ -1554,6 +1616,21 @@ class IRNormalizer:
                 predicate=predicate,
             )
 
+        if isinstance(node, IRTailcallReturn):
+            return IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                shuffle=node.shuffle,
+                cleanup_mask=node.cleanup_mask,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
         return node
 
     def _pass_call_contracts(self, items: _ItemList) -> None:
@@ -1567,6 +1644,7 @@ class IRNormalizer:
                     IRCallReturn,
                     IRAsciiWrapperCall,
                     IRTailcallAscii,
+                    IRTailcallReturn,
                 ),
             ):
                 index += 1
@@ -1584,7 +1662,13 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        node: Union[
+            IRCall,
+            IRCallReturn,
+            IRAsciiWrapperCall,
+            IRTailcallAscii,
+            IRTailcallReturn,
+        ],
         signature: CallSignature,
     ) -> int:
         current_index = index
@@ -1806,7 +1890,13 @@ class IRNormalizer:
 
     def _rebuild_call_node(
         self,
-        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        node: Union[
+            IRCall,
+            IRCallReturn,
+            IRAsciiWrapperCall,
+            IRTailcallAscii,
+            IRTailcallReturn,
+        ],
         *,
         tail: bool,
         arity: Optional[int],
@@ -1816,7 +1906,13 @@ class IRNormalizer:
         predicate: Optional[CallPredicate],
         target: int,
         signature: CallSignature,
-    ) -> Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii]:
+    ) -> Union[
+        IRCall,
+        IRCallReturn,
+        IRAsciiWrapperCall,
+        IRTailcallAscii,
+        IRTailcallReturn,
+    ]:
         if isinstance(node, IRCall):
             return IRCall(
                 target=target,
@@ -1872,6 +1968,24 @@ class IRNormalizer:
                 returns=returns,
                 varargs=node.varargs,
                 cleanup=cleanup,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRTailcallReturn):
+            returns = node.returns
+            if signature.returns is not None and not node.varargs:
+                returns = max(signature.returns, 0)
+            return IRTailcallReturn(
+                target=target,
+                args=node.args,
+                returns=returns,
+                varargs=node.varargs,
+                cleanup=cleanup,
+                tail=tail,
                 arity=arity,
                 shuffle=shuffle,
                 cleanup_mask=cleanup_mask,
