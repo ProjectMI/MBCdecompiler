@@ -5,15 +5,29 @@
     "cleanup": [
       {"mnemonic": "stack_teardown", "pops": 1}
     ],
+    "shuffle": "0x4B08",
     "shuffle_options": ["0x4B08", "0x3032", "0x7223"],
-    "postlude": [
+    "prelude": [
       {
         "kind": "raw",
-        "mnemonic": "op_29_10",
-        "operand": "0x2910",
-        "cleanup_mask": "0x2910",
-        "tail": true
+        "mnemonic": "op_F0_4B",
+        "operand": "0x4B08",
+        "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"}
       },
+      {
+        "kind": "raw",
+        "mnemonic": "op_5E_29",
+        "operand": "0x2910",
+        "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"}
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_6C_01",
+        "operand": "0x6C01",
+        "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"}
+      }
+    ],
+    "postlude": [
       {
         "kind": "raw",
         "mnemonic": "op_70_29",
@@ -31,8 +45,7 @@
         "mnemonic": "op_06_66",
         "effect": {"mnemonic": "op_06_66", "inherit_operand": true},
         "optional": true
-      },
-      {"kind": "testset", "optional": true}
+      }
     ]
   }
 }
