@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Optional, Tuple
 
+from ..constants import OPERAND_ALIASES
+
 
 class MemSpace(Enum):
     """High level classification of indirect memory accesses."""
@@ -125,9 +127,9 @@ class IRCall(IRNode):
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.shuffle is not None:
-            details.append(f"shuffle=0x{self.shuffle:04X}")
+            details.append(f"shuffle={_format_operand(self.shuffle)}")
         if self.cleanup_mask is not None:
-            details.append(f"mask=0x{self.cleanup_mask:04X}")
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
@@ -315,9 +317,9 @@ class IRAsciiWrapperCall(IRNode):
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.shuffle is not None:
-            details.append(f"shuffle=0x{self.shuffle:04X}")
+            details.append(f"shuffle={_format_operand(self.shuffle)}")
         if self.cleanup_mask is not None:
-            details.append(f"mask=0x{self.cleanup_mask:04X}")
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
@@ -356,9 +358,9 @@ class IRTailcallAscii(IRNode):
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.shuffle is not None:
-            details.append(f"shuffle=0x{self.shuffle:04X}")
+            details.append(f"shuffle={_format_operand(self.shuffle)}")
         if self.cleanup_mask is not None:
-            details.append(f"mask=0x{self.cleanup_mask:04X}")
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
@@ -646,9 +648,9 @@ class IRCallReturn(IRNode):
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.shuffle is not None:
-            details.append(f"shuffle=0x{self.shuffle:04X}")
+            details.append(f"shuffle={_format_operand(self.shuffle)}")
         if self.cleanup_mask is not None:
-            details.append(f"mask=0x{self.cleanup_mask:04X}")
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
@@ -814,3 +816,16 @@ __all__ = [
     "SSAValueKind",
     "NormalizerMetrics",
 ]
+
+
+def _format_operand(value: int) -> str:
+    hex_value = f"0x{value:04X}"
+    alias = OPERAND_ALIASES.get(value)
+    if alias:
+        alias_text = alias if isinstance(alias, str) else str(alias)
+        upper = alias_text.upper()
+        if upper.startswith("0X"):
+            alias_text = upper
+        return alias_text if alias_text == hex_value else f"{alias_text}({hex_value})"
+    return hex_value
+

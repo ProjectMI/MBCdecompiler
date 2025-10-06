@@ -63,6 +63,7 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
 CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "stack_shuffle", "fanout"}
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
+CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -348,6 +349,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_call_return_templates(items)
+        self._pass_call_predicates(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -1348,29 +1350,211 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
-                if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = cleanup_steps + items[offset].steps
-                    offset += 1
+                cleanup_steps: List[IRStackEffect] = list(call.cleanup)
+                cleanup_mask = call.cleanup_mask
+                tail = call.tail
+                consumed = 0
+
+                while offset < len(items):
+                    candidate = items[offset]
+                    if isinstance(candidate, IRCallCleanup):
+                        cleanup_steps.extend(candidate.steps)
+                        offset += 1
+                        consumed += 1
+                        tail = False
+                        continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and candidate.mnemonic == "op_29_10"
+                        and candidate.operand == RET_MASK
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        cleanup_mask = RET_MASK
+                        offset += 1
+                        consumed += 1
+                        tail = False
+                        continue
+                    break
+
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
+                    if return_node.cleanup:
+                        tail = False
+                    combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
                     node = IRCallReturn(
                         target=call.target,
                         args=call.args,
-                        tail=call.tail,
+                        tail=tail and consumed == 0,
                         returns=return_node.values,
                         varargs=return_node.varargs,
-                        cleanup=cleanup_steps + return_node.cleanup,
+                        cleanup=combined_cleanup,
                         arity=call.arity,
                         shuffle=call.shuffle,
-                        cleanup_mask=call.cleanup_mask,
+                        cleanup_mask=cleanup_mask,
                         symbol=call.symbol,
                         predicate=call.predicate,
                     )
+                    self._transfer_ssa(call, node)
                     end = offset + 1
                     items.replace_slice(index, end, [node])
                     continue
             index += 1
+
+    def _pass_call_predicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items) - 1:
+            call = items[index]
+            if not isinstance(
+                call,
+                (IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii),
+            ):
+                index += 1
+                continue
+
+            if getattr(call, "predicate", None) is not None:
+                index += 1
+                continue
+
+            extracted = self._extract_call_predicate(items, index)
+            if extracted is None:
+                index += 1
+                continue
+
+            predicate, branch_index, alias = extracted
+            updated = self._call_with_predicate(call, predicate)
+            self._transfer_ssa(call, updated)
+            items.replace_slice(index, index + 1, [updated])
+
+            branch = items[branch_index]
+            if isinstance(branch, IRTestSetBranch) and branch.expr != alias:
+                updated_branch = IRTestSetBranch(
+                    var=branch.var,
+                    expr=alias,
+                    then_target=branch.then_target,
+                    else_target=branch.else_target,
+                )
+                items.replace_slice(branch_index, branch_index + 1, [updated_branch])
+            elif isinstance(branch, IRIf) and branch.condition != alias:
+                updated_branch = IRIf(
+                    condition=alias,
+                    then_target=branch.then_target,
+                    else_target=branch.else_target,
+                )
+                items.replace_slice(branch_index, branch_index + 1, [updated_branch])
+
+            index += 1
+
+    def _extract_call_predicate(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[CallPredicate, int, str]]:
+        scan = index + 1
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, IRCallCleanup):
+                scan += 1
+                continue
+            if isinstance(candidate, RawInstruction) and candidate.mnemonic in CALL_PREDICATE_SKIP_MNEMONICS:
+                scan += 1
+                continue
+            break
+
+        if scan >= len(items):
+            return None
+
+        branch = items[scan]
+        call = items[index]
+        alias = self._ssa_value(call)
+        if not alias or alias == "stack_top":
+            raw_name = f"call_predicate_{id(call)}"
+            self._record_ssa(call, (raw_name,))
+            self._promote_ssa_kind(raw_name, SSAValueKind.BOOLEAN)
+            alias = self._render_ssa(raw_name)
+
+        if isinstance(branch, IRIf):
+            predicate = CallPredicate(
+                kind="if",
+                expr=alias,
+                then_target=branch.then_target,
+                else_target=branch.else_target,
+            )
+            return predicate, scan, alias
+
+        if isinstance(branch, IRTestSetBranch):
+            predicate = CallPredicate(
+                kind="testset",
+                var=branch.var,
+                expr=alias,
+                then_target=branch.then_target,
+                else_target=branch.else_target,
+            )
+            return predicate, scan, alias
+
+        return None
+
+    def _call_with_predicate(
+        self,
+        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        predicate: CallPredicate,
+    ) -> Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii]:
+        if isinstance(node, IRCall):
+            return IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                shuffle=node.shuffle,
+                cleanup_mask=node.cleanup_mask,
+                cleanup=node.cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRCallReturn):
+            return IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                arity=node.arity,
+                shuffle=node.shuffle,
+                cleanup_mask=node.cleanup_mask,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRAsciiWrapperCall):
+            return IRAsciiWrapperCall(
+                target=node.target,
+                args=node.args,
+                ascii_chunks=node.ascii_chunks,
+                tail=node.tail,
+                arity=node.arity,
+                shuffle=node.shuffle,
+                cleanup_mask=node.cleanup_mask,
+                cleanup=node.cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        if isinstance(node, IRTailcallAscii):
+            return IRTailcallAscii(
+                target=node.target,
+                args=node.args,
+                ascii_chunks=node.ascii_chunks,
+                condition=node.condition,
+                then_target=node.then_target,
+                else_target=node.else_target,
+                arity=node.arity,
+                shuffle=node.shuffle,
+                cleanup_mask=node.cleanup_mask,
+                cleanup=node.cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+
+        return node
 
     def _pass_call_contracts(self, items: _ItemList) -> None:
         index = 0
