@@ -26,6 +26,8 @@ from .model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRTailcallReturnBundle,
+    IRConditionMask,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
@@ -350,6 +352,7 @@ class IRNormalizer:
         self._pass_call_contracts(items)
         self._pass_call_return_templates(items)
         self._pass_call_predicates(items)
+        self._pass_condition_masks(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -1346,58 +1349,97 @@ class IRNormalizer:
 
     def _pass_call_return_templates(self, items: _ItemList) -> None:
         index = 0
+        call_types = (IRCall, IRAsciiWrapperCall, IRTailcallAscii)
         while index < len(items) - 1:
-            call = items[index]
-            if isinstance(call, IRCall):
-                offset = index + 1
-                cleanup_steps: List[IRStackEffect] = list(call.cleanup)
-                cleanup_mask = call.cleanup_mask
-                tail = call.tail
-                consumed = 0
+            candidate = items[index]
+            if not isinstance(candidate, call_types):
+                index += 1
+                continue
 
-                while offset < len(items):
-                    candidate = items[offset]
-                    if isinstance(candidate, IRCallCleanup):
-                        cleanup_steps.extend(candidate.steps)
-                        offset += 1
-                        consumed += 1
-                        tail = False
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and candidate.mnemonic == "op_29_10"
-                        and candidate.operand == RET_MASK
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        cleanup_mask = RET_MASK
-                        offset += 1
-                        consumed += 1
-                        tail = False
-                        continue
-                    break
+            call = candidate
+            offset = index + 1
+            cleanup_steps: List[IRStackEffect] = list(call.cleanup)
+            cleanup_mask = call.cleanup_mask
+            original_tail = getattr(call, "tail", False)
+            has_interleaved_cleanup = False
+            literal_indices: List[int] = []
+            extra_ascii_chunks: List[str] = []
 
-                if offset < len(items) and isinstance(items[offset], IRReturn):
-                    return_node = items[offset]
-                    if return_node.cleanup:
-                        tail = False
-                    combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
-                    node = IRCallReturn(
+            while offset < len(items):
+                follower = items[offset]
+                if isinstance(follower, IRCallCleanup):
+                    cleanup_steps.extend(follower.steps)
+                    offset += 1
+                    has_interleaved_cleanup = True
+                    continue
+                if isinstance(follower, IRLiteralChunk):
+                    extra_ascii_chunks.append(follower.describe())
+                    literal_indices.append(offset)
+                    offset += 1
+                    continue
+                if isinstance(follower, IRLiteral):
+                    literal_indices.append(offset)
+                    offset += 1
+                    continue
+                if (
+                    isinstance(follower, RawInstruction)
+                    and follower.mnemonic == "op_29_10"
+                    and follower.operand == RET_MASK
+                ):
+                    cleanup_steps.append(self._call_cleanup_effect(follower))
+                    cleanup_mask = RET_MASK
+                    offset += 1
+                    has_interleaved_cleanup = True
+                    continue
+                break
+
+            if offset < len(items) and isinstance(items[offset], IRReturn):
+                return_node = items[offset]
+                if return_node.cleanup:
+                    has_interleaved_cleanup = True
+                combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
+                for removal in sorted(literal_indices, reverse=True):
+                    items.pop(removal)
+                    if removal < offset:
+                        offset -= 1
+                base_ascii = list(getattr(call, "ascii_chunks", tuple()))
+                ascii_chunks: Tuple[str, ...] = tuple(base_ascii + extra_ascii_chunks)
+                predicate = getattr(call, "predicate", None)
+
+                if original_tail:
+                    node: IRNode = IRTailcallReturnBundle(
                         target=call.target,
                         args=call.args,
-                        tail=tail and consumed == 0,
                         returns=return_node.values,
                         varargs=return_node.varargs,
                         cleanup=combined_cleanup,
-                        arity=call.arity,
-                        shuffle=call.shuffle,
+                        arity=getattr(call, "arity", None),
+                        shuffle=getattr(call, "shuffle", None),
                         cleanup_mask=cleanup_mask,
-                        symbol=call.symbol,
-                        predicate=call.predicate,
+                        symbol=getattr(call, "symbol", None),
+                        predicate=predicate,
+                        ascii_chunks=ascii_chunks,
                     )
-                    self._transfer_ssa(call, node)
-                    end = offset + 1
-                    items.replace_slice(index, end, [node])
-                    continue
+                else:
+                    node = IRCallReturn(
+                        target=call.target,
+                        args=call.args,
+                        tail=original_tail and not has_interleaved_cleanup,
+                        returns=return_node.values,
+                        varargs=return_node.varargs,
+                        cleanup=combined_cleanup,
+                        arity=getattr(call, "arity", None),
+                        shuffle=getattr(call, "shuffle", None),
+                        cleanup_mask=cleanup_mask,
+                        symbol=getattr(call, "symbol", None),
+                        predicate=predicate,
+                    )
+
+                self._transfer_ssa(call, node)
+                end = offset + 1
+                items.replace_slice(index, end, [node])
+                continue
+
             index += 1
 
     def _pass_call_predicates(self, items: _ItemList) -> None:
@@ -1406,7 +1448,13 @@ class IRNormalizer:
             call = items[index]
             if not isinstance(
                 call,
-                (IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii),
+                (
+                    IRCall,
+                    IRCallReturn,
+                    IRTailcallReturnBundle,
+                    IRAsciiWrapperCall,
+                    IRTailcallAscii,
+                ),
             ):
                 index += 1
                 continue
@@ -1493,9 +1541,21 @@ class IRNormalizer:
 
     def _call_with_predicate(
         self,
-        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        node: Union[
+            IRCall,
+            IRCallReturn,
+            IRTailcallReturnBundle,
+            IRAsciiWrapperCall,
+            IRTailcallAscii,
+        ],
         predicate: CallPredicate,
-    ) -> Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii]:
+    ) -> Union[
+        IRCall,
+        IRCallReturn,
+        IRTailcallReturnBundle,
+        IRAsciiWrapperCall,
+        IRTailcallAscii,
+    ]:
         if isinstance(node, IRCall):
             return IRCall(
                 target=node.target,
@@ -1522,6 +1582,21 @@ class IRNormalizer:
                 cleanup_mask=node.cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+            )
+
+        if isinstance(node, IRTailcallReturnBundle):
+            return IRTailcallReturnBundle(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                arity=node.arity,
+                shuffle=node.shuffle,
+                cleanup_mask=node.cleanup_mask,
+                symbol=node.symbol,
+                predicate=predicate,
+                ascii_chunks=node.ascii_chunks,
             )
 
         if isinstance(node, IRAsciiWrapperCall):
@@ -1556,6 +1631,37 @@ class IRNormalizer:
 
         return node
 
+    def _pass_condition_masks(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRCallCleanup) and len(item.steps) == 1:
+                step = item.steps[0]
+                if step.mnemonic == "fanout" and step.operand == RET_MASK:
+                    node = IRConditionMask(mask=step.operand, source="fanout", pops=step.pops)
+                    items.replace_slice(index, index + 1, [node])
+                    index += 1
+                    continue
+
+            if isinstance(item, RawInstruction):
+                if item.mnemonic == "fanout" and item.operand == RET_MASK:
+                    node = IRConditionMask(mask=item.operand, source="fanout")
+                    self._transfer_ssa(item, node)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+                if item.mnemonic == "terminator" and item.operand == RET_MASK:
+                    node = IRConditionMask(mask=item.operand, source="terminator")
+                    self._transfer_ssa(item, node)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+
+            if isinstance(item, IRRaw) and item.mnemonic == "terminator" and item.operand == RET_MASK:
+                node = IRConditionMask(mask=item.operand, source="terminator")
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            index += 1
+
     def _pass_call_contracts(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1565,6 +1671,7 @@ class IRNormalizer:
                 (
                     IRCall,
                     IRCallReturn,
+                    IRTailcallReturnBundle,
                     IRAsciiWrapperCall,
                     IRTailcallAscii,
                 ),
@@ -1584,7 +1691,13 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        node: Union[
+            IRCall,
+            IRCallReturn,
+            IRTailcallReturnBundle,
+            IRAsciiWrapperCall,
+            IRTailcallAscii,
+        ],
         signature: CallSignature,
     ) -> int:
         current_index = index
@@ -1806,7 +1919,13 @@ class IRNormalizer:
 
     def _rebuild_call_node(
         self,
-        node: Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii],
+        node: Union[
+            IRCall,
+            IRCallReturn,
+            IRTailcallReturnBundle,
+            IRAsciiWrapperCall,
+            IRTailcallAscii,
+        ],
         *,
         tail: bool,
         arity: Optional[int],
@@ -1816,7 +1935,13 @@ class IRNormalizer:
         predicate: Optional[CallPredicate],
         target: int,
         signature: CallSignature,
-    ) -> Union[IRCall, IRCallReturn, IRAsciiWrapperCall, IRTailcallAscii]:
+    ) -> Union[
+        IRCall,
+        IRCallReturn,
+        IRTailcallReturnBundle,
+        IRAsciiWrapperCall,
+        IRTailcallAscii,
+    ]:
         if isinstance(node, IRCall):
             return IRCall(
                 target=target,
@@ -1842,6 +1967,21 @@ class IRNormalizer:
                 cleanup=cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
+            )
+
+        if isinstance(node, IRTailcallReturnBundle):
+            return IRTailcallReturnBundle(
+                target=target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=cleanup,
+                arity=arity,
+                shuffle=shuffle,
+                cleanup_mask=cleanup_mask,
+                symbol=node.symbol,
+                predicate=predicate,
+                ascii_chunks=node.ascii_chunks,
             )
 
         if isinstance(node, IRTailcallAscii):

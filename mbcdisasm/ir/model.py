@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ..constants import OPERAND_ALIASES
 
@@ -562,6 +562,20 @@ class IRCallCleanup(IRNode):
 
 
 @dataclass(frozen=True)
+class IRConditionMask(IRNode):
+    """Normalised representation of RET_MASK driven condition updates."""
+
+    mask: int
+    source: str
+    pops: int = 0
+
+    def describe(self) -> str:
+        mask_repr = _format_operand(self.mask)
+        suffix = f" pop={self.pops}" if self.pops else ""
+        return f"condition_mask source={self.source} mask={mask_repr}{suffix}"
+
+
+@dataclass(frozen=True)
 class IRTailcallFrame(IRNode):
     """Canonical frame setup that precedes the VM tailcall helpers."""
 
@@ -657,6 +671,60 @@ class IRCallReturn(IRNode):
         return (
             f"{prefix} target={target_repr} args=[{args}] returns=[{ret}]"
             f"{cleanup}{extra}"
+        )
+
+
+@dataclass(frozen=True)
+class IRTailcallReturnBundle(IRNode):
+    """Combined representation of tailcall/return epilogues."""
+
+    target: int
+    args: Tuple[str, ...]
+    returns: Tuple[str, ...]
+    varargs: bool = False
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    symbol: Optional[str] = None
+    predicate: Optional[CallPredicate] = None
+    ascii_chunks: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+
+        args = ", ".join(self.args)
+        cleanup = ""
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            cleanup = f" cleanup=[{rendered}]"
+
+        returns_repr = "varargs" if self.varargs else str(len(self.returns))
+        values_note = ""
+        if not self.varargs and self.returns:
+            values_note = f" values=[{', '.join(self.returns)}]"
+        elif self.varargs and self.returns:
+            values_note = f" values=[{', '.join(self.returns)}]"
+
+        details: List[str] = []
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle is not None:
+            details.append(f"shuffle={_format_operand(self.shuffle)}")
+        if self.cleanup_mask is not None:
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
+        if self.predicate is not None:
+            details.append(f"predicate={self.predicate.describe()}")
+        if self.ascii_chunks:
+            rendered = ", ".join(self.ascii_chunks)
+            details.append(f"ascii=[{rendered}]")
+
+        suffix = f" {' '.join(details)}" if details else ""
+        return (
+            f"tailcall_return target={target_repr} args=[{args}] returns={returns_repr}"
+            f"{values_note}{cleanup}{suffix}"
         )
 
 
@@ -802,6 +870,8 @@ __all__ = [
     "IRStackDrop",
     "IRAsciiHeader",
     "IRCallReturn",
+    "IRTailcallReturnBundle",
+    "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
     "IRAsciiPreamble",

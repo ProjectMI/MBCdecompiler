@@ -9,6 +9,8 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRTailcallReturnBundle,
+    IRConditionMask,
     IRAsciiWrapperCall,
     IRTailcallAscii,
     IRIf,
@@ -19,6 +21,7 @@ from mbcdisasm.ir.model import (
     IRRaw,
 )
 from mbcdisasm.mbc import Segment
+from mbcdisasm.constants import RET_MASK
 from mbcdisasm.instruction import InstructionWord
 
 
@@ -65,6 +68,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x30:0x00"],
             "name": "return_values",
             "category": "return_values",
+        },
+        "terminator": {
+            "opcodes": ["0xFF:0x00"],
+            "name": "terminator",
+            "category": "terminator",
         },
         "call_dispatch": {
             "opcodes": ["0x28:0x00"],
@@ -341,6 +349,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             (
                 IRCall,
                 IRCallReturn,
+                IRTailcallReturnBundle,
                 IRAsciiWrapperCall,
                 IRTailcallAscii,
             ),
@@ -402,7 +411,9 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
     assert any(
-        text.startswith("tailcall_ascii") or text.startswith("ascii_wrapper_call tail")
+        text.startswith("tailcall_ascii")
+        or text.startswith("tailcall_return")
+        or text.startswith("ascii_wrapper_call")
         for text in descriptions
     )
     assert any(text.startswith("ascii_header[") for text in descriptions)
@@ -461,6 +472,33 @@ def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
 
     cleanup_rendered = node.describe()
     assert "fanout(flags=FANOUT_FLAGS(0x2C02))" in cleanup_rendered
+
+
+def test_normalizer_groups_condition_masks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x10, 0x08, RET_MASK),  # fanout RET_MASK
+        build_word(4, 0xFF, 0x00, RET_MASK),  # terminator RET_MASK
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    masks = [node for node in block.nodes if isinstance(node, IRConditionMask)]
+    assert [node.source for node in masks] == ["fanout", "terminator"]
+    assert all(node.mask == RET_MASK for node in masks)
+    assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic in {"fanout", "terminator"}
+        for node in block.nodes
+    )
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -608,7 +646,9 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert not call_return.tail
-    assert call_return.cleanup and call_return.cleanup[-1].mnemonic == "stack_teardown"
-    assert call_return.cleanup[-1].pops == 4
+    bundle = next(
+        node for node in block.nodes if isinstance(node, IRTailcallReturnBundle)
+    )
+    assert bundle.cleanup and bundle.cleanup[-1].mnemonic == "stack_teardown"
+    assert bundle.cleanup[-1].pops == 4
+    assert bundle.returns == ("ret0",)
