@@ -258,7 +258,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     )
     assert any(text.startswith("load ") and "[bank=" in text for text in descriptions)
     assert any(text.startswith("store ") and "[bank=" in text for text in descriptions)
-    assert any(text.startswith("load F_") for text in descriptions)
+    assert any("banked F_" in text for text in descriptions)
     assert any("bank=0x11BE" in text for text in descriptions)
 
     renderer = IRTextRenderer()
@@ -314,6 +314,24 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("call_return") for text in descriptions)
     assert any(text.startswith("ascii_wrapper_call target") for text in descriptions)
 
+    kinds = {section.kind for section in program.resources}
+    assert "ascii" in kinds
+    assert "literal_block" in kinds
+    ascii_summaries = [
+        resource.summary or ""
+        for section in program.resources
+        if section.kind == "ascii"
+        for resource in section.resources
+    ]
+    assert any("COND" in summary for summary in ascii_summaries)
+    literal_summaries = [
+        resource.summary or ""
+        for section in program.resources
+        if section.kind == "literal_block"
+        for resource in section.resources
+    ]
+    assert any("literal_block" in summary for summary in literal_summaries)
+
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -337,6 +355,13 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
+    ascii_resources = [
+        resource.summary or ""
+        for section in program.resources
+        if section.kind == "ascii"
+        for resource in section.resources
+    ]
+    assert any("A\\x00B" in summary for summary in ascii_resources)
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

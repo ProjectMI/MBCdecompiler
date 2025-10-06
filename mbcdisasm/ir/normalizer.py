@@ -13,6 +13,7 @@ from ..instruction import read_instructions
 from ..knowledge import KnowledgeBase
 from ..mbc import MbcContainer, Segment
 from .model import (
+    IRAddress,
     IRAsciiFinalize,
     IRAsciiHeader,
     IRAsciiPreamble,
@@ -34,13 +35,16 @@ from .model import (
     IRNode,
     IRProgram,
     IRRaw,
+    IRResource,
+    IRResourceRef,
+    IRResourceSection,
     IRReturn,
     IRSegment,
     IRSlot,
-    MemRef,
     IRStackEffect,
     IRStore,
     IRStackDuplicate,
+    IRAddrCast,
     IRStackDrop,
     IRTailcallAscii,
     IRTablePatch,
@@ -49,6 +53,10 @@ from .model import (
     IRIf,
     IRIndirectLoad,
     IRIndirectStore,
+    IRBankedAddress,
+    IRGlobalAddress,
+    IRIoSlotAddress,
+    IRStackPointerAddress,
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
@@ -147,6 +155,10 @@ class IRNormalizer:
         SSAValueKind.UNKNOWN: "ssa",
         SSAValueKind.INTEGER: "int",
         SSAValueKind.ADDRESS: "addr",
+        SSAValueKind.GLOBAL_ADDRESS: "gaddr",
+        SSAValueKind.BANKED_ADDRESS: "baddr",
+        SSAValueKind.IO_ADDRESS: "io",
+        SSAValueKind.STACK_ADDRESS: "sptr",
         SSAValueKind.POINTER: "ptr",
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
@@ -157,6 +169,10 @@ class IRNormalizer:
         SSAValueKind.INTEGER: 1,
         SSAValueKind.IDENTIFIER: 1,
         SSAValueKind.ADDRESS: 2,
+        SSAValueKind.GLOBAL_ADDRESS: 2,
+        SSAValueKind.BANKED_ADDRESS: 2,
+        SSAValueKind.IO_ADDRESS: 2,
+        SSAValueKind.STACK_ADDRESS: 2,
         SSAValueKind.POINTER: 3,
         SSAValueKind.BOOLEAN: 4,
     }
@@ -171,6 +187,9 @@ class IRNormalizer:
         self._memref_regions: Dict[int, str] = {}
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
+        self._resource_counters: Dict[str, int] = defaultdict(int)
+        self._resources: Dict[str, List[IRResource]] = defaultdict(list)
+        self._resource_lookup: Dict[str, IRResource] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -185,6 +204,10 @@ class IRNormalizer:
         aggregate_metrics = NormalizerMetrics()
         selection = set(segment_indices or [])
 
+        self._resource_counters.clear()
+        self._resources.clear()
+        self._resource_lookup.clear()
+
         for segment in container.segments():
             if selection and segment.index not in selection:
                 continue
@@ -192,7 +215,15 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
-        return IRProgram(segments=tuple(segments), metrics=aggregate_metrics)
+        sections = tuple(
+            IRResourceSection(kind=kind, resources=tuple(resources))
+            for kind, resources in sorted(self._resources.items())
+            if resources
+        )
+
+        return IRProgram(
+            segments=tuple(segments), metrics=aggregate_metrics, resources=sections
+        )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
         raw_blocks = self._parse_segment(segment)
@@ -327,6 +358,7 @@ class IRNormalizer:
 
         self._pass_literals(items, metrics)
         self._pass_ascii_runs(items, metrics)
+        self._pass_promote_resources(items)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -636,6 +668,25 @@ class IRNormalizer:
             items.replace_slice(start, index, [chunk])
             index = start + 1
 
+    def _pass_promote_resources(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRLiteralChunk):
+                resource = self._register_resource(
+                    "ascii", item.data, item.annotations
+                )
+                ref = IRResourceRef(
+                    name=resource.name,
+                    kind=resource.kind,
+                    summary=resource.summary,
+                    annotations=item.annotations,
+                )
+                self._transfer_ssa(item, ref)
+                items.replace_slice(index, index + 1, [ref])
+                continue
+            index += 1
+
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int
     ) -> Tuple[List[str], int]:
@@ -644,7 +695,7 @@ class IRNormalizer:
         scan = call_index - 1
         while scan >= 0:
             candidate = items[scan]
-            if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRResourceRef)):
                 name = self._ssa_value(candidate)
                 args.append(name or candidate.describe())
                 scan -= 1
@@ -848,8 +899,12 @@ class IRNormalizer:
             triplets = tuple(
                 tuple(values[pos : pos + 3]) for pos in range(0, len(values), 3)
             )
+            resource = self._register_literal_block_resource(triplets, tuple())
             return IRLiteralBlock(
-                triplets=triplets, reducer=reducer, reducer_operand=operand
+                triplets=triplets,
+                reducer=reducer,
+                reducer_operand=operand,
+                resource=resource.name,
             )
 
         if len(values) < 6:
@@ -865,11 +920,14 @@ class IRNormalizer:
             return None
 
         tail = tuple(values[trip_count * 3 :])
+        block_triplets = tuple(triplets)
+        resource = self._register_literal_block_resource(block_triplets, tail)
         return IRLiteralBlock(
-            triplets=tuple(triplets),
+            triplets=block_triplets,
             reducer=reducer,
             reducer_operand=operand,
             tail=tail,
+            resource=resource.name,
         )
 
     def _pass_literal_block_reducers(
@@ -887,6 +945,7 @@ class IRNormalizer:
                             reducer=first.mnemonic,
                             reducer_operand=first.operand,
                             tail=second.tail,
+                            resource=second.resource,
                         )
                         self._transfer_ssa(first, updated)
                         items.replace_slice(index, index + 2, [updated])
@@ -993,7 +1052,9 @@ class IRNormalizer:
                 continue
 
             prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+            while prev_index >= 0 and isinstance(
+                items[prev_index], (IRLiteral, IRLiteralChunk, IRResourceRef)
+            ):
                 prev_index -= 1
 
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
@@ -1002,7 +1063,9 @@ class IRNormalizer:
                 continue
 
             next_index = end
-            while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
+            while next_index < len(items) and isinstance(
+                items[next_index], (IRLiteral, IRLiteralChunk, IRResourceRef)
+            ):
                 next_index += 1
 
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
@@ -1100,7 +1163,7 @@ class IRNormalizer:
             summary = ""
             if index > 0:
                 previous = items[index - 1]
-                if isinstance(previous, IRLiteralChunk):
+                if isinstance(previous, (IRLiteralChunk, IRResourceRef)):
                     summary = previous.describe()
                 elif isinstance(previous, IRLiteral):
                     summary = previous.describe()
@@ -1154,6 +1217,7 @@ class IRNormalizer:
             (
                 IRAsciiHeader,
                 IRLiteralChunk,
+                IRResourceRef,
                 IRLiteral,
                 IRCallPreparation,
                 IRCallCleanup,
@@ -1172,7 +1236,7 @@ class IRNormalizer:
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
-                if isinstance(candidate, IRLiteralChunk):
+                if isinstance(candidate, (IRLiteralChunk, IRResourceRef)):
                     ascii_chunks.append(candidate.describe())
                     scan += 1
                     continue
@@ -1220,25 +1284,32 @@ class IRNormalizer:
         if not items:
             return
         chunks: List[str] = []
+        raw_data: List[Optional[bytes]] = []
         index = 0
-        while index < len(items) and isinstance(items[index], IRLiteralChunk):
-            chunks.append(items[index].describe())
+        while index < len(items) and isinstance(
+            items[index], (IRLiteralChunk, IRResourceRef)
+        ):
+            node = items[index]
+            chunks.append(node.describe())
+            if isinstance(node, IRLiteralChunk):
+                raw_data.append(node.data)
+            else:
+                assert isinstance(node, IRResourceRef)
+                raw_data.append(self._resource_data(node))
             index += 1
         if len(chunks) >= 2:
             items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(chunks))])
             return
 
         if len(chunks) == 1:
-            literal = items[0]
-            if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
-                if len(literal.data) % 4 == 0:
-                    parts = []
-                    for pos in range(0, len(literal.data), 4):
-                        segment = literal.data[pos : pos + 4]
-                        piece = IRLiteralChunk(data=segment, source=literal.source)
-                        parts.append(piece.describe())
-                    if len(parts) >= 2:
-                        items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
+            data = raw_data[0]
+            if data and len(data) >= 8 and len(data) % 4 == 0:
+                parts = []
+                for pos in range(0, len(data), 4):
+                    segment = data[pos : pos + 4]
+                    parts.append(self._render_ascii_summary(segment))
+                if len(parts) >= 2:
+                    items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
 
     def _pass_call_return_templates(self, items: _ItemList) -> None:
         index = 0
@@ -1434,7 +1505,9 @@ class IRNormalizer:
                 target_name = item.ssa_values[0] if item.ssa_values else None
                 target_alias = self._render_ssa(target_name) if target_name else "stack"
                 base_name = base_sources[0][0] if base_sources else None
-                memref, index = self._collect_memref(items, index, base_slot, base_name, item)
+                address, index = self._collect_memref(
+                    items, index, base_slot, base_name, item
+                )
                 if base_name is not None:
                     base_alias = self._render_ssa(base_name)
                 node = IRIndirectLoad(
@@ -1442,7 +1515,7 @@ class IRNormalizer:
                     offset=item.operand,
                     target=target_alias,
                     base_slot=base_slot,
-                    ref=memref,
+                    address=address,
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
@@ -1462,7 +1535,9 @@ class IRNormalizer:
                     self._promote_ssa_kind(base_name, SSAValueKind.POINTER)
                 base_alias = self._render_ssa(base_name) if base_name else "stack"
                 value_alias = self._render_ssa(value_name) if value_name else "stack"
-                memref, index = self._collect_memref(items, index, base_slot, base_name, item)
+                address, index = self._collect_memref(
+                    items, index, base_slot, base_name, item
+                )
                 if base_name:
                     base_alias = self._render_ssa(base_name)
                 node = IRIndirectStore(
@@ -1470,7 +1545,7 @@ class IRNormalizer:
                     value=value_alias,
                     offset=item.operand,
                     base_slot=base_slot,
-                    ref=memref,
+                    address=address,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.stores += 1
@@ -1496,7 +1571,7 @@ class IRNormalizer:
                 if name:
                     return name
                 return candidate.describe()
-            elif isinstance(candidate, IRLiteralChunk):
+            elif isinstance(candidate, (IRLiteralChunk, IRResourceRef)):
                 name = self._ssa_value(candidate)
                 if name:
                     return name
@@ -1562,7 +1637,7 @@ class IRNormalizer:
                     scan -= 1
                     continue
                 return candidate.describe()
-            if isinstance(candidate, IRLiteralChunk):
+            if isinstance(candidate, (IRLiteralChunk, IRResourceRef)):
                 mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
                     self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
@@ -1611,7 +1686,7 @@ class IRNormalizer:
         base_slot: Optional[IRSlot],
         base_name: Optional[str],
         instruction: RawInstruction,
-    ) -> Tuple[Optional[MemRef], int]:
+    ) -> Tuple[Optional[IRAddress], int]:
         components: List[Tuple[int, int]] = []
         scan = index - 1
         while scan >= 0:
@@ -1645,19 +1720,34 @@ class IRNormalizer:
         offset = instruction.operand & 0xFF
         region = self._memref_region(base_slot, bank)
         symbol = self._memref_symbol(region, bank, page, offset)
-        memref = MemRef(
-            region=region,
-            bank=bank,
-            base=base_value,
-            page=page,
-            offset=offset,
-            symbol=symbol,
-        )
+
+        address: Optional[IRAddress]
+        if bank is not None:
+            address = IRBankedAddress(
+                bank=bank,
+                page=page,
+                offset=offset,
+                base=base_value,
+                symbol=symbol,
+            )
+        elif base_slot is not None:
+            alias = self._render_ssa(base_name) if base_name else None
+            if base_slot.space is MemSpace.FRAME:
+                address = IRStackPointerAddress(
+                    slot=base_slot,
+                    offset=instruction.operand,
+                    alias=alias,
+                )
+            else:
+                address = IRGlobalAddress(index=instruction.operand)
+        else:
+            address = None
 
         if base_name and symbol:
             self._ssa_aliases[base_name] = symbol
 
-        return memref, index
+        index = self._ensure_address_kind(items, index, base_name, address)
+        return address, index
 
     @staticmethod
     def _is_memref_bridge(node: Union[RawInstruction, IRNode]) -> bool:
@@ -1714,6 +1804,126 @@ class IRNormalizer:
         alias = alias_base if counter == 0 else f"{alias_base}_{counter}"
         self._memref_symbols[key] = alias
         return alias
+
+    def _register_resource(
+        self,
+        kind: str,
+        data: bytes,
+        annotations: Sequence[str] = (),
+        *,
+        summary: Optional[str] = None,
+    ) -> IRResource:
+        index = self._resource_counters[kind]
+        self._resource_counters[kind] += 1
+        name = f"{kind}_{index:04X}"
+        if summary is None:
+            summary = self._summarise_resource(kind, data)
+        resource = IRResource(
+            name=name,
+            kind=kind,
+            data=data,
+            summary=summary,
+            annotations=tuple(annotations),
+        )
+        self._resources[kind].append(resource)
+        self._resource_lookup[name] = resource
+        return resource
+
+    def _register_literal_block_resource(
+        self,
+        triplets: Sequence[Tuple[int, int, int]],
+        tail: Sequence[int],
+    ) -> IRResource:
+        payload = bytearray()
+        for triplet in triplets:
+            for value in triplet:
+                payload.extend(int(value).to_bytes(2, "big", signed=False))
+        for value in tail:
+            payload.extend(int(value).to_bytes(2, "big", signed=False))
+        summary = f"literal_block[{len(triplets)}]"
+        if tail:
+            summary += f"+{len(tail)}"
+        return self._register_resource("literal_block", bytes(payload), summary=summary)
+
+    @staticmethod
+    def _summarise_resource(kind: str, data: bytes) -> Optional[str]:
+        if kind == "ascii":
+            return IRNormalizer._render_ascii_summary(data)
+        return None
+
+    @staticmethod
+    def _render_ascii_summary(data: bytes) -> str:
+        printable: List[str] = []
+        for byte in data:
+            if 0x20 <= byte <= 0x7E:
+                printable.append(chr(byte))
+            elif byte in {0x09, 0x0A, 0x0D}:
+                printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+            else:
+                printable.append(f"\\x{byte:02x}")
+        text = "".join(printable)
+        return f"ascii({text})"
+
+    def _resource_data(self, ref: IRResourceRef) -> Optional[bytes]:
+        resource = self._resource_lookup.get(ref.name)
+        if resource is None:
+            return None
+        return resource.data
+
+    def _classify_address_kind(self, address: IRAddress) -> SSAValueKind:
+        if isinstance(address, IRBankedAddress):
+            return SSAValueKind.BANKED_ADDRESS
+        if isinstance(address, IRStackPointerAddress):
+            return SSAValueKind.STACK_ADDRESS
+        if isinstance(address, IRIoSlotAddress):
+            return SSAValueKind.IO_ADDRESS
+        if isinstance(address, IRGlobalAddress):
+            return SSAValueKind.GLOBAL_ADDRESS
+        return SSAValueKind.ADDRESS
+
+    @staticmethod
+    def _address_space_label(kind: SSAValueKind) -> str:
+        mapping = {
+            SSAValueKind.GLOBAL_ADDRESS: "global",
+            SSAValueKind.BANKED_ADDRESS: "banked",
+            SSAValueKind.IO_ADDRESS: "io_slot",
+            SSAValueKind.STACK_ADDRESS: "stack_ptr",
+            SSAValueKind.ADDRESS: "addr",
+            SSAValueKind.POINTER: "ptr",
+        }
+        return mapping.get(kind, kind.name.lower())
+
+    def _ensure_address_kind(
+        self,
+        items: _ItemList,
+        index: int,
+        name: Optional[str],
+        address: Optional[IRAddress],
+    ) -> int:
+        if not name or address is None:
+            return index
+        desired = self._classify_address_kind(address)
+        current = self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+        if current in {
+            desired,
+            SSAValueKind.UNKNOWN,
+            SSAValueKind.ADDRESS,
+            SSAValueKind.POINTER,
+        }:
+            self._set_ssa_kind(name, desired)
+            return index
+
+        if current != desired:
+            alias = self._render_ssa(name)
+            cast = IRAddrCast(
+                value=alias,
+                source_space=self._address_space_label(current),
+                target_space=self._address_space_label(desired),
+            )
+            items.insert(index, cast)
+            index += 1
+            self._set_ssa_kind(name, desired)
+        return index
 
     @staticmethod
     def _flag_literal_value(text: str) -> Optional[int]:

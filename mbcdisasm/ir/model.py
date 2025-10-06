@@ -21,6 +21,10 @@ class SSAValueKind(Enum):
     UNKNOWN = auto()
     INTEGER = auto()
     ADDRESS = auto()
+    GLOBAL_ADDRESS = auto()
+    BANKED_ADDRESS = auto()
+    IO_ADDRESS = auto()
+    STACK_ADDRESS = auto()
     POINTER = auto()
     BOOLEAN = auto()
     IDENTIFIER = auto()
@@ -34,33 +38,67 @@ class IRSlot:
     index: int
 
 
-@dataclass(frozen=True)
-class MemRef:
-    """Symbolic description of an indirect memory reference."""
+class IRAddress:
+    """Base class for concrete address space descriptors."""
 
-    region: str
-    bank: Optional[int] = None
+    def describe(self) -> str:  # pragma: no cover - subclasses provide details
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class IRGlobalAddress(IRAddress):
+    """Address inside the global data segment."""
+
+    index: int
+
+    def describe(self) -> str:
+        return f"global[0x{self.index:04X}]"
+
+
+@dataclass(frozen=True)
+class IRBankedAddress(IRAddress):
+    """Descriptor for banked memory references."""
+
+    bank: int
+    page: int
+    offset: int
     base: Optional[int] = None
-    page: Optional[int] = None
-    offset: Optional[int] = None
     symbol: Optional[str] = None
 
     def describe(self) -> str:
-        prefix = self.symbol or self.region
-        details = []
-        if self.bank is not None:
-            details.append(f"bank=0x{self.bank:04X}")
+        label = self.symbol or f"bank_{self.bank:04X}"
+        pieces = [f"bank=0x{self.bank:04X}", f"page=0x{self.page:02X}", f"off=0x{self.offset:02X}"]
         if self.base is not None:
-            details.append(f"base=0x{self.base:04X}")
-        if self.page is not None:
-            details.append(f"page=0x{self.page:02X}")
-        if self.offset is not None:
-            width = 2 if self.offset <= 0xFF else 4
-            details.append(f"off=0x{self.offset:0{width}X}")
-        if not details:
-            return prefix
-        inner = ", ".join(details)
-        return f"{prefix}[{inner}]"
+            pieces.append(f"base=0x{self.base:04X}")
+        inner = ", ".join(pieces)
+        return f"banked {label}[{inner}]"
+
+
+@dataclass(frozen=True)
+class IRIoSlotAddress(IRAddress):
+    """Explicit reference to a dedicated IO slot."""
+
+    slot: int
+    alias: Optional[str] = None
+
+    def describe(self) -> str:
+        alias = self.alias or f"0x{self.slot:04X}"
+        return f"io_slot[{alias}]"
+
+
+@dataclass(frozen=True)
+class IRStackPointerAddress(IRAddress):
+    """Address derived from a stack frame slot."""
+
+    slot: IRSlot
+    offset: int = 0
+    alias: Optional[str] = None
+
+    def describe(self) -> str:
+        label = self.alias or f"{self.slot.space.name.lower()}[{self.slot.index}]"
+        if not self.offset:
+            return f"stack_ptr[{label}]"
+        return f"stack_ptr[{label}+0x{self.offset:04X}]"
 
 
 @dataclass(frozen=True)
@@ -223,6 +261,7 @@ class IRLiteralBlock(IRNode):
     reducer: Optional[str] = None
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
+    resource: Optional[str] = None
 
     def describe(self) -> str:
         chunks = []
@@ -237,6 +276,8 @@ class IRLiteralBlock(IRNode):
                 f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
             )
             base += f" via {self.reducer}{operand}"
+        if self.resource:
+            base += f" resource={self.resource}"
         return base
 
 
@@ -366,11 +407,11 @@ class IRIndirectLoad(IRNode):
     offset: int
     target: str
     base_slot: Optional[IRSlot] = None
-    ref: Optional[MemRef] = None
+    address: Optional[IRAddress] = None
 
     def describe(self) -> str:
-        if self.ref is not None:
-            return f"load {self.ref.describe()} -> {self.target}"
+        if self.address is not None:
+            return f"load {self.address.describe()} -> {self.target}"
 
         prefix = self.base
         if self.base_slot is not None:
@@ -390,11 +431,11 @@ class IRIndirectStore(IRNode):
     value: str
     offset: int
     base_slot: Optional[IRSlot] = None
-    ref: Optional[MemRef] = None
+    address: Optional[IRAddress] = None
 
     def describe(self) -> str:
-        if self.ref is not None:
-            return f"store {self.value} -> {self.ref.describe()}"
+        if self.address is not None:
+            return f"store {self.value} -> {self.address.describe()}"
 
         prefix = self.base
         if self.base_slot is not None:
@@ -417,6 +458,18 @@ class IRStackDuplicate(IRNode):
         if self.copies <= 1:
             return f"dup {self.value}"
         return f"dup {self.value} -> copies={self.copies}"
+
+
+@dataclass(frozen=True)
+class IRAddrCast(IRNode):
+    """Explicit conversion between incompatible address spaces."""
+
+    value: str
+    source_space: str
+    target_space: str
+
+    def describe(self) -> str:
+        return f"addr_cast {self.value} {self.source_space}->{self.target_space}"
 
 
 @dataclass(frozen=True)
@@ -516,6 +569,24 @@ class IRAsciiHeader(IRNode):
 
 
 @dataclass(frozen=True)
+class IRResourceRef(IRNode):
+    """Reference to a resource recorded in :class:`IRProgram.resources`."""
+
+    name: str
+    kind: str
+    summary: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        detail = self.name
+        if self.summary:
+            detail += f" {self.summary}"
+        if self.annotations:
+            detail += " " + ", ".join(self.annotations)
+        return f"resource[{self.kind}:{detail}]"
+
+
+@dataclass(frozen=True)
 class IRCallReturn(IRNode):
     """Compact representation for immediate call/return templates."""
 
@@ -602,6 +673,34 @@ class IRProgram:
 
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
+    resources: Tuple["IRResourceSection", ...] = tuple()
+
+
+@dataclass(frozen=True)
+class IRResource:
+    """Concrete blob stored in a resource section."""
+
+    name: str
+    kind: str
+    data: bytes
+    summary: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        base = f"{self.kind} {self.name} size={len(self.data)}"
+        if self.summary:
+            base += f" summary={self.summary}"
+        if self.annotations:
+            base += " annotations=" + ",".join(self.annotations)
+        return base
+
+
+@dataclass(frozen=True)
+class IRResourceSection:
+    """Grouping of resources that share the same kind."""
+
+    kind: str
+    resources: Tuple[IRResource, ...]
 
 
 @dataclass
@@ -678,8 +777,10 @@ __all__ = [
     "IRIndirectLoad",
     "IRIndirectStore",
     "IRStackDuplicate",
+    "IRAddrCast",
     "IRStackDrop",
     "IRAsciiHeader",
+    "IRResourceRef",
     "IRCallReturn",
     "IRLiteral",
     "IRLiteralChunk",
@@ -689,9 +790,15 @@ __all__ = [
     "IRTablePatch",
     "IRAsciiFinalize",
     "IRSlot",
-    "MemRef",
+    "IRAddress",
+    "IRGlobalAddress",
+    "IRBankedAddress",
+    "IRIoSlotAddress",
+    "IRStackPointerAddress",
     "IRRaw",
     "MemSpace",
     "SSAValueKind",
+    "IRResource",
+    "IRResourceSection",
     "NormalizerMetrics",
 ]

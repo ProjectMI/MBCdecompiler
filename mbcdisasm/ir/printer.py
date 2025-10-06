@@ -14,6 +14,15 @@ class IRTextRenderer:
     def render(self, program: IRProgram) -> str:
         lines: List[str] = []
         lines.append("; normalizer metrics: " + program.metrics.describe())
+        if program.resources:
+            lines.append("; resources:")
+            for section in program.resources:
+                header = (
+                    f";   section {section.kind} count={len(section.resources)}"
+                )
+                lines.append(header)
+                for resource in section.resources:
+                    lines.append(f";     {resource.describe()}")
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"
