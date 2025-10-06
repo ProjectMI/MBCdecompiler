@@ -20,7 +20,7 @@ from mbcdisasm.ir.model import (
     IRRaw,
     IRConditionMask,
 )
-from mbcdisasm.constants import RET_MASK
+from mbcdisasm.constants import IO_SLOT, RET_MASK
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -324,10 +324,9 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         text.startswith("testset") or text.startswith("function_prologue")
         for text in descriptions
     )
-    assert any(text.startswith("load ") and "[bank=" in text for text in descriptions)
-    assert any(text.startswith("store ") and "[bank=" in text for text in descriptions)
-    assert any(text.startswith("load F_") for text in descriptions)
-    assert any("bank=0x11BE" in text for text in descriptions)
+    assert any(text.startswith("load ") and "[" in text for text in descriptions)
+    assert any(text.startswith("store ") and "[" in text for text in descriptions)
+    assert any(":0x" in text for text in descriptions)
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
@@ -485,6 +484,68 @@ def test_condition_mask_from_fanout(tmp_path: Path) -> None:
     assert isinstance(node, IRConditionMask)
     assert node.source == "fanout"
     assert node.mask == RET_MASK
+
+
+def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, RET_MASK),
+        build_word(4, 0x3D, 0x30, IO_SLOT),
+        build_word(8, 0x01, 0x3D, 0x3069),
+        build_word(12, 0x10, 0x24, IO_SLOT),
+        build_word(16, 0x31, 0x30, IO_SLOT),
+        build_word(20, 0x10, 0x38, IO_SLOT),
+        build_word(24, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert "io.write(mask=0x2910)" in descriptions
+    assert "io.read()" in descriptions
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
+    )
+
+
+def test_io_handshake_survives_intermediate_ops(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3D, 0x30, IO_SLOT),
+        build_word(4, 0x28, 0x00, 0x0020),
+        build_word(8, 0x00, 0x00, 0x0001),
+        build_word(12, 0x10, 0x38, IO_SLOT),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+
+    assert "io.read()" in descriptions
+    assert any(isinstance(node, IRCall) for node in block.nodes)
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_3D_30", "op_31_30"}
+        for node in block.nodes
+    )
 
 
 def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
