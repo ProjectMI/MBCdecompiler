@@ -145,8 +145,18 @@ def write_manual(path: Path) -> KnowledgeBase:
                 {"mnemonic": "stack_teardown", "pops": 1},
             ],
             "shuffle": "0x4B08",
-            "shuffle_options": ["0x4B08", "0x3032"],
+            "shuffle_options": ["0x4B08", "0x3032", "0x7223"],
             "prelude": [
+                {
+                    "kind": "raw",
+                    "predicate": "literal_marker",
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "predicate": "literal_marker",
+                    "optional": True,
+                },
                 {
                     "kind": "raw",
                     "mnemonic": "op_F0_4B",
@@ -173,6 +183,25 @@ def write_manual(path: Path) -> KnowledgeBase:
                     "effect": {"mnemonic": "op_70_29", "inherit_operand": True},
                     "optional": True,
                 },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_52_05",
+                    "effect": {"mnemonic": "op_52_05", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_32_29",
+                    "effect": {"mnemonic": "op_32_29", "inherit_operand": True},
+                    "cleanup_mask": "0x2910",
+                    "optional": True,
+                },
+                {
+                    "kind": "cleanup",
+                    "predicate": "ascii_epilogue",
+                    "cleanup_mask": "0x2910",
+                    "optional": True,
+                },
             ],
         }
     }
@@ -192,8 +221,10 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
         build_word(20, 0x2B, 0x00, 0x0072),
         build_word(24, 0x29, 0x10, 0x2910),
         build_word(28, 0x70, 0x29, 0x0001),
-        build_word(32, 0x27, 0x00, 0x0008),
-        build_word(36, 0x30, 0x00, 0x0001),
+        build_word(32, 0x52, 0x05, 0x0000),
+        build_word(36, 0x32, 0x29, 0x2910),
+        build_word(40, 0x27, 0x00, 0x0008),
+        build_word(44, 0x30, 0x00, 0x0001),
     ]
     seg1_words = [
         build_word(0, 0x00, 0x00, 0x0003),
@@ -363,6 +394,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         "op_5E_29",
         "op_F0_4B",
         "stack_teardown",
+        "op_52_05",
+        "op_32_29",
     ]
 
     if_nodes = [

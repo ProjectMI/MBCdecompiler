@@ -1878,10 +1878,8 @@ class IRNormalizer:
             return False, [], None, False, None, 0
 
         candidate = items[position]
-        if pattern.kind == "raw" and isinstance(candidate, RawInstruction):
-            if pattern.mnemonic and candidate.mnemonic != pattern.mnemonic:
-                return False, [], None, False, None, 0
-            if pattern.operand is not None and candidate.operand != pattern.operand:
+        if pattern.kind == "raw" and isinstance(candidate, (RawInstruction, IRRaw)):
+            if not self._call_pattern_matches_raw(candidate, pattern):
                 return False, [], None, False, None, 0
             effects: List[IRStackEffect] = []
             if pattern.effect is not None:
@@ -1900,15 +1898,12 @@ class IRNormalizer:
         index: int,
         pattern: CallSignaturePattern,
     ) -> Tuple[bool, List[IRStackEffect], Optional[int], bool, Optional[CallPredicate]]:
-        if index + 1 >= len(items):
+        candidate_index, candidate = self._next_call_pattern_candidate(items, index)
+        if candidate is None:
             return False, [], None, False, None
 
-        candidate = items[index + 1]
-
-        if pattern.kind == "raw" and isinstance(candidate, RawInstruction):
-            if pattern.mnemonic and candidate.mnemonic != pattern.mnemonic:
-                return False, [], None, False, None
-            if pattern.operand is not None and candidate.operand != pattern.operand:
+        if pattern.kind == "raw" and isinstance(candidate, (RawInstruction, IRRaw)):
+            if not self._call_pattern_matches_raw(candidate, pattern):
                 return False, [], None, False, None
             effects: List[IRStackEffect] = []
             if pattern.effect is not None:
@@ -1916,8 +1911,17 @@ class IRNormalizer:
             cleanup_mask = pattern.cleanup_mask
             tail = pattern.tail
             predicate: Optional[CallPredicate] = None
-            items.pop(index + 1)
+            items.pop(candidate_index)
             return True, effects, cleanup_mask, tail, predicate
+
+        if pattern.kind == "cleanup" and isinstance(candidate, IRCallCleanup):
+            if not self._call_pattern_matches_cleanup(candidate, pattern):
+                return False, [], None, False, None
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            effects = list(candidate.steps)
+            items.pop(candidate_index)
+            return True, effects, cleanup_mask, tail, None
 
         if pattern.kind == "testset" and isinstance(candidate, IRTestSetBranch):
             predicate = CallPredicate(
@@ -1958,6 +1962,64 @@ class IRNormalizer:
 
         return False, [], None, False, None
 
+    @staticmethod
+    def _next_call_pattern_candidate(
+        items: _ItemList, index: int
+    ) -> Tuple[Optional[int], Optional[IRNode]]:
+        position = index + 1
+        while position < len(items):
+            candidate = items[position]
+            if isinstance(candidate, IRConditionMask):
+                position += 1
+                continue
+            if isinstance(candidate, RawInstruction) and candidate.mnemonic in CALL_PREDICATE_SKIP_MNEMONICS:
+                position += 1
+                continue
+            return position, candidate
+        return None, None
+
+    def _call_pattern_matches_raw(
+        self, candidate: Union[RawInstruction, IRRaw], pattern: CallSignaturePattern
+    ) -> bool:
+        if pattern.predicate and not self._call_raw_predicate(pattern.predicate, candidate):
+            return False
+        mnemonic = getattr(candidate, "mnemonic", None)
+        if pattern.mnemonic and mnemonic != pattern.mnemonic:
+            return False
+        operand = getattr(candidate, "operand", None)
+        if pattern.operand is not None and operand != pattern.operand:
+            return False
+        return True
+
+    @staticmethod
+    def _call_raw_predicate(
+        predicate: str, candidate: Union[RawInstruction, IRRaw]
+    ) -> bool:
+        if predicate == "literal_marker":
+            profile = getattr(candidate, "profile", None)
+            if profile is not None:
+                return profile.is_literal_marker()
+            mnemonic = getattr(candidate, "mnemonic", "")
+            return mnemonic.startswith("literal_marker")
+        return False
+
+    def _call_pattern_matches_cleanup(
+        self, candidate: IRCallCleanup, pattern: CallSignaturePattern
+    ) -> bool:
+        if pattern.predicate and not self._call_cleanup_predicate(pattern.predicate, candidate):
+            return False
+        if pattern.mnemonic and not any(step.mnemonic == pattern.mnemonic for step in candidate.steps):
+            return False
+        if pattern.operand is not None and not any(step.operand == pattern.operand for step in candidate.steps):
+            return False
+        return True
+
+    @staticmethod
+    def _call_cleanup_predicate(predicate: str, candidate: IRCallCleanup) -> bool:
+        if predicate == "ascii_epilogue":
+            return all(step.mnemonic in {"op_52_05", "op_32_29"} for step in candidate.steps)
+        return False
+
     def _convert_signature_effects(
         self, specs: Sequence[CallSignatureEffect]
     ) -> List[IRStackEffect]:
@@ -1967,26 +2029,39 @@ class IRNormalizer:
         return effects
 
     def _stack_effect_from_signature(
-        self, spec: CallSignatureEffect, instruction: Optional[RawInstruction]
+        self,
+        spec: CallSignatureEffect,
+        instruction: Optional[Union[RawInstruction, IRRaw]],
     ) -> IRStackEffect:
         operand = spec.operand
         operand_role = spec.operand_role
         operand_alias = spec.operand_alias
+        profile = None
         if instruction is not None:
+            operand_value = getattr(instruction, "operand", None)
+            profile = getattr(instruction, "profile", None)
             if operand is None or spec.inherit_operand:
-                operand = instruction.operand
+                if operand_value is not None:
+                    operand = operand_value
             if operand_role is None:
-                operand_role = instruction.profile.operand_role()
+                if profile is not None:
+                    operand_role = profile.operand_role()
+                else:
+                    operand_role = getattr(instruction, "operand_role", None)
             if spec.inherit_alias or operand_alias is None:
-                alias = instruction.profile.operand_alias()
+                alias = None
+                if profile is not None:
+                    alias = profile.operand_alias()
+                else:
+                    alias = getattr(instruction, "operand_alias", None)
                 if alias is not None:
                     operand_alias = alias
         if operand is None:
             operand = 0
 
         pops = spec.pops
-        if instruction is not None and pops == 0:
-            if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
+        if instruction is not None and pops == 0 and profile is not None:
+            if profile.kind is InstructionKind.STACK_TEARDOWN:
                 delta = -instruction.event.delta
                 if delta > 0:
                     pops = delta

@@ -10,6 +10,16 @@
     "prelude": [
       {
         "kind": "raw",
+        "predicate": "literal_marker",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "predicate": "literal_marker",
+        "optional": true
+      },
+      {
+        "kind": "raw",
         "mnemonic": "op_F0_4B",
         "operand": "0x4B08",
         "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"}
@@ -32,6 +42,25 @@
         "kind": "raw",
         "mnemonic": "op_70_29",
         "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_52_05",
+        "effect": {"mnemonic": "op_52_05", "inherit_operand": true},
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_32_29",
+        "effect": {"mnemonic": "op_32_29", "inherit_operand": true},
+        "cleanup_mask": "0x2910",
+        "optional": true
+      },
+      {
+        "kind": "cleanup",
+        "predicate": "ascii_epilogue",
+        "cleanup_mask": "0x2910",
         "optional": true
       },
       {
