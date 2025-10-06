@@ -1892,6 +1892,31 @@ class IRNormalizer:
             items.pop(position)
             return True, effects, cleanup_mask, tail, predicate, 1
 
+        if pattern.kind == "raw" and isinstance(candidate, IRCallCleanup):
+            if len(candidate.steps) != 1:
+                return False, [], None, False, None, 0
+            step = candidate.steps[0]
+            if pattern.mnemonic and step.mnemonic != pattern.mnemonic:
+                return False, [], None, False, None, 0
+            if pattern.operand is not None and step.operand != pattern.operand:
+                return False, [], None, False, None, 0
+            if pattern.effect is not None:
+                effect = self._stack_effect_from_cleanup_step(pattern.effect, step)
+                effects = [effect]
+            else:
+                effects = [IRStackEffect(
+                    mnemonic=step.mnemonic,
+                    operand=step.operand,
+                    pops=step.pops,
+                    operand_role=step.operand_role,
+                    operand_alias=step.operand_alias,
+                )]
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            predicate: Optional[CallPredicate] = None
+            items.pop(position)
+            return True, effects, cleanup_mask, tail, predicate, 1
+
         return False, [], None, False, None, 0
 
     def _consume_call_pattern_after(
@@ -1913,6 +1938,31 @@ class IRNormalizer:
             effects: List[IRStackEffect] = []
             if pattern.effect is not None:
                 effects.append(self._stack_effect_from_signature(pattern.effect, candidate))
+            cleanup_mask = pattern.cleanup_mask
+            tail = pattern.tail
+            predicate: Optional[CallPredicate] = None
+            items.pop(index + 1)
+            return True, effects, cleanup_mask, tail, predicate
+
+        if pattern.kind == "raw" and isinstance(candidate, IRCallCleanup):
+            if len(candidate.steps) != 1:
+                return False, [], None, False, None
+            step = candidate.steps[0]
+            if pattern.mnemonic and step.mnemonic != pattern.mnemonic:
+                return False, [], None, False, None
+            if pattern.operand is not None and step.operand != pattern.operand:
+                return False, [], None, False, None
+            if pattern.effect is not None:
+                effect = self._stack_effect_from_cleanup_step(pattern.effect, step)
+                effects = [effect]
+            else:
+                effects = [IRStackEffect(
+                    mnemonic=step.mnemonic,
+                    operand=step.operand,
+                    pops=step.pops,
+                    operand_role=step.operand_role,
+                    operand_alias=step.operand_alias,
+                )]
             cleanup_mask = pattern.cleanup_mask
             tail = pattern.tail
             predicate: Optional[CallPredicate] = None
@@ -1994,6 +2044,31 @@ class IRNormalizer:
         return IRStackEffect(
             mnemonic=spec.mnemonic,
             operand=operand,
+            pops=pops,
+            operand_role=operand_role,
+            operand_alias=operand_alias,
+        )
+
+    def _stack_effect_from_cleanup_step(
+        self, spec: CallSignatureEffect, step: IRStackEffect
+    ) -> IRStackEffect:
+        operand = spec.operand
+        if operand is None or spec.inherit_operand:
+            operand = step.operand
+
+        operand_role = spec.operand_role
+        if operand_role is None:
+            operand_role = step.operand_role
+
+        operand_alias = spec.operand_alias
+        if spec.inherit_alias or operand_alias is None:
+            operand_alias = step.operand_alias
+
+        pops = spec.pops or step.pops
+
+        return IRStackEffect(
+            mnemonic=spec.mnemonic,
+            operand=operand or 0,
             pops=pops,
             operand_role=operand_role,
             operand_alias=operand_alias,

@@ -611,6 +611,64 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_collapses_tail_helper_72_wrapper_cleanup() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+
+    words = [
+        build_word(0, 0x00, 0x4F, 0x0110),
+        build_word(4, 0x04, 0x00, 0x0000),
+        build_word(8, 0x72, 0x23, 0x4F00),
+        build_word(12, 0x31, 0x30, 0x2C00),
+        build_word(16, 0x66, 0x1B, 0x4B08),
+        build_word(20, 0x00, 0x52, 0x0200),
+        build_word(24, 0x4A, 0x05, 0x0052),
+        build_word(28, 0x03, 0x00, 0x3032),
+        build_word(32, 0x29, 0x10, 0x0072),
+        build_word(36, 0x23, 0x48, 0x2348),
+        build_word(40, 0x23, 0x4F, 0x0031),
+        build_word(44, 0x52, 0x05, 0x0030),
+        build_word(48, 0x32, 0x29, 0x1000),
+        build_word(52, 0x72, 0x23, 0x7C48),
+        build_word(56, 0x23, 0x30, 0x2C00),
+        build_word(60, 0x66, 0x1B, 0x4B08),
+        build_word(64, 0x00, 0x52, 0x0700),
+        build_word(68, 0x4A, 0x05, 0x0052),
+        build_word(72, 0x3D, 0x00, 0x2323),
+        build_word(76, 0x30, 0x2C, 0x0063),
+        build_word(80, 0x05, 0x00, 0x0000),
+        build_word(84, 0x23, 0x4F, 0x0030),
+        build_word(88, 0x69, 0x10, 0x2805),
+        build_word(92, 0x00, 0x00, 0x2910),
+        build_word(96, 0x01, 0xF0, 0x4B03),
+        build_word(100, 0x00, 0x72, 0x3069),
+        build_word(104, 0x10, 0x28, 0x0500),
+        build_word(108, 0x00, 0x29, 0x1001),
+        build_word(112, 0x3D, 0x30, 0x6C01),
+        build_word(116, 0x48, 0x01, 0x0000),
+        build_word(120, 0x14, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
+
+    ascii_call = next(node for node in block.nodes if isinstance(node, IRAsciiWrapperCall))
+    cleanup_mnemonics = [step.mnemonic for step in ascii_call.cleanup]
+    assert cleanup_mnemonics == [
+        "stack_teardown",
+        "op_52_05",
+        "op_32_29",
+        "stack_shuffle",
+    ]
+
+
 def test_normalizer_lifts_branch_predicate_from_call(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

@@ -45,6 +45,16 @@
         "mnemonic": "op_06_66",
         "effect": {"mnemonic": "op_06_66", "inherit_operand": true},
         "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "stack_shuffle",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "fanout",
+        "optional": true
       }
     ]
   }
