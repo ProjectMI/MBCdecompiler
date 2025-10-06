@@ -74,17 +74,54 @@ class IRNode:
 
 
 @dataclass(frozen=True)
+class IRCallSignature:
+    """Metadata extracted from the helper prologue/epilogue around a call."""
+
+    arity: Optional[int] = None
+    shuffle: Optional[int] = None
+    cleanup_mask: Optional[int] = None
+    optional_tail_dispatch: bool = False
+
+    def describe(self) -> str:
+        parts = []
+        if self.arity is not None:
+            parts.append(f"arity={self.arity}")
+        if self.shuffle is not None:
+            parts.append(f"shuffle=0x{self.shuffle:04X}")
+        if self.cleanup_mask is not None:
+            parts.append(f"cleanup_mask=0x{self.cleanup_mask:04X}")
+        if self.optional_tail_dispatch:
+            parts.append("tail_dispatch=optional")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
 class IRCall(IRNode):
     """Invocation of another routine."""
 
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    signature: Optional[IRCallSignature] = None
+    cleanup: Tuple["IRStackEffect", ...] = field(default_factory=tuple)
+    target_symbol: Optional[str] = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
-        return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        target_repr = f"0x{self.target:04X}"
+        if self.target_symbol:
+            target_repr = f"{self.target_symbol}({target_repr})"
+        metadata = ""
+        if self.signature:
+            details = self.signature.describe()
+            if details:
+                metadata = " " + details
+        cleanup = ""
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            cleanup = f" cleanup=[{rendered}]"
+        return f"call{suffix} target={target_repr} args=[{args}]{metadata}{cleanup}"
 
 
 @dataclass(frozen=True)
@@ -525,6 +562,8 @@ class IRCallReturn(IRNode):
     returns: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    signature: Optional[IRCallSignature] = None
+    target_symbol: Optional[str] = None
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -532,11 +571,19 @@ class IRCallReturn(IRNode):
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
+        target_repr = f"0x{self.target:04X}"
+        if self.target_symbol:
+            target_repr = f"{self.target_symbol}({target_repr})"
+        metadata = ""
+        if self.signature:
+            details = self.signature.describe()
+            if details:
+                metadata = " " + details
         cleanup = ""
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             cleanup = f" cleanup=[{rendered}]"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
+        return f"{prefix} target={target_repr} args=[{args}] returns=[{ret}]{metadata}{cleanup}"
 
 
 @dataclass(frozen=True)

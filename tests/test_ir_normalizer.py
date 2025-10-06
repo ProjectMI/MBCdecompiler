@@ -6,14 +6,14 @@ from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
 from mbcdisasm.ir.model import (
     IRCallCleanup,
-    IRCallPreparation,
     IRCallReturn,
-    IRIf,
-    IRReturn,
+    IRCallSignature,
     IRFunctionPrologue,
+    IRIf,
+    IRRaw,
+    IRReturn,
     IRStackEffect,
     IRTestSetBranch,
-    IRRaw,
 )
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
@@ -388,10 +388,12 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
-    assert prep.steps == (("stack_shuffle", 0x4B08), ("op_4A_05", 0x0052))
-
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.target == 0x1234
+    assert isinstance(call_return.signature, IRCallSignature)
+    assert call_return.signature.shuffle == 0x4B08
+    assert call_return.signature.cleanup_mask == 0x1000
+    assert not call_return.signature.optional_tail_dispatch
     assert [step.mnemonic for step in call_return.cleanup] == [
         "call_helpers",
         "op_32_29",
@@ -399,7 +401,6 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     ]
     assert [step.operand for step in call_return.cleanup[:2]] == [0x0001, 0x1000]
     assert call_return.cleanup[-1].pops == 4
-    assert call_return.target == 0x1234
 
     assert not any(
         isinstance(node, IRRaw)
@@ -427,8 +428,9 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    prep = next(node for node in block.nodes if isinstance(node, IRCallPreparation))
-    assert [step[0] for step in prep.steps] == ["stack_shuffle", "stack_shuffle"]
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert isinstance(call_return.signature, IRCallSignature)
+    assert call_return.signature.shuffle == 0x4B10
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
     )

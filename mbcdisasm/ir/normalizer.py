@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..constants import CALL_SHUFFLE_STANDARD
+from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
@@ -25,6 +25,7 @@ from .model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRCallSignature,
     IRFlagCheck,
     IRFunctionPrologue,
     IRLiteral,
@@ -582,7 +583,40 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
-                call = IRCall(target=item.operand, args=tuple(args), tail=mnemonic == "tailcall_dispatch")
+                arity, shuffle, prologue_indices = self._gather_call_prologue(items, index)
+                (
+                    cleanup_indices,
+                    cleanup_steps,
+                    cleanup_mask,
+                    optional_tail_dispatch,
+                    ascii_chunks,
+                ) = self._gather_call_epilogue(items, index)
+
+                for removal in sorted(set(prologue_indices + cleanup_indices), reverse=True):
+                    items.pop(removal)
+                    if removal < index:
+                        index -= 1
+                    if removal < start:
+                        start -= 1
+
+                signature = self._build_call_signature(
+                    arity=arity,
+                    shuffle=shuffle,
+                    cleanup_mask=cleanup_mask,
+                    optional_tail_dispatch=optional_tail_dispatch,
+                )
+                target_symbol = None
+                if mnemonic == "tailcall_dispatch":
+                    target_symbol = self._derive_tail_symbol(ascii_chunks)
+
+                call = IRCall(
+                    target=item.operand,
+                    args=tuple(args),
+                    tail=mnemonic == "tailcall_dispatch",
+                    signature=signature,
+                    cleanup=tuple(cleanup_steps),
+                    target_symbol=target_symbol,
+                )
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
@@ -1024,6 +1058,130 @@ class IRNormalizer:
             items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
             index = start + 1
 
+    def _gather_call_prologue(
+        self, items: _ItemList, call_index: int
+    ) -> Tuple[Optional[int], Optional[int], List[int]]:
+        indices: List[int] = []
+        arity: Optional[int] = None
+        shuffle: Optional[int] = None
+        scan = call_index - 1
+        remaining = 6
+        while scan >= 0 and remaining > 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRLiteral) and self._literal_has_arity_hint(candidate):
+                if arity is None:
+                    arity = (candidate.value >> 8) & 0xFF
+                indices.append(scan)
+                scan -= 1
+                remaining -= 1
+                continue
+            if isinstance(candidate, RawInstruction) and candidate.mnemonic == "op_4A_05":
+                indices.append(scan)
+                scan -= 1
+                remaining -= 1
+                continue
+            if isinstance(candidate, RawInstruction) and candidate.mnemonic == "stack_shuffle":
+                if shuffle is None:
+                    shuffle = candidate.operand
+                indices.append(scan)
+                scan -= 1
+                remaining -= 1
+                continue
+            break
+        return arity, shuffle, indices
+
+    def _literal_has_arity_hint(self, literal: IRLiteral) -> bool:
+        if literal.value & 0xFF:
+            return False
+        arity = (literal.value >> 8) & 0xFF
+        if arity == 0 or arity > 32:
+            return False
+        source = literal.source.lower()
+        if source.startswith("op_00_") or source.startswith("push_literal"):
+            return True
+        return False
+
+    def _gather_call_epilogue(
+        self, items: _ItemList, call_index: int
+    ) -> Tuple[List[int], List[IRStackEffect], Optional[int], bool, List[str]]:
+        cleanup_indices: List[int] = []
+        cleanup_steps: List[IRStackEffect] = []
+        cleanup_mask: Optional[int] = None
+        optional_tail_dispatch = False
+        ascii_chunks: List[str] = []
+        scan = call_index + 1
+        remaining = 16
+        while scan < len(items) and remaining > 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRLiteralChunk):
+                ascii_chunks.append(self._render_ascii_chunk(candidate))
+                scan += 1
+                remaining -= 1
+                continue
+            if isinstance(candidate, IRLiteral):
+                scan += 1
+                remaining -= 1
+                continue
+            if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                cleanup_indices.append(scan)
+                effect = self._call_cleanup_effect(candidate)
+                cleanup_steps.append(effect)
+                if candidate.mnemonic == "op_32_29" and cleanup_mask is None:
+                    cleanup_mask = candidate.operand
+                if effect.mnemonic == "fanout" and effect.operand == RET_MASK:
+                    optional_tail_dispatch = True
+                scan += 1
+                remaining -= 1
+                continue
+            break
+        if cleanup_mask == RET_MASK:
+            optional_tail_dispatch = True
+        return cleanup_indices, cleanup_steps, cleanup_mask, optional_tail_dispatch, ascii_chunks
+
+    @staticmethod
+    def _render_ascii_chunk(chunk: IRLiteralChunk) -> str:
+        parts: List[str] = []
+        for byte in chunk.data:
+            if 0x30 <= byte <= 0x39 or 0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A:
+                parts.append(chr(byte))
+            elif byte == 0:
+                parts.append("_")
+        text = "".join(parts)
+        return text
+
+    @staticmethod
+    def _build_call_signature(
+        *,
+        arity: Optional[int],
+        shuffle: Optional[int],
+        cleanup_mask: Optional[int],
+        optional_tail_dispatch: bool,
+    ) -> Optional[IRCallSignature]:
+        if (
+            arity is None
+            and shuffle is None
+            and cleanup_mask is None
+            and not optional_tail_dispatch
+        ):
+            return None
+        return IRCallSignature(
+            arity=arity,
+            shuffle=shuffle,
+            cleanup_mask=cleanup_mask,
+            optional_tail_dispatch=optional_tail_dispatch,
+        )
+
+    @staticmethod
+    def _derive_tail_symbol(ascii_chunks: Sequence[str]) -> Optional[str]:
+        if not ascii_chunks:
+            return None
+        combined = "".join(ascii_chunks)
+        sanitized = "".join(ch for ch in combined if ch.isalnum() or ch == "_")
+        sanitized = sanitized.strip("_")
+        if not sanitized:
+            return None
+        return sanitized
+
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1246,9 +1404,9 @@ class IRNormalizer:
             call = items[index]
             if isinstance(call, IRCall):
                 offset = index + 1
-                cleanup_steps: Tuple[IRStackEffect, ...] = tuple()
+                cleanup_steps: Tuple[IRStackEffect, ...] = call.cleanup
                 if offset < len(items) and isinstance(items[offset], IRCallCleanup):
-                    cleanup_steps = items[offset].steps
+                    cleanup_steps = cleanup_steps + items[offset].steps
                     offset += 1
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
@@ -1259,6 +1417,8 @@ class IRNormalizer:
                         returns=return_node.values,
                         varargs=return_node.varargs,
                         cleanup=cleanup_steps + return_node.cleanup,
+                        signature=call.signature,
+                        target_symbol=call.target_symbol,
                     )
                     end = offset + 1
                     items.replace_slice(index, end, [node])
