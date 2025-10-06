@@ -120,10 +120,12 @@ class KnowledgeBase:
         *,
         wildcards: Optional[Mapping[int, OpcodeInfo]] = None,
         by_name: Optional[Mapping[str, OpcodeInfo]] = None,
+        addresses: Optional[Mapping[int, str]] = None,
     ) -> None:
         self._annotations: Dict[str, OpcodeInfo] = dict(annotations)
         self._wildcards: Dict[int, OpcodeInfo] = dict(wildcards or {})
         self._by_name: Dict[str, OpcodeInfo] = dict(by_name or {})
+        self._addresses: Dict[int, str] = dict(addresses or {})
 
     @classmethod
     def load(cls, manual_path: Path) -> "KnowledgeBase":
@@ -169,7 +171,25 @@ class KnowledgeBase:
                 wildcard_specs[opcode_value] = entry
 
         wildcard_annotations = _materialise_wildcards(wildcard_specs, by_name)
-        return cls(annotations, wildcards=wildcard_annotations, by_name=by_name)
+
+        address_path = resolved.with_name("address_labels.json")
+        address_map: Dict[int, str] = {}
+        if address_path.exists():
+            raw_addresses = json.loads(address_path.read_text("utf-8"))
+            if isinstance(raw_addresses, Mapping):
+                for key, value in raw_addresses.items():
+                    try:
+                        address = _parse_address(str(key))
+                    except ValueError:
+                        continue
+                    address_map[address] = str(value)
+
+        return cls(
+            annotations,
+            wildcards=wildcard_annotations,
+            by_name=by_name,
+            addresses=address_map,
+        )
 
     def lookup(self, label: str) -> Optional[OpcodeInfo]:
         """Return manual information for the requested opcode label."""
@@ -189,6 +209,11 @@ class KnowledgeBase:
 
         return self._by_name.get(name)
 
+    def address_symbol(self, address: int) -> Optional[str]:
+        """Return a symbolic name for ``address`` when it is known."""
+
+        return self._addresses.get(address)
+
 
 def _parse_component(component: str) -> int:
     """Parse a single opcode component which may be hex or decimal."""
@@ -201,6 +226,19 @@ def _parse_component(component: str) -> int:
         return int(token, 16)
 
     if any(ch in string.hexdigits[10:] for ch in token):
+        return int(token, 16)
+
+    return int(token, 10)
+
+
+def _parse_address(value: str) -> int:
+    """Return the integer value encoded in ``value``."""
+
+    token = value.strip()
+    if not token:
+        raise ValueError("empty address")
+
+    if token.lower().startswith("0x"):
         return int(token, 16)
 
     return int(token, 10)

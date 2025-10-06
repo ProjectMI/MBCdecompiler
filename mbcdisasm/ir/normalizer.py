@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
-from ..constants import CALL_SHUFFLE_STANDARD
+from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
@@ -345,6 +345,7 @@ class IRNormalizer:
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
         self._pass_call_return_templates(items)
+        self._attach_call_context(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -945,7 +946,7 @@ class IRNormalizer:
                 continue
 
             start = index
-            steps: List[Tuple[str, int]] = []
+            steps: List[IRStackEffect] = []
             scan = index - 1
             while scan >= 0:
                 candidate = items[scan]
@@ -1265,6 +1266,70 @@ class IRNormalizer:
                     continue
             index += 1
 
+    def _attach_call_context(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, (IRCall, IRCallReturn)):
+                index += 1
+                continue
+
+            start = index
+            shuffle_steps: List[IRStackEffect] = []
+            scan = index - 1
+            while scan >= 0 and isinstance(items[scan], IRCallPreparation):
+                shuffle_steps = list(items[scan].steps) + shuffle_steps
+                start = scan
+                scan -= 1
+
+            end = index + 1
+            cleanup_steps: List[IRStackEffect] = list(item.cleanup)
+            while end < len(items) and isinstance(items[end], IRCallCleanup):
+                cleanup_steps.extend(items[end].steps)
+                end += 1
+
+            tail = item.tail
+            if not tail:
+                for step in cleanup_steps:
+                    if step.operand == RET_MASK:
+                        tail = True
+                        break
+
+            symbol = item.symbol
+            if tail and not symbol:
+                symbol = self.knowledge.address_symbol(item.target)
+
+            arity = item.arity
+            if arity is None and hasattr(item, "args"):
+                arity = len(item.args)
+
+            replacements: Dict[str, object] = {}
+            shuffle_tuple = tuple(shuffle_steps)
+            if shuffle_steps and shuffle_tuple != item.shuffle:
+                replacements["shuffle"] = shuffle_tuple
+            cleanup_tuple = tuple(cleanup_steps)
+            if cleanup_steps and cleanup_tuple != item.cleanup:
+                replacements["cleanup"] = cleanup_tuple
+            if arity is not None and arity != item.arity:
+                replacements["arity"] = arity
+            if tail != item.tail:
+                replacements["tail"] = tail
+            if symbol and symbol != item.symbol:
+                replacements["symbol"] = symbol
+
+            if replacements:
+                updated = replace(item, **replacements)
+                items.replace_slice(index, index + 1, [updated])
+                item = updated
+
+            if end > index + 1:
+                items.replace_slice(index + 1, end, [])
+            if start < index:
+                items.replace_slice(start, index, [])
+                index = start
+            else:
+                index += 1
+
     @staticmethod
     def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
@@ -1272,14 +1337,21 @@ class IRNormalizer:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
 
-    @staticmethod
-    def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
+    def _call_preparation_step(self, instruction: RawInstruction) -> IRStackEffect:
         mnemonic = instruction.mnemonic
+        operand = instruction.operand
+        pops = 0
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             pops = -instruction.event.delta
-            if pops > 0:
-                return ("stack_teardown", pops)
-        return (mnemonic, instruction.operand)
+            if mnemonic.startswith("stack_teardown"):
+                mnemonic = "stack_teardown"
+        return IRStackEffect(
+            mnemonic=mnemonic,
+            operand=operand,
+            pops=pops,
+            operand_role=instruction.profile.operand_role(),
+            operand_alias=instruction.profile.operand_alias(),
+        )
 
     @staticmethod
     def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:

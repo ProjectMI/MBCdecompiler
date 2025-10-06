@@ -80,11 +80,26 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    symbol: Optional[str] = None
+    arity: Optional[int] = None
+    shuffle: Tuple["IRStackEffect", ...] = field(default_factory=tuple)
+    cleanup: Tuple["IRStackEffect", ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
+        target = self.symbol or f"0x{self.target:04X}"
         args = ", ".join(self.args)
-        return f"call{suffix} target=0x{self.target:04X} args=[{args}]"
+        details = [f"target={target}", f"args=[{args}]"]
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle:
+            rendered = ", ".join(step.describe() for step in self.shuffle)
+            details.append(f"shuffle=[{rendered}]")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            details.append(f"cleanup=[{rendered}]")
+        inner = " ".join(details)
+        return f"call{suffix} {inner}"
 
 
 @dataclass(frozen=True)
@@ -438,10 +453,10 @@ class IRAsciiPreamble(IRNode):
 class IRCallPreparation(IRNode):
     """Grouped stack permutations that prepare arguments for helper calls."""
 
-    steps: Tuple[Tuple[str, int], ...]
+    steps: Tuple["IRStackEffect", ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(step.describe() for step in self.steps)
         return f"prep_call_args[{rendered}]"
 
 
@@ -523,20 +538,31 @@ class IRCallReturn(IRNode):
     args: Tuple[str, ...]
     tail: bool
     returns: Tuple[str, ...]
+    symbol: Optional[str] = None
+    arity: Optional[int] = None
+    shuffle: Tuple["IRStackEffect", ...] = field(default_factory=tuple)
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
+        target = self.symbol or f"0x{self.target:04X}"
         args = ", ".join(self.args)
         ret = "varargs" if self.varargs else ", ".join(self.returns)
         if self.varargs and self.returns:
             ret = f"varargs({ret})"
+        details = [f"target={target}", f"args=[{args}]", f"returns=[{ret}]"]
+        if self.arity is not None:
+            details.append(f"arity={self.arity}")
+        if self.shuffle:
+            rendered_shuffle = ", ".join(step.describe() for step in self.shuffle)
+            details.append(f"shuffle=[{rendered_shuffle}]")
         cleanup = ""
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
-            cleanup = f" cleanup=[{rendered}]"
-        return f"{prefix} target=0x{self.target:04X} args=[{args}] returns=[{ret}]{cleanup}"
+            details.append(f"cleanup=[{rendered}]")
+        inner = " ".join(details)
+        return f"{prefix} {inner}"
 
 
 @dataclass(frozen=True)
