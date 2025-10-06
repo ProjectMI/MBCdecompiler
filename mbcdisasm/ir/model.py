@@ -74,6 +74,34 @@ class IRNode:
 
 
 @dataclass(frozen=True)
+class CallPredicate:
+    """Description of the control-flow predicate derived from a call result."""
+
+    kind: str
+    var: Optional[str] = None
+    expr: Optional[str] = None
+    then_target: Optional[int] = None
+    else_target: Optional[int] = None
+    flag: Optional[int] = None
+
+    def describe(self) -> str:
+        if self.kind == "testset":
+            var = self.var or "var"
+            expr = self.expr or "expr"
+            then_target = f"0x{self.then_target:04X}" if self.then_target is not None else "?"
+            else_target = f"0x{self.else_target:04X}" if self.else_target is not None else "?"
+            return f"testset {var}={expr} then={then_target} else={else_target}"
+        if self.kind == "flag":
+            flag = f"0x{self.flag:04X}" if self.flag is not None else "?"
+            then_target = f"0x{self.then_target:04X}" if self.then_target is not None else "?"
+            else_target = f"0x{self.else_target:04X}" if self.else_target is not None else "?"
+            return f"flag {flag} then={then_target} else={else_target}"
+        then_target = f"0x{self.then_target:04X}" if self.then_target is not None else "?"
+        else_target = f"0x{self.else_target:04X}" if self.else_target is not None else "?"
+        return f"{self.kind} then={then_target} else={else_target}"
+
+
+@dataclass(frozen=True)
 class IRCall(IRNode):
     """Invocation of another routine."""
 
@@ -85,6 +113,7 @@ class IRCall(IRNode):
     cleanup_mask: Optional[int] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
+    predicate: Optional[CallPredicate] = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
@@ -102,6 +131,8 @@ class IRCall(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.predicate is not None:
+            details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
         return f"call{suffix} target={target_repr} args=[{args}]{extra}"
 
@@ -272,6 +303,7 @@ class IRAsciiWrapperCall(IRNode):
     cleanup_mask: Optional[int] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
+    predicate: Optional[CallPredicate] = None
 
     def describe(self) -> str:
         ascii_repr = ", ".join(self.ascii_chunks)
@@ -289,6 +321,8 @@ class IRAsciiWrapperCall(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.predicate is not None:
+            details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
         return (
             f"{prefix} target={target_repr} ascii=[{ascii_repr}] "
@@ -311,6 +345,7 @@ class IRTailcallAscii(IRNode):
     cleanup_mask: Optional[int] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
+    predicate: Optional[CallPredicate] = None
 
     def describe(self) -> str:
         ascii_repr = ", ".join(self.ascii_chunks)
@@ -327,6 +362,8 @@ class IRTailcallAscii(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.predicate is not None:
+            details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
         return (
             f"tailcall_ascii target={target_repr} cond={self.condition} "
@@ -590,6 +627,7 @@ class IRCallReturn(IRNode):
     shuffle: Optional[int] = None
     cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
+    predicate: Optional[CallPredicate] = None
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -611,6 +649,8 @@ class IRCallReturn(IRNode):
             details.append(f"shuffle=0x{self.shuffle:04X}")
         if self.cleanup_mask is not None:
             details.append(f"mask=0x{self.cleanup_mask:04X}")
+        if self.predicate is not None:
+            details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
         return (
             f"{prefix} target={target_repr} args=[{args}] returns=[{ret}]"

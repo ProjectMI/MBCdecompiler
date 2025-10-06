@@ -6,7 +6,7 @@ import json
 import string
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,49 @@ class OpcodeInfo:
         )
 
 
+@dataclass(frozen=True)
+class CallSignatureEffect:
+    """Description of an instruction folded into a call contract."""
+
+    mnemonic: str
+    operand: Optional[int] = None
+    pops: int = 0
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+    inherit_operand: bool = False
+    inherit_alias: bool = False
+
+
+@dataclass(frozen=True)
+class CallSignaturePattern:
+    """Sequence element consumed when assembling a call contract."""
+
+    kind: str
+    mnemonic: Optional[str] = None
+    operand: Optional[int] = None
+    optional: bool = False
+    effect: Optional[CallSignatureEffect] = None
+    cleanup_mask: Optional[int] = None
+    tail: bool = False
+    predicate: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CallSignature:
+    """Contract describing how a helper call should appear in the IR."""
+
+    target: int
+    arity: Optional[int] = None
+    returns: Optional[int] = None
+    shuffle: Optional[int] = None
+    shuffle_options: Tuple[int, ...] = tuple()
+    cleanup_mask: Optional[int] = None
+    cleanup: Tuple[CallSignatureEffect, ...] = tuple()
+    prelude: Tuple[CallSignaturePattern, ...] = tuple()
+    postlude: Tuple[CallSignaturePattern, ...] = tuple()
+    tail: Optional[bool] = None
+
+
 class KnowledgeBase:
     """Resolve opcode/mode pairs to :class:`OpcodeInfo` entries.
 
@@ -121,11 +164,13 @@ class KnowledgeBase:
         wildcards: Optional[Mapping[int, OpcodeInfo]] = None,
         by_name: Optional[Mapping[str, OpcodeInfo]] = None,
         addresses: Optional[Mapping[int, str]] = None,
+        call_signatures: Optional[Mapping[int, CallSignature]] = None,
     ) -> None:
         self._annotations: Dict[str, OpcodeInfo] = dict(annotations)
         self._wildcards: Dict[int, OpcodeInfo] = dict(wildcards or {})
         self._by_name: Dict[str, OpcodeInfo] = dict(by_name or {})
         self._addresses: Dict[int, str] = dict(addresses or {})
+        self._call_signatures: Dict[int, CallSignature] = dict(call_signatures or {})
 
     @classmethod
     def load(cls, manual_path: Path) -> "KnowledgeBase":
@@ -144,6 +189,7 @@ class KnowledgeBase:
         by_name: Dict[str, OpcodeInfo] = {}
         wildcard_specs: Dict[int, Mapping[str, Any]] = {}
         address_table: Dict[int, str] = {}
+        call_signatures: Dict[int, CallSignature] = {}
 
         if isinstance(data, dict):
             for key, entry in data.items():
@@ -177,11 +223,16 @@ class KnowledgeBase:
         if table_path.exists():
             address_table = _load_address_table(table_path)
 
+        signatures_path = resolved.with_name("call_signatures.json")
+        if signatures_path.exists():
+            call_signatures = _load_call_signatures(signatures_path)
+
         return cls(
             annotations,
             wildcards=wildcard_annotations,
             by_name=by_name,
             addresses=address_table,
+            call_signatures=call_signatures,
         )
 
     def lookup(self, label: str) -> Optional[OpcodeInfo]:
@@ -206,6 +257,11 @@ class KnowledgeBase:
         """Resolve ``address`` to a symbolic name if it is known."""
 
         return self._addresses.get(int(address) & 0xFFFF)
+
+    def call_signature(self, target: int) -> Optional[CallSignature]:
+        """Return the call contract for ``target`` when available."""
+
+        return self._call_signatures.get(int(target) & 0xFFFF)
 
 
 def _parse_component(component: str) -> int:
@@ -376,6 +432,28 @@ def _load_address_table(table_path: Path) -> Dict[int, str]:
     return table
 
 
+def _load_call_signatures(table_path: Path) -> Dict[int, CallSignature]:
+    """Load ABI contracts for helper calls."""
+
+    try:
+        raw = json.loads(table_path.read_text("utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+    if not isinstance(raw, Mapping):
+        return {}
+
+    signatures: Dict[int, CallSignature] = {}
+    for key, entry in raw.items():
+        target = _parse_operand_value(key)
+        if target is None:
+            continue
+        signature = _parse_call_signature_entry(target, entry)
+        if signature is not None:
+            signatures[target] = signature
+    return signatures
+
+
 def _parse_operand_value(key: Any) -> Optional[int]:
     """Interpret ``key`` as a hexadecimal or decimal operand value."""
 
@@ -402,3 +480,163 @@ def _parse_operand_value(key: Any) -> Optional[int]:
             return None
 
     return None
+
+
+def _parse_call_signature_entry(
+    target: int, entry: Any
+) -> Optional[CallSignature]:
+    if not isinstance(entry, Mapping):
+        return CallSignature(target=target)
+
+    arity = _parse_optional_int(entry.get("arity"))
+    returns = _parse_optional_int(entry.get("returns"))
+    shuffle = _parse_optional_int(entry.get("shuffle"))
+
+    shuffle_options: Tuple[int, ...] = tuple(
+        value
+        for value in (
+            _parse_optional_int(candidate)
+            for candidate in _ensure_sequence(entry.get("shuffle_options"))
+        )
+        if value is not None
+    )
+
+    cleanup_mask = _parse_optional_int(entry.get("cleanup_mask"))
+
+    cleanup_effects: Tuple[CallSignatureEffect, ...] = tuple(
+        effect
+        for effect in (
+            _parse_call_signature_effect(spec)
+            for spec in _ensure_sequence(entry.get("cleanup"))
+        )
+        if effect is not None
+    )
+
+    prelude_patterns: Tuple[CallSignaturePattern, ...] = tuple(
+        pattern
+        for pattern in (
+            _parse_call_signature_pattern(spec)
+            for spec in _ensure_sequence(entry.get("prelude"))
+        )
+        if pattern is not None
+    )
+
+    postlude_patterns: Tuple[CallSignaturePattern, ...] = tuple(
+        pattern
+        for pattern in (
+            _parse_call_signature_pattern(spec)
+            for spec in _ensure_sequence(entry.get("postlude"))
+        )
+        if pattern is not None
+    )
+
+    tail_value = entry.get("tail")
+    tail = tail_value if isinstance(tail_value, bool) else None
+
+    return CallSignature(
+        target=target,
+        arity=arity,
+        returns=returns,
+        shuffle=shuffle,
+        shuffle_options=shuffle_options,
+        cleanup_mask=cleanup_mask,
+        cleanup=cleanup_effects,
+        prelude=prelude_patterns,
+        postlude=postlude_patterns,
+        tail=tail,
+    )
+
+
+def _parse_call_signature_effect(spec: Any) -> Optional[CallSignatureEffect]:
+    if not isinstance(spec, Mapping):
+        return None
+
+    mnemonic = spec.get("mnemonic")
+    if not isinstance(mnemonic, str) or not mnemonic:
+        return None
+
+    operand = _parse_optional_int(spec.get("operand"))
+    pops_value = spec.get("pops")
+    pops = _parse_optional_int(pops_value)
+    if pops is None:
+        pops = 0
+
+    operand_role = spec.get("operand_role")
+    if operand_role is not None:
+        operand_role = str(operand_role)
+
+    operand_alias = spec.get("operand_alias")
+    if operand_alias is not None:
+        operand_alias = str(operand_alias)
+
+    inherit_operand = bool(spec.get("inherit_operand", False))
+    inherit_alias = bool(spec.get("inherit_alias", False))
+
+    return CallSignatureEffect(
+        mnemonic=mnemonic,
+        operand=operand,
+        pops=pops,
+        operand_role=operand_role,
+        operand_alias=operand_alias,
+        inherit_operand=inherit_operand,
+        inherit_alias=inherit_alias,
+    )
+
+
+def _parse_call_signature_pattern(spec: Any) -> Optional[CallSignaturePattern]:
+    if not isinstance(spec, Mapping):
+        return None
+
+    kind = spec.get("kind", "raw")
+    if not isinstance(kind, str) or not kind:
+        return None
+
+    mnemonic = spec.get("mnemonic")
+    if mnemonic is not None:
+        mnemonic = str(mnemonic)
+
+    operand = _parse_optional_int(spec.get("operand"))
+    optional = bool(spec.get("optional", False))
+    effect = _parse_call_signature_effect(spec.get("effect"))
+    cleanup_mask = _parse_optional_int(spec.get("cleanup_mask"))
+    tail_value = spec.get("tail")
+    tail = bool(tail_value) if isinstance(tail_value, bool) else False
+    predicate = spec.get("predicate")
+    if predicate is not None:
+        predicate = str(predicate)
+
+    return CallSignaturePattern(
+        kind=kind,
+        mnemonic=mnemonic,
+        operand=operand,
+        optional=optional,
+        effect=effect,
+        cleanup_mask=cleanup_mask,
+        tail=tail,
+        predicate=predicate,
+    )
+
+
+def _parse_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        token = value.strip()
+        if not token:
+            return None
+        base = 16 if token.lower().startswith("0x") else 10
+        try:
+            return int(token, base)
+        except ValueError:
+            return None
+    return None
+
+
+def _ensure_sequence(value: Any) -> Sequence[Any]:
+    if isinstance(value, (list, tuple)):
+        return value
+    if value is None:
+        return ()
+    return (value,)
