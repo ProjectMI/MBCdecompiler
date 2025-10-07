@@ -1366,62 +1366,23 @@ class IRNormalizer:
                 continue
 
             helper_target = getattr(item, "target", None)
-            if helper_target not in {0x0072, 0x003D}:
+            if helper_target not in {0x0072, 0x003D, 0x00F0}:
                 index += 1
                 continue
 
             new_target = self._extract_tail_helper_target(items, index, helper_target)
-            if new_target is None or new_target == helper_target:
+            if new_target is None:
                 index += 1
                 continue
 
-            symbol = self.knowledge.lookup_address(new_target)
-            cleanup: Tuple[IRStackEffect, ...] = tuple()
-            updated: Union[IRCall, IRCallReturn, IRTailcallReturn]
-            if isinstance(item, IRCall):
-                updated = IRCall(
-                    target=new_target,
-                    args=item.args,
-                    tail=item.tail,
-                    arity=item.arity,
-                    convention=item.convention,
-                    cleanup=cleanup,
-                    cleanup_mask=None,
-                    symbol=symbol,
-                    predicate=item.predicate,
-                )
-            elif isinstance(item, IRCallReturn):
-                updated = IRCallReturn(
-                    target=new_target,
-                    args=item.args,
-                    tail=item.tail,
-                    returns=item.returns,
-                    varargs=item.varargs,
-                    cleanup=cleanup,
-                    arity=item.arity,
-                    convention=item.convention,
-                    cleanup_mask=None,
-                    symbol=symbol,
-                    predicate=item.predicate,
-                )
-            else:
-                updated = IRTailcallReturn(
-                    target=new_target,
-                    args=item.args,
-                    returns=item.returns,
-                    varargs=item.varargs,
-                    cleanup=cleanup,
-                    tail=item.tail,
-                    arity=item.arity,
-                    convention=item.convention,
-                    cleanup_mask=None,
-                    symbol=symbol,
-                    predicate=item.predicate,
-                )
+            if helper_target == 0x0072:
+                self._rewrite_tail_helper_72(items, index, item, new_target)
+                continue
 
-            self._transfer_ssa(item, updated)
-            items.replace_slice(index, index + 1, [updated])
-            # re-evaluate following nodes since cleanup wrappers may remain
+            if helper_target in {0x003D, 0x00F0}:
+                self._rewrite_tail_helper_io(items, index, item, helper_target, new_target)
+                continue
+
             index += 1
 
     def _extract_tail_helper_target(
@@ -1474,6 +1435,207 @@ class IRNormalizer:
                 return hints.pop(0)
             return 0x3D30
 
+        return None
+
+    def _rewrite_tail_helper_72(
+        self,
+        items: _ItemList,
+        index: int,
+        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        target: int,
+    ) -> None:
+        args = list(getattr(node, "args", tuple()))
+        convention = getattr(node, "convention", None)
+        if convention is not None and convention.mnemonic == "stack_shuffle":
+            args = self._apply_call_shuffle(args, convention.operand)
+
+        cleanup_mask = getattr(node, "cleanup_mask", None)
+        predicate = getattr(node, "predicate", None)
+        arity = getattr(node, "arity", None)
+
+        cleanup_effects = list(getattr(node, "cleanup", tuple()))
+        teardown: Optional[IRStackEffect] = None
+        retained_cleanup: List[IRStackEffect] = []
+        for effect in cleanup_effects:
+            if (
+                teardown is None
+                and effect.mnemonic == "stack_teardown"
+                and effect.pops in {0, 1}
+            ):
+                pops = effect.pops if effect.pops else 1
+                teardown = IRStackEffect(
+                    mnemonic="stack_teardown",
+                    operand=effect.operand,
+                    pops=pops,
+                    operand_role=effect.operand_role,
+                    operand_alias=effect.operand_alias,
+                )
+                continue
+            retained_cleanup.append(effect)
+
+        next_node: Optional[IRNode] = items[index + 1] if index + 1 < len(items) else None
+        returns_node: Optional[IRReturn] = None
+        if isinstance(next_node, IRReturn):
+            returns_node = next_node
+            items.pop(index + 1)
+
+        symbol = self.knowledge.lookup_address(target)
+
+        if cleanup_mask == RET_MASK and returns_node is not None:
+            cleanup_chain = list(returns_node.cleanup)
+            if teardown is not None:
+                cleanup_chain.append(teardown)
+                teardown = None
+            new_return = IRReturn(
+                values=returns_node.values,
+                varargs=returns_node.varargs,
+                cleanup=tuple(cleanup_chain),
+            )
+            self._transfer_ssa(node, new_return)
+            items.replace_slice(index, index + 1, [new_return])
+            return
+
+        returns = 0
+        varargs = False
+        if returns_node is not None:
+            returns = len(returns_node.values)
+            varargs = returns_node.varargs
+
+        tailcall = IRTailcallReturn(
+            target=target,
+            args=tuple(args),
+            returns=returns,
+            varargs=varargs,
+            cleanup=tuple(retained_cleanup),
+            tail=True,
+            arity=arity,
+            convention=None,
+            cleanup_mask=None,
+            symbol=symbol,
+            predicate=predicate,
+        )
+        self._transfer_ssa(node, tailcall)
+        items.replace_slice(index, index + 1, [tailcall])
+
+        if teardown is not None:
+            self._attach_tail_helper_cleanup(items, index, teardown)
+
+    def _rewrite_tail_helper_io(
+        self,
+        items: _ItemList,
+        index: int,
+        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        helper: int,
+        target: int,
+    ) -> None:
+        handshake_index = self._find_io_handshake(items, index)
+        if handshake_index is None:
+            symbol = self.knowledge.lookup_address(target)
+            replacement: Union[IRCall, IRCallReturn, IRTailcallReturn]
+            cleanup: Tuple[IRStackEffect, ...] = tuple()
+            args = getattr(node, "args", tuple())
+            predicate = getattr(node, "predicate", None)
+            arity = getattr(node, "arity", None)
+            if isinstance(node, IRCall):
+                replacement = IRCall(
+                    target=target,
+                    args=args,
+                    tail=getattr(node, "tail", False),
+                    arity=arity,
+                    convention=None,
+                    cleanup=cleanup,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=predicate,
+                )
+            elif isinstance(node, IRCallReturn):
+                replacement = IRCallReturn(
+                    target=target,
+                    args=args,
+                    tail=getattr(node, "tail", False),
+                    returns=getattr(node, "returns", tuple()),
+                    varargs=getattr(node, "varargs", False),
+                    cleanup=cleanup,
+                    arity=arity,
+                    convention=None,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=predicate,
+                )
+            else:
+                replacement = IRTailcallReturn(
+                    target=target,
+                    args=args,
+                    returns=getattr(node, "returns", 0),
+                    varargs=getattr(node, "varargs", False),
+                    cleanup=cleanup,
+                    tail=getattr(node, "tail", True),
+                    arity=arity,
+                    convention=None,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=predicate,
+                )
+            self._transfer_ssa(node, replacement)
+            items.replace_slice(index, index + 1, [replacement])
+            return
+
+        mask = self._io_mask_value(items, handshake_index)
+        if helper == 0x00F0:
+            io_node: IRNode = IRIORead(port=IO_PORT_NAME)
+        else:
+            io_node = IRIOWrite(mask=mask, port=IO_PORT_NAME)
+        port_node = items[handshake_index]
+        self._transfer_ssa(port_node, io_node)
+        self._transfer_ssa(node, io_node)
+
+        slice_end = index + 1
+        if slice_end < len(items) and isinstance(items[slice_end], IRReturn):
+            slice_end += 1
+        items.replace_slice(handshake_index, slice_end, [io_node])
+
+    @staticmethod
+    def _apply_call_shuffle(args: Sequence[str], operand: int) -> List[str]:
+        if not args:
+            return list(args)
+        if operand == CALL_SHUFFLE_STANDARD and len(args) >= 2:
+            reordered = list(args)
+            reordered[0], reordered[1] = reordered[1], reordered[0]
+            return reordered
+        return list(args)
+
+    def _attach_tail_helper_cleanup(
+        self, items: _ItemList, index: int, effect: IRStackEffect
+    ) -> None:
+        # Prefer attaching to an existing cleanup node to avoid splitting blocks.
+        for offset in (1, -1):
+            pos = index + offset
+            if 0 <= pos < len(items) and isinstance(items[pos], IRCallCleanup):
+                cleanup = items[pos]
+                assert isinstance(cleanup, IRCallCleanup)
+                items.replace_slice(
+                    pos,
+                    pos + 1,
+                    [IRCallCleanup(steps=cleanup.steps + (effect,))],
+                )
+                return
+        items.insert(index + 1, IRCallCleanup(steps=(effect,)))
+
+    def _find_io_handshake(self, items: _ItemList, index: int) -> Optional[int]:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if candidate.mnemonic == "op_3D_30" and candidate.operand == IO_SLOT:
+                    return scan
+                if candidate.mnemonic.startswith("op_10_"):
+                    break
+            elif isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                scan -= 1
+                continue
+            else:
+                break
+            scan -= 1
         return None
 
     def _update_tail_helper_hints(self, block: RawBlock) -> None:

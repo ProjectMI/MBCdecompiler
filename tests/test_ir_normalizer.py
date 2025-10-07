@@ -457,20 +457,18 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
     ]
 
     tail_nodes = [node for node in flattened if isinstance(node, IRTailcallReturn)]
-    assert len(tail_nodes) == 2
+    assert len(tail_nodes) == 1
 
-    helper_3d = next(node for node in tail_nodes if node.returns == 16)
-    helper_72 = next(node for node in tail_nodes if node.returns != 16)
-
-    assert helper_3d.target == 0x3D30
-    assert helper_3d.cleanup == ()
-    assert helper_3d.cleanup_mask is None
+    helper_72 = tail_nodes[0]
 
     assert helper_72.target == 0x3032
     assert helper_72.cleanup == ()
     assert helper_72.cleanup_mask is None
 
-    assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in tail_nodes)
+    io_nodes = [node for node in flattened if isinstance(node, IRIOWrite)]
+    assert io_nodes and all(node.port == "io.port_6910" for node in io_nodes)
+
+    assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
 
     ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
     assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
