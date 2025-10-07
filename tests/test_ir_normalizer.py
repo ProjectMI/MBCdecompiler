@@ -21,6 +21,7 @@ from mbcdisasm.ir.model import (
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
+    IRSwitchDispatch,
     NormalizerMetrics,
 )
 from mbcdisasm.ir.normalizer import _ItemList
@@ -141,6 +142,8 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x0020": "call_helper_20",
         "0x0072": "tail_helper_72",
         "0x00F0": "tail_helper_f0",
+        "0x6623": "dispatch_helper_6623",
+        "0x6624": "dispatch_helper_6624",
     }
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
     call_signatures = {
@@ -456,14 +459,14 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
         for node in block.nodes
     ]
 
-    tail_nodes = [node for node in flattened if isinstance(node, IRTailcallReturn)]
-    assert len(tail_nodes) == 1
+    assert not any(isinstance(node, IRTailcallReturn) for node in flattened)
 
-    helper_72 = tail_nodes[0]
+    return_nodes = [node for node in flattened if isinstance(node, IRReturn)]
+    assert return_nodes
 
-    assert helper_72.target == 0x3032
-    assert helper_72.cleanup == ()
-    assert helper_72.cleanup_mask is None
+    helper_return = return_nodes[0]
+    assert helper_return.cleanup == ()
+    assert helper_return.mask is None
 
     io_nodes = [node for node in flattened if isinstance(node, IRIOWrite)]
     assert io_nodes and all(node.port == "io.port_6910" for node in io_nodes)
@@ -765,10 +768,9 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    tail_bundle = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
-    assert tail_bundle.tail
-    assert tail_bundle.cleanup and tail_bundle.cleanup[-1].mnemonic == "stack_teardown"
-    assert tail_bundle.cleanup[-1].pops == 4
+    tail_return = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert tail_return.cleanup and tail_return.cleanup[-1].mnemonic == "stack_teardown"
+    assert tail_return.cleanup[-1].pops == 4
 
 
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
@@ -795,6 +797,34 @@ def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
     assert any(
         isinstance(node, (IRCall, IRCallReturn, IRTailcallReturn)) for node in block.nodes
     )
+
+
+def test_normalizer_extracts_table_dispatch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x01, 0x6623),
+        build_word(4, 0x2C, 0x02, 0x6624),
+        build_word(8, 0x28, 0x00, 0x6623),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    keys = {case.key for case in dispatch.cases}
+    targets = {case.target for case in dispatch.cases}
+
+    assert dispatch.helper == 0x6623
+    assert keys == {0x01, 0x02}
+    assert targets == {0x6623, 0x6624}
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
@@ -842,8 +872,8 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    tail_node = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
-    assert tail_node.target == 0x00F0
+    tail_node = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert tail_node.mask == RET_MASK
     assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
