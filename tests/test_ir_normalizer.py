@@ -19,6 +19,8 @@ from mbcdisasm.ir.model import (
     IRFunctionPrologue,
     IRStackEffect,
     IRTestSetBranch,
+    IRIndirectLoad,
+    IRIndirectStore,
     IRRaw,
     IRConditionMask,
     IRIOWrite,
@@ -57,7 +59,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_push": 1,
         },
         "literal_marker": {
-            "opcodes": ["00:38"],
+            "opcodes": ["00:38", "0x00:0x72"],
             "name": "literal_marker",
             "category": "literal_marker",
         },
@@ -102,7 +104,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "branch_eq",
         },
         "testset_branch": {
-            "opcodes": ["0x27:0x00"],
+            "opcodes": ["0x27:0x00", "0x27:0x33"],
             "name": "testset_branch",
             "category": "testset_branch",
         },
@@ -810,6 +812,63 @@ def test_normalizer_lifts_branch_predicate_from_call(tmp_path: Path) -> None:
     assert call.predicate.expr == branch.expr
     assert call.predicate.then_target == branch.then_target
     assert call.predicate.else_target == branch.else_target
+
+
+def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x27, 0x33, 0x0010),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    try:
+        predicate = next(node for node in block.nodes if isinstance(node, IRTestSetBranch))
+    except StopIteration:
+        predicate = next(node for node in block.nodes if isinstance(node, IRFunctionPrologue))
+
+    branch = next(node for node in block.nodes if isinstance(node, IRIf))
+
+    assert branch.then_target == predicate.then_target
+    assert branch.else_target == predicate.else_target
+    assert branch.condition == predicate.var
+
+
+def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x1000),
+        build_word(4, 0x00, 0x00, 0x2000),
+        build_word(8, 0x69, 0x10, 0x0000),
+        build_word(12, 0x01, 0xF0, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    store = next(node for node in block.nodes if isinstance(node, IRIndirectStore))
+    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
+
+    assert store.offset == 0
+    assert store.value.startswith("word")
+    assert store.base.startswith("ptr")
+    assert cleanup.pops == 4
 
 
 def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:

@@ -35,6 +35,24 @@ def test_literal_marker_is_stack_neutral():
     assert literal_event.depth_after == marker_event.depth_after + literal_event.delta
 
 
+def test_literal_marker_mode_72_is_stack_neutral():
+    words = [
+        make_word(0x00, 0x72, 0x0000, 0),
+        make_word(0x00, 0x00, 0x0001, 4),
+    ]
+
+    profiles = load_profiles(words)
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    marker_event = events[0]
+    literal_event = events[1]
+
+    assert marker_event.delta == 0
+    assert marker_event.pushed_types == (StackValueType.MARKER,)
+    assert literal_event.depth_after == marker_event.depth_after + literal_event.delta
+
+
 def test_indirect_access_load_variant():
     words = [
         make_word(0x02, 0x00, 0x0000, 0),  # stack push helper
