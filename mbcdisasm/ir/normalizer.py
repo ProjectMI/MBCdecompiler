@@ -202,6 +202,10 @@ class IRNormalizer:
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
+    _OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x48, 0x50, 0x51, 0x4E, 0x4F}
+    _OPCODE_TABLE_MIN_LENGTH = 8
+    _OPCODE_TABLE_MIN_CORE = 6
+    _OPCODE_TABLE_MAX_NONZERO = 4
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -377,6 +381,17 @@ class IRNormalizer:
         control = (profile.control_flow or "").lower()
         return any(token in control for token in {"return", "jump", "stop"})
 
+    @staticmethod
+    def _is_stack_neutral(instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        if event.uncertain and (event.minimum != 0 or event.maximum != 0):
+            return False
+        return True
+
     # ------------------------------------------------------------------
     # normalisation passes
     # ------------------------------------------------------------------
@@ -404,6 +419,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
+        self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
@@ -1511,6 +1527,88 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _is_opcode_table_instruction(
+        self, instruction: RawInstruction, *, mode: Optional[int] = None
+    ) -> bool:
+        if instruction.profile.mode not in self._OPCODE_TABLE_MODES:
+            return False
+        if mode is not None and instruction.profile.mode != mode:
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        if not self._is_stack_neutral(instruction):
+            return False
+        return True
+
+    @staticmethod
+    def _collect_opcode_table_annotations(
+        instructions: Sequence[RawInstruction],
+    ) -> Tuple[str, ...]:
+        ordered: List[str] = []
+        seen: Set[str] = set()
+
+        def add(note: str) -> None:
+            if note and note not in seen:
+                seen.add(note)
+                ordered.append(note)
+
+        add("opcode_table")
+        for instruction in instructions:
+            for note in instruction.annotations:
+                add(note)
+        return tuple(ordered)
+
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_opcode_table_instruction(item):
+                index += 1
+                continue
+
+            mode = item.profile.mode
+            start = index
+            while start > 0:
+                previous = items[start - 1]
+                if isinstance(previous, RawInstruction) and self._is_opcode_table_instruction(
+                    previous, mode=mode
+                ):
+                    start -= 1
+                    continue
+                break
+
+            end = index + 1
+            while end < len(items):
+                candidate = items[end]
+                if isinstance(candidate, RawInstruction) and self._is_opcode_table_instruction(
+                    candidate, mode=mode
+                ):
+                    end += 1
+                    continue
+                break
+
+            sequence = [
+                node for node in items[start:end] if isinstance(node, RawInstruction)
+            ]
+            total = len(sequence)
+            if total < self._OPCODE_TABLE_MIN_LENGTH:
+                index = end
+                continue
+
+            core = sum(1 for instruction in sequence if instruction.operand == 0)
+            non_zero = total - core
+            if core < self._OPCODE_TABLE_MIN_CORE or non_zero > self._OPCODE_TABLE_MAX_NONZERO:
+                index = end
+                continue
+
+            operations = [
+                (instruction.mnemonic, instruction.operand) for instruction in sequence
+            ]
+            annotations = self._collect_opcode_table_annotations(sequence)
+            table = IRTablePatch(operations=tuple(operations), annotations=annotations)
+            items.replace_slice(start, end, [table])
+            index = start + 1
 
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0

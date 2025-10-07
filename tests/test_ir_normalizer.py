@@ -22,6 +22,7 @@ from mbcdisasm.ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
+    IRTablePatch,
     IRConditionMask,
     IRIOWrite,
     IRBuildTuple,
@@ -138,6 +139,30 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x70:0x29"],
             "name": "op_70_29",
             "category": "call_cleanup",
+        },
+        "op_table_stub_10": {
+            "opcodes": ["0x10:0x2A", "0x10:0x48"],
+            "name": "op_10_stub",
+            "category": "meta",
+            "stack_delta": 0,
+        },
+        "op_table_stub_11": {
+            "opcodes": ["0x11:0x2A", "0x11:0x48"],
+            "name": "op_11_stub",
+            "category": "meta",
+            "stack_delta": 0,
+        },
+        "op_table_stub_12": {
+            "opcodes": ["0x12:0x2A", "0x12:0x48"],
+            "name": "op_12_stub",
+            "category": "meta",
+            "stack_delta": 0,
+        },
+        "op_table_stub_13": {
+            "opcodes": ["0x13:0x2A", "0x13:0x48"],
+            "name": "op_13_stub",
+            "category": "meta",
+            "stack_delta": 0,
         },
     }
     manual_path = path / "manual_annotations.json"
@@ -972,6 +997,42 @@ def test_normalizer_extracts_table_dispatch(tmp_path: Path) -> None:
     assert dispatch.helper == 0x6623
     assert keys == {0x01, 0x02}
     assert targets == {0x6623, 0x6624}
+
+
+def test_normalizer_groups_opcode_table_runs(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    for mode in (0x2A, 0x48):
+        words: list[InstructionWord] = []
+        offset = 0
+        words.append(build_word(offset, 0x10, mode, 0x0001))
+        offset += 4
+        table_opcodes = [0x11, 0x12] * 6
+        for opcode in table_opcodes:
+            words.append(build_word(offset, opcode, mode, 0x0000))
+            offset += 4
+        words.append(build_word(offset, 0x13, mode, 0x0002))
+        offset += 4
+        words.append(build_word(offset, 0x30, 0x00, 0x0000))
+
+        data = encode_instructions(words)
+        descriptor = SegmentDescriptor(0, 0, len(data))
+        segment = Segment(descriptor, data)
+        container = MbcContainer(Path("dummy"), [segment])
+
+        normalizer = IRNormalizer(knowledge)
+        program = normalizer.normalise_container(container)
+        block = program.segments[0].blocks[0]
+
+        patch = next(node for node in block.nodes if isinstance(node, IRTablePatch))
+        assert "opcode_table" in patch.annotations
+        assert len(patch.operations) == len(words) - 1
+        zero_operands = sum(1 for _, operand in patch.operations if operand == 0)
+        assert zero_operands == 12
+        assert all(
+            not (isinstance(node, IRRaw) and node.mnemonic.endswith(f"_{mode:02X}"))
+            for node in block.nodes
+        )
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
