@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
@@ -96,6 +96,8 @@ CALL_CLEANUP_MNEMONICS = {
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
+
+OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F}
 
 TAILCALL_HELPERS = {0x00F0}
 TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
@@ -394,6 +396,7 @@ class IRNormalizer:
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
+        self._pass_opcode_tables(items)
         self._pass_aggregates(items, metrics)
         self._pass_literal_blocks(items)
         self._pass_literal_block_reducers(items, metrics)
@@ -768,6 +771,82 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            run = self._collect_opcode_table_run(items, index)
+            if run is None:
+                index += 1
+                continue
+
+            start, end = run
+            operations: List[Tuple[str, int]] = []
+            for position in range(start, end):
+                instruction = cast(RawInstruction, items[position])
+                operations.append((instruction.mnemonic, instruction.operand))
+                self._ssa_bindings.pop(id(instruction), None)
+
+            table = IRTablePatch(operations=tuple(operations), annotations=("opcode_table",))
+            items.replace_slice(start, end, [table])
+            index = start + 1
+
+    def _collect_opcode_table_run(
+        self, items: _ItemList, start: int
+    ) -> Optional[Tuple[int, int]]:
+        if start >= len(items):
+            return None
+
+        first = items[start]
+        if not isinstance(first, RawInstruction):
+            return None
+        if not self._is_opcode_table_instruction(first):
+            return None
+
+        mode = first.profile.mode
+        end = start + 1
+        while end < len(items):
+            candidate = items[end]
+            if isinstance(candidate, RawInstruction) and self._is_opcode_table_instruction(
+                candidate, mode=mode
+            ):
+                end += 1
+                continue
+            break
+
+        if end - start < 8:
+            return None
+        return start, end
+
+    def _is_opcode_table_instruction(
+        self, instruction: RawInstruction, *, mode: Optional[int] = None
+    ) -> bool:
+        if instruction.operand != 0:
+            return False
+
+        profile = instruction.profile
+        candidate_mode = profile.mode
+        if mode is None:
+            if candidate_mode not in OPCODE_TABLE_MODES:
+                return False
+        elif candidate_mode != mode:
+            return False
+
+        if not profile.mnemonic.startswith("op_"):
+            return False
+
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        if event.uncertain:
+            return False
+
+        if instruction.ssa_values:
+            return False
+
+        return True
 
     def _pass_ascii_runs(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
