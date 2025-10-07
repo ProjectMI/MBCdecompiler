@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ..constants import IO_PORT_NAME, OPERAND_ALIASES
 
@@ -21,9 +21,11 @@ class SSAValueKind(Enum):
     """Lightweight annotation attached to SSA values."""
 
     UNKNOWN = auto()
-    INTEGER = auto()
-    ADDRESS = auto()
+    BYTE = auto()
+    WORD = auto()
     POINTER = auto()
+    IO = auto()
+    PAGE_REGISTER = auto()
     BOOLEAN = auto()
     IDENTIFIER = auto()
 
@@ -81,6 +83,18 @@ class MemRef:
 
     def _has_region_alias(self) -> bool:
         return bool(self.region and not self.region.startswith("mem"))
+
+
+def _render_ascii(data: bytes) -> str:
+    printable: List[str] = []
+    for byte in data:
+        if 0x20 <= byte <= 0x7E:
+            printable.append(chr(byte))
+        elif byte in {0x09, 0x0A, 0x0D}:
+            printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+        else:
+            printable.append(f"\\x{byte:02x}")
+    return "".join(printable)
 
 
 @dataclass(frozen=True)
@@ -239,21 +253,38 @@ class IRLiteralChunk(IRNode):
     data: bytes
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
-        printable = []
-        for byte in self.data:
-            if 0x20 <= byte <= 0x7E:
-                printable.append(chr(byte))
-            elif byte in {0x09, 0x0A, 0x0D}:
-                printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
-            else:
-                printable.append(f"\\x{byte:02x}")
-        text = "".join(printable)
-        note = f"ascii({text})"
+        if self.symbol:
+            rendered = f"str({self.symbol})"
+            if self.annotations:
+                rendered += " " + ", ".join(self.annotations)
+            return rendered
+
+        note = f"ascii({_render_ascii(self.data)})"
         if self.annotations:
             note += " " + ", ".join(self.annotations)
         return note
+
+
+@dataclass(frozen=True)
+class IRStringConstant(IRNode):
+    """Entry in the global ASCII constant pool."""
+
+    name: str
+    data: bytes
+    segments: Tuple[bytes, ...]
+    source: str
+
+    def describe(self) -> str:
+        if len(self.segments) == 1:
+            body = _render_ascii(self.segments[0])
+            payload = f"ascii({body})"
+        else:
+            parts = ", ".join(f"ascii({_render_ascii(segment)})" for segment in self.segments)
+            payload = f"[{parts}]"
+        return f"const {self.name} = {payload}"
 
 
 @dataclass(frozen=True)
@@ -624,6 +655,20 @@ class IRStackDrop(IRNode):
 
 
 @dataclass(frozen=True)
+class IRPageRegister(IRNode):
+    """Interaction with the VM page register latch."""
+
+    register: int
+    value: Optional[str] = None
+
+    def describe(self) -> str:
+        operand = _format_operand(self.register)
+        if self.value:
+            return f"page_register {operand}={self.value}"
+        return f"page_register[{operand}]"
+
+
+@dataclass(frozen=True)
 class IRAsciiHeader(IRNode):
     """Captures dense ASCII banners embedded at block boundaries."""
 
@@ -793,6 +838,7 @@ class IRProgram:
 
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
+    string_pool: Tuple[IRStringConstant, ...] = tuple()
 
 
 @dataclass
@@ -870,12 +916,14 @@ __all__ = [
     "IRIOWrite",
     "IRStackDuplicate",
     "IRStackDrop",
+    "IRPageRegister",
     "IRAsciiHeader",
     "IRCallReturn",
     "IRTailcallReturn",
     "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRStringConstant",
     "IRAsciiPreamble",
     "IRCallPreparation",
     "IRTailcallFrame",
