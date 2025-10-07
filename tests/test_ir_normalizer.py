@@ -9,9 +9,8 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRAsciiFinalize,
     IRTailcallReturn,
-    IRAsciiWrapperCall,
-    IRTailcallAscii,
     IRIf,
     IRReturn,
     IRFunctionPrologue,
@@ -28,6 +27,7 @@ from mbcdisasm.ir.normalizer import _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
+from mbcdisasm.knowledge import KnowledgeBase
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -349,8 +349,6 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             (
                 IRCall,
                 IRCallReturn,
-                IRAsciiWrapperCall,
-                IRTailcallAscii,
                 IRTailcallReturn,
             ),
         )
@@ -361,8 +359,11 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             contract_call = node
             break
     assert contract_call is not None
-    assert isinstance(contract_call, IRTailcallReturn)
+    assert isinstance(contract_call, IRCall)
+    assert contract_call.tail
     assert contract_call.cleanup_mask == 0x2910
+    assert contract_call.convention is not None
+    assert contract_call.convention.operand == CALL_SHUFFLE_STANDARD
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
     call_block = next(
@@ -379,11 +380,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         == ["op_6C_01", "op_5E_29", "op_F0_4B"]
         for node in cleanup_nodes
     )
-    assert [step.mnemonic for step in contract_call.cleanup] == [
-        "stack_teardown",
-        "op_29_10",
-        "op_70_29",
-    ]
+    assert [step.mnemonic for step in contract_call.cleanup] == ["stack_teardown"]
+    assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
         node
@@ -411,6 +409,71 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         assert prologue_nodes
 
 
+def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
+    knowledge_path = Path(__file__).resolve().parent.parent / "knowledge" / "manual_annotations.json"
+    knowledge = KnowledgeBase.load(knowledge_path)
+
+    helper_3d_words = [
+        InstructionWord(0, int("3D306910", 16)),
+        InstructionWord(4, int("4C000000", 16)),
+        InstructionWord(8, int("2910003D", 16)),
+        InstructionWord(12, int("30691050", 16)),
+        InstructionWord(16, int("00000029", 16)),
+        InstructionWord(20, int("10013D30", 16)),
+    ]
+
+    helper_72_words = [
+        InstructionWord(0, int("306C0104", 16)),
+        InstructionWord(4, int("0B00005F", 16)),
+        InstructionWord(8, int("0000002C", 16)),
+        InstructionWord(12, int("0163D3FE", 16)),
+        InstructionWord(16, int("FFFF3032", 16)),
+        InstructionWord(20, int("29100072", 16)),
+        InstructionWord(24, int("302810FC", 16)),
+        InstructionWord(28, int("012C0066", 16)),
+        InstructionWord(32, int("27291000", 16)),
+        InstructionWord(36, int("6C01040B", 16)),
+        InstructionWord(40, int("00005F00", 16)),
+        InstructionWord(44, int("00006C01", 16)),
+    ]
+
+    segments = []
+    offset = 0
+    for words in (helper_3d_words, helper_72_words):
+        data = encode_instructions(words)
+        descriptor = SegmentDescriptor(len(segments), offset, offset + len(data))
+        segments.append(Segment(descriptor, data))
+        offset += len(data)
+
+    container = MbcContainer(Path("dummy"), segments)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    flattened = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    tail_nodes = [node for node in flattened if isinstance(node, IRTailcallReturn)]
+    assert len(tail_nodes) == 1
+
+    helper_72 = tail_nodes[0]
+
+    assert helper_72.target == 0x3032
+    assert helper_72.cleanup == ()
+    assert helper_72.cleanup_mask is None
+
+    io_nodes = [node for node in flattened if isinstance(node, IRIOWrite)]
+    assert io_nodes and all(node.port == "io.port_6910" for node in io_nodes)
+
+    assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
+
+    ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
+    assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
+
+
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
     container, knowledge = build_template_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
@@ -424,10 +487,7 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     ]
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
-    assert any(
-        text.startswith("tailcall_ascii") or text.startswith("ascii_wrapper_call tail")
-        for text in descriptions
-    )
+    assert any(text.startswith("call tail") for text in descriptions)
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
@@ -591,7 +651,8 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
     assert call_return.symbol == "test_helper_1234"
-    assert call_return.shuffle == 0x4B08
+    assert call_return.convention is not None
+    assert call_return.convention.operand == 0x4B08
     assert call_return.cleanup_mask == 0x2910
     assert call_return.arity is None
 
@@ -624,7 +685,8 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert call_return.shuffle == 0x4B10
+    assert call_return.convention is not None
+    assert call_return.convention.operand == 0x4B10
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes

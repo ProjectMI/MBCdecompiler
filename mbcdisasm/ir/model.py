@@ -51,7 +51,7 @@ class MemRef:
     def describe(self) -> str:
         region = self.page_alias or self.region or "mem"
         prefix = region
-        if not prefix.startswith("mem") and prefix not in {"frame", "global", "const"}:
+        if not prefix.startswith(("mem", "io")) and prefix not in {"frame", "global", "const"}:
             prefix = f"mem.{prefix}"
 
         details = []
@@ -129,7 +129,7 @@ class IRCall(IRNode):
     args: Tuple[str, ...]
     tail: bool = False
     arity: Optional[int] = None
-    shuffle: Optional[int] = None
+    convention: Optional[IRStackEffect] = None
     cleanup_mask: Optional[int] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
@@ -144,8 +144,8 @@ class IRCall(IRNode):
         details = []
         if self.arity is not None:
             details.append(f"arity={self.arity}")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
+        if self.convention is not None:
+            details.append(f"convention={self.convention.describe()}")
         if self.cleanup_mask is not None:
             details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
@@ -308,88 +308,6 @@ class IRLiteralBlock(IRNode):
             )
             base += f" via {self.reducer}{operand}"
         return base
-
-
-@dataclass(frozen=True)
-class IRAsciiWrapperCall(IRNode):
-    """Tailored representation of helper calls guarded by inline ASCII chunks."""
-
-    target: int
-    args: Tuple[str, ...]
-    ascii_chunks: Tuple[str, ...]
-    tail: bool = False
-    arity: Optional[int] = None
-    shuffle: Optional[int] = None
-    cleanup_mask: Optional[int] = None
-    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    symbol: Optional[str] = None
-    predicate: Optional[CallPredicate] = None
-
-    def describe(self) -> str:
-        ascii_repr = ", ".join(self.ascii_chunks)
-        prefix = "ascii_wrapper_call tail" if self.tail else "ascii_wrapper_call"
-        target_repr = f"0x{self.target:04X}"
-        if self.symbol:
-            target_repr = f"{self.symbol}({target_repr})"
-        details = []
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
-        if self.cleanup:
-            rendered = ", ".join(step.describe() for step in self.cleanup)
-            details.append(f"cleanup=[{rendered}]")
-        if self.predicate is not None:
-            details.append(f"predicate={self.predicate.describe()}")
-        extra = f" {' '.join(details)}" if details else ""
-        return (
-            f"{prefix} target={target_repr} ascii=[{ascii_repr}] "
-            f"args=[{', '.join(self.args)}]{extra}"
-        )
-
-
-@dataclass(frozen=True)
-class IRTailcallAscii(IRNode):
-    """Tail calls immediately followed by ASCII driven conditionals."""
-
-    target: int
-    args: Tuple[str, ...]
-    ascii_chunks: Tuple[str, ...]
-    condition: str
-    then_target: int
-    else_target: int
-    arity: Optional[int] = None
-    shuffle: Optional[int] = None
-    cleanup_mask: Optional[int] = None
-    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    symbol: Optional[str] = None
-    predicate: Optional[CallPredicate] = None
-
-    def describe(self) -> str:
-        ascii_repr = ", ".join(self.ascii_chunks)
-        target_repr = f"0x{self.target:04X}"
-        if self.symbol:
-            target_repr = f"{self.symbol}({target_repr})"
-        details = []
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
-        if self.cleanup:
-            rendered = ", ".join(step.describe() for step in self.cleanup)
-            details.append(f"cleanup=[{rendered}]")
-        if self.predicate is not None:
-            details.append(f"predicate={self.predicate.describe()}")
-        extra = f" {' '.join(details)}" if details else ""
-        return (
-            f"tailcall_ascii target={target_repr} cond={self.condition} "
-            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X} "
-            f"ascii=[{ascii_repr}]{extra}"
-        )
 
 
 @dataclass(frozen=True)
@@ -684,7 +602,7 @@ class IRCallReturn(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     arity: Optional[int] = None
-    shuffle: Optional[int] = None
+    convention: Optional[IRStackEffect] = None
     cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
@@ -705,8 +623,8 @@ class IRCallReturn(IRNode):
         details = []
         if self.arity is not None:
             details.append(f"arity={self.arity}")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
+        if self.convention is not None:
+            details.append(f"convention={self.convention.describe()}")
         if self.cleanup_mask is not None:
             details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.predicate is not None:
@@ -765,7 +683,7 @@ class IRTailcallReturn(IRNode):
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     tail: bool = True
     arity: Optional[int] = None
-    shuffle: Optional[int] = None
+    convention: Optional[IRStackEffect] = None
     cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
@@ -778,8 +696,8 @@ class IRTailcallReturn(IRNode):
         details = [f"returns={self.returns}"]
         if self.varargs:
             details.append("varargs")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
+        if self.convention is not None:
+            details.append(f"convention={self.convention.describe()}")
         if self.cleanup_mask is not None:
             details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
@@ -897,8 +815,6 @@ __all__ = [
     "IRBuildMap",
     "IRBuildTuple",
     "IRLiteralBlock",
-    "IRAsciiWrapperCall",
-    "IRTailcallAscii",
     "IRIf",
     "IRTestSetBranch",
     "IRFlagCheck",
