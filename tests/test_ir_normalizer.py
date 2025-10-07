@@ -19,8 +19,9 @@ from mbcdisasm.ir.model import (
     IRTestSetBranch,
     IRRaw,
     IRConditionMask,
+    IRIOWrite,
 )
-from mbcdisasm.constants import IO_SLOT, RET_MASK
+from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 
@@ -135,6 +136,7 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x1234": "test_helper_1234",
         "0x0020": "call_helper_20",
         "0x0072": "tail_helper_72",
+        "0x00F0": "tail_helper_f0",
     }
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
     call_signatures = {
@@ -690,3 +692,76 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert tail_bundle.tail
     assert tail_bundle.cleanup and tail_bundle.cleanup[-1].mnemonic == "stack_teardown"
     assert tail_bundle.cleanup[-1].pops == 4
+
+
+def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x00, 0x00F0),  # tailcall_dispatch -> helper F0
+        build_word(4, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),  # op_F0_4B shuffle
+        build_word(8, 0x29, 0x10, RET_MASK),  # call mask fan-out
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    tail_node = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
+    assert tail_node.target == 0x00F0
+    assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
+    )
+
+
+def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x1234),  # call_dispatch
+        build_word(4, 0x27, 0x00, 0x0010),  # testset_branch
+        build_word(8, 0x23, 0x00, 0x0008),  # branch_eq on stored predicate
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert any(isinstance(node, IRTestSetBranch) for node in block.nodes)
+    assert not any(isinstance(node, IRIf) for node in block.nodes)
+
+
+def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3D, 0x30, IO_SLOT),  # io handshake
+        build_word(4, 0x10, 0x24, 0x00FF),  # masked write
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRIOWrite)
+    assert node.mask == 0x00FF
+    assert node.port == "io.port_6910"

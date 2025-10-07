@@ -72,7 +72,14 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
-CALL_CLEANUP_MNEMONICS = {"call_helpers", "op_32_29", "op_52_05", "op_05_00", "stack_shuffle", "fanout"}
+CALL_CLEANUP_MNEMONICS = {
+    "call_helpers",
+    "op_32_29",
+    "op_52_05",
+    "op_05_00",
+    "stack_shuffle",
+    "fanout",
+}
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
 
@@ -371,6 +378,7 @@ class IRNormalizer:
         self._pass_call_contracts(items)
         self._pass_condition_masks(items)
         self._pass_call_predicates(items)
+        self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_indirect_access(items, metrics)
 
@@ -1087,10 +1095,7 @@ class IRNormalizer:
                         scan += direction
                         steps += 1
                         continue
-                    if (
-                        node.mnemonic.startswith("op_10_")
-                        and node.operand in IO_ACCEPTED_OPERANDS
-                    ):
+                    if node.mnemonic.startswith("op_10_"):
                         return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
@@ -1492,6 +1497,15 @@ class IRNormalizer:
                         offset += 1
                         consumed += 1
                         continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and call.target in TAILCALL_HELPERS
+                        and candidate.mnemonic == "op_F0_4B"
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        offset += 1
+                        consumed += 1
+                        continue
                     if isinstance(candidate, IRConditionMask):
                         effect = IRStackEffect(
                             mnemonic=candidate.source,
@@ -1627,6 +1641,22 @@ class IRNormalizer:
                 )
                 items.replace_slice(branch_index, branch_index + 1, [updated_branch])
 
+            index += 1
+
+    def _pass_prune_testset_duplicates(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRTestSetBranch):
+                scan = index + 1
+                while scan < len(items) and isinstance(items[scan], IRLiteralChunk):
+                    scan += 1
+                if scan < len(items):
+                    candidate = items[scan]
+                    if isinstance(candidate, IRIf):
+                        if item.var in candidate.condition or item.expr in candidate.condition:
+                            items.pop(scan)
+                            continue
             index += 1
 
     def _extract_call_predicate(
@@ -2183,6 +2213,25 @@ class IRNormalizer:
             next_step = steps[index + 1] if index + 1 < len(steps) else None
             if (
                 step.mnemonic == "op_52_05"
+                and next_step is not None
+                and next_step.mnemonic == "op_32_29"
+                and step.operand == next_step.operand
+            ):
+                operand_role = step.operand_role or next_step.operand_role
+                operand_alias = step.operand_alias or next_step.operand_alias
+                combined.append(
+                    IRStackEffect(
+                        mnemonic="epilogue",
+                        operand=step.operand,
+                        pops=step.pops + next_step.pops,
+                        operand_role=operand_role,
+                        operand_alias=operand_alias,
+                    )
+                )
+                index += 2
+                continue
+            if (
+                step.mnemonic.startswith("op_4A_")
                 and next_step is not None
                 and next_step.mnemonic == "op_32_29"
                 and step.operand == next_step.operand
