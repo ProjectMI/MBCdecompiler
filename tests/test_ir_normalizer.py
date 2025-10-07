@@ -20,6 +20,7 @@ from mbcdisasm.ir.model import (
     IRRaw,
     IRConditionMask,
     IRIOWrite,
+    IRBuildTuple,
 )
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
@@ -320,7 +321,9 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for block in segment.blocks
         for node in block.nodes
     ]
-    assert any("map" in text for text in descriptions)
+    assert any(
+        text.startswith("map(") or text.startswith("tuple([") for text in descriptions
+    )
     assert any(text.startswith("if cond") for text in descriptions)
     assert any(
         text.startswith("testset") or text.startswith("function_prologue")
@@ -442,6 +445,79 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
     assert "lit(0x6704)" in descriptions
 
+
+def test_normalizer_converts_reduce_pair_to_tuple(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x00, 0x00, 0x0002),
+        build_word(8, 0x04, 0x00, 0x0000),  # reduce_pair
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    tuples = [node for node in block.nodes if isinstance(node, IRBuildTuple)]
+    assert tuples and tuples[0].elements == ("lit(0x0001)", "lit(0x0002)")
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "reduce_pair" for node in block.nodes
+    )
+
+
+def test_normalizer_wraps_unknown_call_cleanup_helpers(tmp_path: Path) -> None:
+    manual_path = tmp_path / "manual_annotations.json"
+    manual_path.write_text("{}", "utf-8")
+    knowledge = KnowledgeBase.load(manual_path)
+
+    words = [
+        build_word(0, 0x10, 0xE8, 0x0000),  # op_10_E8
+        build_word(4, 0xF0, 0x4B, 0x4B08),  # op_F0_4B
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    cleanup = block.nodes[0]
+    assert isinstance(cleanup, IRCallCleanup)
+    mnemonics = [step.mnemonic for step in cleanup.steps]
+    assert mnemonics == ["op_10_E8", "op_F0_4B"]
+
+
+def test_normalizer_collects_unknown_call_preparation(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3C, 0x02, 0x0000),  # op_3C_02
+        build_word(4, 0x28, 0x00, 0x1234),  # call_dispatch
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert any(isinstance(node, IRCall) for node in block.nodes)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3C_02" for node in block.nodes
+    )
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

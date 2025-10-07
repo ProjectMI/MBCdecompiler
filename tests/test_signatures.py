@@ -226,7 +226,7 @@ def test_signature_detector_matches_indirect_return_ex():
     assert match.name == "indirect_return_ex"
 
 
-def test_signature_detector_matches_header_ascii_ctrl_seq():
+def test_signature_detector_matches_ascii_header():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [
         InstructionWord(0, int.from_bytes(b"scpt", "big")),
@@ -239,7 +239,7 @@ def test_signature_detector_matches_header_ascii_ctrl_seq():
     detector = SignatureDetector()
     match = detector.detect(profiles, summary)
     assert match is not None
-    assert match.name == "header_ascii_ctrl_seq"
+    assert match.name == "ascii_header"
 
 
 def test_signature_detector_matches_ascii_control_cluster():
@@ -291,7 +291,7 @@ def test_signature_detector_matches_literal_run_with_markers():
     assert match.name == "literal_run_with_markers"
 
 
-def test_signature_detector_matches_ascii_reduce_marker_seq():
+def test_signature_detector_matches_ascii_block():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [
         make_word(0x04, 0x00, 0x0000, 0),
@@ -305,7 +305,7 @@ def test_signature_detector_matches_ascii_reduce_marker_seq():
     detector = SignatureDetector()
     match = detector.detect(profiles, summary)
     assert match is not None
-    assert match.name == "ascii_reduce_marker_seq"
+    assert match.name == "ascii_block"
 
 
 def test_signature_detector_matches_reduce_ascii_prolog():

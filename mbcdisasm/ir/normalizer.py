@@ -71,7 +71,7 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
-CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
+CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_3C_02"}
 CALL_CLEANUP_MNEMONICS = {
     "call_helpers",
     "op_32_29",
@@ -86,6 +86,8 @@ CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
 TAILCALL_HELPERS = {0x0072, 0x003D, 0x00F0}
 TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
 
+LATE_CALL_HELPERS = {"op_10_E8", "op_F0_4B"}
+
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
@@ -98,7 +100,7 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 IO_READ_MNEMONICS = {"op_10_38"}
 IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
-IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00", "op_3C_02"}
 
 
 @dataclass(frozen=True)
@@ -370,12 +372,14 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_assign_ssa_names(items)
+        self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
+        self._pass_late_call_helpers(items)
         self._pass_condition_masks(items)
         self._pass_call_predicates(items)
         self._pass_prune_testset_duplicates(items)
@@ -709,6 +713,7 @@ class IRNormalizer:
     def _collapse_tail_return(self, items: _ItemList, call_index: int, metrics: NormalizerMetrics) -> None:
         index = call_index + 1
         collected_cleanup: List[IRStackEffect] = []
+        cleanup_sources: List[RawInstruction] = []
         while index < len(items):
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
@@ -716,11 +721,10 @@ class IRNormalizer:
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
-                items.replace_slice(
-                    index,
-                    index + 1,
-                    [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
-                )
+                node = IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))
+                for source in cleanup_sources:
+                    self._transfer_ssa(source, node)
+                items.replace_slice(index, index + 1, [node])
                 metrics.returns += 1
                 return
             if isinstance(item, RawInstruction) and item.profile.kind in {
@@ -729,6 +733,7 @@ class IRNormalizer:
             }:
                 if item.profile.kind is InstructionKind.STACK_TEARDOWN:
                     collected_cleanup.append(self._call_cleanup_effect(item))
+                cleanup_sources.append(item)
                 items.pop(index)
                 continue
             break
@@ -838,7 +843,13 @@ class IRNormalizer:
 
             literals = [self._literal_repr(node) for node in literal_nodes]
             replacement: IRNode
-            if len(literals) >= 2 and len(literals) == 2 * len(reducers):
+            if (
+                len(reducers) == 1
+                and reducers[0].mnemonic == "reduce_pair"
+                and len(literals) == 2
+            ):
+                replacement = IRBuildTuple(elements=tuple(literals))
+            elif len(literals) >= 2 and len(literals) == 2 * len(reducers):
                 entries = []
                 for pos in range(0, len(literals), 2):
                     entries.append((literals[pos], literals[pos + 1]))
@@ -1001,6 +1012,7 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            raw_slice: List[RawInstruction] = []
             steps: List[IRStackEffect] = []
             start = index
             end = index
@@ -1009,6 +1021,7 @@ class IRNormalizer:
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
                     steps.append(self._call_cleanup_effect(candidate))
+                    raw_slice.append(candidate)
                     end = scan + 1
                     scan += 1
                     continue
@@ -1025,7 +1038,10 @@ class IRNormalizer:
                 prev_index -= 1
 
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
-                items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
+                node = IRCallCleanup(steps=tuple(steps))
+                for source in raw_slice:
+                    self._transfer_ssa(source, node)
+                items.replace_slice(start, end, [node])
                 index = prev_index + 2
                 continue
 
@@ -1042,6 +1058,8 @@ class IRNormalizer:
                     varargs=return_node.varargs,
                     cleanup=combined,
                 )
+                for source in raw_slice:
+                    self._transfer_ssa(source, updated)
                 self._transfer_ssa(return_node, updated)
                 items.replace_slice(start, end, [])
                 next_index -= len(steps)
@@ -1049,7 +1067,10 @@ class IRNormalizer:
                 index = next_index + 1
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
+            node = IRCallCleanup(steps=tuple(steps))
+            for source in raw_slice:
+                self._transfer_ssa(source, node)
+            items.replace_slice(start, end, [node])
             index = start + 1
 
     def _pass_io_operations(self, items: _ItemList) -> None:
@@ -1236,6 +1257,7 @@ class IRNormalizer:
                 continue
 
             steps: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            sources: List[RawInstruction] = [item]
             scan = index + 1
             end = index + 1
             while scan < len(items) and scan - index <= 6:
@@ -1243,13 +1265,17 @@ class IRNormalizer:
                 if not isinstance(candidate, RawInstruction):
                     break
                 steps.append((candidate.mnemonic, candidate.operand))
+                sources.append(candidate)
                 if candidate.mnemonic == "op_F0_4B":
                     end = scan + 1
                     break
                 scan += 1
 
             if steps[-1][0] == "op_F0_4B":
-                items.replace_slice(index, end, [IRTailcallFrame(steps=tuple(steps))])
+                node = IRTailcallFrame(steps=tuple(steps))
+                for source in sources:
+                    self._transfer_ssa(source, node)
+                items.replace_slice(index, end, [node])
                 continue
 
             index += 1
@@ -1822,6 +1848,33 @@ class IRNormalizer:
 
             updated_index = self._apply_call_signature(items, index, node, signature)
             index = updated_index + 1
+
+    def _pass_late_call_helpers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or item.mnemonic not in LATE_CALL_HELPERS:
+                index += 1
+                continue
+
+            raw_slice: List[RawInstruction] = []
+            steps: List[IRStackEffect] = []
+            start = index
+            scan = index
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and candidate.mnemonic in LATE_CALL_HELPERS:
+                    steps.append(self._call_cleanup_effect(candidate))
+                    raw_slice.append(candidate)
+                    scan += 1
+                    continue
+                break
+
+            node = IRCallCleanup(steps=tuple(steps))
+            for source in raw_slice:
+                self._transfer_ssa(source, node)
+            items.replace_slice(start, start + len(steps), [node])
+            index = start + 1
 
     def _apply_call_signature(
         self,
@@ -2398,24 +2451,34 @@ class IRNormalizer:
             if isinstance(item, RawInstruction) and item.ssa_values:
                 self._record_ssa(item, item.ssa_values, kinds=item.ssa_kinds)
 
+    def _pass_testset_branches(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or item.mnemonic != "testset_branch":
+                index += 1
+                continue
+
+            expr = self._describe_condition(items, index, skip_literals=True)
+            node = IRTestSetBranch(
+                var=self._format_testset_var(item),
+                expr=expr,
+                then_target=self._branch_target(item),
+                else_target=self._fallthrough_target(item),
+            )
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            metrics.testset_branches += 1
+            index += 1
+
     def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
             item = items[index]
             if not isinstance(item, RawInstruction):
                 index += 1
-                continue
-
-            if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
-                node = IRTestSetBranch(
-                    var=self._format_testset_var(item),
-                    expr=expr,
-                    then_target=self._branch_target(item),
-                    else_target=self._fallthrough_target(item),
-                )
-                items.replace_slice(index, index + 1, [node])
-                metrics.testset_branches += 1
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
