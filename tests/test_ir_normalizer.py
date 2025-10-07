@@ -20,6 +20,7 @@ from mbcdisasm.ir.model import (
     IRRaw,
     IRConditionMask,
 )
+from mbcdisasm.ir.normalizer import _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
@@ -134,47 +135,74 @@ def write_manual(path: Path) -> KnowledgeBase:
     address_table = {
         "0x1234": "test_helper_1234",
         "0x0020": "call_helper_20",
+        "0x003D": "tail_helper_3d",
         "0x0072": "tail_helper_72",
+        "0x00F0": "tail_helper_f0",
     }
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
+    common_signature = {
+        "arity": 2,
+        "cleanup_mask": "0x2910",
+        "cleanup": [
+            {"mnemonic": "stack_teardown", "pops": 1},
+        ],
+        "shuffle": "0x4B08",
+        "shuffle_options": ["0x4B08", "0x3032"],
+        "prelude": [
+            {
+                "kind": "raw",
+                "mnemonic": "op_F0_4B",
+                "operand": "0x4B08",
+                "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"},
+                "optional": True,
+            },
+            {
+                "kind": "raw",
+                "mnemonic": "op_5E_29",
+                "operand": "0x2910",
+                "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"},
+                "optional": True,
+            },
+            {
+                "kind": "raw",
+                "mnemonic": "op_6C_01",
+                "operand": "0x6C01",
+                "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"},
+                "optional": True,
+            },
+        ],
+        "postlude": [
+            {
+                "kind": "raw",
+                "mnemonic": "op_70_29",
+                "effect": {"mnemonic": "op_70_29", "inherit_operand": True},
+                "optional": True,
+            },
+        ],
+    }
     call_signatures = {
-        "0x0072": {
-            "arity": 2,
-            "cleanup_mask": "0x2910",
-            "cleanup": [
-                {"mnemonic": "stack_teardown", "pops": 1},
-            ],
-            "shuffle": "0x4B08",
-            "shuffle_options": ["0x4B08", "0x3032"],
-            "prelude": [
-                {
-                    "kind": "raw",
-                    "mnemonic": "op_F0_4B",
-                    "operand": "0x4B08",
-                    "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"},
-                },
-                {
-                    "kind": "raw",
-                    "mnemonic": "op_5E_29",
-                    "operand": "0x2910",
-                    "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"},
-                },
-                {
-                    "kind": "raw",
-                    "mnemonic": "op_6C_01",
-                    "operand": "0x6C01",
-                    "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"},
-                },
-            ],
-            "postlude": [
-                {
-                    "kind": "raw",
-                    "mnemonic": "op_70_29",
-                    "effect": {"mnemonic": "op_70_29", "inherit_operand": True},
-                    "optional": True,
-                },
-            ],
-        }
+        "0x003D": dict(common_signature),
+        "0x0072": {**common_signature, "prelude": [
+            {
+                "kind": "raw",
+                "mnemonic": "op_F0_4B",
+                "operand": "0x4B08",
+                "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"},
+            },
+            {
+                "kind": "raw",
+                "mnemonic": "op_5E_29",
+                "operand": "0x2910",
+                "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"},
+            },
+            {
+                "kind": "raw",
+                "mnemonic": "op_6C_01",
+                "operand": "0x6C01",
+                "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"},
+            },
+        ]},
+        "0x00F0": dict(common_signature),
     }
     (path / "call_signatures.json").write_text(json.dumps(call_signatures, indent=2), "utf-8")
     return KnowledgeBase.load(manual_path)
@@ -355,15 +383,16 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             contract_call = node
             break
     assert contract_call is not None
+    assert isinstance(contract_call, IRTailcallReturn)
     assert contract_call.cleanup_mask == 0x2910
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
-    assert [step.mnemonic for step in contract_call.cleanup] == [
-        "op_6C_01",
-        "op_5E_29",
-        "op_F0_4B",
-        "stack_teardown",
-    ]
+    cleanup_mnemonics = [step.mnemonic for step in contract_call.cleanup]
+    assert cleanup_mnemonics[:2] == ["op_6C_01", "op_5E_29"]
+    assert "op_F0_4B" in cleanup_mnemonics
+    assert "stack_teardown" in cleanup_mnemonics
+    assert "op_29_10" in cleanup_mnemonics
+    assert cleanup_mnemonics[-1] == "op_70_29"
 
     if_nodes = [
         node
@@ -510,7 +539,7 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "io.write(mask=0x2910)" in descriptions
+    assert "io.write(port=io.port_6910, mask=0x2910)" in descriptions
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
@@ -687,3 +716,60 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert tail_bundle.tail
     assert tail_bundle.cleanup and tail_bundle.cleanup[-1].mnemonic == "stack_teardown"
     assert tail_bundle.cleanup[-1].pops == 4
+
+
+def test_normalizer_canonicalises_f0_tail_helper(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x6C, 0x01, 0x6C01),
+        build_word(4, 0x5E, 0x29, 0x2910),
+        build_word(8, 0xF0, 0x4B, 0x4B08),
+        build_word(12, 0x2B, 0x00, 0x00F0),
+        build_word(16, 0x29, 0x10, 0x2910),
+        build_word(20, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_6C_01", "op_5E_29", "op_F0_4B"}
+        for node in block.nodes
+    )
+
+    tail_node = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
+    assert tail_node.target == 0x00F0
+    assert tail_node.cleanup_mask == RET_MASK
+    cleanup_mnemonics = [step.mnemonic for step in tail_node.cleanup]
+    assert cleanup_mnemonics[:2] == ["op_6C_01", "op_5E_29"]
+    assert "op_F0_4B" in cleanup_mnemonics
+    assert "stack_teardown" in cleanup_mnemonics
+
+
+def test_normalizer_merges_duplicate_testset_branch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    prologue = IRFunctionPrologue(
+        var="slot(0x0008)", expr="stack_top", then_target=0x0008, else_target=0x0004
+    )
+    duplicate_if = IRIf(
+        condition="testset slot(0x0008)=stack_top then=0x0008 else=0x0004",
+        then_target=0x0008,
+        else_target=0x0004,
+    )
+    items = _ItemList([prologue, duplicate_if])
+
+    normalizer._pass_testset_merges(items)
+
+    remaining = items.to_tuple()
+    assert len(remaining) == 1
+    assert isinstance(remaining[0], IRFunctionPrologue)
