@@ -10,8 +10,6 @@ from mbcdisasm.ir.model import (
     IRCallPreparation,
     IRCallReturn,
     IRTailcallReturn,
-    IRAsciiWrapperCall,
-    IRTailcallAscii,
     IRIf,
     IRReturn,
     IRFunctionPrologue,
@@ -344,16 +342,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for seg in program.segments
         for block in seg.blocks
         for node in block.nodes
-        if isinstance(
-            node,
-            (
-                IRCall,
-                IRCallReturn,
-                IRAsciiWrapperCall,
-                IRTailcallAscii,
-                IRTailcallReturn,
-            ),
-        )
+        if isinstance(node, (IRCall, IRCallReturn, IRTailcallReturn))
     ]
     contract_call = None
     for node in call_nodes:
@@ -371,19 +360,14 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for block in seg.blocks
         if contract_call in block.nodes
     )
-    cleanup_nodes = [
-        node for node in call_block.nodes if isinstance(node, IRCallCleanup)
-    ]
-    assert any(
-        [step.mnemonic for step in node.steps]
-        == ["op_6C_01", "op_5E_29", "op_F0_4B"]
-        for node in cleanup_nodes
+    assert not any(
+        isinstance(node, IRCallCleanup)
+        and any(step.mnemonic in {"op_6C_01", "op_5E_29", "op_F0_4B"} for step in node.steps)
+        for node in call_block.nodes
     )
-    assert [step.mnemonic for step in contract_call.cleanup] == [
-        "stack_teardown",
-        "op_29_10",
-        "op_70_29",
-    ]
+    assert contract_call.cleanup and len(contract_call.cleanup) == 1
+    assert contract_call.cleanup[0].mnemonic == "stack_teardown"
+    assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
         node
@@ -424,10 +408,7 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     ]
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
-    assert any(
-        text.startswith("tailcall_ascii") or text.startswith("ascii_wrapper_call tail")
-        for text in descriptions
-    )
+    assert any(text.startswith("call tail") for text in descriptions)
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
@@ -584,10 +565,9 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert [step.mnemonic for step in call_return.cleanup] == [
         "call_helpers",
         "op_32_29",
-        "op_29_10",
         "stack_teardown",
     ]
-    assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
+    assert [step.operand for step in call_return.cleanup[:2]] == [0x0001, 0x1000]
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
     assert call_return.symbol == "test_helper_1234"
@@ -782,7 +762,7 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
 
     tail_node = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
     assert tail_node.target == 0x00F0
-    assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
+    assert not tail_node.cleanup
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
     )
