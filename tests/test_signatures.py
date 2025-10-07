@@ -137,6 +137,21 @@ def test_signature_detector_matches_mode_sweep_block():
     assert match.name == "mode_sweep_block"
 
 
+def test_signature_detector_matches_extended_mode_sweep_block():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x80, 0x2A, 0x0001, 0),
+        make_word(0x81, 0x2A, 0x0002, 4),
+        make_word(0x82, 0x2A, 0x0003, 8),
+        make_word(0x83, 0x2A, 0x0004, 12),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "mode_sweep_block"
+
+
 def test_signature_detector_matches_stack_lift_pair():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [

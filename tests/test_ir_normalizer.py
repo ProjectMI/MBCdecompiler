@@ -26,6 +26,7 @@ from mbcdisasm.ir.model import (
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
+    IRTablePatch,
     IRSwitchDispatch,
     NormalizerMetrics,
 )
@@ -1100,3 +1101,66 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
+
+def test_normalizer_collapses_opcode_table_runs(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(offset * 4, 0x80 + offset, 0x2A, 0x0000)
+        for offset in range(12)
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert node.annotations == ("opcode_table", "mode=0x2A")
+    assert len(node.operations) == len(words)
+    assert all(operand == 0 for _, operand in node.operations)
+    assert not any(isinstance(entry, IRRaw) for entry in block.nodes)
+
+
+def test_opcode_table_literals_are_tagged(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words: list[InstructionWord] = []
+    offset = 0
+    for opcode in range(0x80, 0x88):
+        words.append(build_word(offset, opcode, 0x2B, 0x0000))
+        offset += 4
+    words.append(build_ascii_word(offset, "DATA"))
+    offset += 4
+    for opcode in range(0x90, 0x98):
+        words.append(build_word(offset, opcode, 0x2B, 0x0000))
+        offset += 4
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 3
+    left, middle, right = block.nodes
+
+    assert isinstance(left, IRTablePatch)
+    assert isinstance(right, IRTablePatch)
+    assert all("opcode_table" in node.annotations for node in (left, right))
+    assert left.annotations[1] == "mode=0x2B"
+    assert right.annotations[1] == "mode=0x2B"
+
+    assert isinstance(middle, IRLiteralChunk)
+    assert "opcode_table" in middle.annotations
+    assert middle.symbol is not None
+    assert not any(isinstance(entry, IRRaw) for entry in block.nodes)

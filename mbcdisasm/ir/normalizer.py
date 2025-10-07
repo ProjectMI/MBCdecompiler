@@ -75,6 +75,10 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
+OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F}
+OPCODE_TABLE_MIN_SPAN = 6
+
+
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
 CALL_PREPARATION_MNEMONICS = {"op_3C_02"}
 CALL_CLEANUP_MNEMONICS = {
@@ -405,6 +409,7 @@ class IRNormalizer:
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
+        self._pass_opcode_tables(items)
         self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
@@ -1112,6 +1117,7 @@ class IRNormalizer:
                             reducer=first.mnemonic,
                             reducer_operand=first.operand,
                             tail=second.tail,
+                            annotations=second.annotations,
                         )
                         self._transfer_ssa(first, updated)
                         items.replace_slice(index, index + 2, [updated])
@@ -1545,11 +1551,126 @@ class IRNormalizer:
             items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
             index += 1
 
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_opcode_table_instruction(item):
+                index += 1
+                continue
+
+            mode = item.profile.mode
+            start = index
+            operations: List[Tuple[str, int]] = []
+            removed: List[Union[RawInstruction, IRNode]] = []
+            last_instruction: Optional[RawInstruction] = None
+
+            while index < len(items):
+                candidate = items[index]
+                if (
+                    isinstance(candidate, RawInstruction)
+                    and self._is_opcode_table_instruction(candidate, mode)
+                ):
+                    operations.append((candidate.mnemonic, candidate.operand))
+                    removed.append(candidate)
+                    last_instruction = candidate
+                    index += 1
+                    continue
+                break
+
+            if len(operations) < OPCODE_TABLE_MIN_SPAN:
+                index = start + 1
+                continue
+
+            patch = IRTablePatch(
+                operations=tuple(operations),
+                annotations=("opcode_table", f"mode=0x{mode:02X}"),
+            )
+
+            if last_instruction is not None:
+                self._transfer_ssa(last_instruction, patch)
+
+            for removed_item in removed:
+                if removed_item is last_instruction:
+                    continue
+                self._ssa_bindings.pop(id(removed_item), None)
+
+            items.replace_slice(start, index, [patch])
+            index = start + 1
+
+        self._annotate_opcode_table_literals(items)
+
+    def _annotate_opcode_table_literals(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, (IRLiteralBlock, IRLiteralChunk)):
+                existing = getattr(item, "annotations", tuple())
+                if "opcode_table" in existing:
+                    index += 1
+                    continue
+
+                if self._has_opcode_table_neighbor(items, index):
+                    annotated = self._mark_opcode_table_literal(item)
+                    items.replace_slice(index, index + 1, [annotated])
+            index += 1
+
+    def _mark_opcode_table_literal(
+        self, literal: Union[IRLiteralBlock, IRLiteralChunk]
+    ) -> Union[IRLiteralBlock, IRLiteralChunk]:
+        annotations = tuple(getattr(literal, "annotations", tuple()))
+        if "opcode_table" in annotations:
+            return literal
+        updated = annotations + ("opcode_table",)
+        if isinstance(literal, IRLiteralBlock):
+            return IRLiteralBlock(
+                triplets=literal.triplets,
+                reducer=literal.reducer,
+                reducer_operand=literal.reducer_operand,
+                tail=literal.tail,
+                annotations=updated,
+            )
+        return IRLiteralChunk(
+            data=literal.data,
+            source=literal.source,
+            annotations=updated,
+            symbol=literal.symbol,
+        )
+
+    def _has_opcode_table_neighbor(self, items: _ItemList, index: int) -> bool:
+        if index > 0 and self._is_opcode_table_patch(items[index - 1]):
+            return True
+        if index + 1 < len(items) and self._is_opcode_table_patch(items[index + 1]):
+            return True
+        return False
+
+    @staticmethod
+    def _is_opcode_table_patch(item: Union[RawInstruction, IRNode]) -> bool:
+        return isinstance(item, IRTablePatch) and "opcode_table" in item.annotations
+
+    @staticmethod
+    def _is_opcode_table_instruction(
+        instruction: RawInstruction, expected_mode: Optional[int] = None
+    ) -> bool:
+        if instruction.profile.mode not in OPCODE_TABLE_MODES:
+            return False
+        if expected_mode is not None and instruction.profile.mode != expected_mode:
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        if instruction.operand != 0:
+            return False
+        if instruction.event.delta != 0:
+            return False
+        if instruction.event.popped_types or instruction.event.pushed_types:
+            return False
+        return True
+
     def _pass_table_dispatch(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, IRTablePatch):
+            if not isinstance(item, IRTablePatch) or "opcode_table" in item.annotations:
                 index += 1
                 continue
 
