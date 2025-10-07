@@ -24,7 +24,7 @@
         "kind": "raw",
         "mnemonic": "op_6C_01",
         "operand": "0x6C01",
-        "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"}
+        "effect": {"mnemonic": "page_register", "operand": "0x6C01"}
       }
     ],
     "postlude": [
@@ -46,6 +46,17 @@
         "effect": {"mnemonic": "op_06_66", "inherit_operand": true},
         "optional": true
       }
+    ]
+  },
+  "0x3D30": {
+    "tail": true,
+    "prelude": [
+      {"kind": "raw", "mnemonic": "op_D0_04", "optional": true},
+      {"kind": "raw", "mnemonic": "op_D8_04", "optional": true},
+      {"kind": "raw", "mnemonic": "op_C4_06", "optional": true}
+    ],
+    "postlude": [
+      {"kind": "raw", "mnemonic": "op_D0_06", "optional": true}
     ]
   }
 }

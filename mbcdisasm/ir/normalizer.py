@@ -10,6 +10,7 @@ from ..constants import (
     CALL_SHUFFLE_STANDARD,
     IO_PORT_NAME,
     IO_SLOT,
+    PAGE_REGISTER,
     MEMORY_BANK_ALIASES,
     MEMORY_PAGE_ALIASES,
     RET_MASK,
@@ -39,6 +40,7 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRPageRegister,
     IRLoad,
     IRNode,
     IRProgram,
@@ -51,6 +53,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRStringConstant,
     IRTablePatch,
     IRDispatchCase,
     IRSwitchDispatch,
@@ -84,6 +87,11 @@ CALL_CLEANUP_MNEMONICS = {
     "op_F0_4B",
     "op_6C_01",
     "op_5E_29",
+    "op_D0_04",
+    "op_D8_04",
+    "op_C4_06",
+    "op_D0_06",
+    "op_01_2E",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
@@ -182,20 +190,24 @@ class IRNormalizer:
 
     _SSA_PREFIX = {
         SSAValueKind.UNKNOWN: "ssa",
-        SSAValueKind.INTEGER: "int",
-        SSAValueKind.ADDRESS: "addr",
+        SSAValueKind.BYTE: "byte",
+        SSAValueKind.WORD: "word",
         SSAValueKind.POINTER: "ptr",
+        SSAValueKind.IO: "io",
+        SSAValueKind.PAGE_REGISTER: "page",
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
-        SSAValueKind.INTEGER: 1,
-        SSAValueKind.IDENTIFIER: 1,
-        SSAValueKind.ADDRESS: 2,
+        SSAValueKind.BYTE: 1,
+        SSAValueKind.WORD: 2,
+        SSAValueKind.IDENTIFIER: 2,
         SSAValueKind.POINTER: 3,
-        SSAValueKind.BOOLEAN: 4,
+        SSAValueKind.IO: 4,
+        SSAValueKind.PAGE_REGISTER: 5,
+        SSAValueKind.BOOLEAN: 6,
     }
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
@@ -209,6 +221,8 @@ class IRNormalizer:
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
+        self._string_pool: Dict[bytes, IRStringConstant] = {}
+        self._string_pool_order: List[IRStringConstant] = []
 
     # ------------------------------------------------------------------
     # public entry points
@@ -222,6 +236,8 @@ class IRNormalizer:
         segments: List[IRSegment] = []
         aggregate_metrics = NormalizerMetrics()
         selection = set(segment_indices or [])
+        self._string_pool.clear()
+        self._string_pool_order.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -230,7 +246,11 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
-        return IRProgram(segments=tuple(segments), metrics=aggregate_metrics)
+        return IRProgram(
+            segments=tuple(segments),
+            metrics=aggregate_metrics,
+            string_pool=tuple(self._string_pool_order),
+        )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
         raw_blocks = self._parse_segment(segment)
@@ -396,6 +416,7 @@ class IRNormalizer:
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
+        self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -453,11 +474,16 @@ class IRNormalizer:
         target: Union[RawInstruction, IRNode],
     ) -> None:
         values: Sequence[str] = ()
+        kinds: Optional[Sequence[SSAValueKind]] = None
         if isinstance(source, RawInstruction):
             values = source.ssa_values
-        values = self._ssa_bindings.get(id(source), values)
+            kinds = source.ssa_kinds
+        stored = self._ssa_bindings.get(id(source))
+        if stored:
+            values = stored
+            kinds = None
         if values:
-            self._record_ssa(target, values)
+            self._record_ssa(target, values, kinds=kinds)
         self._ssa_bindings.pop(id(source), None)
 
     def _ssa_value(
@@ -508,7 +534,7 @@ class IRNormalizer:
         if value_type is StackValueType.SLOT:
             return SSAValueKind.POINTER
         if value_type is StackValueType.NUMBER:
-            return SSAValueKind.INTEGER
+            return SSAValueKind.WORD
         if value_type is StackValueType.IDENTIFIER:
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
@@ -551,7 +577,44 @@ class IRNormalizer:
                 metrics.literal_chunks += 1
 
             self._transfer_ssa(item, literal)
+            if isinstance(literal, IRLiteral):
+                self._annotate_literal_ssa(literal)
             items.replace_slice(index, index + 1, [literal])
+            index += 1
+
+    def _annotate_literal_ssa(self, node: IRLiteral) -> None:
+        names = self._ssa_bindings.get(id(node))
+        if not names:
+            return
+        kind = self._literal_ssa_kind(node)
+        if kind is None:
+            return
+        for name in names:
+            self._promote_ssa_kind(name, kind)
+
+    def _literal_ssa_kind(self, node: IRLiteral) -> Optional[SSAValueKind]:
+        value = node.value & 0xFFFF
+        if value == PAGE_REGISTER:
+            return SSAValueKind.PAGE_REGISTER
+        if value == IO_SLOT:
+            return SSAValueKind.IO
+        if value <= 0xFF:
+            return SSAValueKind.BYTE
+        return SSAValueKind.WORD
+
+    def _pass_page_registers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if (
+                isinstance(item, RawInstruction)
+                and item.mnemonic == "op_6C_01"
+                and item.operand == PAGE_REGISTER
+            ):
+                node = IRPageRegister(register=item.operand)
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
+                continue
             index += 1
 
     def _pass_stack_manipulation(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
@@ -587,6 +650,31 @@ class IRNormalizer:
 
             index += 1
 
+    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
+        constant = self._string_pool.get(data)
+        if constant is not None:
+            return constant
+
+        segments = tuple(
+            data[pos : pos + 4] for pos in range(0, len(data), 4)
+        ) or (b"",)
+        name = f"str_{len(self._string_pool_order):04d}"
+        constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
+        self._string_pool[data] = constant
+        self._string_pool_order.append(constant)
+        return constant
+
+    def _make_literal_chunk(
+        self, data: bytes, source: str, annotations: Sequence[str]
+    ) -> IRLiteralChunk:
+        constant = self._intern_string_constant(data, source)
+        return IRLiteralChunk(
+            data=data,
+            source=source,
+            annotations=tuple(annotations),
+            symbol=constant.name,
+        )
+
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
 
@@ -606,11 +694,7 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
-            return IRLiteralChunk(
-                data=data,
-                source=profile.mnemonic,
-                annotations=instruction.annotations,
-            )
+            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -685,10 +769,8 @@ class IRNormalizer:
                 index = start + 1
                 continue
 
-            chunk = IRLiteralChunk(
-                data=b"".join(data_parts),
-                source="ascii_run",
-                annotations=tuple(annotations),
+            chunk = self._make_literal_chunk(
+                b"".join(data_parts), "ascii_run", annotations
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
@@ -1798,6 +1880,10 @@ class IRNormalizer:
                 elif isinstance(previous, IRAsciiPreamble):
                     summary = previous.describe()
 
+            if not summary:
+                index += 1
+                continue
+
             finalize = IRAsciiFinalize(helper=helper_operand, summary=summary or "ascii")
             self._transfer_ssa(item, finalize)
 
@@ -1873,24 +1959,27 @@ class IRNormalizer:
     def _pass_ascii_headers(self, items: _ItemList) -> None:
         if not items:
             return
-        chunks: List[str] = []
+        chunk_nodes: List[IRLiteralChunk] = []
         index = 0
         while index < len(items) and isinstance(items[index], IRLiteralChunk):
-            chunks.append(items[index].describe())
+            chunk_nodes.append(items[index])
             index += 1
-        if len(chunks) >= 2:
-            items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(chunks))])
+        if len(chunk_nodes) >= 2:
+            names = [chunk.symbol or chunk.describe() for chunk in chunk_nodes]
+            items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(names))])
             return
 
-        if len(chunks) == 1:
-            literal = items[0]
+        if len(chunk_nodes) == 1:
+            literal = chunk_nodes[0]
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
                     parts = []
                     for pos in range(0, len(literal.data), 4):
                         segment = literal.data[pos : pos + 4]
-                        piece = IRLiteralChunk(data=segment, source=literal.source)
-                        parts.append(piece.describe())
+                        piece = self._make_literal_chunk(
+                            segment, literal.source, literal.annotations
+                        )
+                        parts.append(piece.symbol or piece.describe())
                     if len(parts) >= 2:
                         items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
 
@@ -2540,6 +2629,8 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         pops = 0
+        if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:
+            mnemonic = "page_register"
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):

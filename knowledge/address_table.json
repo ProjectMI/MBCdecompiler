@@ -2,6 +2,8 @@
   "0x0072": "tail_helper_72",
   "0x00F0": "tail_helper_f0",
   "0x003D": "tail_helper_3d",
+  "0x4B10": "sys.helper",
+  "0x3D30": "io.write",
   "0x1234": "test_helper_1234",
   "0x0020": "call_helper_20"
 }

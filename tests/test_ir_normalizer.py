@@ -10,6 +10,7 @@ from mbcdisasm.ir.model import (
     IRCallPreparation,
     IRCallReturn,
     IRAsciiFinalize,
+    IRAsciiHeader,
     IRTailcallReturn,
     IRIf,
     IRReturn,
@@ -172,7 +173,7 @@ def write_manual(path: Path) -> KnowledgeBase:
                     "kind": "raw",
                     "mnemonic": "op_6C_01",
                     "operand": "0x6C01",
-                    "effect": {"mnemonic": "op_6C_01", "operand": "0x6C01"},
+                    "effect": {"mnemonic": "page_register", "operand": "0x6C01"},
                 },
             ],
             "postlude": [
@@ -183,7 +184,18 @@ def write_manual(path: Path) -> KnowledgeBase:
                     "optional": True,
                 },
             ],
-        }
+        },
+        "0x3D30": {
+            "tail": True,
+            "prelude": [
+                {"kind": "raw", "mnemonic": "op_D0_04", "optional": True},
+                {"kind": "raw", "mnemonic": "op_D8_04", "optional": True},
+                {"kind": "raw", "mnemonic": "op_C4_06", "optional": True},
+            ],
+            "postlude": [
+                {"kind": "raw", "mnemonic": "op_D0_06", "optional": True},
+            ],
+        },
     }
     (path / "call_signatures.json").write_text(json.dumps(call_signatures, indent=2), "utf-8")
     return KnowledgeBase.load(manual_path)
@@ -380,7 +392,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     ]
     assert any(
         [step.mnemonic for step in node.steps]
-        == ["op_6C_01", "op_5E_29", "op_F0_4B"]
+        == ["page_register", "op_5E_29", "op_F0_4B"]
         for node in cleanup_nodes
     )
     assert [step.mnemonic for step in contract_call.cleanup] == ["stack_teardown"]
@@ -515,9 +527,20 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+    descriptions = [
+        getattr(node, "describe", lambda: "")() for node in block.nodes
+    ]
 
-    assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
+    header = next(
+        (node for node in block.nodes if isinstance(node, IRAsciiHeader)), None
+    )
+    assert header is not None
+    assert len(header.chunks) == 2
+
+    pool = {const.name: const for const in program.string_pool}
+    assert all(chunk in pool for chunk in header.chunks)
+    assert pool[header.chunks[0]].data == b"A\x00B\x00"
+    assert pool[header.chunks[1]].data == b"\x00C\x00D"
     assert "lit(0x6704)" in descriptions
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
@@ -597,6 +620,34 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
+    )
+
+
+def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0xD0, 0x04, 0x0000),
+        build_word(4, 0x10, 0xE8, 0x3D30),
+        build_word(8, 0xD0, 0x06, 0x0000),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    cleanup_mnemonics = [step.mnemonic for step in ret.cleanup]
+    assert cleanup_mnemonics == ["op_D0_04", "call_helpers", "op_D0_06"]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic in {"op_D0_04", "op_D0_06"}
+        for node in block.nodes
     )
 
 
