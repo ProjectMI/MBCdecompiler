@@ -11,6 +11,8 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteralChunk,
+    IRTailCall,
     IRTailcallReturn,
     IRIf,
     IRReturn,
@@ -535,13 +537,48 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
         (node for node in block.nodes if isinstance(node, IRAsciiHeader)), None
     )
     assert header is not None
-    assert len(header.chunks) == 2
+    assert len(header.chunks) == 1
 
     pool = {const.name: const for const in program.string_pool}
-    assert all(chunk in pool for chunk in header.chunks)
-    assert pool[header.chunks[0]].data == b"A\x00B\x00"
-    assert pool[header.chunks[1]].data == b"\x00C\x00D"
+    assert header.chunks[0] in pool
+    constant = pool[header.chunks[0]]
+    assert constant.data == b"A\x00B\x00\x00C\x00D"
+    assert constant.segments == (constant.data,)
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_ascii_word(0, "HEAD"),
+        build_ascii_word(4, " ER"),
+        build_word(8, 0x04, 0x00, 0x0000),
+        build_ascii_word(12, " TEXT"),
+        build_word(16, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks and len(header.chunks) == 1
+    symbol = header.chunks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+    assert not any("reduce_pair" in text for text in descriptions)
+
+    pool = {const.name: const for const in program.string_pool}
+    assert symbol in pool
+    constant = pool[symbol]
+    assert constant.data == b"HEAD ER  TEX"
+    assert constant.segments == (constant.data,)
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -819,9 +856,9 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    tail_return = next(node for node in block.nodes if isinstance(node, IRReturn))
-    assert tail_return.cleanup and tail_return.cleanup[-1].mnemonic == "stack_teardown"
-    assert tail_return.cleanup[-1].pops == 4
+    tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert tail_call.cleanup and tail_call.cleanup[-1].mnemonic == "stack_teardown"
+    assert tail_call.cleanup[-1].pops == 4
 
 
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
@@ -923,12 +960,41 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    tail_node = next(node for node in block.nodes if isinstance(node, IRReturn))
-    assert tail_node.mask == RET_MASK
+    tail_node = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert tail_node.cleanup_mask == RET_MASK
     assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
     )
+
+
+def test_normalizer_collapses_inline_tail_dispatch() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge"))
+
+    words = [
+        build_word(0, 0x00, 0x52, 0x0000),
+        build_word(4, 0x4A, 0x05, 0x0052),
+        build_word(8, 0x03, 0x00, 0x1234),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    tail_call = block.nodes[0]
+    assert isinstance(tail_call, IRTailCall)
+    assert tail_call.call.target == 0x1234
+    assert tail_call.call.symbol == "test_helper_1234"
+    assert tail_call.call.args == ()
+    assert tail_call.returns == ("ret0",)
 
 
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:

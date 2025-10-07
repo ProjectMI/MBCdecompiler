@@ -272,6 +272,16 @@ def infer_stack_effect(
         # Markers carry metadata but should not occupy stack slots.
         pushed = [StackValueType.MARKER]
 
+    hint, popped, pushed, kind_override = _apply_literal_chain_overrides(
+        profiles,
+        index,
+        profile,
+        hint,
+        popped,
+        pushed,
+        kind_override,
+    )
+
     if _is_indirect_candidate(profile):
         variant = classify_indirect_variant(profiles, index, prior_types)
         if variant is IndirectVariant.STORE:
@@ -473,6 +483,76 @@ def _teardown_count(profile: InstructionProfile) -> int:
     if not suffix.isdigit():
         return 0
     return int(suffix)
+
+
+def _apply_literal_chain_overrides(
+    profiles: Sequence[InstructionProfile],
+    index: int,
+    profile: InstructionProfile,
+    hint: StackEffectHint,
+    popped: Sequence[StackValueType],
+    pushed: Sequence[StackValueType],
+    kind_override: InstructionKind | None,
+) -> tuple[StackEffectHint, List[StackValueType], List[StackValueType], InstructionKind | None]:
+    """Boost confidence for literal/reduce chains.
+
+    The bytecode frequently emits the ``push_literal``/``push_literal``/
+    ``reduce_pair`` trio when materialising constants.  The manual knowledge base
+    does not yet annotate their stack effects which forces the tracker to rely on
+    low-confidence heuristics.  Recognising the pattern allows us to attribute a
+    deterministic stack delta to every participant which removes the "uncertain"
+    noise from pipeline reports.
+    """
+
+    role = _literal_chain_role(profiles, index)
+    if role is None:
+        return hint, list(popped), list(pushed), kind_override
+
+    if role in {"literal_head", "literal_tail"}:
+        stable_hint = StackEffectHint(nominal=1, minimum=1, maximum=1, confidence=0.9)
+        return stable_hint, list(popped), [StackValueType.NUMBER], kind_override
+
+    if role == "reduce_pair":
+        stable_hint = StackEffectHint(nominal=-1, minimum=-1, maximum=-1, confidence=0.9)
+        pops = [StackValueType.NUMBER, StackValueType.NUMBER]
+        pushes = [StackValueType.NUMBER]
+        return stable_hint, pops, pushes, InstructionKind.REDUCE
+
+    return hint, list(popped), list(pushed), kind_override
+
+
+def _literal_chain_role(
+    profiles: Sequence[InstructionProfile], index: int
+) -> str | None:
+    """Return the role ``profiles[index]`` plays in a literal reduction chain."""
+
+    current = profiles[index]
+    opcode = current.opcode
+    mode = current.mode
+
+    if opcode == 0x04 and mode == 0x00:
+        if index >= 2 and all(profiles[pos].opcode == 0x00 for pos in (index - 1, index - 2)):
+            return "reduce_pair"
+        return None
+
+    if opcode != 0x00:
+        return None
+
+    total = len(profiles)
+
+    if index + 2 < total:
+        second = profiles[index + 1]
+        third = profiles[index + 2]
+        if second.opcode == 0x00 and third.opcode == 0x04 and third.mode == 0x00:
+            return "literal_head"
+
+    if index >= 1 and index + 1 < total:
+        prev = profiles[index - 1]
+        nxt = profiles[index + 1]
+        if prev.opcode == 0x00 and nxt.opcode == 0x04 and nxt.mode == 0x00:
+            return "literal_tail"
+
+    return None
 
 
 def classify_indirect_variant(

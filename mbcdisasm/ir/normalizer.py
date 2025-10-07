@@ -33,6 +33,7 @@ from .model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRTailCall,
     IRTailcallReturn,
     IRConditionMask,
     IRFlagCheck,
@@ -153,6 +154,9 @@ class RawBlock:
     index: int
     start_offset: int
     instructions: Tuple[RawInstruction, ...]
+
+
+CallLike = Union[IRCall, IRCallReturn, IRTailcallReturn, IRTailCall]
 
 
 class _ItemList:
@@ -386,6 +390,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
@@ -655,9 +660,10 @@ class IRNormalizer:
         if constant is not None:
             return constant
 
-        segments = tuple(
-            data[pos : pos + 4] for pos in range(0, len(data), 4)
-        ) or (b"",)
+        if data:
+            segments = (data,)
+        else:
+            segments = (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
         constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
         self._string_pool[data] = constant
@@ -717,9 +723,28 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
-                symbol = self.knowledge.lookup_address(item.operand)
+                target = item.operand
+                symbol = self.knowledge.lookup_address(target)
+                if mnemonic == "tailcall_dispatch":
+                    inline_target = self._extract_tail_dispatch_target(items, index)
+                    if inline_target is not None:
+                        target = inline_target
+                        symbol = self.knowledge.lookup_address(target)
+                        if args:
+                            args = args[:-1]
+                        if not args and start > 0:
+                            literal_index = start - 1
+                            while literal_index > 0 and isinstance(
+                                items[literal_index], RawInstruction
+                            ) and items[literal_index].mnemonic == "op_4A_05":
+                                literal_index -= 1
+                            prior = items[literal_index]
+                            if isinstance(prior, IRLiteral):
+                                source = getattr(prior, "source", "")
+                                if source in {"op_00_52", "push_literal"} or prior.value == 0:
+                                    start = literal_index
                 call = IRCall(
-                    target=item.operand,
+                    target=target,
                     args=tuple(args),
                     tail=mnemonic == "tailcall_dispatch",
                     symbol=symbol,
@@ -775,6 +800,69 @@ class IRNormalizer:
             items.replace_slice(start, index, [chunk])
             index = start + 1
 
+    def _pass_ascii_glue(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            if not isinstance(items[index], IRLiteralChunk):
+                index += 1
+                continue
+
+            start = index
+            scan = index
+            chunk_nodes: List[IRLiteralChunk] = []
+
+            while scan < len(items) and isinstance(items[scan], IRLiteralChunk):
+                chunk = items[scan]
+                assert isinstance(chunk, IRLiteralChunk)
+                chunk_nodes.append(chunk)
+                scan += 1
+
+            reducers: List[RawInstruction] = []
+
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and candidate.mnemonic == "reduce_pair":
+                    reducers.append(candidate)
+                    scan += 1
+                    if scan < len(items) and isinstance(items[scan], IRLiteralChunk):
+                        next_chunk = items[scan]
+                        assert isinstance(next_chunk, IRLiteralChunk)
+                        chunk_nodes.append(next_chunk)
+                        scan += 1
+                        continue
+                    break
+                break
+
+            if not reducers or len(chunk_nodes) != len(reducers) + 1:
+                index += 1
+                continue
+
+            removal_end = scan
+            removed_items = [items[pos] for pos in range(start, removal_end)]
+            source = reducers[-1]
+
+            merged_annotations: List[str] = []
+            seen_annotations: set[str] = set()
+            for chunk in chunk_nodes:
+                for note in chunk.annotations:
+                    if note in seen_annotations:
+                        continue
+                    seen_annotations.add(note)
+                    merged_annotations.append(note)
+
+            data = b"".join(chunk.data for chunk in chunk_nodes)
+            combined = self._make_literal_chunk(data, "ascii_glue", merged_annotations)
+            self._transfer_ssa(source, combined)
+
+            for removed in removed_items:
+                if removed is source:
+                    continue
+                self._ssa_bindings.pop(id(removed), None)
+
+            items.replace_slice(start, removal_end, [combined])
+            metrics.reduce_replaced += len(reducers)
+            index = start + 1
+
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int
     ) -> Tuple[List[str], int]:
@@ -803,6 +891,19 @@ class IRNormalizer:
         args.reverse()
         start = scan + 1
         return args, start
+
+    def _extract_tail_dispatch_target(
+        self, items: _ItemList, call_index: int
+    ) -> Optional[int]:
+        if call_index <= 0:
+            return None
+        candidate = items[call_index - 1]
+        if isinstance(candidate, RawInstruction) and candidate.pushes_value():
+            if candidate.mnemonic in {"op_03_00", "push_literal"}:
+                return candidate.operand & 0xFFFF
+        if isinstance(candidate, IRLiteral):
+            return candidate.value & 0xFFFF
+        return None
 
     def _collapse_tail_return(self, items: _ItemList, call_index: int, metrics: NormalizerMetrics) -> None:
         index = call_index + 1
@@ -1459,7 +1560,7 @@ class IRNormalizer:
                 follow += 1
             if follow < len(items):
                 candidate = items[follow]
-                if isinstance(candidate, (IRCall, IRCallReturn, IRTailcallReturn)):
+                if isinstance(candidate, CallLike):
                     target = getattr(candidate, "target", None)
                     if isinstance(target, int) and target in {0x6623, 0x6624}:
                         helper_target = target
@@ -1503,7 +1604,7 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, (IRCall, IRCallReturn, IRTailcallReturn)):
+            if not isinstance(item, CallLike):
                 index += 1
                 continue
 
@@ -1531,6 +1632,58 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
+            if isinstance(item, IRTailCall):
+                cleanup_steps: List[IRStackEffect] = list(item.cleanup)
+                mask = item.cleanup_mask
+
+                pre = index - 1
+                while pre >= 0 and isinstance(items[pre], (IRCallCleanup, IRConditionMask)):
+                    prefix = items[pre]
+                    if isinstance(prefix, IRCallCleanup):
+                        cleanup_steps = list(prefix.steps) + cleanup_steps
+                        mask = mask or self._extract_cleanup_mask(prefix.steps)
+                    else:
+                        mask = mask or prefix.mask
+                    items.pop(pre)
+                    index -= 1
+                    pre -= 1
+
+                follow = index + 1
+                while follow < len(items) and isinstance(items[follow], (IRCallCleanup, IRConditionMask)):
+                    suffix = items[follow]
+                    if isinstance(suffix, IRCallCleanup):
+                        cleanup_steps.extend(suffix.steps)
+                        mask = mask or self._extract_cleanup_mask(suffix.steps)
+                    else:
+                        mask = mask or suffix.mask
+                    items.pop(follow)
+
+                cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+                mask = mask or item.cleanup_mask
+
+                updated_call = IRCall(
+                    target=item.target,
+                    args=item.args,
+                    tail=True,
+                    arity=item.arity,
+                    convention=item.convention,
+                    cleanup_mask=mask,
+                    cleanup=item.call.cleanup,
+                    symbol=item.symbol,
+                    predicate=item.predicate,
+                )
+                updated = IRTailCall(
+                    call=updated_call,
+                    returns=item.returns,
+                    varargs=item.varargs,
+                    cleanup=tuple(cleanup_steps),
+                    cleanup_mask=mask,
+                )
+                self._transfer_ssa(item, updated)
+                items.replace_slice(index, index + 1, [updated])
+                index += 1
+                continue
+
             if not isinstance(item, IRTailcallReturn):
                 index += 1
                 continue
@@ -1561,6 +1714,7 @@ class IRNormalizer:
                 items.pop(follow)
 
             cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+            mask = mask or item.cleanup_mask
 
             returns = item.returns
             values: Tuple[str, ...]
@@ -1572,14 +1726,27 @@ class IRNormalizer:
             if item.varargs and not values:
                 values = ("ret*",)
 
-            new_return = IRReturn(
-                values=values,
+            call = IRCall(
+                target=item.target,
+                args=item.args,
+                tail=True,
+                arity=item.arity,
+                convention=item.convention,
+                cleanup_mask=mask,
+                cleanup=tuple(),
+                symbol=item.symbol,
+                predicate=item.predicate,
+            )
+
+            tail_call = IRTailCall(
+                call=call,
+                returns=values,
                 varargs=item.varargs,
                 cleanup=tuple(cleanup_steps),
-                mask=mask,
+                cleanup_mask=mask,
             )
-            self._transfer_ssa(item, new_return)
-            items.replace_slice(index, index + 1, [new_return])
+            self._transfer_ssa(item, tail_call)
+            items.replace_slice(index, index + 1, [tail_call])
             index += 1
 
     def _extract_tail_helper_target(
@@ -1638,7 +1805,7 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        node: CallLike,
         target: int,
     ) -> None:
         args = list(getattr(node, "args", tuple()))
@@ -1721,14 +1888,14 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        node: CallLike,
         helper: int,
         target: int,
     ) -> None:
         handshake_index = self._find_io_handshake(items, index)
         if handshake_index is None:
             symbol = self.knowledge.lookup_address(target)
-            replacement: Union[IRCall, IRCallReturn, IRTailcallReturn]
+            replacement: CallLike
             cleanup: Tuple[IRStackEffect, ...] = tuple()
             args = getattr(node, "args", tuple())
             predicate = getattr(node, "predicate", None)
@@ -1758,6 +1925,39 @@ class IRNormalizer:
                     cleanup_mask=None,
                     symbol=symbol,
                     predicate=predicate,
+                )
+            elif isinstance(node, IRCallReturn):
+                replacement = IRCallReturn(
+                    target=target,
+                    args=args,
+                    tail=getattr(node, "tail", False),
+                    returns=getattr(node, "returns", tuple()),
+                    varargs=getattr(node, "varargs", False),
+                    cleanup=cleanup,
+                    arity=arity,
+                    convention=None,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=predicate,
+                )
+            elif isinstance(node, IRTailCall):
+                updated_call = IRCall(
+                    target=target,
+                    args=args,
+                    tail=True,
+                    arity=arity,
+                    convention=None,
+                    cleanup_mask=None,
+                    cleanup=tuple(),
+                    symbol=symbol,
+                    predicate=predicate,
+                )
+                replacement = IRTailCall(
+                    call=updated_call,
+                    returns=getattr(node, "returns", tuple()),
+                    varargs=getattr(node, "varargs", False),
+                    cleanup=cleanup,
+                    cleanup_mask=None,
                 )
             else:
                 replacement = IRTailcallReturn(
@@ -1971,6 +2171,10 @@ class IRNormalizer:
 
         if len(chunk_nodes) == 1:
             literal = chunk_nodes[0]
+            symbol = literal.symbol
+            if symbol:
+                items.replace_slice(0, 1, [IRAsciiHeader(chunks=(symbol,))])
+                return
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
                     parts = []
@@ -2120,14 +2324,7 @@ class IRNormalizer:
         index = 0
         while index < len(items) - 1:
             call = items[index]
-            if not isinstance(
-                call,
-                (
-                    IRCall,
-                    IRCallReturn,
-                    IRTailcallReturn,
-                ),
-            ):
+            if not isinstance(call, CallLike):
                 index += 1
                 continue
 
@@ -2229,9 +2426,9 @@ class IRNormalizer:
 
     def _call_with_predicate(
         self,
-        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        node: CallLike,
         predicate: CallPredicate,
-    ) -> Union[IRCall, IRCallReturn, IRTailcallReturn]:
+    ) -> CallLike:
         if isinstance(node, IRCall):
             return IRCall(
                 target=node.target,
@@ -2260,6 +2457,26 @@ class IRNormalizer:
                 predicate=predicate,
             )
 
+        if isinstance(node, IRTailCall):
+            updated_call = IRCall(
+                target=node.target,
+                args=node.args,
+                tail=True,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=node.cleanup_mask,
+                cleanup=node.call.cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+            return IRTailCall(
+                call=updated_call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                cleanup_mask=node.cleanup_mask,
+            )
+
         if isinstance(node, IRTailcallReturn):
             return IRTailcallReturn(
                 target=node.target,
@@ -2281,14 +2498,7 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             node = items[index]
-            if not isinstance(
-                node,
-                (
-                    IRCall,
-                    IRCallReturn,
-                    IRTailcallReturn,
-                ),
-            ):
+            if not isinstance(node, CallLike):
                 index += 1
                 continue
 
@@ -2304,7 +2514,7 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        node: CallLike,
         signature: CallSignature,
     ) -> int:
         current_index = index
@@ -2527,7 +2737,7 @@ class IRNormalizer:
 
     def _rebuild_call_node(
         self,
-        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
+        node: CallLike,
         *,
         tail: bool,
         arity: Optional[int],
@@ -2537,7 +2747,7 @@ class IRNormalizer:
         predicate: Optional[CallPredicate],
         target: int,
         signature: CallSignature,
-    ) -> Union[IRCall, IRCallReturn, IRTailcallReturn]:
+    ) -> CallLike:
         if isinstance(node, IRCall):
             return IRCall(
                 target=target,
@@ -2568,6 +2778,30 @@ class IRNormalizer:
                 cleanup_mask=cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+            )
+
+        if isinstance(node, IRTailCall):
+            returns = node.returns
+            if signature.returns is not None and not node.varargs:
+                count = max(signature.returns, 0)
+                returns = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+            updated_call = IRCall(
+                target=target,
+                args=node.args,
+                tail=True,
+                arity=arity,
+                convention=convention,
+                cleanup_mask=cleanup_mask,
+                cleanup=node.call.cleanup,
+                symbol=node.symbol,
+                predicate=predicate,
+            )
+            return IRTailCall(
+                call=updated_call,
+                returns=returns,
+                varargs=node.varargs,
+                cleanup=cleanup,
+                cleanup_mask=cleanup_mask,
             )
 
         if isinstance(node, IRTailcallReturn):
