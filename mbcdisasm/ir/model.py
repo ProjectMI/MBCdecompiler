@@ -172,6 +172,61 @@ class IRCall(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTailCall(IRNode):
+    """Tail call that forwards control to ``call`` and returns its values."""
+
+    call: IRCall
+    returns: Tuple[str, ...]
+    varargs: bool = False
+    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    cleanup_mask: Optional[int] = None
+
+    @property
+    def target(self) -> int:
+        return self.call.target
+
+    @property
+    def args(self) -> Tuple[str, ...]:
+        return self.call.args
+
+    @property
+    def tail(self) -> bool:
+        return True
+
+    @property
+    def arity(self) -> Optional[int]:
+        return self.call.arity
+
+    @property
+    def convention(self) -> Optional[IRStackEffect]:
+        return self.call.convention
+
+    @property
+    def symbol(self) -> Optional[str]:
+        return self.call.symbol
+
+    @property
+    def predicate(self) -> Optional[CallPredicate]:
+        return self.call.predicate
+
+    def describe(self) -> str:
+        call_repr = self.call.describe()
+        details: List[str] = []
+        if self.returns:
+            rendered = ", ".join(self.returns)
+            details.append(f"returns=[{rendered}]")
+        if self.varargs:
+            details.append("varargs")
+        if self.cleanup:
+            rendered = ", ".join(step.describe() for step in self.cleanup)
+            details.append(f"cleanup=[{rendered}]")
+        if self.cleanup_mask is not None:
+            details.append(f"mask={_format_operand(self.cleanup_mask)}")
+        suffix = "" if not details else " " + " ".join(details)
+        return f"tailcall {call_repr}{suffix}"
+
+
+@dataclass(frozen=True)
 class IRStackEffect:
     """Canonical representation of stack shuffles and teardowns."""
 
@@ -898,8 +953,9 @@ __all__ = [
     "IRProgram",
     "IRSegment",
     "IRBlock",
-    "IRCall", 
-    "IRReturn", 
+    "IRCall",
+    "IRTailCall",
+    "IRReturn",
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",

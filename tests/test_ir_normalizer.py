@@ -12,6 +12,7 @@ from mbcdisasm.ir.model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRTailCall,
     IRTailcallReturn,
     IRIf,
     IRReturn,
@@ -851,9 +852,9 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    tail_return = next(node for node in block.nodes if isinstance(node, IRReturn))
-    assert tail_return.cleanup and tail_return.cleanup[-1].mnemonic == "stack_teardown"
-    assert tail_return.cleanup[-1].pops == 4
+    tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert tail_call.cleanup and tail_call.cleanup[-1].mnemonic == "stack_teardown"
+    assert tail_call.cleanup[-1].pops == 4
 
 
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
@@ -955,12 +956,41 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    tail_node = next(node for node in block.nodes if isinstance(node, IRReturn))
-    assert tail_node.mask == RET_MASK
+    tail_node = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert tail_node.cleanup_mask == RET_MASK
     assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
     )
+
+
+def test_normalizer_collapses_inline_tail_dispatch() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge"))
+
+    words = [
+        build_word(0, 0x00, 0x52, 0x0000),
+        build_word(4, 0x4A, 0x05, 0x0052),
+        build_word(8, 0x03, 0x00, 0x1234),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    tail_call = block.nodes[0]
+    assert isinstance(tail_call, IRTailCall)
+    assert tail_call.call.target == 0x1234
+    assert tail_call.call.symbol == "test_helper_1234"
+    assert tail_call.call.args == ()
+    assert tail_call.returns == ("ret0",)
 
 
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
