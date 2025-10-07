@@ -154,7 +154,7 @@ class AsciiRunSignature(SignatureRule):
 class HeaderAsciiCtrlSeqSignature(SignatureRule):
     """Match ASCII headers that transition into control sequences."""
 
-    name = "header_ascii_ctrl_seq"
+    name = "ascii_header"
     category = "literal"
     base_confidence = 0.6
     _ctrl_labels = {"34:2E", "33:FF", "EB:0B", "C9:29"}
@@ -298,7 +298,7 @@ class LiteralRunWithMarkersSignature(SignatureRule):
 class ReduceAsciiPrologSignature(SignatureRule):
     """Recognise the ``reduce`` + ``00:4F`` marker that precedes ASCII payloads."""
 
-    name = "reduce_ascii_prolog"
+    name = "ascii_inline"
     category = "literal"
     base_confidence = 0.6
 
@@ -331,7 +331,7 @@ class ReduceAsciiPrologSignature(SignatureRule):
 class MarkerPairWithHeaderSignature(SignatureRule):
     """Detect paired literal markers that introduce a fixed header sequence."""
 
-    name = "marker_pair_with_header"
+    name = "ascii_marker"
     category = "literal"
     base_confidence = 0.6
 
@@ -376,7 +376,7 @@ class MarkerPairWithHeaderSignature(SignatureRule):
 class AsciiPrologMarkerComboSignature(SignatureRule):
     """Recognise ASCII literals wrapped by a ``05:00`` prolog and marker pair."""
 
-    name = "ascii_prolog_marker_combo"
+    name = "ascii_marker_combo"
     category = "literal"
     base_confidence = 0.59
 
@@ -434,7 +434,7 @@ class AsciiPrologMarkerComboSignature(SignatureRule):
 class AsciiWrapperEf48Signature(SignatureRule):
     """Match ASCII payloads wrapped by ``EF:28`` and ``48:00`` sentinels."""
 
-    name = "ascii_wrapper_ef48"
+    name = "ascii_wrapper"
     category = "literal"
     base_confidence = 0.6
 
@@ -479,7 +479,7 @@ class AsciiWrapperEf48Signature(SignatureRule):
 class AsciiReduceMarkerSignature(SignatureRule):
     """Detect ASCII or reduction prologs that end with ``66:1B`` → markers."""
 
-    name = "ascii_reduce_marker_seq"
+    name = "ascii_block"
     category = "literal"
     base_confidence = 0.58
 

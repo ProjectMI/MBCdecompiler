@@ -20,7 +20,11 @@ from mbcdisasm.ir.model import (
     IRRaw,
     IRConditionMask,
     IRIOWrite,
+    IRBuildTuple,
+    IRBuildArray,
+    NormalizerMetrics,
 )
+from mbcdisasm.ir.normalizer import _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
@@ -361,10 +365,21 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert contract_call.cleanup_mask == 0x2910
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
+    call_block = next(
+        block
+        for seg in program.segments
+        for block in seg.blocks
+        if contract_call in block.nodes
+    )
+    cleanup_nodes = [
+        node for node in call_block.nodes if isinstance(node, IRCallCleanup)
+    ]
+    assert any(
+        [step.mnemonic for step in node.steps]
+        == ["op_6C_01", "op_5E_29", "op_F0_4B"]
+        for node in cleanup_nodes
+    )
     assert [step.mnemonic for step in contract_call.cleanup] == [
-        "op_6C_01",
-        "op_5E_29",
-        "op_F0_4B",
         "stack_teardown",
         "op_29_10",
         "op_70_29",
@@ -693,6 +708,58 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert tail_bundle.cleanup and tail_bundle.cleanup[-1].mnemonic == "stack_teardown"
     assert tail_bundle.cleanup[-1].pops == 4
 
+
+def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3C, 0x02, 0x0000),
+        build_word(4, 0x28, 0x00, 0x1234),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3C_02" for node in block.nodes
+    )
+    assert any(
+        isinstance(node, (IRCall, IRCallReturn, IRTailcallReturn)) for node in block.nodes
+    )
+
+
+def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    reducer_words = [build_word(0, 0x04, 0x00, 0x0000)]
+    reducer_data = encode_instructions(reducer_words)
+    reducer_segment = Segment(SegmentDescriptor(0, 0, len(reducer_data)), reducer_data)
+    raw_blocks = normalizer._parse_segment(reducer_segment)
+    assert raw_blocks and raw_blocks[0].instructions
+    reduce_instruction = raw_blocks[0].instructions[0]
+
+    items = _ItemList(
+        [
+            IRBuildArray(elements=("lit(0x0001)", "lit(0x0002)")),
+            IRBuildArray(elements=("lit(0x0003)", "lit(0x0004)")),
+            reduce_instruction,
+        ]
+    )
+    metrics = NormalizerMetrics()
+    normalizer._pass_reduce_pair_constants(items, metrics)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    assert isinstance(nodes[0], IRBuildTuple)
+    assert metrics.reduce_replaced == 1
 
 def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
