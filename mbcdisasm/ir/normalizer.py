@@ -660,9 +660,10 @@ class IRNormalizer:
         if constant is not None:
             return constant
 
-        segments = tuple(
-            data[pos : pos + 4] for pos in range(0, len(data), 4)
-        ) or (b"",)
+        if data:
+            segments = (data,)
+        else:
+            segments = (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
         constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
         self._string_pool[data] = constant

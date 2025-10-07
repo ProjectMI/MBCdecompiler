@@ -541,7 +541,9 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     pool = {const.name: const for const in program.string_pool}
     assert header.chunks[0] in pool
-    assert pool[header.chunks[0]].data == b"A\x00B\x00\x00C\x00D"
+    constant = pool[header.chunks[0]]
+    assert constant.data == b"A\x00B\x00\x00C\x00D"
+    assert constant.segments == (constant.data,)
     assert "lit(0x6704)" in descriptions
 
 
@@ -572,9 +574,11 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
     assert not any("reduce_pair" in text for text in descriptions)
 
-    pool = {const.name: const.data for const in program.string_pool}
+    pool = {const.name: const for const in program.string_pool}
     assert symbol in pool
-    assert pool[symbol] == b"HEAD ER  TEX"
+    constant = pool[symbol]
+    assert constant.data == b"HEAD ER  TEX"
+    assert constant.segments == (constant.data,)
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
