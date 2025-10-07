@@ -665,6 +665,43 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x2910),
+        build_word(4, 0x10, 0x84, 0x0000),
+        build_word(8, 0x2B, 0x00, 0x0000),
+        build_word(12, 0x3D, 0x30, IO_SLOT),
+        build_word(16, 0x30, 0x00, 0x0000),
+        build_word(20, 0x00, 0x00, 0x1234),
+        build_word(24, 0x3D, 0x30, IO_SLOT),
+        build_word(28, 0x0C, 0x09, 0x0000),
+        build_word(32, 0x10, 0x50, 0x0000),
+        build_word(36, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    writes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRIOWrite)
+    ]
+
+    masks = sorted(write.mask for write in writes)
+    assert masks == [0x1234, 0x2910]
+    assert all(write.port == "io.port_6910" for write in writes)
+
+
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

@@ -116,6 +116,16 @@ IO_READ_MNEMONICS = {"op_10_38"}
 IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
 IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_NODE_TYPES = (
+    IRCall,
+    IRCallCleanup,
+    IRCallPreparation,
+    IRCallReturn,
+    IRTailCall,
+    IRTailcallReturn,
+    IRSwitchDispatch,
+    IRTailcallFrame,
+)
 
 
 @dataclass(frozen=True)
@@ -1365,7 +1375,7 @@ class IRNormalizer:
             while 0 <= scan < len(items) and steps < 6:
                 node = items[scan]
                 if isinstance(node, RawInstruction):
-                    if node.mnemonic in IO_BRIDGE_MNEMONICS:
+                    if self._is_io_bridge_instruction(node):
                         scan += direction
                         steps += 1
                         continue
@@ -1373,6 +1383,10 @@ class IRNormalizer:
                         return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
+                    scan += direction
+                    steps += 1
+                    continue
+                if isinstance(node, IO_BRIDGE_NODE_TYPES):
                     scan += direction
                     steps += 1
                     continue
@@ -1385,7 +1399,7 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         if mnemonic in IO_READ_MNEMONICS:
             return IRIORead(port=IO_PORT_NAME)
-        if mnemonic in IO_WRITE_MNEMONICS:
+        if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
@@ -1400,7 +1414,7 @@ class IRNormalizer:
             if isinstance(node, IRLiteral):
                 return node.value
             if isinstance(node, RawInstruction):
-                if node.mnemonic in IO_BRIDGE_MNEMONICS or (
+                if self._is_io_bridge_instruction(node) or (
                     node.mnemonic == "op_3D_30" and node.operand == IO_SLOT
                 ):
                     scan -= 1
@@ -1409,6 +1423,10 @@ class IRNormalizer:
                 if node.mnemonic.startswith("op_10_"):
                     break
             elif isinstance(node, IRLiteralChunk):
+                scan -= 1
+                steps += 1
+                continue
+            elif isinstance(node, IO_BRIDGE_NODE_TYPES):
                 scan -= 1
                 steps += 1
                 continue
@@ -2169,13 +2187,42 @@ class IRNormalizer:
                     return scan
                 if candidate.mnemonic.startswith("op_10_"):
                     break
+                if self._is_io_bridge_instruction(candidate):
+                    scan -= 1
+                    continue
             elif isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                scan -= 1
+                continue
+            elif isinstance(candidate, IO_BRIDGE_NODE_TYPES):
                 scan -= 1
                 continue
             else:
                 break
             scan -= 1
         return None
+
+    def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic in IO_BRIDGE_MNEMONICS:
+            return True
+        if instruction.mnemonic.startswith("op_10_"):
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        kind = instruction.profile.kind
+        if kind in {
+            InstructionKind.BRANCH,
+            InstructionKind.RETURN,
+            InstructionKind.TERMINATOR,
+            InstructionKind.CALL,
+            InstructionKind.TAILCALL,
+            InstructionKind.TEST,
+            InstructionKind.CONTROL,
+        }:
+            return False
+        return True
 
     def _update_tail_helper_hints(self, block: RawBlock) -> None:
         if not block.instructions:
