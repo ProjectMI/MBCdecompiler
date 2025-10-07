@@ -104,6 +104,10 @@ TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
+OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F}
+OPCODE_TABLE_MIN_LENGTH = 8
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -404,6 +408,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
+        self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
@@ -490,6 +495,18 @@ class IRNormalizer:
         if values:
             self._record_ssa(target, values, kinds=kinds)
         self._ssa_bindings.pop(id(source), None)
+
+    @staticmethod
+    def _merge_annotations(*groups: Sequence[str]) -> Tuple[str, ...]:
+        seen: Set[str] = set()
+        merged: List[str] = []
+        for group in groups:
+            for note in group:
+                if note in seen:
+                    continue
+                seen.add(note)
+                merged.append(note)
+        return tuple(merged)
 
     def _ssa_value(
         self,
@@ -1095,6 +1112,7 @@ class IRNormalizer:
             reducer=reducer,
             reducer_operand=operand,
             tail=tail,
+            annotations=(),
         )
 
     def _pass_literal_block_reducers(
@@ -1112,6 +1130,7 @@ class IRNormalizer:
                             reducer=first.mnemonic,
                             reducer_operand=first.operand,
                             tail=second.tail,
+                            annotations=second.annotations,
                         )
                         self._transfer_ssa(first, updated)
                         items.replace_slice(index, index + 2, [updated])
@@ -1508,6 +1527,67 @@ class IRNormalizer:
 
             if steps[-1][0] == "op_F0_4B":
                 items.replace_slice(index, end, [IRTailcallFrame(steps=tuple(steps))])
+                continue
+
+            index += 1
+
+    def _opcode_table_instruction(
+        self, instruction: RawInstruction, *, mode: Optional[int] = None
+    ) -> bool:
+        if mode is not None and instruction.profile.mode != mode:
+            return False
+        if instruction.profile.mode not in OPCODE_TABLE_MODES:
+            return False
+        if instruction.operand != 0:
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        if event.uncertain:
+            return False
+        return True
+
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._opcode_table_instruction(item):
+                index += 1
+                continue
+
+            mode = item.profile.mode
+            scan = index
+            operations: List[Tuple[str, int]] = []
+            opcodes: Set[int] = set()
+            annotation_buffer: List[str] = []
+
+            while scan < len(items):
+                candidate = items[scan]
+                if not (
+                    isinstance(candidate, RawInstruction)
+                    and self._opcode_table_instruction(candidate, mode=mode)
+                ):
+                    break
+                operations.append((candidate.mnemonic, candidate.operand))
+                opcodes.add(candidate.profile.opcode)
+                annotation_buffer.extend(candidate.annotations)
+                scan += 1
+
+            if (
+                len(operations) >= OPCODE_TABLE_MIN_LENGTH
+                and len(opcodes) >= max(1, min(4, len(operations) // 2))
+            ):
+                annotations = self._merge_annotations(annotation_buffer, ("opcode_table",))
+                node = IRTablePatch(
+                    operations=tuple(operations),
+                    annotations=annotations,
+                )
+                items.replace_slice(index, scan, [node])
+                index += 1
                 continue
 
             index += 1

@@ -27,13 +27,20 @@ from mbcdisasm.ir.model import (
     IRBuildTuple,
     IRBuildArray,
     IRSwitchDispatch,
+    IRTablePatch,
     NormalizerMetrics,
 )
-from mbcdisasm.ir.normalizer import _ItemList
+from mbcdisasm.ir.normalizer import RawInstruction, _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    StackEffectHint,
+)
+from mbcdisasm.analyzer.stack import StackEvent
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -426,6 +433,69 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             if isinstance(node, IRFunctionPrologue)
         ]
         assert prologue_nodes
+
+
+def test_opcode_table_sequences_collapse() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    def build_raw(offset: int, opcode: int, mode: int, operand: int = 0) -> RawInstruction:
+        word = build_word(offset, opcode, mode, operand)
+        profile = InstructionProfile(
+            word=word,
+            info=None,
+            mnemonic=f"op_{opcode:02X}_{mode:02X}",
+            summary=None,
+            category=None,
+            control_flow=None,
+            stack_hint=StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=1.0),
+            kind=InstructionKind.UNKNOWN,
+        )
+        event = StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=InstructionKind.UNKNOWN,
+        )
+        return RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+
+    long_run = _ItemList(
+        [
+            build_raw(index * 4, 0x20 + index, 0x2A)
+            for index in range(12)
+        ]
+    )
+    normalizer._pass_opcode_tables(long_run)
+    collapsed = long_run.to_tuple()
+    assert len(collapsed) == 1
+    table = collapsed[0]
+    assert isinstance(table, IRTablePatch)
+    assert len(table.operations) == 12
+    assert table.annotations == ("opcode_table",)
+
+    short_run = _ItemList([build_raw(index * 4, 0x80 + index, 0x2A) for index in range(6)])
+    normalizer._pass_opcode_tables(short_run)
+    assert len(short_run.to_tuple()) == 6
+
+    mixed_sequence = [build_raw(0, 0x10, 0x2A), build_raw(4, 0x11, 0x2A, operand=1)]
+    mixed_sequence.extend(
+        build_raw(8 + index * 4, 0x12 + index, 0x2A)
+        for index in range(9)
+    )
+    mixed_run = _ItemList(mixed_sequence)
+    normalizer._pass_opcode_tables(mixed_run)
+    parts = mixed_run.to_tuple()
+    assert any(isinstance(item, RawInstruction) and item.operand == 1 for item in parts)
+    assert any(isinstance(item, IRTablePatch) for item in parts)
 
 
 def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
