@@ -98,6 +98,33 @@ def test_call_helper_wrapper_has_stable_stack_model():
     assert teardown.delta == -4
 
 
+def test_literal_reduce_chain_is_tracked_with_high_confidence():
+    words = [
+        make_word(0x00, 0x00, 0x0001, 0),
+        make_word(0x00, 0x00, 0x0002, 4),
+        make_word(0x04, 0x00, 0x0000, 8),
+    ]
+
+    profiles = load_profiles(words)
+    tracker = StackTracker()
+    summary = tracker.run(profiles)
+
+    assert summary.change == 1
+    assert not summary.uncertain
+
+    deltas = [1, 1, -1]
+    for event, expected in zip(summary.events, deltas):
+        assert event.delta == expected
+        assert not event.uncertain
+
+    reducer = summary.events[-1]
+    assert reducer.popped_types == (
+        StackValueType.NUMBER,
+        StackValueType.NUMBER,
+    )
+    assert reducer.pushed_types == (StackValueType.NUMBER,)
+
+
 def test_tail_mask_is_stack_neutral():
     words = [make_word(0x29, 0x10, RET_MASK, 0)]
 
