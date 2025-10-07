@@ -23,7 +23,6 @@ from .model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRAsciiPreamble,
-    IRAsciiWrapperCall,
     IRBlock,
     IRBuildArray,
     IRBuildMap,
@@ -52,7 +51,6 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
-    IRTailcallAscii,
     IRTablePatch,
     IRTailcallFrame,
     IRTestSetBranch,
@@ -88,7 +86,7 @@ CALL_CLEANUP_MNEMONICS = {
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
 
-TAILCALL_HELPERS = {0x0072, 0x003D, 0x00F0}
+TAILCALL_HELPERS = {0x00F0}
 TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
 
 
@@ -380,7 +378,6 @@ class IRNormalizer:
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
-        self._pass_ascii_wrappers(items)
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_condition_masks(items)
@@ -1218,7 +1215,7 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            shuffle = item.shuffle
+            convention = item.convention
             arity = item.arity
             cleanup_mask = item.cleanup_mask
             cleanup_steps = item.cleanup
@@ -1230,7 +1227,7 @@ class IRNormalizer:
                 if isinstance(candidate, IRCallPreparation):
                     for mnemonic, operand in candidate.steps:
                         if mnemonic == "stack_shuffle":
-                            shuffle = operand
+                            convention = self._call_convention_effect(operand)
                     consumed.append(scan)
                     scan -= 1
                     continue
@@ -1244,7 +1241,7 @@ class IRNormalizer:
                 if isinstance(candidate, IRCallCleanup):
                     shuffle_operand = self._extract_call_shuffle(candidate)
                     if shuffle_operand is not None:
-                        shuffle = shuffle_operand
+                        convention = self._call_convention_effect(shuffle_operand)
                         consumed.append(scan)
                         scan -= 1
                         continue
@@ -1284,7 +1281,7 @@ class IRNormalizer:
                 args=call.args,
                 tail=tail,
                 arity=arity,
-                shuffle=shuffle,
+                convention=convention,
                 cleanup_mask=cleanup_mask,
                 cleanup=cleanup_steps,
                 symbol=call.symbol,
@@ -1430,79 +1427,6 @@ class IRNormalizer:
             ),
         )
 
-    def _pass_ascii_wrappers(self, items: _ItemList) -> None:
-        index = 0
-        while index < len(items):
-            item = items[index]
-            if not isinstance(item, IRCall):
-                index += 1
-                continue
-
-            ascii_chunks: List[str] = []
-            scan = index + 1
-            while scan < len(items):
-                candidate = items[scan]
-                if isinstance(candidate, IRLiteralChunk):
-                    ascii_chunks.append(candidate.describe())
-                    scan += 1
-                    continue
-                break
-
-            if not ascii_chunks:
-                index += 1
-                continue
-
-            branch: Optional[IRIf] = None
-            if scan < len(items) and isinstance(items[scan], IRIf):
-                candidate = items[scan]
-                first_chunk = ascii_chunks[0]
-                if (
-                    candidate.condition in {first_chunk, "stack_top"}
-                    or candidate.condition.startswith("ssa")
-                ) and item.tail:
-                    branch = candidate
-                    scan += 1
-
-            ascii_tuple = tuple(ascii_chunks)
-            tail_flag = item.tail
-            if (
-                not tail_flag
-                and item.target in {0x0072}
-                and item.shuffle == CALL_SHUFFLE_STANDARD
-            ):
-                tail_flag = True
-            if branch is not None:
-                node = IRTailcallAscii(
-                    target=item.target,
-                    args=item.args,
-                    ascii_chunks=ascii_tuple,
-                    condition=branch.condition,
-                    then_target=branch.then_target,
-                    else_target=branch.else_target,
-                    arity=item.arity,
-                    shuffle=item.shuffle,
-                    cleanup_mask=item.cleanup_mask,
-                    cleanup=item.cleanup,
-                    symbol=item.symbol,
-                )
-                items.replace_slice(index, scan, [node])
-                continue
-
-            node = IRAsciiWrapperCall(
-                target=item.target,
-                args=item.args,
-                ascii_chunks=ascii_tuple,
-                tail=tail_flag,
-                arity=item.arity,
-                shuffle=item.shuffle,
-                cleanup_mask=item.cleanup_mask,
-                cleanup=item.cleanup,
-                symbol=item.symbol,
-            )
-            end = index + 1 + len(ascii_chunks)
-            items.replace_slice(index, end, [node])
-            index += 1
-
     def _pass_ascii_headers(self, items: _ItemList) -> None:
         if not items:
             return
@@ -1615,7 +1539,7 @@ class IRNormalizer:
                             cleanup=combined_cleanup,
                             tail=True,
                             arity=call.arity,
-                            shuffle=call.shuffle,
+                            convention=call.convention,
                             cleanup_mask=cleanup_mask,
                             symbol=call.symbol,
                             predicate=call.predicate,
@@ -1632,7 +1556,7 @@ class IRNormalizer:
                             varargs=varargs,
                             cleanup=combined_cleanup,
                             arity=call.arity,
-                            shuffle=call.shuffle,
+                            convention=call.convention,
                             cleanup_mask=cleanup_mask,
                             symbol=call.symbol,
                             predicate=call.predicate,
@@ -1669,8 +1593,6 @@ class IRNormalizer:
                 (
                     IRCall,
                     IRCallReturn,
-                    IRAsciiWrapperCall,
-                    IRTailcallAscii,
                     IRTailcallReturn,
                 ),
             ):
@@ -1775,28 +1697,16 @@ class IRNormalizer:
 
     def _call_with_predicate(
         self,
-        node: Union[
-            IRCall,
-            IRCallReturn,
-            IRAsciiWrapperCall,
-            IRTailcallAscii,
-            IRTailcallReturn,
-        ],
+        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
         predicate: CallPredicate,
-    ) -> Union[
-        IRCall,
-        IRCallReturn,
-        IRAsciiWrapperCall,
-        IRTailcallAscii,
-        IRTailcallReturn,
-    ]:
+    ) -> Union[IRCall, IRCallReturn, IRTailcallReturn]:
         if isinstance(node, IRCall):
             return IRCall(
                 target=node.target,
                 args=node.args,
                 tail=node.tail,
                 arity=node.arity,
-                shuffle=node.shuffle,
+                convention=node.convention,
                 cleanup_mask=node.cleanup_mask,
                 cleanup=node.cleanup,
                 symbol=node.symbol,
@@ -1812,38 +1722,8 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 arity=node.arity,
-                shuffle=node.shuffle,
+                convention=node.convention,
                 cleanup_mask=node.cleanup_mask,
-                symbol=node.symbol,
-                predicate=predicate,
-            )
-
-        if isinstance(node, IRAsciiWrapperCall):
-            return IRAsciiWrapperCall(
-                target=node.target,
-                args=node.args,
-                ascii_chunks=node.ascii_chunks,
-                tail=node.tail,
-                arity=node.arity,
-                shuffle=node.shuffle,
-                cleanup_mask=node.cleanup_mask,
-                cleanup=node.cleanup,
-                symbol=node.symbol,
-                predicate=predicate,
-            )
-
-        if isinstance(node, IRTailcallAscii):
-            return IRTailcallAscii(
-                target=node.target,
-                args=node.args,
-                ascii_chunks=node.ascii_chunks,
-                condition=node.condition,
-                then_target=node.then_target,
-                else_target=node.else_target,
-                arity=node.arity,
-                shuffle=node.shuffle,
-                cleanup_mask=node.cleanup_mask,
-                cleanup=node.cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
             )
@@ -1857,7 +1737,7 @@ class IRNormalizer:
                 cleanup=node.cleanup,
                 tail=node.tail,
                 arity=node.arity,
-                shuffle=node.shuffle,
+                convention=node.convention,
                 cleanup_mask=node.cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -1874,8 +1754,6 @@ class IRNormalizer:
                 (
                     IRCall,
                     IRCallReturn,
-                    IRAsciiWrapperCall,
-                    IRTailcallAscii,
                     IRTailcallReturn,
                 ),
             ):
@@ -1894,13 +1772,7 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[
-            IRCall,
-            IRCallReturn,
-            IRAsciiWrapperCall,
-            IRTailcallAscii,
-            IRTailcallReturn,
-        ],
+        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
         signature: CallSignature,
     ) -> int:
         current_index = index
@@ -1908,7 +1780,7 @@ class IRNormalizer:
 
         tail = getattr(node, "tail", False)
         arity = getattr(node, "arity", None)
-        shuffle = getattr(node, "shuffle", None)
+        convention = getattr(node, "convention", None)
         cleanup_mask = getattr(node, "cleanup_mask", None)
         predicate = getattr(node, "predicate", None)
         existing_cleanup = list(getattr(node, "cleanup", tuple()))
@@ -1920,10 +1792,11 @@ class IRNormalizer:
         if signature.cleanup_mask is not None and cleanup_mask is None:
             cleanup_mask = signature.cleanup_mask
         if signature.shuffle is not None:
-            shuffle = signature.shuffle
+            convention = self._call_convention_effect(signature.shuffle)
         elif signature.shuffle_options:
-            if shuffle is None or shuffle not in signature.shuffle_options:
-                shuffle = signature.shuffle_options[0]
+            current_operand = convention.operand if convention is not None else None
+            if current_operand not in signature.shuffle_options:
+                convention = self._call_convention_effect(signature.shuffle_options[0])
 
         prefix_effects: List[IRStackEffect] = []
         suffix_effects: List[IRStackEffect] = []
@@ -1977,7 +1850,7 @@ class IRNormalizer:
             node,
             tail=tail,
             arity=arity,
-            shuffle=shuffle,
+            convention=convention,
             cleanup_mask=cleanup_mask,
             cleanup=combined_cleanup,
             predicate=predicate,
@@ -2122,66 +1995,24 @@ class IRNormalizer:
 
     def _rebuild_call_node(
         self,
-        node: Union[
-            IRCall,
-            IRCallReturn,
-            IRAsciiWrapperCall,
-            IRTailcallAscii,
-            IRTailcallReturn,
-        ],
+        node: Union[IRCall, IRCallReturn, IRTailcallReturn],
         *,
         tail: bool,
         arity: Optional[int],
-        shuffle: Optional[int],
+        convention: Optional[IRStackEffect],
         cleanup_mask: Optional[int],
         cleanup: Tuple[IRStackEffect, ...],
         predicate: Optional[CallPredicate],
         target: int,
         signature: CallSignature,
-    ) -> Union[
-        IRCall,
-        IRCallReturn,
-        IRAsciiWrapperCall,
-        IRTailcallAscii,
-        IRTailcallReturn,
-    ]:
+    ) -> Union[IRCall, IRCallReturn, IRTailcallReturn]:
         if isinstance(node, IRCall):
             return IRCall(
                 target=target,
                 args=node.args,
                 tail=tail,
                 arity=arity,
-                shuffle=shuffle,
-                cleanup_mask=cleanup_mask,
-                cleanup=cleanup,
-                symbol=node.symbol,
-                predicate=predicate,
-            )
-
-        if isinstance(node, IRAsciiWrapperCall):
-            return IRAsciiWrapperCall(
-                target=target,
-                args=node.args,
-                ascii_chunks=node.ascii_chunks,
-                tail=tail,
-                arity=arity,
-                shuffle=shuffle,
-                cleanup_mask=cleanup_mask,
-                cleanup=cleanup,
-                symbol=node.symbol,
-                predicate=predicate,
-            )
-
-        if isinstance(node, IRTailcallAscii):
-            return IRTailcallAscii(
-                target=target,
-                args=node.args,
-                ascii_chunks=node.ascii_chunks,
-                condition=node.condition,
-                then_target=node.then_target,
-                else_target=node.else_target,
-                arity=arity,
-                shuffle=shuffle,
+                convention=convention,
                 cleanup_mask=cleanup_mask,
                 cleanup=cleanup,
                 symbol=node.symbol,
@@ -2201,7 +2032,7 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=cleanup,
                 arity=arity,
-                shuffle=shuffle,
+                convention=convention,
                 cleanup_mask=cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -2219,7 +2050,7 @@ class IRNormalizer:
                 cleanup=cleanup,
                 tail=tail,
                 arity=arity,
-                shuffle=shuffle,
+                convention=convention,
                 cleanup_mask=cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -2253,6 +2084,14 @@ class IRNormalizer:
         if mnemonic in CALL_PREPARATION_MNEMONICS:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
+
+    def _call_convention_effect(self, operand: int) -> IRStackEffect:
+        alias = "CALL_SHUFFLE_STD" if operand == CALL_SHUFFLE_STANDARD else None
+        return IRStackEffect(
+            mnemonic="stack_shuffle",
+            operand=operand,
+            operand_alias=alias,
+        )
 
     def _call_cleanup_effect(self, instruction: RawInstruction) -> IRStackEffect:
         mnemonic = instruction.mnemonic
@@ -2732,9 +2571,6 @@ class IRNormalizer:
                 continue
             break
 
-        if not components:
-            return None, index
-
         removal_indexes = [position for position, _ in components]
         removal_indexes.sort(reverse=True)
         for position in removal_indexes:
@@ -2747,8 +2583,21 @@ class IRNormalizer:
         base_value = components[1][1] if len(components) > 1 else None
         page = instruction.operand >> 8
         offset = instruction.operand & 0xFF
+        region_override: Optional[str] = None
+        page_alias_override: Optional[str] = None
+        symbol_override: Optional[str] = None
+        if instruction.profile.opcode == 0x69 and bank is None and base_slot is None:
+            if instruction.operand == IO_SLOT:
+                region_override = "io"
+                page_alias_override = IO_PORT_NAME
+                symbol_override = IO_PORT_NAME
+
         region, page_alias = self._memref_region(base_slot, bank, page)
-        symbol = self._memref_symbol(region, bank, page, offset)
+        if region_override is not None:
+            region = region_override
+        if page_alias_override is not None:
+            page_alias = page_alias_override
+        symbol = symbol_override or self._memref_symbol(region, bank, page, offset)
         memref = MemRef(
             region=region,
             bank=bank,

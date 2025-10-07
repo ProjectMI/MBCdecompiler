@@ -10,8 +10,6 @@ from mbcdisasm.ir.model import (
     IRCallPreparation,
     IRCallReturn,
     IRTailcallReturn,
-    IRAsciiWrapperCall,
-    IRTailcallAscii,
     IRIf,
     IRReturn,
     IRFunctionPrologue,
@@ -349,8 +347,6 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             (
                 IRCall,
                 IRCallReturn,
-                IRAsciiWrapperCall,
-                IRTailcallAscii,
                 IRTailcallReturn,
             ),
         )
@@ -361,8 +357,11 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             contract_call = node
             break
     assert contract_call is not None
-    assert isinstance(contract_call, IRTailcallReturn)
+    assert isinstance(contract_call, IRCall)
+    assert contract_call.tail
     assert contract_call.cleanup_mask == 0x2910
+    assert contract_call.convention is not None
+    assert contract_call.convention.operand == CALL_SHUFFLE_STANDARD
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
     call_block = next(
@@ -379,11 +378,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         == ["op_6C_01", "op_5E_29", "op_F0_4B"]
         for node in cleanup_nodes
     )
-    assert [step.mnemonic for step in contract_call.cleanup] == [
-        "stack_teardown",
-        "op_29_10",
-        "op_70_29",
-    ]
+    assert [step.mnemonic for step in contract_call.cleanup] == ["stack_teardown"]
+    assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
         node
@@ -424,10 +420,7 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     ]
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
-    assert any(
-        text.startswith("tailcall_ascii") or text.startswith("ascii_wrapper_call tail")
-        for text in descriptions
-    )
+    assert any(text.startswith("call tail") for text in descriptions)
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
@@ -591,7 +584,8 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
     assert call_return.symbol == "test_helper_1234"
-    assert call_return.shuffle == 0x4B08
+    assert call_return.convention is not None
+    assert call_return.convention.operand == 0x4B08
     assert call_return.cleanup_mask == 0x2910
     assert call_return.arity is None
 
@@ -624,7 +618,8 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert call_return.shuffle == 0x4B10
+    assert call_return.convention is not None
+    assert call_return.convention.operand == 0x4B10
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
