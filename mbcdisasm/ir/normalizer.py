@@ -72,6 +72,7 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
+CALL_PREPARATION_MNEMONICS = {"op_3C_02"}
 CALL_CLEANUP_MNEMONICS = {
     "call_helpers",
     "op_32_29",
@@ -79,6 +80,10 @@ CALL_CLEANUP_MNEMONICS = {
     "op_05_00",
     "stack_shuffle",
     "fanout",
+    "op_10_E8",
+    "op_F0_4B",
+    "op_6C_01",
+    "op_5E_29",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
@@ -361,6 +366,7 @@ class IRNormalizer:
         self._pass_aggregates(items, metrics)
         self._pass_literal_blocks(items)
         self._pass_literal_block_reducers(items, metrics)
+        self._pass_reduce_pair_constants(items, metrics)
         self._pass_ascii_preamble(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
@@ -370,6 +376,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
         self._pass_assign_ssa_names(items)
+        self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -940,6 +947,65 @@ class IRNormalizer:
                         continue
             index += 1
 
+    def _pass_reduce_pair_constants(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (isinstance(item, RawInstruction) and item.mnemonic == "reduce_pair"):
+                index += 1
+                continue
+
+            constants: List[str] = []
+            removal_start = index
+            scan = index - 1
+            while scan >= 0 and len(constants) < 2:
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                    scan -= 1
+                    continue
+
+                rendered = self._constant_aggregate_repr(candidate)
+                if rendered is None:
+                    break
+
+                constants.insert(0, rendered)
+                removal_start = scan
+                scan -= 1
+
+            if len(constants) != 2:
+                index += 1
+                continue
+
+            for pos in range(removal_start, index):
+                removed = items[pos]
+                self._ssa_bindings.pop(id(removed), None)
+
+            tuple_node = IRBuildTuple(elements=tuple(constants))
+            self._transfer_ssa(item, tuple_node)
+            items.replace_slice(removal_start, index + 1, [tuple_node])
+            metrics.aggregates += 1
+            metrics.reduce_replaced += 1
+            index = removal_start + 1
+
+    def _constant_aggregate_repr(
+        self, item: Union[RawInstruction, IRNode]
+    ) -> Optional[str]:
+        if isinstance(item, IRLiteral):
+            return item.describe()
+        if isinstance(item, IRLiteralChunk):
+            return item.describe()
+        if isinstance(item, IRLiteralBlock):
+            return item.describe()
+        if isinstance(item, IRBuildTuple):
+            return item.describe()
+        if isinstance(item, IRBuildArray):
+            return item.describe()
+        if isinstance(item, IRBuildMap):
+            return item.describe()
+        return None
+
     def _pass_ascii_preamble(self, items: _ItemList) -> None:
         index = 0
         while index <= len(items) - 3:
@@ -1345,6 +1411,7 @@ class IRNormalizer:
                             then_target=item.then_target,
                             else_target=item.else_target,
                         )
+                        self._transfer_ssa(item, node)
                         items.replace_slice(index, index + 1, [node])
                         index += 1
                         continue
@@ -2183,6 +2250,8 @@ class IRNormalizer:
             return True
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             return True
+        if mnemonic in CALL_PREPARATION_MNEMONICS:
+            return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
 
     def _call_cleanup_effect(self, instruction: RawInstruction) -> IRStackEffect:
@@ -2398,7 +2467,9 @@ class IRNormalizer:
             if isinstance(item, RawInstruction) and item.ssa_values:
                 self._record_ssa(item, item.ssa_values, kinds=item.ssa_kinds)
 
-    def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+    def _pass_testset_branches(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
         index = 0
         while index < len(items):
             item = items[index]
@@ -2414,8 +2485,19 @@ class IRNormalizer:
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
                 )
+                self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 metrics.testset_branches += 1
+                continue
+
+            index += 1
+
+    def _pass_branches(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
