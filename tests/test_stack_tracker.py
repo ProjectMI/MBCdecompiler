@@ -47,7 +47,7 @@ def test_indirect_access_load_variant():
     indirect_event = events[-1]
     assert indirect_event.kind is InstructionKind.INDIRECT_LOAD
     assert indirect_event.delta == 1
-    assert indirect_event.pushed_types == (StackValueType.NUMBER,)
+    assert indirect_event.pushed_types == (StackValueType.WORD,)
 
 
 def test_indirect_access_store_variant_detects_cleanup():

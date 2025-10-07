@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from .model import IRBlock, IRProgram, IRSegment
+from .model import IRBlock, IRProgram, IRSegment, IRStringConstant
 
 
 class IRTextRenderer:
@@ -14,6 +14,8 @@ class IRTextRenderer:
     def render(self, program: IRProgram) -> str:
         lines: List[str] = []
         lines.append("; normalizer metrics: " + program.metrics.describe())
+        if program.strings:
+            lines.extend(self._render_strings(program.strings))
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"
@@ -46,6 +48,14 @@ class IRTextRenderer:
                 yield f"  {describe()}"
             else:
                 yield f"  {node!r}"
+
+    def _render_strings(
+        self, constants: Iterable[IRStringConstant]
+    ) -> Iterable[str]:
+        yield "; string pool"
+        for const in constants:
+            yield f"const {const.describe()}"
+        yield ""
 
 
 __all__ = ["IRTextRenderer"]

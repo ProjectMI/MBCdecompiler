@@ -12,6 +12,7 @@ from ..constants import (
     IO_SLOT,
     MEMORY_BANK_ALIASES,
     MEMORY_PAGE_ALIASES,
+    PAGE_REGISTER,
     RET_MASK,
 )
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
@@ -61,6 +62,8 @@ from .model import (
     IRIndirectStore,
     IRIORead,
     IRIOWrite,
+    IRPageRegister,
+    IRStringConstant,
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
@@ -182,20 +185,24 @@ class IRNormalizer:
 
     _SSA_PREFIX = {
         SSAValueKind.UNKNOWN: "ssa",
-        SSAValueKind.INTEGER: "int",
-        SSAValueKind.ADDRESS: "addr",
+        SSAValueKind.BYTE: "byte",
+        SSAValueKind.WORD: "word",
         SSAValueKind.POINTER: "ptr",
+        SSAValueKind.IO: "io",
+        SSAValueKind.PAGE: "page",
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
-        SSAValueKind.INTEGER: 1,
+        SSAValueKind.BYTE: 1,
+        SSAValueKind.WORD: 1,
         SSAValueKind.IDENTIFIER: 1,
-        SSAValueKind.ADDRESS: 2,
-        SSAValueKind.POINTER: 3,
-        SSAValueKind.BOOLEAN: 4,
+        SSAValueKind.IO: 2,
+        SSAValueKind.PAGE: 3,
+        SSAValueKind.POINTER: 4,
+        SSAValueKind.BOOLEAN: 5,
     }
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
@@ -208,6 +215,8 @@ class IRNormalizer:
         self._memref_regions: Dict[int, str] = {}
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
+        self._string_pool: Dict[bytes, str] = {}
+        self._string_order: List[bytes] = []
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
 
     # ------------------------------------------------------------------
@@ -219,6 +228,8 @@ class IRNormalizer:
         *,
         segment_indices: Optional[Sequence[int]] = None,
     ) -> IRProgram:
+        self._string_pool.clear()
+        self._string_order.clear()
         segments: List[IRSegment] = []
         aggregate_metrics = NormalizerMetrics()
         selection = set(segment_indices or [])
@@ -230,7 +241,11 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
-        return IRProgram(segments=tuple(segments), metrics=aggregate_metrics)
+        strings = tuple(
+            IRStringConstant(name=self._string_pool[data], data=data)
+            for data in self._string_order
+        )
+        return IRProgram(segments=tuple(segments), metrics=aggregate_metrics, strings=strings)
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
         raw_blocks = self._parse_segment(segment)
@@ -303,6 +318,7 @@ class IRNormalizer:
             if event.pushed_types:
                 for value_type in event.pushed_types[:pushes]:
                     pushed_kinds.append(self._map_stack_type(value_type))
+            self._refine_ssa_kinds(profile, pushed_kinds)
             while len(pushed_kinds) < len(pushed_names):
                 pushed_kinds.append(SSAValueKind.UNKNOWN)
             if pushed_names:
@@ -377,6 +393,7 @@ class IRNormalizer:
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
         self._pass_io_operations(items)
+        self._pass_helper_calls(items, metrics)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
@@ -397,6 +414,7 @@ class IRNormalizer:
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
         self._pass_indirect_access(items, metrics)
+        self._pass_page_register(items)
 
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
@@ -507,11 +525,45 @@ class IRNormalizer:
     def _map_stack_type(self, value_type: StackValueType) -> SSAValueKind:
         if value_type is StackValueType.SLOT:
             return SSAValueKind.POINTER
-        if value_type is StackValueType.NUMBER:
-            return SSAValueKind.INTEGER
+        if value_type is StackValueType.WORD:
+            return SSAValueKind.WORD
+        if value_type is StackValueType.BYTE:
+            return SSAValueKind.BYTE
+        if value_type is StackValueType.IO:
+            return SSAValueKind.IO
+        if value_type is StackValueType.PAGE_REGISTER:
+            return SSAValueKind.PAGE
         if value_type is StackValueType.IDENTIFIER:
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
+
+    def _intern_string(self, data: bytes) -> str:
+        name = self._string_pool.get(data)
+        if name is None:
+            name = f"str{len(self._string_pool)}"
+            self._string_pool[data] = name
+            self._string_order.append(data)
+        return name
+
+    def _refine_ssa_kinds(
+        self, profile: InstructionProfile, kinds: List[SSAValueKind]
+    ) -> None:
+        if not kinds:
+            return
+        operand = profile.operand
+        mnemonic = profile.mnemonic
+        if profile.kind is InstructionKind.LITERAL:
+            if operand == PAGE_REGISTER:
+                kinds[0] = SSAValueKind.PAGE
+            elif operand <= 0xFF and kinds[0] in {
+                SSAValueKind.UNKNOWN,
+                SSAValueKind.WORD,
+            }:
+                kinds[0] = SSAValueKind.BYTE
+            elif kinds[0] is SSAValueKind.UNKNOWN:
+                kinds[0] = SSAValueKind.WORD
+        if mnemonic in IO_READ_MNEMONICS and kinds:
+            kinds[0] = SSAValueKind.IO
 
     def _stack_sources(
         self, items: _ItemList, index: int, count: int
@@ -606,10 +658,12 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
+            symbol = self._intern_string(data)
             return IRLiteralChunk(
                 data=data,
                 source=profile.mnemonic,
                 annotations=instruction.annotations,
+                symbol=symbol,
             )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
@@ -685,10 +739,13 @@ class IRNormalizer:
                 index = start + 1
                 continue
 
+            combined = b"".join(data_parts)
+            symbol = self._intern_string(combined)
             chunk = IRLiteralChunk(
-                data=b"".join(data_parts),
+                data=combined,
                 source="ascii_run",
                 annotations=tuple(annotations),
+                symbol=symbol,
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
@@ -1124,6 +1181,11 @@ class IRNormalizer:
                 index = next_index + 1
                 continue
 
+            helper_only = len(steps) == 1 and steps[0].mnemonic == "sys.helper"
+            if helper_only:
+                index = end
+                continue
+
             items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
             index = start + 1
 
@@ -1179,6 +1241,45 @@ class IRNormalizer:
                     continue
                 break
         return None
+
+    def _pass_helper_calls(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or item.mnemonic != "call_helpers":
+                index += 1
+                continue
+
+            args, start = self._collect_call_arguments(items, index)
+            symbol = self._helper_symbol(item.operand)
+            call = IRCall(target=item.operand, args=tuple(args), tail=False, symbol=symbol)
+            self._transfer_ssa(item, call)
+            items.replace_slice(start, index + 1, [call])
+            metrics.calls += 1
+            index = start + 1
+
+    def _helper_symbol(self, operand: int) -> str:
+        alias = self.knowledge.lookup_address(operand)
+        if alias:
+            return alias
+        return f"helper_{operand:04X}"
+
+    def _pass_page_register(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, RawInstruction) and item.mnemonic == "op_6C_01":
+                node = IRPageRegister(value=item.operand)
+                items.replace_slice(index, index + 1, [node])
+                index += 1
+                continue
+            if isinstance(item, IRCallCleanup) and len(item.steps) == 1:
+                step = item.steps[0]
+                if step.mnemonic == "op_6C_01":
+                    node = IRPageRegister(value=step.operand)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+            index += 1
 
     def _build_io_node(
         self, items: _ItemList, index: int, instruction: RawInstruction
@@ -1764,7 +1865,10 @@ class IRNormalizer:
             if instruction.mnemonic == "op_08_00":
                 self._pending_tail_targets[0x0072].append(instruction.operand & 0xFFFF)
                 break
-            if instruction.mnemonic == "call_helpers" and instruction.operand in ASCII_HELPER_IDS:
+            if (
+                instruction.mnemonic in {"call_helpers", "sys.helper"}
+                and instruction.operand in ASCII_HELPER_IDS
+            ):
                 self._pending_tail_targets[0x003D].append(instruction.operand & 0xFFFF)
                 break
 
@@ -1773,17 +1877,27 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             helper_operand: Optional[int] = None
+            cleanup_steps: Tuple[IRStackEffect, ...] = tuple()
             if isinstance(item, RawInstruction):
-                if item.mnemonic == "call_helpers" and item.operand in ASCII_HELPER_IDS:
+                if (
+                    item.mnemonic in {"call_helpers", "sys.helper"}
+                    and item.operand in ASCII_HELPER_IDS
+                ):
                     helper_operand = item.operand
             elif isinstance(item, IRCallCleanup):
                 ascii_steps = [
                     step
                     for step in item.steps
-                    if step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS
+                    if step.mnemonic in {"call_helpers", "sys.helper"}
+                    and step.operand in ASCII_HELPER_IDS
                 ]
                 if ascii_steps:
                     helper_operand = ascii_steps[0].operand
+            elif isinstance(item, (IRCall, IRCallReturn, IRTailcallReturn)):
+                target = getattr(item, "target", None)
+                if target in ASCII_HELPER_IDS:
+                    helper_operand = target
+                    cleanup_steps = getattr(item, "cleanup", tuple())
             if helper_operand is None:
                 index += 1
                 continue
@@ -1814,6 +1928,22 @@ class IRNormalizer:
                 else:
                     items.replace_slice(index, index + 1, [finalize])
                     index += 1
+                continue
+
+            if isinstance(item, (IRCall, IRCallReturn, IRTailcallReturn)):
+                remaining_cleanup = tuple(
+                    step
+                    for step in cleanup_steps
+                    if not (
+                        step.mnemonic in {"call_helpers", "sys.helper"}
+                        and step.operand in ASCII_HELPER_IDS
+                    )
+                )
+                replacement: List[IRNode] = [finalize]
+                if remaining_cleanup:
+                    replacement.append(IRCallCleanup(steps=remaining_cleanup))
+                items.replace_slice(index, index + 1, replacement)
+                index += len(replacement)
                 continue
 
             items.replace_slice(index, index + 1, [finalize])
@@ -1876,7 +2006,19 @@ class IRNormalizer:
         chunks: List[str] = []
         index = 0
         while index < len(items) and isinstance(items[index], IRLiteralChunk):
-            chunks.append(items[index].describe())
+            chunk = items[index]
+            symbol = chunk.symbol
+            if symbol is None:
+                symbol = self._intern_string(chunk.data)
+                replacement = IRLiteralChunk(
+                    data=chunk.data,
+                    source=chunk.source,
+                    annotations=chunk.annotations,
+                    symbol=symbol,
+                )
+                items.replace_slice(index, index + 1, [replacement])
+                chunk = replacement
+            chunks.append(symbol)
             index += 1
         if len(chunks) >= 2:
             items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(chunks))])
@@ -1886,11 +2028,11 @@ class IRNormalizer:
             literal = items[0]
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
-                    parts = []
+                    parts: List[str] = []
                     for pos in range(0, len(literal.data), 4):
                         segment = literal.data[pos : pos + 4]
-                        piece = IRLiteralChunk(data=segment, source=literal.source)
-                        parts.append(piece.describe())
+                        symbol = self._intern_string(segment)
+                        parts.append(symbol)
                     if len(parts) >= 2:
                         items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
 
@@ -2544,6 +2686,8 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
+        if mnemonic == "call_helpers":
+            mnemonic = "sys.helper"
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,

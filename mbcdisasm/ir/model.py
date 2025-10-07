@@ -21,9 +21,11 @@ class SSAValueKind(Enum):
     """Lightweight annotation attached to SSA values."""
 
     UNKNOWN = auto()
-    INTEGER = auto()
-    ADDRESS = auto()
+    BYTE = auto()
+    WORD = auto()
     POINTER = auto()
+    IO = auto()
+    PAGE = auto()
     BOOLEAN = auto()
     IDENTIFIER = auto()
 
@@ -239,18 +241,13 @@ class IRLiteralChunk(IRNode):
     data: bytes
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
-        printable = []
-        for byte in self.data:
-            if 0x20 <= byte <= 0x7E:
-                printable.append(chr(byte))
-            elif byte in {0x09, 0x0A, 0x0D}:
-                printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
-            else:
-                printable.append(f"\\x{byte:02x}")
-        text = "".join(printable)
-        note = f"ascii({text})"
+        if self.symbol:
+            note = f"ascii[{self.symbol}]"
+        else:
+            note = f"ascii({_render_ascii_bytes(self.data)})"
         if self.annotations:
             note += " " + ", ".join(self.annotations)
         return note
@@ -484,6 +481,16 @@ class IRIOWrite(IRNode):
         if details:
             return f"io.write({', '.join(details)})"
         return "io.write()"
+
+
+@dataclass(frozen=True)
+class IRPageRegister(IRNode):
+    """Explicit update of the interpreter's page register."""
+
+    value: int
+
+    def describe(self) -> str:
+        return f"page_reg = 0x{self.value:04X}"
 
 
 @dataclass(frozen=True)
@@ -788,11 +795,23 @@ class IRSegment:
 
 
 @dataclass(frozen=True)
+class IRStringConstant:
+    """Immutable representation of an extracted ASCII blob."""
+
+    name: str
+    data: bytes
+
+    def describe(self) -> str:
+        return f"{self.name} = ascii({_render_ascii_bytes(self.data)})"
+
+
+@dataclass(frozen=True)
 class IRProgram:
     """Normalised representation for the entire container."""
 
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
+    strings: Tuple[IRStringConstant, ...] = tuple()
 
 
 @dataclass
@@ -868,6 +887,7 @@ __all__ = [
     "IRIndirectStore",
     "IRIORead",
     "IRIOWrite",
+    "IRPageRegister",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRAsciiHeader",
@@ -889,6 +909,7 @@ __all__ = [
     "MemSpace",
     "SSAValueKind",
     "NormalizerMetrics",
+    "IRStringConstant",
 ]
 
 
@@ -902,4 +923,16 @@ def _format_operand(value: int) -> str:
             alias_text = upper
         return alias_text if alias_text == hex_value else f"{alias_text}({hex_value})"
     return hex_value
+
+def _render_ascii_bytes(data: bytes) -> str:
+    printable = []
+    for byte in data:
+        if 0x20 <= byte <= 0x7E:
+            printable.append(chr(byte))
+        elif byte in {0x09, 0x0A, 0x0D}:
+            printable.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+        else:
+            printable.append(f"\\x{byte:02x}")
+    return "".join(printable)
+
 

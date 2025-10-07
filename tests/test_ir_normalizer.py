@@ -22,10 +22,11 @@ from mbcdisasm.ir.model import (
     IRBuildTuple,
     IRBuildArray,
     IRSwitchDispatch,
+    IRPageRegister,
     NormalizerMetrics,
 )
 from mbcdisasm.ir.normalizer import _ItemList
-from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
+from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD, PAGE_REGISTER
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase
@@ -517,8 +518,36 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "ascii_header[ascii(A\\x00B\\x00), ascii(\\x00C\\x00D)]" in descriptions
+    header = next(text for text in descriptions if text.startswith("ascii_header["))
+    names = header[len("ascii_header[") : -1].split(", ")
+    pool = {const.name: const.data for const in program.strings}
+    assert {pool[name] for name in names} == {b"A\x00B\x00", b"\x00C\x00D"}
     assert "lit(0x6704)" in descriptions
+
+
+def test_page_register_is_normalised(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, PAGE_REGISTER),
+        InstructionWord(4, int("6C010123", 16)),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    register_nodes = [node for node in block.nodes if isinstance(node, IRPageRegister)]
+    assert register_nodes and register_nodes[0].value == 0x0123
+    assert program.metrics.raw_remaining == 0
+
+    renderer = IRTextRenderer()
+    rendered = renderer.render(program)
+    assert "page_reg = 0x0123" in rendered
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -645,7 +674,7 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
 
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
     assert [step.mnemonic for step in call_return.cleanup] == [
-        "call_helpers",
+        "sys.helper",
         "op_32_29",
         "op_29_10",
         "stack_teardown",
@@ -666,6 +695,34 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
         and node.mnemonic in {"op_4A_05", "op_32_29", "op_29_10", "stack_teardown_4"}
         for node in block.nodes
     )
+
+
+def test_normalizer_converts_call_helpers_to_call_nodes(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0042),
+        build_word(4, 0x10, 0xE8, 0x0020),
+        build_word(8, 0x00, 0x00, 0x0010),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    calls = [node for node in block.nodes if isinstance(node, IRCall)]
+    assert len(calls) == 1
+    helper_call = calls[0]
+    assert helper_call.target == 0x0020
+    assert helper_call.symbol == "call_helper_20"
+    assert helper_call.args
+    assert program.metrics.calls >= 1
+    assert program.metrics.raw_remaining == 0
 
 
 def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:

@@ -24,10 +24,13 @@ class StackValueType(Enum):
     """Lightweight classification for stack values."""
 
     UNKNOWN = auto()
-    NUMBER = auto()
+    WORD = auto()
     SLOT = auto()
     IDENTIFIER = auto()
     MARKER = auto()
+    BYTE = auto()
+    IO = auto()
+    PAGE_REGISTER = auto()
 
 
 @dataclass(frozen=True)
@@ -282,7 +285,7 @@ def infer_stack_effect(
                 confidence=max(0.65, hint.confidence),
             )
             kind_override = InstructionKind.INDIRECT_STORE
-            popped = [StackValueType.SLOT, StackValueType.NUMBER]
+            popped = [StackValueType.SLOT, StackValueType.WORD]
             pushed = []
         else:
             hint = StackEffectHint(
@@ -293,7 +296,7 @@ def infer_stack_effect(
             )
             kind_override = InstructionKind.INDIRECT_LOAD
             popped = [StackValueType.SLOT]
-            pushed = [StackValueType.NUMBER]
+            pushed = [StackValueType.WORD]
 
     hint, popped, pushed, kind_override = _apply_wrapper_overrides(
         profiles,
@@ -317,7 +320,7 @@ def _default_push_types(profile: InstructionProfile) -> Tuple[StackValueType, ..
     if profile.is_literal_marker():
         return (StackValueType.MARKER,)
     if profile.kind is InstructionKind.LITERAL:
-        return (StackValueType.NUMBER,)
+        return (StackValueType.WORD,)
     if profile.kind is InstructionKind.ASCII_CHUNK:
         return (StackValueType.IDENTIFIER,)
     if profile.kind is InstructionKind.PUSH:
@@ -327,7 +330,7 @@ def _default_push_types(profile: InstructionProfile) -> Tuple[StackValueType, ..
         InstructionKind.INDIRECT,
         InstructionKind.INDIRECT_LOAD,
     }:
-        return (StackValueType.NUMBER,)
+        return (StackValueType.WORD,)
     return tuple()
 
 
