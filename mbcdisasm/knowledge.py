@@ -103,6 +103,8 @@ class CallSignatureEffect:
     operand_alias: Optional[str] = None
     inherit_operand: bool = False
     inherit_alias: bool = False
+    kind: str = "stack"
+    port: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -572,6 +574,14 @@ def _parse_call_signature_effect(spec: Any) -> Optional[CallSignatureEffect]:
     inherit_operand = bool(spec.get("inherit_operand", False))
     inherit_alias = bool(spec.get("inherit_alias", False))
 
+    kind = spec.get("kind", "stack")
+    if not isinstance(kind, str) or not kind:
+        kind = "stack"
+
+    port = spec.get("port")
+    if port is not None:
+        port = str(port)
+
     return CallSignatureEffect(
         mnemonic=mnemonic,
         operand=operand,
@@ -580,6 +590,8 @@ def _parse_call_signature_effect(spec: Any) -> Optional[CallSignatureEffect]:
         operand_alias=operand_alias,
         inherit_operand=inherit_operand,
         inherit_alias=inherit_alias,
+        kind=kind,
+        port=port,
     )
 
 

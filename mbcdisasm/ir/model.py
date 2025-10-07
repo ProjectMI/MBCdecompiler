@@ -51,7 +51,11 @@ class MemRef:
     def describe(self) -> str:
         region = self.page_alias or self.region or "mem"
         prefix = region
-        if not prefix.startswith("mem") and prefix not in {"frame", "global", "const"}:
+        if (
+            not prefix.startswith("mem")
+            and not prefix.startswith("io.")
+            and prefix not in {"frame", "global", "const"}
+        ):
             prefix = f"mem.{prefix}"
 
         details = []
@@ -311,88 +315,6 @@ class IRLiteralBlock(IRNode):
 
 
 @dataclass(frozen=True)
-class IRAsciiWrapperCall(IRNode):
-    """Tailored representation of helper calls guarded by inline ASCII chunks."""
-
-    target: int
-    args: Tuple[str, ...]
-    ascii_chunks: Tuple[str, ...]
-    tail: bool = False
-    arity: Optional[int] = None
-    shuffle: Optional[int] = None
-    cleanup_mask: Optional[int] = None
-    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    symbol: Optional[str] = None
-    predicate: Optional[CallPredicate] = None
-
-    def describe(self) -> str:
-        ascii_repr = ", ".join(self.ascii_chunks)
-        prefix = "ascii_wrapper_call tail" if self.tail else "ascii_wrapper_call"
-        target_repr = f"0x{self.target:04X}"
-        if self.symbol:
-            target_repr = f"{self.symbol}({target_repr})"
-        details = []
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
-        if self.cleanup:
-            rendered = ", ".join(step.describe() for step in self.cleanup)
-            details.append(f"cleanup=[{rendered}]")
-        if self.predicate is not None:
-            details.append(f"predicate={self.predicate.describe()}")
-        extra = f" {' '.join(details)}" if details else ""
-        return (
-            f"{prefix} target={target_repr} ascii=[{ascii_repr}] "
-            f"args=[{', '.join(self.args)}]{extra}"
-        )
-
-
-@dataclass(frozen=True)
-class IRTailcallAscii(IRNode):
-    """Tail calls immediately followed by ASCII driven conditionals."""
-
-    target: int
-    args: Tuple[str, ...]
-    ascii_chunks: Tuple[str, ...]
-    condition: str
-    then_target: int
-    else_target: int
-    arity: Optional[int] = None
-    shuffle: Optional[int] = None
-    cleanup_mask: Optional[int] = None
-    cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    symbol: Optional[str] = None
-    predicate: Optional[CallPredicate] = None
-
-    def describe(self) -> str:
-        ascii_repr = ", ".join(self.ascii_chunks)
-        target_repr = f"0x{self.target:04X}"
-        if self.symbol:
-            target_repr = f"{self.symbol}({target_repr})"
-        details = []
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
-        if self.shuffle is not None:
-            details.append(f"shuffle={_format_operand(self.shuffle)}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
-        if self.cleanup:
-            rendered = ", ".join(step.describe() for step in self.cleanup)
-            details.append(f"cleanup=[{rendered}]")
-        if self.predicate is not None:
-            details.append(f"predicate={self.predicate.describe()}")
-        extra = f" {' '.join(details)}" if details else ""
-        return (
-            f"tailcall_ascii target={target_repr} cond={self.condition} "
-            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X} "
-            f"ascii=[{ascii_repr}]{extra}"
-        )
-
-
-@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
@@ -558,7 +480,7 @@ class IRIOWrite(IRNode):
     def describe(self) -> str:
         details = [f"port={self.port}"]
         if self.mask is not None:
-            details.append(f"mask=0x{self.mask:04X}")
+            details.append(f"mask={_format_operand(self.mask)}")
         if details:
             return f"io.write({', '.join(details)})"
         return "io.write()"
@@ -639,6 +561,42 @@ class IRTablePatch(IRNode):
     def describe(self) -> str:
         rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
         return f"table_patch[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRSwitch(IRNode):
+    """Structured representation of jump-table patch sequences."""
+
+    prefix: Tuple[int, ...]
+    triplets: Tuple[Tuple[int, int, int], ...]
+    tail: Tuple[int, ...]
+    patch: Tuple[Tuple[str, int], ...]
+    reducer: Optional[str] = None
+    reducer_operand: Optional[int] = None
+    suffix: Tuple[int, ...] = tuple()
+
+    def describe(self) -> str:
+        prefix = ", ".join(f"0x{value:04X}" for value in self.prefix)
+        triplets = ", ".join(
+            f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})" for a, b, c in self.triplets
+        )
+        tail = ", ".join(f"0x{value:04X}" for value in self.tail)
+        suffix = ", ".join(f"0x{value:04X}" for value in self.suffix)
+        parts = [
+            f"prefix=[{prefix}]" if self.prefix else None,
+            f"triplets=[{triplets}]" if self.triplets else None,
+            f"tail=[{tail}]" if self.tail else None,
+            f"patch=[{', '.join(f'{m}(0x{o:04X})' for m, o in self.patch)}]" if self.patch else None,
+            f"suffix=[{suffix}]" if self.suffix else None,
+        ]
+        if self.reducer:
+            operand = (
+                f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
+            )
+            parts.append(f"reducer={self.reducer}{operand}")
+        filtered = [part for part in parts if part]
+        inner = " ".join(filtered)
+        return f"switch {inner}".strip()
 
 
 @dataclass(frozen=True)
@@ -897,8 +855,6 @@ __all__ = [
     "IRBuildMap",
     "IRBuildTuple",
     "IRLiteralBlock",
-    "IRAsciiWrapperCall",
-    "IRTailcallAscii",
     "IRIf",
     "IRTestSetBranch",
     "IRFlagCheck",
@@ -921,6 +877,7 @@ __all__ = [
     "IRCallPreparation",
     "IRTailcallFrame",
     "IRTablePatch",
+    "IRSwitch",
     "IRAsciiFinalize",
     "IRSlot",
     "MemRef",

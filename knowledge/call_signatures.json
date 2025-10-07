@@ -47,5 +47,78 @@
         "optional": true
       }
     ]
+  },
+  "0x003D": {
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "prelude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_10_24",
+        "operand": "0x6910",
+        "effect": {
+          "mnemonic": "io.write",
+          "kind": "io_write",
+          "operand": "0x2910",
+          "port": "io.port_6910"
+        }
+      }
+    ],
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_10_38",
+        "operand": "0x6910",
+        "effect": {
+          "mnemonic": "io.read",
+          "kind": "io_read",
+          "port": "io.port_6910"
+        }
+      }
+    ]
+  },
+  "0x0040": {
+    "cleanup_mask": "0x2910",
+    "shuffle_options": ["0x4B08", "0x3032"],
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ]
+  },
+  "0x0045": {
+    "cleanup_mask": "0x2910",
+    "shuffle_options": ["0x4B08", "0x3032"],
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ]
+  },
+  "0x0046": {
+    "cleanup_mask": "0x2910",
+    "shuffle_options": ["0x4B08", "0x3032"],
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ]
+  },
+  "0x0047": {
+    "cleanup_mask": "0x2910",
+    "shuffle_options": ["0x4B08", "0x3032"],
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ]
+  },
+  "0x0050": {
+    "cleanup_mask": "0x2910",
+    "shuffle_options": ["0x4B08", "0x3032"],
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ]
+  },
+  "0x0051": {
+    "cleanup_mask": "0x2910",
+    "shuffle_options": ["0x4B08", "0x3032"],
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ]
   }
 }

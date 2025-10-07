@@ -10,8 +10,6 @@ from mbcdisasm.ir.model import (
     IRCallPreparation,
     IRCallReturn,
     IRTailcallReturn,
-    IRAsciiWrapperCall,
-    IRTailcallAscii,
     IRIf,
     IRReturn,
     IRFunctionPrologue,
@@ -19,6 +17,7 @@ from mbcdisasm.ir.model import (
     IRTestSetBranch,
     IRRaw,
     IRConditionMask,
+    IRIORead,
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
@@ -140,6 +139,7 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x1234": "test_helper_1234",
         "0x0020": "call_helper_20",
         "0x0072": "tail_helper_72",
+        "0x003D": "tail_helper_3d",
         "0x00F0": "tail_helper_f0",
     }
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
@@ -180,6 +180,37 @@ def write_manual(path: Path) -> KnowledgeBase:
                     "optional": True,
                 },
             ],
+        },
+        "0x003D": {
+            "cleanup_mask": "0x2910",
+            "cleanup": [
+                {"mnemonic": "stack_teardown", "pops": 1},
+            ],
+            "prelude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_10_24",
+                    "operand": "0x6910",
+                    "effect": {
+                        "mnemonic": "io.write",
+                        "kind": "io_write",
+                        "operand": "0x2910",
+                        "port": "io.port_6910",
+                    },
+                }
+            ],
+            "postlude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_10_38",
+                    "operand": "0x6910",
+                    "effect": {
+                        "mnemonic": "io.read",
+                        "kind": "io_read",
+                        "port": "io.port_6910",
+                    },
+                }
+            ],
         }
     }
     (path / "call_signatures.json").write_text(json.dumps(call_signatures, indent=2), "utf-8")
@@ -217,14 +248,32 @@ def build_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBase]:
         build_word(48, 0x01, 0x00, 0x0000),
     ]
 
+    seg2_words = [
+        build_word(0, 0x10, 0x24, IO_SLOT),
+        build_word(4, 0x28, 0x00, 0x003D),
+        build_word(8, 0x10, 0x38, IO_SLOT),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
     seg0_bytes = encode_instructions(seg0_words)
     seg1_bytes = encode_instructions(seg1_words)
+
+    seg2_bytes = encode_instructions(seg2_words)
 
     segments = [
         Segment(SegmentDescriptor(0, 0, len(seg0_bytes)), seg0_bytes),
         Segment(
             SegmentDescriptor(1, len(seg0_bytes), len(seg0_bytes) + len(seg1_bytes)),
             seg1_bytes,
+        ),
+        Segment(
+            SegmentDescriptor(
+                2,
+                len(seg0_bytes) + len(seg1_bytes),
+                len(seg0_bytes) + len(seg1_bytes) + len(seg2_bytes),
+            ),
+            seg2_bytes,
         ),
     ]
 
@@ -297,6 +346,21 @@ def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBas
         ]
     )
 
+    add_segment(
+        [
+            build_word(0, 0x00, 0x00, 0x0067),
+            build_word(4, 0x00, 0x00, 0x0400),
+            build_word(8, 0x00, 0x00, 0x6704),
+            build_word(12, 0x00, 0x00, 0x0067),
+            build_word(16, 0x00, 0x00, 0x0400),
+            build_word(20, 0x00, 0x00, 0x6704),
+            build_word(24, 0x2C, 0x10, 0x6601),
+            build_word(28, 0x2C, 0x10, 0x6602),
+            build_word(32, 0x00, 0x00, 0x0001),
+            build_word(36, 0x30, 0x00, 0x0000),
+        ]
+    )
+
     container = MbcContainer(Path("dummy"), segments)
     return container, knowledge
 
@@ -306,15 +370,15 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
 
-    assert program.metrics.calls == 1
+    assert program.metrics.calls == 2
     assert program.metrics.tail_calls == 1
-    assert program.metrics.returns >= 1
+    assert program.metrics.returns >= 2
     assert program.metrics.literals == 5
     assert program.metrics.literal_chunks == 0
     assert program.metrics.aggregates == 1
-    assert program.metrics.testset_branches >= 1
+    assert program.metrics.testset_branches >= 2
     assert program.metrics.if_branches == 1
-    assert program.metrics.loads >= 2
+    assert program.metrics.loads >= 3
     assert program.metrics.stores >= 1
     assert program.metrics.reduce_replaced == 1
 
@@ -344,16 +408,7 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for seg in program.segments
         for block in seg.blocks
         for node in block.nodes
-        if isinstance(
-            node,
-            (
-                IRCall,
-                IRCallReturn,
-                IRAsciiWrapperCall,
-                IRTailcallAscii,
-                IRTailcallReturn,
-            ),
-        )
+        if isinstance(node, (IRCall, IRCallReturn, IRTailcallReturn))
     ]
     contract_call = None
     for node in call_nodes:
@@ -361,7 +416,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             contract_call = node
             break
     assert contract_call is not None
-    assert isinstance(contract_call, IRTailcallReturn)
+    assert isinstance(contract_call, IRCallReturn)
+    assert contract_call.tail
     assert contract_call.cleanup_mask == 0x2910
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
@@ -371,19 +427,29 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         for block in seg.blocks
         if contract_call in block.nodes
     )
-    cleanup_nodes = [
-        node for node in call_block.nodes if isinstance(node, IRCallCleanup)
-    ]
-    assert any(
-        [step.mnemonic for step in node.steps]
-        == ["op_6C_01", "op_5E_29", "op_F0_4B"]
-        for node in cleanup_nodes
+    assert not any(
+        isinstance(node, IRCallCleanup)
+        and any(step.mnemonic in {"op_6C_01", "op_5E_29", "op_F0_4B"} for step in node.steps)
+        for node in call_block.nodes
     )
-    assert [step.mnemonic for step in contract_call.cleanup] == [
-        "stack_teardown",
-        "op_29_10",
-        "op_70_29",
-    ]
+    assert contract_call.cleanup and len(contract_call.cleanup) == 1
+    assert contract_call.cleanup[0].mnemonic == "stack_teardown"
+    assert contract_call.cleanup[0].pops == 1
+
+    io_call = None
+    for node in call_nodes:
+        if getattr(node, "target", None) == 0x003D:
+            io_call = node
+            break
+    assert io_call is not None
+    io_block = next(
+        block
+        for seg in program.segments
+        for block in seg.blocks
+        if io_call in block.nodes
+    )
+    assert any(isinstance(node, IRIOWrite) for node in io_block.nodes)
+    assert any(isinstance(node, IRIORead) for node in io_block.nodes)
 
     if_nodes = [
         node
@@ -424,14 +490,12 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     ]
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
-    assert any(
-        text.startswith("tailcall_ascii") or text.startswith("ascii_wrapper_call tail")
-        for text in descriptions
-    )
+    assert any(text.startswith("call tail") for text in descriptions)
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any("call_helper_20" in text for text in descriptions)
+    assert any(text.startswith("switch ") for text in descriptions)
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
@@ -530,7 +594,7 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "io.write(port=io.port_6910, mask=0x2910)" in descriptions
+    assert "io.write(port=io.port_6910, mask=RET_MASK(0x2910))" in descriptions
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
@@ -584,10 +648,9 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert [step.mnemonic for step in call_return.cleanup] == [
         "call_helpers",
         "op_32_29",
-        "op_29_10",
         "stack_teardown",
     ]
-    assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
+    assert [step.operand for step in call_return.cleanup[:2]] == [0x0001, 0x1000]
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
     assert call_return.symbol == "test_helper_1234"
@@ -782,7 +845,7 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
 
     tail_node = next(node for node in block.nodes if isinstance(node, IRTailcallReturn))
     assert tail_node.target == 0x00F0
-    assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
+    assert not tail_node.cleanup
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
     )
