@@ -386,6 +386,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
@@ -773,6 +774,69 @@ class IRNormalizer:
                 b"".join(data_parts), "ascii_run", annotations
             )
             items.replace_slice(start, index, [chunk])
+            index = start + 1
+
+    def _pass_ascii_glue(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            if not isinstance(items[index], IRLiteralChunk):
+                index += 1
+                continue
+
+            start = index
+            scan = index
+            chunk_nodes: List[IRLiteralChunk] = []
+
+            while scan < len(items) and isinstance(items[scan], IRLiteralChunk):
+                chunk = items[scan]
+                assert isinstance(chunk, IRLiteralChunk)
+                chunk_nodes.append(chunk)
+                scan += 1
+
+            reducers: List[RawInstruction] = []
+
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and candidate.mnemonic == "reduce_pair":
+                    reducers.append(candidate)
+                    scan += 1
+                    if scan < len(items) and isinstance(items[scan], IRLiteralChunk):
+                        next_chunk = items[scan]
+                        assert isinstance(next_chunk, IRLiteralChunk)
+                        chunk_nodes.append(next_chunk)
+                        scan += 1
+                        continue
+                    break
+                break
+
+            if not reducers or len(chunk_nodes) != len(reducers) + 1:
+                index += 1
+                continue
+
+            removal_end = scan
+            removed_items = [items[pos] for pos in range(start, removal_end)]
+            source = reducers[-1]
+
+            merged_annotations: List[str] = []
+            seen_annotations: set[str] = set()
+            for chunk in chunk_nodes:
+                for note in chunk.annotations:
+                    if note in seen_annotations:
+                        continue
+                    seen_annotations.add(note)
+                    merged_annotations.append(note)
+
+            data = b"".join(chunk.data for chunk in chunk_nodes)
+            combined = self._make_literal_chunk(data, "ascii_glue", merged_annotations)
+            self._transfer_ssa(source, combined)
+
+            for removed in removed_items:
+                if removed is source:
+                    continue
+                self._ssa_bindings.pop(id(removed), None)
+
+            items.replace_slice(start, removal_end, [combined])
+            metrics.reduce_replaced += len(reducers)
             index = start + 1
 
     def _collect_call_arguments(
@@ -1971,6 +2035,10 @@ class IRNormalizer:
 
         if len(chunk_nodes) == 1:
             literal = chunk_nodes[0]
+            symbol = literal.symbol
+            if symbol:
+                items.replace_slice(0, 1, [IRAsciiHeader(chunks=(symbol,))])
+                return
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
                     parts = []

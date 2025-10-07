@@ -11,6 +11,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteralChunk,
     IRTailcallReturn,
     IRIf,
     IRReturn,
@@ -535,13 +536,44 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
         (node for node in block.nodes if isinstance(node, IRAsciiHeader)), None
     )
     assert header is not None
-    assert len(header.chunks) == 2
+    assert len(header.chunks) == 1
 
     pool = {const.name: const for const in program.string_pool}
-    assert all(chunk in pool for chunk in header.chunks)
-    assert pool[header.chunks[0]].data == b"A\x00B\x00"
-    assert pool[header.chunks[1]].data == b"\x00C\x00D"
+    assert header.chunks[0] in pool
+    assert pool[header.chunks[0]].data == b"A\x00B\x00\x00C\x00D"
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_ascii_word(0, "HEAD"),
+        build_ascii_word(4, " ER"),
+        build_word(8, 0x04, 0x00, 0x0000),
+        build_ascii_word(12, " TEXT"),
+        build_word(16, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks and len(header.chunks) == 1
+    symbol = header.chunks[0]
+
+    descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
+    assert not any("reduce_pair" in text for text in descriptions)
+
+    pool = {const.name: const.data for const in program.string_pool}
+    assert symbol in pool
+    assert pool[symbol] == b"HEAD ER  TEX"
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
