@@ -3086,14 +3086,25 @@ class IRNormalizer:
 
             if item.mnemonic == "testset_branch":
                 expr = self._describe_condition(items, index, skip_literals=True)
+                then_target = self._branch_target(item)
+                else_target = self._fallthrough_target(item)
                 node = IRTestSetBranch(
                     var=self._format_testset_var(item),
                     expr=expr,
-                    then_target=self._branch_target(item),
-                    else_target=self._fallthrough_target(item),
+                    then_target=then_target,
+                    else_target=else_target,
                 )
                 self._transfer_ssa(item, node)
-                items.replace_slice(index, index + 1, [node])
+                replacement: List[Union[RawInstruction, IRNode]] = [node]
+                if item.profile.mode == 0x33:
+                    branch = IRIf(
+                        condition=node.var,
+                        then_target=then_target,
+                        else_target=else_target,
+                    )
+                    replacement.append(branch)
+                    metrics.if_branches += 1
+                items.replace_slice(index, index + 1, replacement)
                 metrics.testset_branches += 1
                 continue
 
