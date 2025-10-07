@@ -383,6 +383,7 @@ class IRLiteralBlock(IRNode):
     reducer: Optional[str] = None
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
+    tag: Optional[str] = None
 
     def describe(self) -> str:
         chunks = []
@@ -397,6 +398,8 @@ class IRLiteralBlock(IRNode):
                 f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
             )
             base += f" via {self.reducer}{operand}"
+        if self.tag:
+            base = f"{self.tag} {base}"
         return base
 
 
@@ -643,10 +646,12 @@ class IRTablePatch(IRNode):
     """Collapses the recurring 0x66xx table patch sequences."""
 
     operations: Tuple[Tuple[str, int], ...]
+    tag: Optional[str] = None
 
     def describe(self) -> str:
         rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
-        return f"table_patch[{rendered}]"
+        prefix = f"{self.tag} " if self.tag else ""
+        return f"{prefix}table_patch[{rendered}]"
 
 
 @dataclass(frozen=True)

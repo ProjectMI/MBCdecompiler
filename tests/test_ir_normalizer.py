@@ -22,6 +22,7 @@ from mbcdisasm.ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
+    IRTablePatch,
     IRConditionMask,
     IRIOWrite,
     IRBuildTuple,
@@ -999,6 +1000,30 @@ def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
     assert len(nodes) == 1
     assert isinstance(nodes[0], IRBuildTuple)
     assert metrics.reduce_replaced == 1
+
+
+def test_normalizer_groups_opcode_table_runs(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(index * 4, 0x10 + index, 0x2A, 0x0000) for index in range(12)
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert node.tag == "opcode_table"
+    assert len(node.operations) == len(words)
+
 
 def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

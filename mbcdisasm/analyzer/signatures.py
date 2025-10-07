@@ -699,7 +699,8 @@ class ModeSweepSignature(SignatureRule):
             return None
 
         (mode,) = modes
-        if mode not in {0x4E, 0x4F}:
+        allowed_modes = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F}
+        if mode not in allowed_modes:
             return None
 
         distinct_opcodes = {profile.opcode for profile in profiles}

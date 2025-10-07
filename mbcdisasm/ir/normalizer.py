@@ -404,6 +404,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
+        self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
@@ -1511,6 +1512,69 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    _OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F}
+    _MIN_OPCODE_TABLE_LENGTH = 8
+
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not self._is_opcode_table_member(item, item.profile.mode):
+                index += 1
+                continue
+
+            mode = item.profile.mode
+            if mode not in self._OPCODE_TABLE_MODES:
+                index += 1
+                continue
+
+            run: List[RawInstruction] = [item]
+            scan = index + 1
+            while scan < len(items):
+                candidate = items[scan]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                if not self._is_opcode_table_member(candidate, mode):
+                    break
+                run.append(candidate)
+                scan += 1
+
+            if len(run) < self._MIN_OPCODE_TABLE_LENGTH:
+                index += 1
+                continue
+
+            operations = [(instruction.mnemonic, instruction.operand) for instruction in run]
+            patch = IRTablePatch(operations=tuple(operations), tag="opcode_table")
+            self._transfer_ssa(run[-1], patch)
+            items.replace_slice(index, index + len(run), [patch])
+            index += 1
+
+    @staticmethod
+    def _is_opcode_table_member(instruction: RawInstruction, mode: int) -> bool:
+        if instruction.profile.mode != mode:
+            return False
+        if instruction.operand != 0:
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        if instruction.profile.kind in {
+            InstructionKind.TAILCALL,
+            InstructionKind.RETURN,
+            InstructionKind.BRANCH,
+            InstructionKind.TERMINATOR,
+        }:
+            return False
+        return True
 
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
