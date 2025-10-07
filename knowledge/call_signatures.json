@@ -1,4 +1,314 @@
 {
+  "0x003D": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "prelude": [
+      {"kind": "io", "mnemonic": "write"}
+    ],
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0040": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0041": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0042": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0043": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0044": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0045": {
+    "arity": 1,
+    "returns": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0046": {
+    "arity": 1,
+    "returns": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0047": {
+    "arity": 1,
+    "returns": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0048": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0049": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x004A": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x004B": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x004C": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x004D": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x004E": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x004F": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0050": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
+  "0x0051": {
+    "arity": 1,
+    "cleanup_mask": "0x2910",
+    "cleanup": [
+      {"mnemonic": "stack_teardown", "pops": 1}
+    ],
+    "shuffle": "0x4B08",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_70_29",
+        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "optional": true
+      }
+    ]
+  },
   "0x0072": {
     "arity": 2,
     "cleanup_mask": "0x2910",

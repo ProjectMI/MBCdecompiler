@@ -138,6 +138,7 @@ class IRCall(IRNode):
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    effects: Tuple[IRNode, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
@@ -155,6 +156,9 @@ class IRCall(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.effects:
+            rendered = ", ".join(effect.describe() for effect in self.effects)
+            details.append(f"effects=[{rendered}]")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
@@ -518,10 +522,10 @@ class IRAsciiPreamble(IRNode):
 class IRCallPreparation(IRNode):
     """Grouped stack permutations that prepare arguments for helper calls."""
 
-    steps: Tuple[Tuple[str, int], ...]
+    steps: Tuple[IRStackEffect, ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(step.describe() for step in self.steps)
         return f"prep_call_args[{rendered}]"
 
 
@@ -561,6 +565,42 @@ class IRTablePatch(IRNode):
     def describe(self) -> str:
         rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
         return f"table_patch[{rendered}]"
+
+
+@dataclass(frozen=True)
+class IRTableSwitch(IRNode):
+    """Structured representation of a literal table patched via 0x66xx helpers."""
+
+    operations: Tuple[Tuple[str, int], ...]
+    entries: Tuple[Tuple[str, str], ...] = tuple()
+    table: Tuple[Tuple[int, int, int], ...] = tuple()
+    tail: Tuple[int, ...] = tuple()
+    reducer: Optional[str] = None
+    reducer_operand: Optional[int] = None
+
+    def describe(self) -> str:
+        parts = []
+        if self.entries:
+            rendered = ", ".join(f"{key}:{value}" for key, value in self.entries)
+            parts.append(f"entries=[{rendered}]")
+        if self.table:
+            rendered = ", ".join(
+                f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})" for a, b, c in self.table
+            )
+            parts.append(f"table=[{rendered}]")
+        if self.tail:
+            rendered = ", ".join(f"0x{value:04X}" for value in self.tail)
+            parts.append(f"tail=[{rendered}]")
+        if self.reducer:
+            operand = (
+                f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
+            )
+            parts.append(f"reducer={self.reducer}{operand}")
+        if self.operations:
+            rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+            parts.append(f"patch=[{rendered}]")
+        inner = " ".join(parts)
+        return f"table_switch{(' ' + inner) if inner else ''}"
 
 
 @dataclass(frozen=True)
@@ -610,6 +650,7 @@ class IRCallReturn(IRNode):
     cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    effects: Tuple[IRNode, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -621,6 +662,9 @@ class IRCallReturn(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             cleanup = f" cleanup=[{rendered}]"
+        if self.effects:
+            rendered = ", ".join(effect.describe() for effect in self.effects)
+            cleanup += f" effects=[{rendered}]"
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
@@ -691,6 +735,7 @@ class IRTailcallReturn(IRNode):
     cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    effects: Tuple[IRNode, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"
@@ -707,6 +752,9 @@ class IRTailcallReturn(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.effects:
+            rendered = ", ".join(effect.describe() for effect in self.effects)
+            details.append(f"effects=[{rendered}]")
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.predicate is not None:
@@ -841,6 +889,7 @@ __all__ = [
     "IRCallPreparation",
     "IRTailcallFrame",
     "IRTablePatch",
+    "IRTableSwitch",
     "IRAsciiFinalize",
     "IRSlot",
     "MemRef",

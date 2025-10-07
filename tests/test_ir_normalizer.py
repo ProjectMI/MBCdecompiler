@@ -20,6 +20,9 @@ from mbcdisasm.ir.model import (
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
+    IRLiteralBlock,
+    IRTablePatch,
+    IRTableSwitch,
     NormalizerMetrics,
 )
 from mbcdisasm.ir.normalizer import _ItemList
@@ -137,11 +140,31 @@ def write_manual(path: Path) -> KnowledgeBase:
     address_table = {
         "0x1234": "test_helper_1234",
         "0x0020": "call_helper_20",
+        "0x003D": "tail_helper_3d",
         "0x0072": "tail_helper_72",
         "0x00F0": "tail_helper_f0",
     }
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
     call_signatures = {
+        "0x003D": {
+            "arity": 1,
+            "cleanup_mask": "0x2910",
+            "cleanup": [
+                {"mnemonic": "stack_teardown", "pops": 1},
+            ],
+            "shuffle": "0x4B08",
+            "prelude": [
+                {"kind": "io", "mnemonic": "write"},
+            ],
+            "postlude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_70_29",
+                    "effect": {"mnemonic": "op_70_29", "inherit_operand": True},
+                    "optional": True,
+                },
+            ],
+        },
         "0x0072": {
             "arity": 2,
             "cleanup_mask": "0x2910",
@@ -178,7 +201,7 @@ def write_manual(path: Path) -> KnowledgeBase:
                     "optional": True,
                 },
             ],
-        }
+        },
     }
     (path / "call_signatures.json").write_text(json.dumps(call_signatures, indent=2), "utf-8")
     return KnowledgeBase.load(manual_path)
@@ -350,7 +373,8 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             contract_call = node
             break
     assert contract_call is not None
-    assert isinstance(contract_call, IRTailcallReturn)
+    assert isinstance(contract_call, (IRCall, IRCallReturn))
+    assert not isinstance(contract_call, IRTailcallReturn)
     assert contract_call.cleanup_mask == 0x2910
     assert contract_call.predicate is not None
     assert contract_call.predicate.kind == "testset"
@@ -768,6 +792,35 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_promotes_tail_helper_72_to_call_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),  # literal arg
+        build_word(4, 0x00, 0x00, 0x0002),  # literal arg
+        build_word(8, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),  # shuffle prelude
+        build_word(12, 0x5E, 0x29, RET_MASK),  # fanout mask
+        build_word(16, 0x6C, 0x01, 0x6C01),  # page register
+        build_word(20, 0x28, 0x00, 0x0072),  # call_dispatch helper 72
+        build_word(24, 0x29, 0x10, RET_MASK),  # cleanup mask
+        build_word(28, 0x30, 0x00, 0x0002),  # return two values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(isinstance(node, IRTailcallReturn) for node in block.nodes)
+    bundled = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert bundled.target == 0x0072
+    assert not bundled.tail
+
+
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -812,3 +865,59 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
+
+
+def test_normalizer_attaches_io_effects_to_helper_signature(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x00FF),  # literal mask
+        build_word(4, 0x3D, 0x30, IO_SLOT),  # io handshake
+        build_word(8, 0x10, 0x24, 0x0000),  # masked write using literal
+        build_word(12, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),  # shuffle prelude
+        build_word(16, 0x28, 0x00, 0x003D),  # call_dispatch helper 3D
+        build_word(20, 0x29, 0x10, RET_MASK),  # cleanup mask fanout
+        build_word(24, 0x30, 0x00, 0x0001),  # return values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_index = next(i for i, node in enumerate(block.nodes) if isinstance(node, IRCallReturn))
+    call = block.nodes[call_index]
+    assert call.target == 0x003D
+    assert call.effects
+    io_effects = [effect for effect in call.effects if isinstance(effect, IRIOWrite)]
+    assert len(io_effects) == 1
+    assert io_effects[0].mask == 0x00FF
+    assert not any(isinstance(node, IRIOWrite) for node in block.nodes[:call_index])
+
+
+def test_table_patch_promotes_to_switch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    literal = IRLiteralBlock(
+        triplets=((0x1000, 0x2000, 0x3000),),
+        reducer="reduce_pair",
+        reducer_operand=0x4000,
+        tail=(0x5000,),
+    )
+    patch = IRTablePatch(operations=(("op_2C_10", 0x6601), ("op_2C_11", 0x6602)))
+    items = _ItemList([literal, patch])
+
+    normalizer._pass_table_switches(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    switch = nodes[0]
+    assert isinstance(switch, IRTableSwitch)
+    assert switch.table == literal.triplets
+    assert switch.tail == literal.tail
+    assert switch.operations == patch.operations
