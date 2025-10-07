@@ -324,6 +324,21 @@ class IRLiteralChunk(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStringLiteral(IRNode):
+    """Reference to a pooled string constant."""
+
+    symbol: str
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+    source: str = "string_pool"
+
+    def describe(self) -> str:
+        rendered = f"str({self.symbol})"
+        if self.annotations:
+            rendered += " " + ", ".join(self.annotations)
+        return rendered
+
+
+@dataclass(frozen=True)
 class IRStringConstant(IRNode):
     """Entry in the global ASCII constant pool."""
 
@@ -583,6 +598,27 @@ class IRStackDuplicate(IRNode):
         if self.copies <= 1:
             return f"dup {self.value}"
         return f"dup {self.value} -> copies={self.copies}"
+
+
+@dataclass(frozen=True)
+class IRStackShuffle(IRNode):
+    """Explicit permutation of the top stack slots."""
+
+    pattern: Tuple[int, ...]
+    mode: int
+    operand: int
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        if self.pattern:
+            mapping = ", ".join(str(index) for index in self.pattern)
+            body = f"[{mapping}]"
+        else:
+            body = "[]"
+        details = f"mode=0x{self.mode:02X} operand=0x{self.operand:04X}"
+        if self.annotations:
+            details = f"{details} " + ", ".join(self.annotations)
+        return f"stack_shuffle{body} {details}"
 
 
 @dataclass(frozen=True)
@@ -971,6 +1007,7 @@ __all__ = [
     "IRIORead",
     "IRIOWrite",
     "IRStackDuplicate",
+    "IRStackShuffle",
     "IRStackDrop",
     "IRPageRegister",
     "IRAsciiHeader",
@@ -979,6 +1016,7 @@ __all__ = [
     "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRStringLiteral",
     "IRStringConstant",
     "IRAsciiPreamble",
     "IRCallPreparation",

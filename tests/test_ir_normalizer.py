@@ -12,6 +12,7 @@ from mbcdisasm.ir.model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRStackShuffle,
     IRTailCall,
     IRTailcallReturn,
     IRIf,
@@ -125,7 +126,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": -4,
         },
         "stack_shuffle": {
-            "opcodes": ["0x66:0x15"],
+            "opcodes": ["0x66:0x15", "0x66:0x22"],
             "name": "stack_shuffle",
             "category": "stack_shuffle",
         },
@@ -581,6 +582,77 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
     assert constant.segments == (constant.data,)
+
+
+def test_literal_reduce_chain_promotes_string_literal(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0067),
+        build_word(4, 0x00, 0x00, 0x4142),
+        build_word(8, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks
+    symbol = header.chunks[0]
+    pool = {const.name: const for const in program.string_pool}
+    assert symbol in pool
+    assert pool[symbol].data == b"AB"
+    assert not any(isinstance(node, IRLiteralChunk) for node in block.nodes)
+
+
+def test_inline_ascii_chunk_promoted_to_string_literal(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    word = InstructionWord(0, int.from_bytes(b"WORD", "big"))
+    data = encode_instructions([word])
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks
+    symbol = header.chunks[0]
+    assert symbol in {const.name for const in program.string_pool}
+    assert not any(isinstance(node, IRLiteralChunk) for node in block.nodes)
+
+
+def test_stack_shuffle_decodes_pattern(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x66, 0x22, 0x3069),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    block = program.segments[0].blocks[0]
+    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
+    assert cleanup.steps
+    step = cleanup.steps[0]
+    assert step.mnemonic == "stack_shuffle"
+    assert step.operand == 0x3069
+    assert step.operand_alias == "pattern[3,0,6,9]"
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
