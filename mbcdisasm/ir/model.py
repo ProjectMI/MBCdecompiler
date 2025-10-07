@@ -142,6 +142,7 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
+    varargs: bool = False
     arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
     cleanup_mask: Optional[int] = None
@@ -156,6 +157,8 @@ class IRCall(IRNode):
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         details = []
+        if self.varargs:
+            details.append("varargs")
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.convention is not None:
@@ -823,6 +826,7 @@ class IRTailcallReturn(IRNode):
     args: Tuple[str, ...]
     returns: int
     varargs: bool = False
+    call_varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     tail: bool = True
     arity: Optional[int] = None
@@ -839,6 +843,8 @@ class IRTailcallReturn(IRNode):
         details = [f"returns={self.returns}"]
         if self.varargs:
             details.append("varargs")
+        if self.call_varargs:
+            details.append("call_varargs")
         if self.convention is not None:
             details.append(f"convention={self.convention.describe()}")
         if self.cleanup_mask is not None:

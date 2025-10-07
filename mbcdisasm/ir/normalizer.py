@@ -655,25 +655,52 @@ class IRNormalizer:
 
             index += 1
 
-    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
+    def _intern_string_constant(
+        self,
+        data: bytes,
+        source: str,
+        *,
+        segments: Optional[Sequence[bytes]] = None,
+    ) -> IRStringConstant:
         constant = self._string_pool.get(data)
         if constant is not None:
+            if segments:
+                segment_tuple = tuple(segments)
+                if segment_tuple and segment_tuple != constant.segments:
+                    if len(segment_tuple) > len(constant.segments):
+                        updated = IRStringConstant(
+                            name=constant.name,
+                            data=data,
+                            segments=segment_tuple,
+                            source=constant.source,
+                        )
+                        self._string_pool[data] = updated
+                        index = self._string_pool_order.index(constant)
+                        self._string_pool_order[index] = updated
+                        constant = updated
             return constant
 
-        if data:
-            segments = (data,)
+        if segments is not None:
+            segment_tuple = tuple(segments) if segments else (b"",)
         else:
-            segments = (b"",)
+            segment_tuple = (data,) if data else (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
-        constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
+        constant = IRStringConstant(
+            name=name, data=data, segments=segment_tuple, source=source
+        )
         self._string_pool[data] = constant
         self._string_pool_order.append(constant)
         return constant
 
     def _make_literal_chunk(
-        self, data: bytes, source: str, annotations: Sequence[str]
+        self,
+        data: bytes,
+        source: str,
+        annotations: Sequence[str],
+        *,
+        segments: Optional[Sequence[bytes]] = None,
     ) -> IRLiteralChunk:
-        constant = self._intern_string_constant(data, source)
+        constant = self._intern_string_constant(data, source, segments=segments)
         return IRLiteralChunk(
             data=data,
             source=source,
@@ -723,6 +750,7 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
+                call_varargs = False
                 target = item.operand
                 symbol = self.knowledge.lookup_address(target)
                 if mnemonic == "tailcall_dispatch":
@@ -742,11 +770,22 @@ class IRNormalizer:
                             if isinstance(prior, IRLiteral):
                                 source = getattr(prior, "source", "")
                                 if source in {"op_00_52", "push_literal"} or prior.value == 0:
+                                    helper_node: Optional[RawInstruction] = None
+                                    if literal_index + 1 < index:
+                                        candidate_helper = items[literal_index + 1]
+                                        if isinstance(candidate_helper, RawInstruction):
+                                            helper_node = candidate_helper
+                                    if (
+                                        helper_node is not None
+                                        and helper_node.mnemonic == "op_4A_05"
+                                    ):
+                                        call_varargs = True
                                     start = literal_index
                 call = IRCall(
                     target=target,
                     args=tuple(args),
                     tail=mnemonic == "tailcall_dispatch",
+                    varargs=call_varargs,
                     symbol=symbol,
                 )
                 metrics.calls += 1
@@ -795,7 +834,10 @@ class IRNormalizer:
                 continue
 
             chunk = self._make_literal_chunk(
-                b"".join(data_parts), "ascii_run", annotations
+                b"".join(data_parts),
+                "ascii_run",
+                annotations,
+                segments=data_parts,
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
@@ -851,7 +893,12 @@ class IRNormalizer:
                     merged_annotations.append(note)
 
             data = b"".join(chunk.data for chunk in chunk_nodes)
-            combined = self._make_literal_chunk(data, "ascii_glue", merged_annotations)
+            combined = self._make_literal_chunk(
+                data,
+                "ascii_glue",
+                merged_annotations,
+                segments=[chunk.data for chunk in chunk_nodes],
+            )
             self._transfer_ssa(source, combined)
 
             for removed in removed_items:
@@ -1035,6 +1082,42 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            if (
+                len(literal_nodes) == 2
+                and len(reducers) == 1
+                and all(isinstance(node, IRLiteral) for node in literal_nodes)
+            ):
+                values = {(literal_nodes[0].value & 0xFFFF), (literal_nodes[1].value & 0xFFFF)}
+                if values == {0x0067, 0x6704}:
+                    hi_node, lo_node = literal_nodes
+                    if (lo_node.value & 0xFFFF) > 0xFF and (hi_node.value & 0xFFFF) <= 0xFF:
+                        hi_node, lo_node = lo_node, hi_node
+                    combined_value = (
+                        ((hi_node.value & 0xFFFF) << 16) | (lo_node.value & 0xFFFF)
+                    )
+                    merged_annotations: List[str] = []
+                    seen_annotations: Set[str] = set()
+                    for literal_node in (hi_node, lo_node):
+                        for note in literal_node.annotations:
+                            if note in seen_annotations:
+                                continue
+                            seen_annotations.add(note)
+                            merged_annotations.append(note)
+                    combined_literal = IRLiteral(
+                        value=combined_value,
+                        mode=hi_node.mode,
+                        source=f"{reducers[-1].mnemonic}_literal",
+                        annotations=tuple(merged_annotations),
+                    )
+                    for literal_node in literal_nodes:
+                        self._ssa_bindings.pop(id(literal_node), None)
+                    self._transfer_ssa(reducers[-1], combined_literal)
+                    items.replace_slice(index, scan, [combined_literal])
+                    metrics.reduce_replaced += len(reducers)
+                    metrics.literals += 1
+                    index += 1
+                    continue
+
             literals = [self._literal_repr(node) for node in literal_nodes]
             replacement: IRNode
             if len(literals) >= 2 and len(literals) == 2 * len(reducers):
@@ -1150,6 +1233,7 @@ class IRNormalizer:
                 continue
 
             constants: List[str] = []
+            literal_nodes: List[Union[RawInstruction, IRNode]] = []
             removal_start = index
             scan = index - 1
             while scan >= 0 and len(constants) < 2:
@@ -1163,8 +1247,48 @@ class IRNormalizer:
                     break
 
                 constants.insert(0, rendered)
+                literal_nodes.insert(0, candidate)
                 removal_start = scan
                 scan -= 1
+
+            if (
+                len(literal_nodes) == 2
+                and all(isinstance(node, IRLiteral) for node in literal_nodes)
+            ):
+                literal_a = literal_nodes[0]
+                literal_b = literal_nodes[1]
+                assert isinstance(literal_a, IRLiteral) and isinstance(literal_b, IRLiteral)
+                values = {(literal_a.value & 0xFFFF), (literal_b.value & 0xFFFF)}
+                if values == {0x0067, 0x6704}:
+                    hi_node, lo_node = literal_a, literal_b
+                    if (literal_b.value & 0xFFFF) > 0xFF and (literal_a.value & 0xFFFF) <= 0xFF:
+                        hi_node, lo_node = literal_b, literal_a
+                    combined_value = (
+                        ((hi_node.value & 0xFFFF) << 16) | (lo_node.value & 0xFFFF)
+                    )
+                    merged_annotations: List[str] = []
+                    seen_annotations: Set[str] = set()
+                    for literal in (hi_node, lo_node):
+                        for note in literal.annotations:
+                            if note in seen_annotations:
+                                continue
+                            seen_annotations.add(note)
+                            merged_annotations.append(note)
+                    combined_literal = IRLiteral(
+                        value=combined_value,
+                        mode=hi_node.mode,
+                        source=f"{item.mnemonic}_literal",
+                        annotations=tuple(merged_annotations),
+                    )
+                    for pos in range(removal_start, index):
+                        removed = items[pos]
+                        self._ssa_bindings.pop(id(removed), None)
+                    self._transfer_ssa(item, combined_literal)
+                    items.replace_slice(removal_start, index + 1, [combined_literal])
+                    metrics.reduce_replaced += 1
+                    metrics.literals += 1
+                    index = removal_start + 1
+                    continue
 
             if len(constants) != 2:
                 index += 1
@@ -1475,6 +1599,7 @@ class IRNormalizer:
                 target=call.target,
                 args=call.args,
                 tail=tail,
+                varargs=call.varargs,
                 arity=arity,
                 convention=convention,
                 cleanup_mask=cleanup_mask,
@@ -1665,6 +1790,7 @@ class IRNormalizer:
                     target=item.target,
                     args=item.args,
                     tail=True,
+                    varargs=item.call.varargs,
                     arity=item.arity,
                     convention=item.convention,
                     cleanup_mask=mask,
@@ -1730,6 +1856,7 @@ class IRNormalizer:
                 target=item.target,
                 args=item.args,
                 tail=True,
+                varargs=item.call_varargs,
                 arity=item.arity,
                 convention=item.convention,
                 cleanup_mask=mask,
@@ -1870,6 +1997,7 @@ class IRNormalizer:
             args=tuple(args),
             returns=returns,
             varargs=varargs,
+            call_varargs=getattr(node, "varargs", False),
             cleanup=tuple(retained_cleanup),
             tail=True,
             arity=arity,
@@ -1905,6 +2033,7 @@ class IRNormalizer:
                     target=target,
                     args=args,
                     tail=getattr(node, "tail", False),
+                    varargs=getattr(node, "varargs", False),
                     arity=arity,
                     convention=None,
                     cleanup=cleanup,
@@ -1945,6 +2074,7 @@ class IRNormalizer:
                     target=target,
                     args=args,
                     tail=True,
+                    varargs=node.call.varargs,
                     arity=arity,
                     convention=None,
                     cleanup_mask=None,
@@ -1965,6 +2095,7 @@ class IRNormalizer:
                     args=args,
                     returns=getattr(node, "returns", 0),
                     varargs=getattr(node, "varargs", False),
+                    call_varargs=getattr(node, "call_varargs", False),
                     cleanup=cleanup,
                     tail=getattr(node, "tail", True),
                     arity=arity,
@@ -2272,6 +2403,7 @@ class IRNormalizer:
                             args=call.args,
                             returns=return_count,
                             varargs=varargs,
+                            call_varargs=call.varargs,
                             cleanup=combined_cleanup,
                             tail=True,
                             arity=call.arity,
@@ -2434,6 +2566,7 @@ class IRNormalizer:
                 target=node.target,
                 args=node.args,
                 tail=node.tail,
+                varargs=node.varargs,
                 arity=node.arity,
                 convention=node.convention,
                 cleanup_mask=node.cleanup_mask,
@@ -2462,6 +2595,7 @@ class IRNormalizer:
                 target=node.target,
                 args=node.args,
                 tail=True,
+                varargs=node.call.varargs,
                 arity=node.arity,
                 convention=node.convention,
                 cleanup_mask=node.cleanup_mask,
@@ -2483,6 +2617,7 @@ class IRNormalizer:
                 args=node.args,
                 returns=node.returns,
                 varargs=node.varargs,
+                call_varargs=node.call_varargs,
                 cleanup=node.cleanup,
                 tail=node.tail,
                 arity=node.arity,
@@ -2753,6 +2888,7 @@ class IRNormalizer:
                 target=target,
                 args=node.args,
                 tail=tail,
+                varargs=node.varargs,
                 arity=arity,
                 convention=convention,
                 cleanup_mask=cleanup_mask,
@@ -2789,6 +2925,7 @@ class IRNormalizer:
                 target=target,
                 args=node.args,
                 tail=True,
+                varargs=node.call.varargs,
                 arity=arity,
                 convention=convention,
                 cleanup_mask=cleanup_mask,
@@ -2813,6 +2950,7 @@ class IRNormalizer:
                 args=node.args,
                 returns=returns,
                 varargs=node.varargs,
+                call_varargs=node.call_varargs,
                 cleanup=cleanup,
                 tail=tail,
                 arity=arity,

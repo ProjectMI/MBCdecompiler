@@ -11,6 +11,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
     IRTailCall,
     IRTailcallReturn,
@@ -545,7 +546,7 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert header.chunks[0] in pool
     constant = pool[header.chunks[0]]
     assert constant.data == b"A\x00B\x00\x00C\x00D"
-    assert constant.segments == (constant.data,)
+    assert constant.segments == (b"A\x00B\x00", b"\x00C\x00D")
     assert "lit(0x6704)" in descriptions
 
 
@@ -580,7 +581,34 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     assert symbol in pool
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
-    assert constant.segments == (constant.data,)
+    assert constant.segments == (b"HEAD", b" ER ", b" TEX")
+
+
+def test_reduce_pair_literal_pair_collapses(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x6704),
+        build_word(4, 0x00, 0x00, 0x0067),
+        build_word(8, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    literals = [node for node in block.nodes if isinstance(node, IRLiteral)]
+    assert len(literals) == 1
+    literal = literals[0]
+    assert literal.value == 0x67040067
+    assert literal.source == "reduce_pair_literal"
+
+    assert not any(isinstance(node, IRBuildTuple) for node in block.nodes)
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
@@ -1053,6 +1081,7 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.call.target == 0x1234
     assert tail_call.call.symbol == "test_helper_1234"
     assert tail_call.call.args == ()
+    assert tail_call.call.varargs
     assert tail_call.returns == ("ret0",)
 
 
