@@ -22,6 +22,7 @@ from mbcdisasm.ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
+    IRTablePatch,
     IRConditionMask,
     IRIOWrite,
     IRBuildTuple,
@@ -29,11 +30,13 @@ from mbcdisasm.ir.model import (
     IRSwitchDispatch,
     NormalizerMetrics,
 )
-from mbcdisasm.ir.normalizer import _ItemList
+from mbcdisasm.ir.normalizer import RawInstruction, _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.analyzer.instruction_profile import InstructionKind, InstructionProfile
+from mbcdisasm.analyzer.stack import StackEvent
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -581,6 +584,54 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
     assert constant.segments == (constant.data,)
+
+
+def test_normalizer_coalesces_opcode_tables(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    def build_profile(offset: int, opcode: int, mode: int) -> InstructionProfile:
+        word = build_word(offset, opcode, mode, 0)
+        return InstructionProfile.from_word(word, knowledge)
+
+    def make_instruction(offset: int, opcode: int, mode: int) -> RawInstruction:
+        profile = build_profile(offset, opcode, mode)
+        event = StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=InstructionKind.UNKNOWN,
+        )
+        return RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+
+    instructions: list[RawInstruction] = [make_instruction(0, 0x10, 0x10)]
+    for index in range(16):
+        offset = 4 * (index + 1)
+        instructions.append(make_instruction(offset, 0x80 + index, 0x48))
+
+    items = _ItemList(instructions)
+    normalizer = IRNormalizer(knowledge)
+    normalizer._pass_opcode_tables(items)
+
+    nodes = items.to_tuple()
+    table_nodes = [node for node in nodes if isinstance(node, IRTablePatch)]
+    assert len(table_nodes) == 1
+    table = table_nodes[0]
+    assert table.annotations and table.annotations[0] == "opcode_table"
+    assert len(table.operations) == 16
+
+    raw_nodes = [node for node in nodes if isinstance(node, RawInstruction)]
+    assert len(raw_nodes) <= 1
+
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

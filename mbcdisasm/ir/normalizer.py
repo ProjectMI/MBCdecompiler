@@ -118,6 +118,22 @@ IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
 IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
 
 
+OPCODE_TABLE_MODES = {
+    0x2A,
+    0x2B,
+    0x32,
+    0x33,
+    0x46,
+    0x47,
+    0x48,
+    0x4E,
+    0x4F,
+    0x50,
+    0x51,
+}
+OPCODE_TABLE_MIN_LENGTH = 12
+
+
 @dataclass(frozen=True)
 class RawInstruction:
     """Wrapper that couples a profile with stack tracking details."""
@@ -406,6 +422,7 @@ class IRNormalizer:
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
+        self._pass_opcode_tables(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
@@ -1580,6 +1597,80 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
 
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not self._is_opcode_table_instruction(item):
+                index += 1
+                continue
+
+            mode = item.profile.mode
+            operations: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            aggregated: List[RawInstruction] = [item]
+            annotations: List[str] = []
+            seen_annotations: Set[str] = set()
+
+            def _record_annotations(source: RawInstruction) -> None:
+                for note in source.annotations:
+                    if note not in seen_annotations:
+                        seen_annotations.add(note)
+                        annotations.append(note)
+
+            _record_annotations(item)
+
+            scan = index + 1
+            while scan < len(items):
+                candidate = items[scan]
+                if not isinstance(candidate, RawInstruction):
+                    if self._is_opcode_table_node_spacer(candidate):
+                        scan += 1
+                        continue
+                    break
+                if isinstance(candidate, RawInstruction) and self._is_opcode_table_instruction(
+                    candidate, mode=mode
+                ):
+                    operations.append((candidate.mnemonic, candidate.operand))
+                    aggregated.append(candidate)
+                    _record_annotations(candidate)
+                    scan += 1
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_opcode_table_spacer(
+                    candidate
+                ):
+                    scan += 1
+                    continue
+                break
+
+            if len(operations) < OPCODE_TABLE_MIN_LENGTH:
+                index += 1
+                continue
+
+            for removed in aggregated:
+                self._ssa_bindings.pop(id(removed), None)
+
+            notes = ["opcode_table"]
+            for note in annotations:
+                if note == "opcode_table":
+                    continue
+                if note not in notes:
+                    notes.append(note)
+            replacement = IRTablePatch(
+                operations=tuple(operations),
+                annotations=tuple(notes),
+            )
+            slice_items = list(items[index:scan])
+            extras = [node for node in slice_items if id(node) not in {id(raw) for raw in aggregated}]
+            replacement_sequence: List[Union[RawInstruction, IRNode]] = [replacement]
+            if extras:
+                replacement_sequence.extend(extras)
+            items.replace_slice(index, scan, replacement_sequence)
+            index += 1
+
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]
     ) -> Tuple[List[IRDispatchCase], Optional[int]]:
@@ -1599,6 +1690,44 @@ class IRNormalizer:
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    def _is_opcode_table_instruction(
+        self, instruction: RawInstruction, *, mode: Optional[int] = None
+    ) -> bool:
+        if mode is not None and instruction.profile.mode != mode:
+            return False
+        if instruction.profile.mode not in OPCODE_TABLE_MODES:
+            return False
+        if instruction.operand != 0:
+            return False
+        if instruction.event.delta != 0:
+            return False
+        if instruction.event.pushed_types or instruction.event.popped_types:
+            return False
+        if instruction.event.uncertain:
+            return False
+        if instruction.ssa_values:
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        if self._is_annotation_only(instruction):
+            return False
+        return True
+
+    def _is_opcode_table_spacer(self, instruction: RawInstruction) -> bool:
+        return self._is_annotation_only(instruction)
+
+    @staticmethod
+    def _is_opcode_table_node_spacer(node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, IRLiteralChunk):
+            return True
+        if isinstance(node, IRStringConstant):
+            return True
+        if isinstance(node, IRCallCleanup):
+            return True
+        if isinstance(node, IRLiteralBlock):
+            return "opcode_table" in node.annotations
+        return False
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0
