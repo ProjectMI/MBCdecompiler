@@ -12,6 +12,7 @@ from mbcdisasm.ir.model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRLiteralBlock,
     IRTailCall,
     IRTailcallReturn,
     IRIf,
@@ -581,6 +582,39 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
     assert constant.segments == (constant.data,)
+
+
+def test_normalizer_collapses_literal_reduce_chain_ex(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x67, 0x04, 0x0000),
+        build_word(4, 0x00, 0x00, 0x0067),
+        build_word(8, 0x00, 0x00, 0x0400),
+        build_word(12, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    literal_block = next(
+        (node for node in block.nodes if isinstance(node, IRLiteralBlock)),
+        None,
+    )
+    assert literal_block is not None
+    assert literal_block.triplets == ((0x0067, 0x0400, 0x6704),)
+
+    descriptions = [
+        getattr(node, "describe", lambda: "")() for node in block.nodes
+    ]
+    assert not any("reduce_pair" in text for text in descriptions)
+
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

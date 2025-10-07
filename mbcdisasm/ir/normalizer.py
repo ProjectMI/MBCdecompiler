@@ -112,6 +112,11 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
+MARKER_LITERAL_OVERRIDES: Dict[str, int] = {
+    "op_67_04": 0x6704,
+}
+
+
 IO_READ_MNEMONICS = {"op_10_38"}
 IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
@@ -694,6 +699,14 @@ class IRNormalizer:
                     source=hint,
                     annotations=instruction.annotations,
                 )
+            override = MARKER_LITERAL_OVERRIDES.get(profile.mnemonic)
+            if override is not None:
+                return IRLiteral(
+                    value=override,
+                    mode=profile.mode,
+                    source="literal_hint",
+                    annotations=instruction.annotations,
+                )
             return None
 
         if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
@@ -1035,7 +1048,43 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            literals = [self._literal_repr(node) for node in literal_nodes]
+            literals: List[str] = []
+            for node in literal_nodes:
+                if isinstance(node, IRLiteral):
+                    for note in node.annotations:
+                        override_value = MARKER_LITERAL_OVERRIDES.get(note)
+                        if override_value is not None:
+                            literals.append(f"lit(0x{override_value:04X})")
+                literals.append(self._literal_repr(node))
+
+            # Canonicalise well-known literal marker triplets so they can be
+            # collapsed into literal blocks during later passes.  The
+            # ``literal_reduce_chain_ex`` pattern emits ``op_67_04`` markers
+            # followed by ``op_00_67`` helpers and a literal value prior to the
+            # reducing instruction.  Without reordering the values the tuple is
+            # constructed as ``[0x6704, 0x0067, value]`` which fails the shape
+            # checks in :meth:`_normalize_literal_block`.  Detect the triplet and
+            # rewrite it into ``[0x0067, marker, anchor]`` where ``marker`` and
+            # ``anchor`` use the VM-specific constants.
+            parsed_values = self._parse_literal_list(tuple(literals))
+            if (
+                len(parsed_values) == 3
+                and len(reducers) == 1
+                and 0x0067 in parsed_values
+            ):
+                marker_value = next(
+                    (value for value in parsed_values if value in {0x0400, 0x0110}),
+                    None,
+                )
+                anchor_value = next(
+                    (value for value in parsed_values if value in {0x6704, 0x0000}),
+                    None,
+                )
+                if marker_value is not None and anchor_value is not None:
+                    literals = [
+                        f"lit(0x{value:04X})" for value in (0x0067, marker_value, anchor_value)
+                    ]
+
             replacement: IRNode
             if len(literals) >= 2 and len(literals) == 2 * len(reducers):
                 entries = []
