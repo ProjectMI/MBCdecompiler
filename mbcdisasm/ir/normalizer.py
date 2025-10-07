@@ -90,6 +90,9 @@ TAILCALL_HELPERS = {0x00F0}
 TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
 
 
+ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -203,6 +206,7 @@ class IRNormalizer:
         self._memref_regions: Dict[int, str] = {}
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
+        self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
 
     # ------------------------------------------------------------------
     # public entry points
@@ -230,11 +234,13 @@ class IRNormalizer:
         raw_blocks = self._parse_segment(segment)
         blocks: List[IRBlock] = []
         metrics = NormalizerMetrics()
+        self._pending_tail_targets.clear()
 
         for block in raw_blocks:
             ir_block, block_metrics = self._normalise_block(block)
             blocks.append(ir_block)
             metrics.observe(block_metrics)
+            self._update_tail_helper_hints(block)
 
         return IRSegment(
             index=segment.index,
@@ -373,6 +379,7 @@ class IRNormalizer:
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
         self._pass_ascii_finalize(items)
+        self._pass_tail_helpers(items)
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
@@ -1350,16 +1357,157 @@ class IRNormalizer:
             items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
             index += 1
 
-    def _pass_ascii_finalize(self, items: _ItemList) -> None:
+    def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0
-        ascii_helpers = {0xF172, 0x7223, 0x3D30}
         while index < len(items):
             item = items[index]
-            if not (
-                isinstance(item, RawInstruction)
-                and item.mnemonic == "call_helpers"
-                and item.operand in ascii_helpers
-            ):
+            if not isinstance(item, (IRCall, IRCallReturn, IRTailcallReturn)):
+                index += 1
+                continue
+
+            helper_target = getattr(item, "target", None)
+            if helper_target not in {0x0072, 0x003D}:
+                index += 1
+                continue
+
+            new_target = self._extract_tail_helper_target(items, index, helper_target)
+            if new_target is None or new_target == helper_target:
+                index += 1
+                continue
+
+            symbol = self.knowledge.lookup_address(new_target)
+            cleanup: Tuple[IRStackEffect, ...] = tuple()
+            updated: Union[IRCall, IRCallReturn, IRTailcallReturn]
+            if isinstance(item, IRCall):
+                updated = IRCall(
+                    target=new_target,
+                    args=item.args,
+                    tail=item.tail,
+                    arity=item.arity,
+                    convention=item.convention,
+                    cleanup=cleanup,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=item.predicate,
+                )
+            elif isinstance(item, IRCallReturn):
+                updated = IRCallReturn(
+                    target=new_target,
+                    args=item.args,
+                    tail=item.tail,
+                    returns=item.returns,
+                    varargs=item.varargs,
+                    cleanup=cleanup,
+                    arity=item.arity,
+                    convention=item.convention,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=item.predicate,
+                )
+            else:
+                updated = IRTailcallReturn(
+                    target=new_target,
+                    args=item.args,
+                    returns=item.returns,
+                    varargs=item.varargs,
+                    cleanup=cleanup,
+                    tail=item.tail,
+                    arity=item.arity,
+                    convention=item.convention,
+                    cleanup_mask=None,
+                    symbol=symbol,
+                    predicate=item.predicate,
+                )
+
+            self._transfer_ssa(item, updated)
+            items.replace_slice(index, index + 1, [updated])
+            # re-evaluate following nodes since cleanup wrappers may remain
+            index += 1
+
+    def _extract_tail_helper_target(
+        self, items: _ItemList, index: int, helper: int
+    ) -> Optional[int]:
+        if helper == 0x0072:
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction):
+                    if candidate.mnemonic in {"op_08_00", "terminator"}:
+                        return candidate.operand & 0xFFFF
+                    if candidate.mnemonic in {"op_0B_00", "op_01_63"}:
+                        scan -= 1
+                        continue
+                elif isinstance(candidate, IRLiteral):
+                    return candidate.value & 0xFFFF
+                elif isinstance(candidate, (IRLiteralChunk, IRAsciiPreamble)):
+                    scan -= 1
+                    continue
+                else:
+                    break
+                scan -= 1
+            hints = self._pending_tail_targets.get(helper)
+            if hints:
+                return hints.pop(0)
+            return None
+
+        if helper == 0x003D:
+            scan = index + 1
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, IRCallCleanup):
+                    for step in candidate.steps:
+                        if step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS:
+                            return step.operand & 0xFFFF
+                    break
+                if isinstance(candidate, IRAsciiFinalize):
+                    return candidate.helper & 0xFFFF
+                if isinstance(candidate, RawInstruction):
+                    if candidate.mnemonic == "call_helpers" and candidate.operand in ASCII_HELPER_IDS:
+                        return candidate.operand & 0xFFFF
+                    break
+                if isinstance(candidate, IRLiteral):
+                    scan += 1
+                    continue
+                break
+            hints = self._pending_tail_targets.get(helper)
+            if hints:
+                return hints.pop(0)
+            return 0x3D30
+
+        return None
+
+    def _update_tail_helper_hints(self, block: RawBlock) -> None:
+        if not block.instructions:
+            return
+
+        for instruction in reversed(block.instructions):
+            if instruction.mnemonic == "terminator":
+                self._pending_tail_targets[0x0072].append(instruction.operand & 0xFFFF)
+                break
+            if instruction.mnemonic == "op_08_00":
+                self._pending_tail_targets[0x0072].append(instruction.operand & 0xFFFF)
+                break
+            if instruction.mnemonic == "call_helpers" and instruction.operand in ASCII_HELPER_IDS:
+                self._pending_tail_targets[0x003D].append(instruction.operand & 0xFFFF)
+                break
+
+    def _pass_ascii_finalize(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            helper_operand: Optional[int] = None
+            if isinstance(item, RawInstruction):
+                if item.mnemonic == "call_helpers" and item.operand in ASCII_HELPER_IDS:
+                    helper_operand = item.operand
+            elif isinstance(item, IRCallCleanup):
+                ascii_steps = [
+                    step
+                    for step in item.steps
+                    if step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS
+                ]
+                if ascii_steps:
+                    helper_operand = ascii_steps[0].operand
+            if helper_operand is None:
                 index += 1
                 continue
 
@@ -1372,8 +1520,26 @@ class IRNormalizer:
                     summary = previous.describe()
                 elif isinstance(previous, IRAsciiPreamble):
                     summary = previous.describe()
-            node = IRAsciiFinalize(helper=item.operand, summary=summary or "ascii")
-            items.replace_slice(index, index + 1, [node])
+
+            finalize = IRAsciiFinalize(helper=helper_operand, summary=summary or "ascii")
+            self._transfer_ssa(item, finalize)
+
+            if isinstance(item, IRCallCleanup):
+                remaining_steps = tuple(
+                    step
+                    for step in item.steps
+                    if not (step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS)
+                )
+                if remaining_steps:
+                    updated_cleanup = IRCallCleanup(steps=remaining_steps)
+                    items.replace_slice(index, index + 1, [finalize, updated_cleanup])
+                    index += 2
+                else:
+                    items.replace_slice(index, index + 1, [finalize])
+                    index += 1
+                continue
+
+            items.replace_slice(index, index + 1, [finalize])
             index += 1
 
     def _pass_flag_checks(self, items: _ItemList) -> None:

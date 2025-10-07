@@ -9,6 +9,7 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRAsciiFinalize,
     IRTailcallReturn,
     IRIf,
     IRReturn,
@@ -26,6 +27,7 @@ from mbcdisasm.ir.normalizer import _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
+from mbcdisasm.knowledge import KnowledgeBase
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -405,6 +407,73 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             if isinstance(node, IRFunctionPrologue)
         ]
         assert prologue_nodes
+
+
+def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
+    knowledge_path = Path(__file__).resolve().parent.parent / "knowledge" / "manual_annotations.json"
+    knowledge = KnowledgeBase.load(knowledge_path)
+
+    helper_3d_words = [
+        InstructionWord(0, int("3D306910", 16)),
+        InstructionWord(4, int("4C000000", 16)),
+        InstructionWord(8, int("2910003D", 16)),
+        InstructionWord(12, int("30691050", 16)),
+        InstructionWord(16, int("00000029", 16)),
+        InstructionWord(20, int("10013D30", 16)),
+    ]
+
+    helper_72_words = [
+        InstructionWord(0, int("306C0104", 16)),
+        InstructionWord(4, int("0B00005F", 16)),
+        InstructionWord(8, int("0000002C", 16)),
+        InstructionWord(12, int("0163D3FE", 16)),
+        InstructionWord(16, int("FFFF3032", 16)),
+        InstructionWord(20, int("29100072", 16)),
+        InstructionWord(24, int("302810FC", 16)),
+        InstructionWord(28, int("012C0066", 16)),
+        InstructionWord(32, int("27291000", 16)),
+        InstructionWord(36, int("6C01040B", 16)),
+        InstructionWord(40, int("00005F00", 16)),
+        InstructionWord(44, int("00006C01", 16)),
+    ]
+
+    segments = []
+    offset = 0
+    for words in (helper_3d_words, helper_72_words):
+        data = encode_instructions(words)
+        descriptor = SegmentDescriptor(len(segments), offset, offset + len(data))
+        segments.append(Segment(descriptor, data))
+        offset += len(data)
+
+    container = MbcContainer(Path("dummy"), segments)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    flattened = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    tail_nodes = [node for node in flattened if isinstance(node, IRTailcallReturn)]
+    assert len(tail_nodes) == 2
+
+    helper_3d = next(node for node in tail_nodes if node.returns == 16)
+    helper_72 = next(node for node in tail_nodes if node.returns != 16)
+
+    assert helper_3d.target == 0x3D30
+    assert helper_3d.cleanup == ()
+    assert helper_3d.cleanup_mask is None
+
+    assert helper_72.target == 0x3032
+    assert helper_72.cleanup == ()
+    assert helper_72.cleanup_mask is None
+
+    assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in tail_nodes)
+
+    ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
+    assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
