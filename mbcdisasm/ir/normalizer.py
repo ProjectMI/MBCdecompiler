@@ -75,7 +75,22 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
-OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F}
+OPCODE_TABLE_MODES = {
+    0x18,
+    0x19,
+    0x1A,
+    0x2A,
+    0x2B,
+    0x32,
+    0x33,
+    0x46,
+    0x47,
+    0x48,
+    0x4E,
+    0x4F,
+    0x50,
+    0x51,
+}
 OPCODE_TABLE_MIN_SPAN = 6
 
 
@@ -1555,7 +1570,7 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, RawInstruction) or not self._is_opcode_table_instruction(item):
+            if not isinstance(item, RawInstruction) or not self._is_opcode_table_candidate(item):
                 index += 1
                 continue
 
@@ -1564,21 +1579,24 @@ class IRNormalizer:
             operations: List[Tuple[str, int]] = []
             removed: List[Union[RawInstruction, IRNode]] = []
             last_instruction: Optional[RawInstruction] = None
+            core_instructions = 0
 
             while index < len(items):
                 candidate = items[index]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and self._is_opcode_table_instruction(candidate, mode)
+                    and self._is_opcode_table_candidate(candidate, mode)
                 ):
                     operations.append((candidate.mnemonic, candidate.operand))
                     removed.append(candidate)
                     last_instruction = candidate
+                    if self._is_opcode_table_instruction(candidate, mode):
+                        core_instructions += 1
                     index += 1
                     continue
                 break
 
-            if len(operations) < OPCODE_TABLE_MIN_SPAN:
+            if core_instructions < OPCODE_TABLE_MIN_SPAN:
                 index = start + 1
                 continue
 
@@ -1649,7 +1667,7 @@ class IRNormalizer:
         return isinstance(item, IRTablePatch) and "opcode_table" in item.annotations
 
     @staticmethod
-    def _is_opcode_table_instruction(
+    def _is_opcode_table_candidate(
         instruction: RawInstruction, expected_mode: Optional[int] = None
     ) -> bool:
         if instruction.profile.mode not in OPCODE_TABLE_MODES:
@@ -1658,11 +1676,19 @@ class IRNormalizer:
             return False
         if not instruction.mnemonic.startswith("op_"):
             return False
-        if instruction.operand != 0:
-            return False
         if instruction.event.delta != 0:
             return False
         if instruction.event.popped_types or instruction.event.pushed_types:
+            return False
+        return True
+
+    @staticmethod
+    def _is_opcode_table_instruction(
+        instruction: RawInstruction, expected_mode: Optional[int] = None
+    ) -> bool:
+        if not IRNormalizer._is_opcode_table_candidate(instruction, expected_mode):
+            return False
+        if instruction.operand != 0:
             return False
         return True
 

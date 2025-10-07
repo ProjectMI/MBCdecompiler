@@ -139,17 +139,30 @@ def test_signature_detector_matches_mode_sweep_block():
 
 def test_signature_detector_matches_extended_mode_sweep_block():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
-    words = [
-        make_word(0x80, 0x2A, 0x0001, 0),
-        make_word(0x81, 0x2A, 0x0002, 4),
-        make_word(0x82, 0x2A, 0x0003, 8),
-        make_word(0x83, 0x2A, 0x0004, 12),
-    ]
-    profiles, summary = profiles_from_words(words, knowledge)
     detector = SignatureDetector()
-    match = detector.detect(profiles, summary)
-    assert match is not None
-    assert match.name == "mode_sweep_block"
+    for mode in (0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x4E, 0x4F):
+        words = [
+            make_word(0x80 + index, mode, index + 1, index * 4)
+            for index in range(4)
+        ]
+        profiles, summary = profiles_from_words(words, knowledge)
+        match = detector.detect(profiles, summary)
+        assert match is not None
+        assert match.name == "mode_sweep_block"
+
+
+def test_signature_detector_matches_additional_mode_sweep_blocks():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    detector = SignatureDetector()
+    for mode in (0x18, 0x19, 0x1A, 0x48, 0x50, 0x51):
+        words = [
+            make_word(0x90 + index, mode, index + 1, index * 4)
+            for index in range(4)
+        ]
+        profiles, summary = profiles_from_words(words, knowledge)
+        match = detector.detect(profiles, summary)
+        assert match is not None
+        assert match.name == "mode_sweep_block"
 
 
 def test_signature_detector_matches_stack_lift_pair():

@@ -30,7 +30,7 @@ from mbcdisasm.ir.model import (
     IRSwitchDispatch,
     NormalizerMetrics,
 )
-from mbcdisasm.ir.normalizer import _ItemList
+from mbcdisasm.ir.normalizer import OPCODE_TABLE_MIN_SPAN, _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
@@ -1164,3 +1164,57 @@ def test_opcode_table_literals_are_tagged(tmp_path: Path) -> None:
     assert "opcode_table" in middle.annotations
     assert middle.symbol is not None
     assert not any(isinstance(entry, IRRaw) for entry in block.nodes)
+
+
+def test_opcode_table_run_absorbs_prefix_and_suffix_slots(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [build_word(0, 0xFA, 0x2A, 0x0004)]
+    offset = 4
+    for opcode in range(0x80, 0x88):
+        words.append(build_word(offset, opcode, 0x2A, 0x0000))
+        offset += 4
+    words.append(build_word(offset, 0xFB, 0x2A, 0x0010))
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert node.annotations == ("opcode_table", "mode=0x2A")
+    assert node.operations[0] == ("op_FA_2A", 0x0004)
+    assert node.operations[-1] == ("op_FB_2A", 0x0010)
+    assert len([op for op, operand in node.operations if operand == 0]) >= 8
+
+
+def test_opcode_table_modes_cover_extended_ranges(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    extended_modes = [0x18, 0x19, 0x1A, 0x48, 0x50, 0x51]
+    for mode in extended_modes:
+        words = [
+            build_word(index * 4, 0x80 + index, mode, 0x0000)
+            for index in range(OPCODE_TABLE_MIN_SPAN)
+        ]
+
+        data = encode_instructions(words)
+        descriptor = SegmentDescriptor(0, 0, len(data))
+        segment = Segment(descriptor, data)
+        container = MbcContainer(Path("dummy"), [segment])
+
+        normalizer = IRNormalizer(knowledge)
+        program = normalizer.normalise_container(container)
+        block = program.segments[0].blocks[0]
+
+        assert len(block.nodes) == 1, f"mode 0x{mode:02X} did not collapse"
+        node = block.nodes[0]
+        assert isinstance(node, IRTablePatch)
+        assert node.annotations == ("opcode_table", f"mode=0x{mode:02X}")
+        assert len(node.operations) == OPCODE_TABLE_MIN_SPAN
