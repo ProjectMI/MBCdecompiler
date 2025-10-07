@@ -1035,6 +1035,21 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            chunk = self._literal_reduce_chain_chunk(literal_nodes, reducers)
+            if chunk is not None:
+                removed_items = [items[pos] for pos in range(index, scan)]
+                source = reducers[-1]
+                self._transfer_ssa(source, chunk)
+                for removed in removed_items:
+                    if removed is source:
+                        continue
+                    self._ssa_bindings.pop(id(removed), None)
+                items.replace_slice(index, scan, [chunk])
+                metrics.aggregates += 1
+                metrics.reduce_replaced += len(reducers)
+                index += 1
+                continue
+
             literals = [self._literal_repr(node) for node in literal_nodes]
             replacement: IRNode
             if len(literals) >= 2 and len(literals) == 2 * len(reducers):
@@ -1197,6 +1212,61 @@ class IRNormalizer:
         if isinstance(item, IRBuildMap):
             return item.describe()
         return None
+
+    def _literal_reduce_chain_chunk(
+        self, literals: Sequence[IRLiteral], reducers: Sequence[RawInstruction]
+    ) -> Optional[IRLiteralChunk]:
+        if not reducers:
+            return None
+        if len(literals) != 2 * len(reducers):
+            return None
+
+        data_parts: List[bytes] = []
+        annotations: List[str] = []
+        seen_annotations: Set[str] = set()
+
+        for index in range(len(reducers)):
+            hint = literals[2 * index]
+            value = literals[2 * index + 1]
+
+            if not self._is_reduce_chain_hint_literal(hint):
+                return None
+            if self._is_reduce_chain_hint_literal(value):
+                return None
+
+            chunk = (value.value & 0xFFFF).to_bytes(2, "big")
+            data_parts.append(chunk)
+
+            for note in (*hint.annotations, *value.annotations):
+                if note in seen_annotations:
+                    continue
+                seen_annotations.add(note)
+                annotations.append(note)
+
+        for reducer in reducers:
+            for note in reducer.annotations:
+                if note in seen_annotations:
+                    continue
+                seen_annotations.add(note)
+                annotations.append(note)
+
+        if not data_parts:
+            return None
+
+        data = b"".join(data_parts)
+        return self._make_literal_chunk(data, "literal_reduce_chain_ex", annotations)
+
+    @staticmethod
+    def _is_reduce_chain_hint_literal(literal: IRLiteral) -> bool:
+        value = literal.value & 0xFFFF
+        if value not in {0x0067, 0x6704}:
+            return False
+        source = literal.source
+        if source == "literal_hint":
+            return True
+        if source.startswith("op_00_"):
+            return True
+        return False
 
     def _pass_ascii_preamble(self, items: _ItemList) -> None:
         index = 0

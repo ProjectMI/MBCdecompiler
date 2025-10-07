@@ -26,6 +26,7 @@ from mbcdisasm.ir.model import (
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
+    IRBuildMap,
     IRSwitchDispatch,
     NormalizerMetrics,
 )
@@ -581,6 +582,40 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
     assert constant.segments == (constant.data,)
+
+
+def test_normalizer_collapses_literal_reduce_chain_ex(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x38, 0x6704),
+        build_word(4, 0x00, 0x00, 0x4142),
+        build_word(8, 0x04, 0x00, 0x0000),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks and len(header.chunks) == 1
+
+    pool = {const.name: const for const in program.string_pool}
+    assert header.chunks[0] in pool
+    constant = pool[header.chunks[0]]
+    assert constant.data == b"AB"
+
+    assert not any(isinstance(node, IRBuildMap) for node in block.nodes)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "reduce_pair" for node in block.nodes
+    )
+
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
