@@ -23,6 +23,7 @@ from mbcdisasm.ir.model import (
     IRIndirectStore,
     IRRaw,
     IRConditionMask,
+    IRIORead,
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
@@ -88,6 +89,23 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "call_dispatch",
             "category": "call_dispatch",
             "stack_delta": -1,
+        },
+        "io_write": {
+            "opcodes": [
+                "0x10:0x24",
+                "0x10:0x48",
+                "0x10:0x50",
+                "0x10:0x84",
+            ],
+            "name": "io_write",
+            "category": "io_write",
+            "stack_pop": 1,
+        },
+        "io_read": {
+            "opcodes": ["0x10:0x38", "0x10:0x58"],
+            "name": "io_read",
+            "category": "io_read",
+            "stack_push": 1,
         },
         "call_helpers": {
             "opcodes": ["0x10:0xE8"],
@@ -663,6 +681,41 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
     )
+
+
+def test_normalizer_handles_additional_io_variants(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0xABCD),
+        build_word(4, 0x01, 0x3D, 0x0000),
+        build_word(8, 0x3D, 0x30, IO_SLOT),
+        build_word(12, 0x10, 0x50, IO_SLOT),
+        build_word(16, 0x01, 0x3D, 0x0000),
+        build_word(20, 0x3D, 0x30, IO_SLOT),
+        build_word(24, 0x10, 0x58, IO_SLOT),
+        build_word(28, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert any(isinstance(node, IRIORead) for node in block.nodes)
+    assert any(
+        isinstance(node, IRIOWrite) and node.mask == 0xABCD for node in block.nodes
+    )
+    lingering = {
+        node.mnemonic
+        for node in block.nodes
+        if isinstance(node, IRRaw) and node.mnemonic.startswith("op_10_")
+    }
+    assert lingering == set()
 
 
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:

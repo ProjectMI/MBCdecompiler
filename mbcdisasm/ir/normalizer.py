@@ -112,8 +112,8 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
-IO_READ_MNEMONICS = {"op_10_38"}
-IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
+IO_READ_MNEMONICS = {"op_10_38", "io_read"}
+IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48", "op_10_50", "op_10_84", "io_write"}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
 IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
 
@@ -1365,11 +1365,11 @@ class IRNormalizer:
             while 0 <= scan < len(items) and steps < 6:
                 node = items[scan]
                 if isinstance(node, RawInstruction):
-                    if node.mnemonic in IO_BRIDGE_MNEMONICS:
+                    if self._is_io_bridge_instruction(node):
                         scan += direction
                         steps += 1
                         continue
-                    if node.mnemonic.startswith("op_10_"):
+                    if self._is_io_candidate(node):
                         return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
@@ -1382,10 +1382,10 @@ class IRNormalizer:
     def _build_io_node(
         self, items: _ItemList, index: int, instruction: RawInstruction
     ) -> Optional[IRNode]:
-        mnemonic = instruction.mnemonic
-        if mnemonic in IO_READ_MNEMONICS:
+        classification = self._io_instruction_kind(instruction)
+        if classification == "read":
             return IRIORead(port=IO_PORT_NAME)
-        if mnemonic in IO_WRITE_MNEMONICS:
+        if classification == "write":
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
@@ -1400,13 +1400,13 @@ class IRNormalizer:
             if isinstance(node, IRLiteral):
                 return node.value
             if isinstance(node, RawInstruction):
-                if node.mnemonic in IO_BRIDGE_MNEMONICS or (
+                if self._is_io_bridge_instruction(node) or (
                     node.mnemonic == "op_3D_30" and node.operand == IO_SLOT
                 ):
                     scan -= 1
                     steps += 1
                     continue
-                if node.mnemonic.startswith("op_10_"):
+                if self._is_io_candidate(node):
                     break
             elif isinstance(node, IRLiteralChunk):
                 scan -= 1
@@ -1417,6 +1417,66 @@ class IRNormalizer:
             scan -= 1
             steps += 1
         return None
+
+    def _io_instruction_kind(self, instruction: RawInstruction) -> Optional[str]:
+        mnemonic = instruction.mnemonic
+        if mnemonic in IO_READ_MNEMONICS:
+            return "read"
+        if mnemonic in IO_WRITE_MNEMONICS:
+            return "write"
+
+        if not mnemonic.startswith("op_10_"):
+            return None
+
+        operand = instruction.operand
+        profile = instruction.profile
+        summary = (profile.summary or "").lower()
+        category = (profile.category or "").lower()
+
+        if "io" in summary or "io" in category:
+            if "read" in summary or "read" in category:
+                return "read"
+            if "write" in summary or "write" in category:
+                return "write"
+
+        if operand not in IO_ACCEPTED_OPERANDS and operand != IO_SLOT:
+            return None
+
+        event = instruction.event
+        if instruction.pushes_value() or event.delta > 0:
+            return "read"
+        if event.delta < 0 or event.popped_types:
+            return "write"
+
+        if "read" in mnemonic:
+            return "read"
+        if "write" in mnemonic:
+            return "write"
+
+        return None
+
+    def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic in IO_BRIDGE_MNEMONICS:
+            return True
+        if instruction.mnemonic.startswith("op_10_"):
+            return False
+        if instruction.mnemonic == "op_3D_30" and instruction.operand == IO_SLOT:
+            return True
+
+        event = instruction.event
+        return (
+            event.delta == 0
+            and not event.popped_types
+            and not event.pushed_types
+        )
+
+    def _is_io_candidate(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic.startswith("op_10_"):
+            return True
+        if mnemonic in IO_READ_MNEMONICS or mnemonic in IO_WRITE_MNEMONICS:
+            return True
+        return mnemonic.startswith("io_")
 
     def _pass_call_conventions(self, items: _ItemList) -> None:
         index = 0
