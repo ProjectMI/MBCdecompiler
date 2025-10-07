@@ -22,6 +22,7 @@ from mbcdisasm.ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
+    IRTablePatch,
     IRConditionMask,
     IRIOWrite,
     IRBuildTuple,
@@ -547,6 +548,31 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert constant.data == b"A\x00B\x00\x00C\x00D"
     assert constant.segments == (constant.data,)
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_groups_opcode_table_runs(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = []
+    for idx in range(12):
+        operand = 0 if idx < 11 else 0x1234
+        words.append(build_word(idx * 4, 0x10 + idx % 4, 0x2A, operand))
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    tables = [node for node in block.nodes if isinstance(node, IRTablePatch)]
+    assert tables, "expected opcode tables to be collapsed into IRTablePatch"
+    table = tables[0]
+    assert table.role == "opcode_table"
+    assert len(table.operations) == len(words)
+    assert not any(isinstance(node, IRRaw) for node in block.nodes)
 
 
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:

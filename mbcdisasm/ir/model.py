@@ -383,12 +383,16 @@ class IRLiteralBlock(IRNode):
     reducer: Optional[str] = None
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
+    role: Optional[str] = None
 
     def describe(self) -> str:
         chunks = []
         for a, b, c in self.triplets:
             chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        base = "literal_block[" + ", ".join(chunks) + "]"
+        label = "literal_block"
+        if self.role:
+            label = f"{label}<{self.role}>"
+        base = f"{label}[" + ", ".join(chunks) + "]"
         if self.tail:
             tail_repr = ", ".join(f"0x{value:04X}" for value in self.tail)
             base += f" tail=[{tail_repr}]"
@@ -643,10 +647,14 @@ class IRTablePatch(IRNode):
     """Collapses the recurring 0x66xx table patch sequences."""
 
     operations: Tuple[Tuple[str, int], ...]
+    role: Optional[str] = None
 
     def describe(self) -> str:
         rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
-        return f"table_patch[{rendered}]"
+        label = "table_patch"
+        if self.role:
+            label = f"{label}<{self.role}>"
+        return f"{label}[{rendered}]"
 
 
 @dataclass(frozen=True)

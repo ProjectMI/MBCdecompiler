@@ -104,6 +104,11 @@ TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
+OPCODE_TABLE_MODES = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x48, 0x4E, 0x4F, 0x50, 0x51}
+OPCODE_TABLE_MIN_RUN = 8
+OPCODE_TABLE_MAX_NONZERO = 2
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -404,6 +409,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
+        self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
@@ -1509,6 +1515,76 @@ class IRNormalizer:
             if steps[-1][0] == "op_F0_4B":
                 items.replace_slice(index, end, [IRTailcallFrame(steps=tuple(steps))])
                 continue
+
+            index += 1
+
+    def _is_opcode_table_candidate(
+        self, instruction: RawInstruction, *, mode: Optional[int] = None
+    ) -> bool:
+        profile = instruction.profile
+        if profile.info is not None:
+            return False
+        if profile.mode not in OPCODE_TABLE_MODES:
+            return False
+        if mode is not None and profile.mode != mode:
+            return False
+        if profile.kind not in {
+            InstructionKind.UNKNOWN,
+            InstructionKind.TABLE_LOOKUP,
+            InstructionKind.META,
+        }:
+            return False
+        if instruction.event.delta != 0:
+            return False
+        if instruction.event.popped_types or instruction.event.pushed_types:
+            return False
+        if instruction.ssa_values:
+            return False
+        return True
+
+    def _is_opcode_table_seed(self, instruction: RawInstruction) -> bool:
+        if not self._is_opcode_table_candidate(instruction):
+            return False
+        return instruction.operand == 0
+
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_opcode_table_seed(item):
+                index += 1
+                continue
+
+            mode = item.profile.mode
+            operations: List[Tuple[str, int]] = []
+            scan = index
+            zero_operands = 0
+            non_zero_operands = 0
+
+            while scan < len(items):
+                candidate = items[scan]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                if not self._is_opcode_table_candidate(candidate, mode=mode):
+                    break
+                operand = candidate.operand & 0xFFFF
+                if operand == 0:
+                    zero_operands += 1
+                else:
+                    if non_zero_operands >= OPCODE_TABLE_MAX_NONZERO:
+                        break
+                    non_zero_operands += 1
+                operations.append((candidate.mnemonic, operand))
+                scan += 1
+
+            length = len(operations)
+            if length >= OPCODE_TABLE_MIN_RUN:
+                zero_ratio = zero_operands / length if length else 0.0
+                if zero_ratio >= 0.8 or zero_operands >= length - OPCODE_TABLE_MAX_NONZERO:
+                    patch = IRTablePatch(operations=tuple(operations), role="opcode_table")
+                    items.replace_slice(index, scan, [patch])
+                    index += 1
+                    continue
 
             index += 1
 

@@ -687,6 +687,7 @@ class ModeSweepSignature(SignatureRule):
     name = "mode_sweep_block"
     category = "setup"
     base_confidence = 0.59
+    accepted_modes = {0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x48, 0x4E, 0x4F, 0x50, 0x51}
 
     def match(
         self, profiles: Sequence[InstructionProfile], stack: StackSummary
@@ -699,7 +700,7 @@ class ModeSweepSignature(SignatureRule):
             return None
 
         (mode,) = modes
-        if mode not in {0x4E, 0x4F}:
+        if mode not in self.accepted_modes:
             return None
 
         distinct_opcodes = {profile.opcode for profile in profiles}
