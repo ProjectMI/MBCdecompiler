@@ -24,6 +24,8 @@ from mbcdisasm.ir.model import (
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
+    IRIndirectLoad,
+    IRIndirectStore,
     IRSwitchDispatch,
     NormalizerMetrics,
 )
@@ -57,7 +59,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_push": 1,
         },
         "literal_marker": {
-            "opcodes": ["00:38"],
+            "opcodes": ["00:38", "0x00:0x72"],
             "name": "literal_marker",
             "category": "literal_marker",
         },
@@ -106,9 +108,15 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "testset_branch",
             "category": "testset_branch",
         },
+        "0x27:*": {
+            "category": "testset_branch",
+        },
         "indirect_access": {
             "opcodes": ["0x69:0x01"],
             "name": "indirect_access",
+            "category": "indirect_access",
+        },
+        "0x69:*": {
             "category": "indirect_access",
         },
         "stack_teardown_1": {
@@ -1019,6 +1027,32 @@ def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
     assert not any(isinstance(node, IRIf) for node in block.nodes)
 
 
+def test_normalizer_emits_if_for_testset_branch_variant(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x27, 0x33, 0x0010),  # testset_branch variant without assignment
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    segment_ir = program.segments[0]
+    block = segment_ir.blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRIf)
+    assert node.condition
+    assert segment_ir.metrics.testset_branches == 1
+    assert segment_ir.metrics.if_branches == 1
+    assert segment_ir.metrics.raw_remaining == 0
+
+
 def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1041,3 +1075,56 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
+
+
+def test_normalizer_indirect_load_uses_stack_pointer(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x2000),  # literal pointer
+        build_word(4, 0x69, 0x10, 0x0004),  # indirect load
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    segment_ir = program.segments[0]
+    block = segment_ir.blocks[0]
+
+    assert any(isinstance(node, IRIndirectLoad) for node in block.nodes)
+    load = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+    assert load.pointer.startswith("ptr")
+    assert load.offset == 0x0004
+    assert load.ref is None
+    assert segment_ir.metrics.loads == 1
+
+
+def test_normalizer_indirect_store_tracks_teardown(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x3000),  # literal pointer
+        build_word(4, 0x00, 0x00, 0x1234),  # literal value
+        build_word(8, 0x69, 0x10, 0x0000),  # indirect store
+        build_word(12, 0x01, 0xF0, 0x0000),  # teardown helper
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    segment_ir = program.segments[0]
+    block = segment_ir.blocks[0]
+
+    store = next(node for node in block.nodes if isinstance(node, IRIndirectStore))
+    assert store.pointer.startswith("ptr")
+    assert store.value.startswith("word")
+    assert store.ref is None
+    assert segment_ir.metrics.stores == 1

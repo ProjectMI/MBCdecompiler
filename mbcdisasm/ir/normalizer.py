@@ -3084,17 +3084,31 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            if item.mnemonic == "testset_branch":
+            label = item.profile.label
+            if item.mnemonic == "testset_branch" or label.startswith("27:"):
                 expr = self._describe_condition(items, index, skip_literals=True)
-                node = IRTestSetBranch(
-                    var=self._format_testset_var(item),
-                    expr=expr,
-                    then_target=self._branch_target(item),
-                    else_target=self._fallthrough_target(item),
-                )
-                self._transfer_ssa(item, node)
-                items.replace_slice(index, index + 1, [node])
+                then_target = self._branch_target(item)
+                else_target = self._fallthrough_target(item)
                 metrics.testset_branches += 1
+
+                if item.profile.mode == 0x33:
+                    node = IRIf(
+                        condition=expr,
+                        then_target=then_target,
+                        else_target=else_target,
+                    )
+                    items.replace_slice(index, index + 1, [node])
+                    metrics.if_branches += 1
+                else:
+                    node: Union[IRTestSetBranch, IRIf]
+                    node = IRTestSetBranch(
+                        var=self._format_testset_var(item),
+                        expr=expr,
+                        then_target=then_target,
+                        else_target=else_target,
+                    )
+                    self._transfer_ssa(item, node)
+                    items.replace_slice(index, index + 1, [node])
                 continue
 
             index += 1
@@ -3359,6 +3373,14 @@ class IRNormalizer:
                 region_override = "io"
                 page_alias_override = IO_PORT_NAME
                 symbol_override = IO_PORT_NAME
+
+        if (
+            instruction.profile.opcode == 0x69
+            and base_slot is None
+            and base_name is not None
+            and not components
+        ):
+            return None, index
 
         region, page_alias = self._memref_region(base_slot, bank, page)
         if region_override is not None:
