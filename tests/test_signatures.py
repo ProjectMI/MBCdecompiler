@@ -1,6 +1,8 @@
 import struct
 from pathlib import Path
 
+import pytest
+
 from mbcdisasm import KnowledgeBase
 from mbcdisasm.analyzer.instruction_profile import (
     InstructionKind,
@@ -122,13 +124,14 @@ def test_signature_detector_matches_literal_mirror_reduce_loop():
     assert match.name == "literal_mirror_reduce_loop"
 
 
-def test_signature_detector_matches_mode_sweep_block():
+@pytest.mark.parametrize("mode", [0x2A, 0x2B, 0x32, 0x33, 0x46, 0x47, 0x48, 0x4E, 0x4F, 0x50, 0x51])
+def test_signature_detector_matches_mode_sweep_block(mode):
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [
-        make_word(0xAF, 0x4E, 0x0001, 0),
-        make_word(0xC6, 0x4E, 0x0002, 4),
-        make_word(0xD7, 0x4E, 0x0003, 8),
-        make_word(0xE0, 0x4E, 0x0004, 12),
+        make_word(0xAF, mode, 0x0001, 0),
+        make_word(0xC6, mode, 0x0002, 4),
+        make_word(0xD7, mode, 0x0003, 8),
+        make_word(0xE0, mode, 0x0004, 12),
     ]
     profiles, summary = profiles_from_words(words, knowledge)
     detector = SignatureDetector()

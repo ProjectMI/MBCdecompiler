@@ -202,6 +202,21 @@ class IRNormalizer:
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
+    _OPCODE_TABLE_MIN_RUN = 8
+    _OPCODE_TABLE_MAX_AFFIX = 2
+    _OPCODE_TABLE_MODES = {
+        0x2A,
+        0x2B,
+        0x32,
+        0x33,
+        0x46,
+        0x47,
+        0x48,
+        0x4E,
+        0x4F,
+        0x50,
+        0x51,
+    }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -404,6 +419,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
+        self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
@@ -1511,6 +1527,132 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_opcode_tables(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not self._is_opcode_table_seed(item):
+                index += 1
+                continue
+
+            assert isinstance(item, RawInstruction)
+            mode = item.profile.mode
+            start = index
+            scan = index
+            body_ops: List[Tuple[str, int]] = []
+            body_annotations: List[str] = []
+
+            while scan < len(items):
+                candidate = items[scan]
+                if self._is_opcode_table_body(candidate, mode):
+                    assert isinstance(candidate, RawInstruction)
+                    body_ops.append((candidate.mnemonic, candidate.operand))
+                    body_annotations.extend(candidate.annotations)
+                    scan += 1
+                    continue
+                break
+
+            if len(body_ops) < self._OPCODE_TABLE_MIN_RUN:
+                index += 1
+                continue
+
+            prefix = start
+            prefix_ops: List[Tuple[str, int]] = []
+            prefix_annotations: List[str] = []
+            affix = 0
+            while prefix > 0 and affix < self._OPCODE_TABLE_MAX_AFFIX:
+                candidate = items[prefix - 1]
+                if not self._is_opcode_table_affix(candidate, mode):
+                    break
+                assert isinstance(candidate, RawInstruction)
+                prefix -= 1
+                prefix_ops.insert(0, (candidate.mnemonic, candidate.operand))
+                prefix_annotations.extend(candidate.annotations)
+                affix += 1
+
+            suffix = scan
+            suffix_ops: List[Tuple[str, int]] = []
+            suffix_annotations: List[str] = []
+            affix = 0
+            while suffix < len(items) and affix < self._OPCODE_TABLE_MAX_AFFIX:
+                candidate = items[suffix]
+                if not self._is_opcode_table_affix(candidate, mode):
+                    break
+                assert isinstance(candidate, RawInstruction)
+                suffix_ops.append((candidate.mnemonic, candidate.operand))
+                suffix_annotations.extend(candidate.annotations)
+                suffix += 1
+                affix += 1
+
+            operations = prefix_ops + body_ops + suffix_ops
+            annotations = ["opcode_table", f"mode=0x{mode:02X}"]
+            seen_annotations = set(annotations)
+            for pool in (prefix_annotations, body_annotations, suffix_annotations):
+                for note in pool:
+                    if not note or note in seen_annotations:
+                        continue
+                    annotations.append(note)
+                    seen_annotations.add(note)
+
+            items.replace_slice(
+                prefix,
+                suffix,
+                [
+                    IRTablePatch(
+                        operations=tuple(operations),
+                        annotations=tuple(annotations),
+                    )
+                ],
+            )
+            index = prefix + 1
+
+    def _is_opcode_table_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        mode = item.profile.mode
+        if mode not in self._OPCODE_TABLE_MODES:
+            return False
+        return self._is_opcode_table_body(item, mode)
+
+    def _is_opcode_table_body(
+        self, item: Union[RawInstruction, IRNode], mode: int
+    ) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if item.profile.mode != mode:
+            return False
+        if item.operand != 0:
+            return False
+        if self._is_annotation_only(item):
+            return False
+        return self._has_trivial_stack_effect(item)
+
+    def _is_opcode_table_affix(
+        self, item: Union[RawInstruction, IRNode], mode: int
+    ) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if item.profile.mode != mode:
+            return False
+        if self._is_annotation_only(item):
+            return False
+        return self._has_trivial_stack_effect(item)
+
+    @staticmethod
+    def _has_trivial_stack_effect(instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.depth_before != event.depth_after:
+            return False
+        if event.minimum != event.depth_before:
+            return False
+        if event.maximum != event.depth_before:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        return True
 
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
