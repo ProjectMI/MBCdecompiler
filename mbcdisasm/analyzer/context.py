@@ -76,8 +76,16 @@ class SegmentContext:
         self._build()
 
     def _build(self) -> None:
+        if not self.profiles:
+            return
+
         boundary_indices = [idx for idx, profile in enumerate(self.profiles) if profile.is_control()]
         if not boundary_indices:
+            start = ControlBoundary(ordinal=0, position=-1, profile=self.profiles[0])
+            end = ControlBoundary(ordinal=1, position=len(self.profiles), profile=self.profiles[-1])
+            window = InstructionWindow(self.profiles)
+            summary = window.stack_summary()
+            self.blocks.append(LinearBlock(start=start, end=end, window=window, stack_summary=summary))
             return
 
         self.boundaries = [
@@ -85,8 +93,20 @@ class SegmentContext:
             for i, idx in enumerate(boundary_indices)
         ]
 
-        for left, right in zip(self.boundaries, self.boundaries[1:]):
-            window = InstructionWindow(self.profiles[left.position + 1 : right.position])
+        sentinel_start = ControlBoundary(ordinal=-1, position=-1, profile=self.profiles[0])
+        sentinel_end = ControlBoundary(
+            ordinal=len(self.boundaries),
+            position=len(self.profiles),
+            profile=self.profiles[self.boundaries[-1].position],
+        )
+
+        chain = [sentinel_start] + self.boundaries + [sentinel_end]
+        for left, right in zip(chain, chain[1:]):
+            start = left.position + 1
+            end = right.position
+            if start >= end:
+                continue
+            window = InstructionWindow(self.profiles[start:end])
             summary = window.stack_summary()
             self.blocks.append(LinearBlock(start=left, end=right, window=window, stack_summary=summary))
 

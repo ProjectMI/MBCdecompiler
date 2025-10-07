@@ -1,5 +1,6 @@
 from mbcdisasm import Disassembler, Segment, SegmentDescriptor
 from mbcdisasm.analyzer import PipelineAnalyzer
+from mbcdisasm.analyzer.context import SegmentContext
 from mbcdisasm.analyzer.instruction_profile import InstructionKind, InstructionProfile
 from mbcdisasm.analyzer.report import PipelineBlock, PipelineReport
 from mbcdisasm.analyzer.stack import StackSummary
@@ -104,6 +105,32 @@ def test_guarded_return_pipeline_detection():
     assert block.pattern is not None
     assert block.pattern.pattern.name == "guarded_return"
 
+
+def test_segment_context_captures_test_and_return_boundaries():
+    knowledge = build_knowledge()
+    instructions = [
+        make_word(0, 0x10),  # literal
+        make_word(4, 0x12),  # test branch
+        make_word(8, 0x10),  # literal between control edges
+        make_word(12, 0x31),  # return terminator
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in instructions]
+
+    context = SegmentContext(profiles)
+    blocks = list(context.iter_blocks())
+
+    assert len(context.boundaries) == 2
+    assert len(blocks) == 2
+
+    first = blocks[0]
+    assert first.start.ordinal == -1
+    assert first.end.profile.mnemonic == "test_branch"
+    assert [profile.mnemonic for profile in first.profiles()] == ["literal"]
+
+    second = blocks[1]
+    assert second.start.profile.mnemonic == "test_branch"
+    assert second.end.profile.mnemonic == "return"
+    assert [profile.mnemonic for profile in second.profiles()] == ["literal"]
 
 class _DummyContainer:
     def __init__(self, segment: Segment) -> None:

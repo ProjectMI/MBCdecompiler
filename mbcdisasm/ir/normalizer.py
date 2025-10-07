@@ -52,6 +52,8 @@ from .model import (
     IRStackDuplicate,
     IRStackDrop,
     IRTablePatch,
+    IRDispatchCase,
+    IRSwitchDispatch,
     IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
@@ -378,8 +380,10 @@ class IRNormalizer:
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_table_patches(items)
+        self._pass_table_dispatch(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
+        self._pass_tailcall_returns(items)
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
@@ -391,6 +395,7 @@ class IRNormalizer:
         self._pass_call_predicates(items)
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
+        self._pass_tailcall_returns(items)
         self._pass_indirect_access(items, metrics)
 
         nodes: List[IRNode] = []
@@ -1357,6 +1362,61 @@ class IRNormalizer:
             items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
             index += 1
 
+    def _pass_table_dispatch(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRTablePatch):
+                index += 1
+                continue
+
+            helper_target: Optional[int] = None
+            helper_symbol: Optional[str] = None
+            follow = index + 1
+            while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
+                follow += 1
+            if follow < len(items):
+                candidate = items[follow]
+                if isinstance(candidate, (IRCall, IRCallReturn, IRTailcallReturn)):
+                    target = getattr(candidate, "target", None)
+                    if isinstance(target, int) and target in {0x6623, 0x6624}:
+                        helper_target = target
+                        helper_symbol = self.knowledge.lookup_address(target)
+
+            cases, default = self._extract_dispatch_cases(item.operations)
+            if not cases:
+                index += 1
+                continue
+
+            dispatch = IRSwitchDispatch(
+                cases=tuple(sorted(cases, key=lambda entry: entry.key)),
+                helper=helper_target,
+                helper_symbol=helper_symbol,
+                default=default,
+            )
+            items.replace_slice(index, index + 1, [dispatch])
+            index += 1
+
+    def _extract_dispatch_cases(
+        self, operations: Sequence[Tuple[str, int]]
+    ) -> Tuple[List[IRDispatchCase], Optional[int]]:
+        cases: List[IRDispatchCase] = []
+        default_target: Optional[int] = None
+        for mnemonic, operand in operations:
+            if mnemonic.startswith("op_2C_"):
+                suffix = mnemonic.split("_")[-1]
+                try:
+                    key = int(suffix, 16)
+                except ValueError:
+                    continue
+                target = operand & 0xFFFF
+                symbol = self.knowledge.lookup_address(target)
+                cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+                continue
+            if mnemonic == "fanout":
+                default_target = operand & 0xFFFF
+        return cases, default_target
+
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1383,6 +1443,61 @@ class IRNormalizer:
                 self._rewrite_tail_helper_io(items, index, item, helper_target, new_target)
                 continue
 
+            index += 1
+
+    def _pass_tailcall_returns(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRTailcallReturn):
+                index += 1
+                continue
+
+            cleanup_steps: List[IRStackEffect] = list(item.cleanup)
+            mask = item.cleanup_mask
+
+            pre = index - 1
+            while pre >= 0 and isinstance(items[pre], (IRCallCleanup, IRConditionMask)):
+                prefix = items[pre]
+                if isinstance(prefix, IRCallCleanup):
+                    cleanup_steps = list(prefix.steps) + cleanup_steps
+                    mask = mask or self._extract_cleanup_mask(prefix.steps)
+                else:
+                    mask = mask or prefix.mask
+                items.pop(pre)
+                index -= 1
+                pre -= 1
+
+            follow = index + 1
+            while follow < len(items) and isinstance(items[follow], (IRCallCleanup, IRConditionMask)):
+                suffix = items[follow]
+                if isinstance(suffix, IRCallCleanup):
+                    cleanup_steps.extend(suffix.steps)
+                    mask = mask or self._extract_cleanup_mask(suffix.steps)
+                else:
+                    mask = mask or suffix.mask
+                items.pop(follow)
+
+            cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+
+            returns = item.returns
+            values: Tuple[str, ...]
+            if isinstance(returns, tuple):
+                values = returns
+            else:
+                count = max(int(returns), 0)
+                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+            if item.varargs and not values:
+                values = ("ret*",)
+
+            new_return = IRReturn(
+                values=values,
+                varargs=item.varargs,
+                cleanup=tuple(cleanup_steps),
+                mask=mask,
+            )
+            self._transfer_ssa(item, new_return)
+            items.replace_slice(index, index + 1, [new_return])
             index += 1
 
     def _extract_tail_helper_target(

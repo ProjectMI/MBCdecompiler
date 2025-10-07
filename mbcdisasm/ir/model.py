@@ -201,12 +201,16 @@ class IRReturn(IRNode):
     values: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    mask: Optional[int] = None
 
     def describe(self) -> str:
         cleanup = ""
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             cleanup = f" cleanup=[{rendered}]"
+        if self.mask is not None:
+            mask_repr = _format_operand(self.mask)
+            cleanup = f" mask={mask_repr}{cleanup}"
         if self.varargs:
             if self.values:
                 return f"return varargs({', '.join(self.values)}){cleanup}"
@@ -560,6 +564,45 @@ class IRTablePatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRDispatchCase:
+    """Single dispatch case extracted from a table patch."""
+
+    key: int
+    target: int
+    symbol: Optional[str] = None
+
+    def describe(self) -> str:
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        return f"{self.key}->{target_repr}"
+
+
+@dataclass(frozen=True)
+class IRSwitchDispatch(IRNode):
+    """High level representation of dispatch helper tables."""
+
+    cases: Tuple[IRDispatchCase, ...]
+    helper: Optional[int] = None
+    helper_symbol: Optional[str] = None
+    default: Optional[int] = None
+
+    def describe(self) -> str:
+        helper_details = "helper=?"
+        if self.helper is not None:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+            helper_details = f"helper={helper_repr}"
+        case_text = ", ".join(case.describe() for case in self.cases)
+        description = f"dispatch {helper_details} cases=[{case_text}]"
+        if self.default is not None:
+            default_repr = f"0x{self.default:04X}"
+            description += f" default={default_repr}"
+        return description
+
+
+@dataclass(frozen=True)
 class IRAsciiFinalize(IRNode):
     """Normalises helper invocations that terminate ASCII aggregation blocks."""
 
@@ -837,6 +880,8 @@ __all__ = [
     "IRCallPreparation",
     "IRTailcallFrame",
     "IRTablePatch",
+    "IRDispatchCase",
+    "IRSwitchDispatch",
     "IRAsciiFinalize",
     "IRSlot",
     "MemRef",

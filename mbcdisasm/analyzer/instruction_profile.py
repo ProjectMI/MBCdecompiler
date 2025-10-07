@@ -255,7 +255,13 @@ class InstructionProfile:
         )
 
     def is_control(self) -> bool:
-        return self.kind in {InstructionKind.CONTROL, InstructionKind.BRANCH, InstructionKind.TERMINATOR}
+        return self.kind in {
+            InstructionKind.CONTROL,
+            InstructionKind.BRANCH,
+            InstructionKind.TERMINATOR,
+            InstructionKind.RETURN,
+            InstructionKind.TEST,
+        }
 
     def is_terminator(self) -> bool:
         return self.kind is InstructionKind.TERMINATOR
