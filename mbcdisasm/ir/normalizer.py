@@ -54,6 +54,7 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRStackShuffle,
     IRStringConstant,
     IRTablePatch,
     IRDispatchCase,
@@ -607,6 +608,39 @@ class IRNormalizer:
             return SSAValueKind.BYTE
         return SSAValueKind.WORD
 
+    @staticmethod
+    def _decode_stack_shuffle_operand(
+        operand: int,
+    ) -> Tuple[Tuple[int, ...], Tuple[int, ...], int]:
+        if operand == 0:
+            return (tuple(), tuple(), 0)
+
+        raw_selectors: List[int] = []
+        value = operand
+        while True:
+            raw_selectors.append(value & 0xF)
+            value >>= 4
+            if value == 0:
+                break
+
+        raw_selectors.reverse()
+        if not raw_selectors:
+            raw_selectors = [0]
+
+        normalized: List[int] = []
+        seen: Dict[int, int] = {}
+        duplicates: List[int] = []
+        for code in raw_selectors:
+            index = code & 0x7
+            normalized.append(index)
+            seen[index] = seen.get(index, 0) + 1
+            if seen[index] > 1 and index not in duplicates:
+                duplicates.append(index)
+
+        unique = sorted(set(normalized))
+        width = unique[-1] + 1 if unique else 0
+        return tuple(normalized), tuple(duplicates), width
+
     def _pass_page_registers(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -651,6 +685,18 @@ class IRNormalizer:
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
+                continue
+
+            if mnemonic == "stack_shuffle":
+                selectors, duplicates, width = self._decode_stack_shuffle_operand(item.operand)
+                node = IRStackShuffle(
+                    operand=item.operand,
+                    selectors=selectors,
+                    width=width,
+                    duplicates=duplicates,
+                )
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
                 continue
 
             index += 1
@@ -1035,6 +1081,20 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            if len(literal_nodes) == 2 and isinstance(literal_nodes[0], IRLiteral):
+                hint_chunk = self._chunk_from_literal_hint(
+                    literal_nodes[0], literal_nodes[1], reducers[-1]
+                )
+                if hint_chunk is not None:
+                    for removal_pos in range(index, scan):
+                        removed = items[removal_pos]
+                        self._ssa_bindings.pop(id(removed), None)
+                    self._transfer_ssa(reducers[-1], hint_chunk)
+                    items.replace_slice(index, scan, [hint_chunk])
+                    metrics.literal_chunks += 1
+                    metrics.reduce_replaced += len(reducers)
+                    continue
+
             literals = [self._literal_repr(node) for node in literal_nodes]
             replacement: IRNode
             if len(literals) >= 2 and len(literals) == 2 * len(reducers):
@@ -1145,6 +1205,9 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
+            if isinstance(item, RawInstruction) and item.mnemonic == "reduce_pair":
+                if self._collapse_literal_hint_reduce(items, index, item, metrics):
+                    continue
             if not (isinstance(item, RawInstruction) and item.mnemonic == "reduce_pair"):
                 index += 1
                 continue
@@ -1181,6 +1244,93 @@ class IRNormalizer:
             metrics.reduce_replaced += 1
             index = removal_start + 1
 
+    def _collapse_literal_hint_reduce(
+        self,
+        items: _ItemList,
+        index: int,
+        reducer: RawInstruction,
+        metrics: NormalizerMetrics,
+    ) -> bool:
+        hints = {0x0067, 0x6704}
+        scan = index - 1
+        data_node: Optional[Union[IRLiteral, IRLiteralChunk]] = None
+        marker_node: Optional[IRLiteral] = None
+        marker_index = index
+
+        while scan >= 0 and (marker_node is None or data_node is None):
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                scan -= 1
+                continue
+            if data_node is None and isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                data_node = candidate
+                scan -= 1
+                continue
+            if (
+                marker_node is None
+                and isinstance(candidate, IRLiteral)
+                and candidate.value in hints
+            ):
+                marker_node = candidate
+                marker_index = scan
+                scan -= 1
+                continue
+            break
+
+        if marker_node is None or data_node is None:
+            return False
+
+        chunk = self._chunk_from_literal_hint(marker_node, data_node, reducer)
+        if chunk is None:
+            return False
+
+        for removal_index in range(marker_index, index):
+            removed = items[removal_index]
+            self._ssa_bindings.pop(id(removed), None)
+
+        self._transfer_ssa(reducer, chunk)
+        items.replace_slice(marker_index, index + 1, [chunk])
+        metrics.literal_chunks += 1
+        metrics.reduce_replaced += 1
+        return True
+
+    def _literal_data_bytes(
+        self, node: Union[IRLiteral, IRLiteralChunk]
+    ) -> Optional[bytes]:
+        if isinstance(node, IRLiteralChunk):
+            return node.data
+        if isinstance(node, IRLiteral):
+            value = node.value & 0xFFFFFFFF
+            if value == 0:
+                return b"\x00\x00"
+            size = 2 if value <= 0xFFFF else 4
+            try:
+                return value.to_bytes(size, "big")
+            except OverflowError:
+                width = (value.bit_length() + 7) // 8
+                width = max(2, (width + 1) & ~1)
+                return value.to_bytes(width, "big")
+        return None
+
+    def _chunk_from_literal_hint(
+        self,
+        marker: IRLiteral,
+        data_node: Union[IRLiteral, IRLiteralChunk],
+        reducer: Optional[RawInstruction] = None,
+        *,
+        source: str = "literal_reduce_chain",
+    ) -> Optional[IRLiteralChunk]:
+        if marker.value not in {0x0067, 0x6704}:
+            return None
+        payload = self._literal_data_bytes(data_node)
+        if payload is None:
+            return None
+        annotations: List[str] = []
+        annotations.extend(getattr(marker, "annotations", ()))
+        annotations.extend(getattr(data_node, "annotations", ()))
+        summary = reducer.mnemonic if reducer is not None else source
+        return self._make_literal_chunk(payload, summary, annotations)
+
     def _constant_aggregate_repr(
         self, item: Union[RawInstruction, IRNode]
     ) -> Optional[str]:
@@ -1205,7 +1355,7 @@ class IRNormalizer:
             if (
                 isinstance(first, RawInstruction)
                 and isinstance(second, RawInstruction)
-                and isinstance(third, RawInstruction)
+                and isinstance(third, (RawInstruction, IRStackShuffle))
                 and first.mnemonic == "op_72_23"
                 and second.mnemonic == "op_31_30"
                 and third.mnemonic == "stack_shuffle"
@@ -1237,7 +1387,7 @@ class IRNormalizer:
                     steps = list(candidate.steps) + steps
                     start = scan
                     break
-                if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
+                if isinstance(candidate, (RawInstruction, IRStackShuffle)) and self._is_call_preparation_instruction(candidate):
                     steps.insert(0, self._call_preparation_step(candidate))
                     start = scan
                     scan -= 1
@@ -1255,7 +1405,7 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
+            if not isinstance(item, (RawInstruction, IRStackShuffle)) or not self._is_call_cleanup_instruction(item):
                 index += 1
                 continue
 
@@ -1265,7 +1415,7 @@ class IRNormalizer:
             scan = index
             while scan < len(items):
                 candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                if isinstance(candidate, (RawInstruction, IRStackShuffle)) and self._is_call_cleanup_instruction(candidate):
                     steps.append(self._call_cleanup_effect(candidate))
                     end = scan + 1
                     scan += 1
@@ -1423,6 +1573,11 @@ class IRNormalizer:
                     for mnemonic, operand in candidate.steps:
                         if mnemonic == "stack_shuffle":
                             convention = self._call_convention_effect(operand)
+                    consumed.append(scan)
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRStackShuffle):
+                    convention = self._call_convention_effect(candidate.operand)
                     consumed.append(scan)
                     scan -= 1
                     continue
@@ -1995,6 +2150,9 @@ class IRNormalizer:
     def _apply_call_shuffle(args: Sequence[str], operand: int) -> List[str]:
         if not args:
             return list(args)
+        selectors, _, _ = IRNormalizer._decode_stack_shuffle_operand(operand)
+        if selectors and len(selectors) == len(args) and all(index < len(args) for index in selectors):
+            return [args[index] for index in selectors]
         if operand == CALL_SHUFFLE_STANDARD and len(args) >= 2:
             reordered = list(args)
             reordered[0], reordered[1] = reordered[1], reordered[0]
@@ -2153,39 +2311,30 @@ class IRNormalizer:
                 IRLiteral,
                 IRCallPreparation,
                 IRCallCleanup,
+                IRStackShuffle,
             ),
         )
 
     def _pass_ascii_headers(self, items: _ItemList) -> None:
         if not items:
             return
+
         chunk_nodes: List[IRLiteralChunk] = []
         index = 0
         while index < len(items) and isinstance(items[index], IRLiteralChunk):
             chunk_nodes.append(items[index])
             index += 1
-        if len(chunk_nodes) >= 2:
-            names = [chunk.symbol or chunk.describe() for chunk in chunk_nodes]
-            items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(names))])
+
+        if not chunk_nodes:
             return
 
-        if len(chunk_nodes) == 1:
-            literal = chunk_nodes[0]
-            symbol = literal.symbol
-            if symbol:
-                items.replace_slice(0, 1, [IRAsciiHeader(chunks=(symbol,))])
-                return
-            if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
-                if len(literal.data) % 4 == 0:
-                    parts = []
-                    for pos in range(0, len(literal.data), 4):
-                        segment = literal.data[pos : pos + 4]
-                        piece = self._make_literal_chunk(
-                            segment, literal.source, literal.annotations
-                        )
-                        parts.append(piece.symbol or piece.describe())
-                    if len(parts) >= 2:
-                        items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
+        data = b"".join(chunk.data for chunk in chunk_nodes)
+        annotations: List[str] = []
+        for chunk in chunk_nodes:
+            annotations.extend(chunk.annotations)
+        merged = self._make_literal_chunk(data, "ascii_header", annotations)
+        symbol = merged.symbol or merged.describe()
+        items.replace_slice(0, index, [IRAsciiHeader(chunks=(symbol,))])
 
     def _pass_call_return_templates(self, items: _ItemList) -> None:
         index = 0
@@ -2825,14 +2974,22 @@ class IRNormalizer:
         return node
 
     @staticmethod
-    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
+    def _is_call_cleanup_instruction(
+        instruction: Union[RawInstruction, IRStackShuffle]
+    ) -> bool:
+        if isinstance(instruction, IRStackShuffle):
+            return True
         mnemonic = instruction.mnemonic
         if mnemonic in CALL_CLEANUP_MNEMONICS:
             return True
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
 
     @staticmethod
-    def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
+    def _call_preparation_step(
+        instruction: Union[RawInstruction, IRStackShuffle]
+    ) -> Tuple[str, int]:
+        if isinstance(instruction, IRStackShuffle):
+            return ("stack_shuffle", instruction.operand)
         mnemonic = instruction.mnemonic
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             pops = -instruction.event.delta
@@ -2841,7 +2998,11 @@ class IRNormalizer:
         return (mnemonic, instruction.operand)
 
     @staticmethod
-    def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:
+    def _is_call_preparation_instruction(
+        instruction: Union[RawInstruction, IRStackShuffle]
+    ) -> bool:
+        if isinstance(instruction, IRStackShuffle):
+            return True
         mnemonic = instruction.mnemonic
         if mnemonic == "op_4A_05":
             return True
@@ -2859,7 +3020,14 @@ class IRNormalizer:
             operand_alias=alias,
         )
 
-    def _call_cleanup_effect(self, instruction: RawInstruction) -> IRStackEffect:
+    def _call_cleanup_effect(
+        self, instruction: Union[RawInstruction, IRStackShuffle]
+    ) -> IRStackEffect:
+        if isinstance(instruction, IRStackShuffle):
+            return IRStackEffect(
+                mnemonic="stack_shuffle",
+                operand=instruction.operand,
+            )
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         pops = 0

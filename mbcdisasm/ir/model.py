@@ -586,6 +586,29 @@ class IRStackDuplicate(IRNode):
 
 
 @dataclass(frozen=True)
+class IRStackShuffle(IRNode):
+    """Explicit permutation/duplication of the top stack slice."""
+
+    operand: int
+    selectors: Tuple[int, ...]
+    width: int
+    duplicates: Tuple[int, ...] = field(default_factory=tuple)
+
+    @property
+    def mnemonic(self) -> str:
+        return "stack_shuffle"
+
+    def describe(self) -> str:
+        mapping = ", ".join(f"s{index}" for index in self.selectors)
+        details = [f"map=[{mapping}]", f"width={self.width}"]
+        if self.duplicates:
+            dup_text = ", ".join(f"s{index}" for index in self.duplicates)
+            details.append(f"dup=[{dup_text}]")
+        details.append(f"operand=0x{self.operand:04X}")
+        return f"stack_shuffle({', '.join(details)})"
+
+
+@dataclass(frozen=True)
 class IRAsciiPreamble(IRNode):
     """Helper node that replaces the common ASCII initialisation prologue."""
 
@@ -972,6 +995,7 @@ __all__ = [
     "IRIOWrite",
     "IRStackDuplicate",
     "IRStackDrop",
+    "IRStackShuffle",
     "IRPageRegister",
     "IRAsciiHeader",
     "IRCallReturn",

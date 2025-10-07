@@ -582,6 +582,35 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     assert constant.data == b"HEAD ER  TEX"
     assert constant.segments == (constant.data,)
 
+
+def test_literal_reduce_chain_hints_collapse_to_string(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    literal_value = int.from_bytes(b"AB", "big")
+    words = [
+        build_word(0, 0x00, 0x00, 0x6704),
+        build_word(4, 0x00, 0x00, literal_value),
+        build_word(8, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks
+    symbol = header.chunks[0]
+    pool = {const.name: const for const in program.string_pool}
+    assert pool[symbol].data == b"AB"
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "reduce_pair" for node in block.nodes
+    )
+
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
