@@ -27,13 +27,16 @@ from mbcdisasm.ir.model import (
     IRBuildTuple,
     IRBuildArray,
     IRSwitchDispatch,
+    IRTablePatch,
     NormalizerMetrics,
 )
-from mbcdisasm.ir.normalizer import _ItemList
+from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
-from mbcdisasm.knowledge import KnowledgeBase
+from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
+from mbcdisasm.analyzer.instruction_profile import InstructionProfile
+from mbcdisasm.analyzer.stack import StackTracker
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -1100,3 +1103,39 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
+
+
+def test_normalizer_collapses_opcode_table_sequences() -> None:
+    annotations = {
+        f"{opcode:02X}:2A": OpcodeInfo(mnemonic=f"op_{opcode:02X}_2A", stack_delta=0)
+        for opcode in range(0x10, 0x1C)
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [build_word(index * 4, opcode, 0x2A, 0x0000) for index, opcode in enumerate(range(0x10, 0x1C))]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 0
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert len(node.operations) == len(raw_instructions)
+    assert node.annotations and node.annotations[0] == "opcode_table"
+    assert any(note == "mode=0x2A" for note in node.annotations)
