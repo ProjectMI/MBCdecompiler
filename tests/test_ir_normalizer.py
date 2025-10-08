@@ -11,6 +11,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -761,9 +762,152 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
         if isinstance(node, IRIOWrite)
     ]
 
+    raw_mnemonics = {
+        node.mnemonic
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRRaw)
+    }
+
+    assert "op_10_84" not in raw_mnemonics
+
     masks = sorted(write.mask for write in writes)
     assert masks == [0x1234, 0x2910]
     assert all(write.port == "io.port_6910" for write in writes)
+
+
+def test_io_handshake_search_skips_prefix_writes() -> None:
+    annotations = {
+        "74:30": OpcodeInfo(mnemonic="op_74_30", stack_delta=0),
+        "3D:30": OpcodeInfo(mnemonic="op_3D_30", stack_delta=0),
+        "10:84": OpcodeInfo(mnemonic="op_10_84", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x74, 0x30, 0x0000),
+        build_word(4, 0x3D, 0x30, IO_SLOT),
+        build_word(8, 0x10, 0x84, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_bridge, raw_handshake, raw_prefix = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    call = IRCall(target=0x003D, args=tuple())
+    items = _ItemList([raw_bridge, raw_handshake, raw_prefix, call])
+
+    assert normalizer._find_io_handshake(items, 3) == 1
+
+
+def test_io_mask_value_skips_prefix_and_bridges() -> None:
+    annotations = {
+        "74:30": OpcodeInfo(mnemonic="op_74_30", stack_delta=0),
+        "3D:30": OpcodeInfo(mnemonic="op_3D_30", stack_delta=0),
+        "10:84": OpcodeInfo(mnemonic="op_10_84", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x74, 0x30, 0x0000),
+        build_word(4, 0x10, 0x84, 0x0000),
+        build_word(8, 0x3D, 0x30, IO_SLOT),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_bridge, raw_prefix, raw_handshake = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    items = _ItemList(
+        [
+            IRLiteral(value=0x5678, mode=0, source="test"),
+            raw_bridge,
+            raw_prefix,
+            raw_handshake,
+        ]
+    )
+
+    assert normalizer._io_mask_value(items, 3) == 0x5678
+
+
+def test_io_bridge_includes_additional_variants() -> None:
+    annotations = {
+        "74:30": OpcodeInfo(mnemonic="op_74_30", stack_delta=0),
+        "7C:1B": OpcodeInfo(mnemonic="op_7C_1B", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x74, 0x30, 0x0000),
+        build_word(4, 0x7C, 0x1B, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_nodes = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    assert all(normalizer._is_io_bridge_instruction(node) for node in raw_nodes)
+
+
+def test_io_read_variants_are_recognised() -> None:
+    annotations = {
+        "10:30": OpcodeInfo(mnemonic="op_10_30", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    word = build_word(0, 0x10, 0x30, 0x0000)
+    profile = InstructionProfile.from_word(word, knowledge)
+    tracker = StackTracker()
+    event = tracker.process_sequence([profile])[0]
+
+    raw_read = RawInstruction(
+        profile=profile,
+        event=event,
+        annotations=tuple(),
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+
+    items = _ItemList([raw_read])
+    node = normalizer._build_io_node(items, 0, raw_read)
+
+    assert isinstance(node, IRIORead)
+    assert node.port == IO_PORT_NAME
 
 
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:

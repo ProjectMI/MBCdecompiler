@@ -149,7 +149,7 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
-IO_READ_MNEMONICS = {"op_10_38", "op_11_28"}
+IO_READ_MNEMONICS = {"op_10_30", "op_10_38", "op_11_28"}
 IO_WRITE_MNEMONICS = {
     "op_10_10",
     "op_10_14",
@@ -158,9 +158,18 @@ IO_WRITE_MNEMONICS = {
     "op_10_64",
     "op_10_68",
     "op_10_F4",
+    "op_10_84",
 }
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
-IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00", "op_5C_08"}
+IO_BRIDGE_MNEMONICS = {
+    "op_01_3D",
+    "op_F1_3D",
+    "op_38_00",
+    "op_4C_00",
+    "op_5C_08",
+    "op_74_30",
+    "op_7C_1B",
+}
 IO_HANDSHAKE_MNEMONICS = {"op_3D_30", "op_43_30"}
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
@@ -1566,7 +1575,9 @@ class IRNormalizer:
                     steps += 1
                     continue
                 if node.mnemonic.startswith("op_10_"):
-                    break
+                    scan -= 1
+                    steps += 1
+                    continue
             elif isinstance(node, IRLiteralChunk):
                 scan -= 1
                 steps += 1
@@ -2406,7 +2417,8 @@ class IRNormalizer:
                 ):
                     return scan
                 if candidate.mnemonic.startswith("op_10_"):
-                    break
+                    scan -= 1
+                    continue
                 if self._is_io_bridge_instruction(candidate):
                     scan -= 1
                     continue
