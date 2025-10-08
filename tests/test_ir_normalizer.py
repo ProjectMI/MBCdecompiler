@@ -552,6 +552,34 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert "lit(0x6704)" in descriptions
 
 
+def test_normalizer_merges_ascii_mixed_sequences(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        InstructionWord(4, int.from_bytes(b"TEXT", "big")),
+        InstructionWord(8, int.from_bytes(b"AB\x80C", "big")),
+        InstructionWord(12, int.from_bytes(b"\x00\x00\r\n", "big")),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    chunk = next(node for node in block.nodes if isinstance(node, IRLiteralChunk))
+    assert chunk.data == b"TEXTAB\x80C\x00\x00\r\n"
+    assert "ascii_mixed" in chunk.annotations
+    assert "ascii_tail" in chunk.annotations
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic.startswith("op_00") for node in block.nodes
+    )
+
+
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

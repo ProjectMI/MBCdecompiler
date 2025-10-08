@@ -15,7 +15,7 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import ASCII_ALLOWED, InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -128,6 +128,23 @@ IO_BRIDGE_NODE_TYPES = (
 )
 
 
+def _ascii_payload_stats(data: bytes) -> Tuple[int, int, int]:
+    """Return printable, allowed and noise counters for ``data``."""
+
+    printable = sum(1 for byte in data if 0x20 <= byte <= 0x7E)
+    allowed = sum(1 for byte in data if byte == 0 or byte in ASCII_ALLOWED)
+    noise = len(data) - allowed
+    return printable, allowed, noise
+
+
+def _append_annotation(notes: List[str], note: str) -> None:
+    if note and note not in notes:
+        notes.append(note)
+
+
+ASCII_CHUNK_OPCODES = {0x41, 0x47, 0x90, 0xDC, 0xF4}
+
+
 @dataclass(frozen=True)
 class RawInstruction:
     """Wrapper that couples a profile with stack tracking details."""
@@ -212,6 +229,7 @@ class IRNormalizer:
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
+
     _OPCODE_TABLE_MIN_RUN = 8
     _OPCODE_TABLE_MAX_AFFIX = 2
     _OPCODE_TABLE_MODES = {
@@ -726,7 +744,31 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
-            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+            printable, allowed, noise = _ascii_payload_stats(data)
+            annotations = list(instruction.annotations)
+            if printable >= 3 and (printable < 4 or noise > 0):
+                _append_annotation(annotations, "ascii_mixed")
+            return self._make_literal_chunk(data, profile.mnemonic, annotations)
+
+        if profile.kind in {InstructionKind.UNKNOWN, InstructionKind.LITERAL}:
+            opcode = instruction.profile.word.opcode
+            if profile.kind is InstructionKind.UNKNOWN and opcode not in ASCII_CHUNK_OPCODES:
+                pass
+            else:
+                data = instruction.profile.word.raw.to_bytes(4, "big")
+                printable, allowed, noise = _ascii_payload_stats(data)
+                annotations = list(instruction.annotations)
+
+                if printable >= 3 and noise <= 1:
+                    _append_annotation(annotations, "ascii_mixed")
+                    return self._make_literal_chunk(data, "ascii_mixed", annotations)
+
+                if noise == 0 and allowed == len(data):
+                    if profile.kind is InstructionKind.LITERAL and printable > 0:
+                        pass
+                    else:
+                        _append_annotation(annotations, "ascii_tail")
+                        return self._make_literal_chunk(data, "ascii_tail", annotations)
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -810,6 +852,16 @@ class IRNormalizer:
                     index += 1
                     continue
 
+                if isinstance(candidate, RawInstruction):
+                    chunk = self._ascii_noise_chunk(candidate)
+                    if chunk is not None:
+                        self._transfer_ssa(candidate, chunk)
+                        items.replace_slice(index, index + 1, [chunk])
+                        data_parts.append(chunk.data)
+                        annotations.extend(chunk.annotations)
+                        index += 1
+                        continue
+
                 break
 
             if not data_parts:
@@ -825,6 +877,29 @@ class IRNormalizer:
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
+
+    def _ascii_noise_chunk(self, instruction: RawInstruction) -> Optional[IRLiteralChunk]:
+        kind = instruction.profile.kind
+        if kind not in {InstructionKind.LITERAL, InstructionKind.UNKNOWN}:
+            return None
+
+        if kind is InstructionKind.UNKNOWN and instruction.profile.word.opcode not in ASCII_CHUNK_OPCODES:
+            return None
+
+        data = instruction.profile.word.raw.to_bytes(4, "big")
+        printable, allowed, noise = _ascii_payload_stats(data)
+
+        if printable >= 3 and noise <= 1:
+            annotations = list(instruction.annotations)
+            _append_annotation(annotations, "ascii_mixed")
+            return self._make_literal_chunk(data, "ascii_mixed", annotations)
+
+        if noise == 0 and printable <= 1 and allowed == len(data):
+            annotations = list(instruction.annotations)
+            _append_annotation(annotations, "ascii_tail")
+            return self._make_literal_chunk(data, "ascii_tail", annotations)
+
+        return None
 
     def _pass_ascii_glue(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0

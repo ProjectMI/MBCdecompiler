@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
 
 from ..constants import RET_MASK
-from .instruction_profile import InstructionKind, InstructionProfile
+from .instruction_profile import ASCII_ALLOWED, InstructionKind, InstructionProfile
 from .stack import StackSummary
 
 
@@ -36,6 +36,31 @@ LiteralLike = {
 
 
 INDIRECT_RETURN_TERMINALS = {"2C:01", "66:3E", "F1:3D", "10:48"}
+
+
+ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
+
+
+def _ascii_payload_kind(profile: InstructionProfile) -> Optional[str]:
+    """Return a coarse flavour for ASCII-like instruction payloads."""
+
+    data = profile.word.raw.to_bytes(4, "big")
+    printable = sum(1 for byte in data if 0x20 <= byte <= 0x7E)
+    allowed = sum(1 for byte in data if byte == 0 or byte in ASCII_ALLOWED)
+    noise = len(data) - allowed
+
+    if profile.kind is InstructionKind.ASCII_CHUNK:
+        if printable >= 3 and (printable < 4 or noise > 0):
+            return "mixed"
+        return "chunk"
+
+    if printable >= 3 and noise <= 1:
+        return "mixed"
+
+    if noise == 0 and printable <= 1:
+        return "filler"
+
+    return None
 
 
 def is_literal_marker(profile: InstructionProfile) -> bool:
@@ -142,10 +167,38 @@ class AsciiRunSignature(SignatureRule):
     ) -> Optional[SignatureMatch]:
         if len(profiles) < 3:
             return None
-        if not all(profile.kind is InstructionKind.ASCII_CHUNK for profile in profiles):
+
+        ascii_words = 0
+        filler = 0
+        helpers = 0
+
+        for profile in profiles:
+            if profile.mnemonic == "call_helpers" and profile.operand in ASCII_HELPER_IDS:
+                helpers += 1
+                continue
+
+            flavour = _ascii_payload_kind(profile)
+            if flavour in {"chunk", "mixed"}:
+                ascii_words += 1
+                continue
+
+            if flavour == "filler":
+                filler += 1
+                continue
+
             return None
+
+        if ascii_words < 3:
+            return None
+
+        filler_budget = max(1, ascii_words // 3)
+        if filler > filler_budget:
+            return None
+
         notes = (
-            f"ascii_run length={len(profiles)}",
+            f"ascii_words={ascii_words}",
+            f"filler={filler}",
+            f"helpers={helpers}",
             f"stackΔ={stack.change:+d}",
         )
         return SignatureMatch(self.name, self.category, self.base_confidence, notes)
@@ -167,8 +220,11 @@ class HeaderAsciiCtrlSeqSignature(SignatureRule):
 
         ascii_prefix = 0
         for profile in profiles:
-            if profile.kind is InstructionKind.ASCII_CHUNK:
+            flavour = _ascii_payload_kind(profile)
+            if flavour in {"chunk", "mixed"}:
                 ascii_prefix += 1
+                continue
+            if profile.mnemonic == "call_helpers" and profile.operand in ASCII_HELPER_IDS:
                 continue
             break
 
@@ -314,14 +370,32 @@ class ReduceAsciiPrologSignature(SignatureRule):
         if second.label != "00:4F":
             return None
 
-        ascii_after = sum(
-            1 for profile in profiles[2:] if profile.kind is InstructionKind.ASCII_CHUNK
-        )
-        if ascii_after == 0:
+        ascii_after = 0
+        filler = 0
+        helpers = 0
+        for profile in profiles[2:]:
+            if profile.mnemonic == "call_helpers" and profile.operand in ASCII_HELPER_IDS:
+                helpers += 1
+                continue
+
+            flavour = _ascii_payload_kind(profile)
+            if flavour in {"chunk", "mixed"}:
+                ascii_after += 1
+                continue
+
+            if flavour == "filler":
+                filler += 1
+                continue
+
+            break
+
+        if ascii_after == 0 or filler > 2:
             return None
 
         notes = (
             f"ascii_after={ascii_after}",
+            f"filler={filler}",
+            f"helpers={helpers}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = min(0.88, self.base_confidence + 0.05 * min(ascii_after, 3))
