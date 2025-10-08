@@ -15,7 +15,11 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    is_ascii_mixed_word,
+)
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -415,6 +419,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_mixed(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
@@ -622,6 +627,41 @@ class IRNormalizer:
             return
         for name in names:
             self._promote_ssa_kind(name, kind)
+
+    def _pass_ascii_mixed(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not is_ascii_mixed_word(item.profile.word):
+                index += 1
+                continue
+
+            has_literal_neighbor = False
+            if index > 0 and isinstance(items[index - 1], IRLiteralChunk):
+                has_literal_neighbor = True
+            if (
+                index + 1 < len(items)
+                and isinstance(items[index + 1], IRLiteralChunk)
+            ):
+                has_literal_neighbor = True
+
+            if not has_literal_neighbor:
+                index += 1
+                continue
+
+            data = item.profile.word.raw.to_bytes(4, "big")
+            annotations = list(item.annotations)
+            if "ascii_mixed" not in annotations:
+                annotations.append("ascii_mixed")
+            chunk = self._make_literal_chunk(data, "ascii_mixed", annotations)
+            self._transfer_ssa(item, chunk)
+            items.replace_slice(index, index + 1, [chunk])
+            metrics.literal_chunks += 1
+            index += 1
 
     def _literal_ssa_kind(self, node: IRLiteral) -> Optional[SSAValueKind]:
         value = node.value & 0xFFFF

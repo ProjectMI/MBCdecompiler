@@ -471,6 +471,25 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     return printable > 0
 
 
+def is_ascii_mixed_word(word: InstructionWord) -> bool:
+    """Return ``True`` when ``word`` mostly consists of printable ASCII bytes."""
+
+    data = word.raw.to_bytes(4, "big")
+    printable = 0
+
+    for byte in data:
+        if 0x20 <= byte <= 0x7E:
+            printable += 1
+            continue
+        if byte <= 0x0F:
+            continue
+        if byte < 0x20:
+            return False
+        return False
+
+    return printable >= 3
+
+
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
     """Return additional stack delta adjustments derived from heuristics."""
 
