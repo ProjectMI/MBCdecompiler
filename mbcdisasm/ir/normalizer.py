@@ -3477,6 +3477,7 @@ class IRNormalizer:
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
+                self._attach_indirect_setup(items, index)
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
@@ -3506,6 +3507,7 @@ class IRNormalizer:
                     pointer=pointer_alias,
                 )
                 items.replace_slice(index, index + 1, [node])
+                self._attach_indirect_setup(items, index)
                 metrics.stores += 1
                 continue
 
@@ -3709,6 +3711,87 @@ class IRNormalizer:
             self._ssa_aliases[base_name] = symbol
 
         return memref, index
+
+    def _attach_indirect_setup(self, items: _ItemList, index: int) -> None:
+        """Fold auxiliary setup instructions surrounding an indirect access."""
+
+        def transform(scan: int) -> Optional[int]:
+            if scan < 0 or scan >= len(items):
+                return None
+
+            candidate = items[scan]
+            if not isinstance(candidate, RawInstruction):
+                return None
+
+            if not self._is_indirect_setup(candidate):
+                return None
+
+            replacement = self._indirect_setup_node(items, scan, candidate)
+            if replacement is None:
+                return None
+
+            self._transfer_ssa(candidate, replacement)
+            items.replace_slice(scan, scan + 1, [replacement])
+            return scan
+
+        for direction in (-1, 1):
+            scan = index + direction
+            skipped_literals = 0
+            while 0 <= scan < len(items):
+                current = items[scan]
+                if isinstance(current, IRLiteral):
+                    skipped_literals += 1
+                    if skipped_literals > 2:
+                        break
+                    scan += direction
+                    continue
+                if isinstance(current, IRLiteralChunk):
+                    skipped_literals += 1
+                    if skipped_literals > 2:
+                        break
+                    scan += direction
+                    continue
+                transformed = transform(scan)
+                if transformed is not None:
+                    scan = transformed + direction
+                    skipped_literals = 0
+                    continue
+                break
+
+    def _is_indirect_setup(self, instruction: RawInstruction) -> bool:
+        if instruction.event.delta != 0:
+            return False
+        if instruction.event.popped_types or instruction.event.pushed_types:
+            return False
+        mnemonic = instruction.mnemonic
+        if mnemonic in {"op_10_05"}:
+            return True
+        if mnemonic in {"op_C8_06", "op_D4_06", "op_01_DC", "op_31_BC"}:
+            return self._memref_component(instruction) is not None
+        return False
+
+    def _indirect_setup_node(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> Optional[IRNode]:
+        mnemonic = instruction.mnemonic
+        if mnemonic == "op_10_05":
+            return IRConditionMask(source=mnemonic, mask=instruction.operand)
+
+        register = self._memref_component(instruction)
+        if register is None:
+            return None
+
+        value_repr: Optional[str] = None
+        literal_value: Optional[int] = None
+
+        previous = items[index - 1] if index > 0 else None
+        if isinstance(previous, IRLiteral):
+            value_repr = previous.describe()
+            literal_value = previous.value & 0xFFFF
+        elif isinstance(previous, IRLiteralChunk):
+            value_repr = previous.describe()
+
+        return IRPageRegister(register=register, value=value_repr, literal=literal_value)
 
     @staticmethod
     def _is_memref_bridge(node: Union[RawInstruction, IRNode]) -> bool:

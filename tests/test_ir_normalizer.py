@@ -1291,3 +1291,61 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
     load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B10
+
+
+def test_indirect_access_consumes_register_setup(tmp_path: Path) -> None:
+    annotations = {
+        "00:00": OpcodeInfo(mnemonic="push_literal", category="literal", stack_push=1),
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_load", stack_push=1),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x4B, 0x0C, 0x0000),
+        build_word(4, 0x69, 0x01, 0xC806),
+        build_word(8, 0x00, 0x00, 0x6901),
+        build_word(12, 0xD4, 0x06, 0x0000),
+        build_word(16, 0xC8, 0x06, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_indirect", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    registers = [node for node in block.nodes if isinstance(node, IRPageRegister)]
+    assert any(node.register == 0xD406 and node.literal == 0x6901 for node in registers)
+    assert any(node.register == 0xC806 for node in registers)
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_D4_06", "op_C8_06"}
+        for node in block.nodes
+    )
+
+
+def test_indirect_access_converts_condition_mask(tmp_path: Path) -> None:
+    annotations = {
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_load", stack_push=1),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x69, 0x01, 0xC806),
+        build_word(4, 0x10, 0x05, 0x2910),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_mask", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    mask = next(node for node in block.nodes if isinstance(node, IRConditionMask))
+    assert mask.source == "op_10_05"
+    assert mask.mask == 0x2910
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_10_05" for node in block.nodes
+    )
