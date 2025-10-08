@@ -14,6 +14,7 @@ from typing import Dict
 RET_MASK = 0x2910
 IO_SLOT = 0x6910
 IO_PORT_NAME = "io.port_6910"
+IO_DIRECT_PORT_NAME = "io.port_3D30"
 PAGE_REGISTER = 0x6C01
 FANOUT_FLAGS_A = 0x2C02
 FANOUT_FLAGS_B = 0x2C03
@@ -53,6 +54,7 @@ __all__ = [
     "RET_MASK",
     "IO_SLOT",
     "IO_PORT_NAME",
+    "IO_DIRECT_PORT_NAME",
     "PAGE_REGISTER",
     "FANOUT_FLAGS_A",
     "FANOUT_FLAGS_B",

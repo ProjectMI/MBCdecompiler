@@ -23,6 +23,7 @@ from mbcdisasm.ir.model import (
     IRIndirectStore,
     IRRaw,
     IRConditionMask,
+    IRIORead,
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
@@ -77,6 +78,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "tailcall_dispatch",
             "category": "call_dispatch",
             "stack_delta": -1,
+        },
+        "op_3D_30": {
+            "opcodes": ["3D:30"],
+            "name": "op_3D_30",
+            "category": "io",
         },
         "return_values": {
             "opcodes": ["0x30:0x00"],
@@ -700,6 +706,74 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     masks = sorted(write.mask for write in writes)
     assert masks == [0x1234, 0x2910]
     assert all(write.port == "io.port_6910" for write in writes)
+
+
+def test_normalizer_handles_direct_port_io(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x3456),
+        build_word(4, 0x3D, 0x30, 0x3D30),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    writes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRIOWrite)
+    ]
+
+    assert len(writes) == 1
+    write = writes[0]
+    assert write.mask == 0x3456
+    assert write.port == "io.port_3D30"
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3D_30"
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    )
+
+
+def test_normalizer_handles_extended_io_reads(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3D, 0x30, IO_SLOT),
+        build_word(4, 0x11, 0x28, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    reads = [
+        node
+        for block in program.segments[0].blocks
+        for node in block.nodes
+        if isinstance(node, IRIORead)
+    ]
+
+    assert len(reads) == 1
+    read = reads[0]
+    assert read.port == "io.port_6910"
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3D_30"
+        for block in program.segments[0].blocks
+        for node in block.nodes
+    )
 
 
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
