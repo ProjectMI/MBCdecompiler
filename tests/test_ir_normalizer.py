@@ -29,9 +29,10 @@ from mbcdisasm.ir.model import (
     IRSwitchDispatch,
     IRTablePatch,
     NormalizerMetrics,
+    IRIORead,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
-from mbcdisasm.constants import IO_SLOT, RET_MASK, CALL_SHUFFLE_STANDARD
+from mbcdisasm.constants import IO_SLOT, IO_PORT_NAME, RET_MASK, CALL_SHUFFLE_STANDARD
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
@@ -494,6 +495,62 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
 
     ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
     assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
+
+
+def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x2C03),
+        build_word(4, 0x10, 0x64, 0x0800),
+        build_word(8, 0x00, 0x00, 0x1000),
+        build_ascii_word(12, "mask"),
+        build_word(16, 0x74, 0x08, 0x0000),
+        build_word(20, 0x39, 0x20, 0x0000),
+        build_word(24, 0x00, 0x00, 0x2810),
+        build_word(28, 0xC0, 0x00, 0x2E2F),
+        build_word(32, 0x3D, 0x30, IO_SLOT),
+        build_word(36, 0x30, 0x00, 0x0000),
+        build_word(40, 0x5C, 0x08, 0x0000),
+        build_word(44, 0x00, 0x00, 0x003F),
+        build_word(48, 0x3D, 0x30, IO_SLOT),
+        build_word(52, 0x5C, 0x08, 0x0000),
+        build_word(56, 0x30, 0x00, 0x0000),
+        build_word(60, 0x00, 0x00, 0x2669),
+        build_word(64, 0x10, 0xF4, 0x0600),
+        build_word(68, 0x30, 0x00, 0x0000),
+        build_word(72, 0x00, 0x00, 0x006C),
+        build_word(76, 0x11, 0x28, 0x0800),
+        build_word(80, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    nodes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    io_writes = [node for node in nodes if isinstance(node, IRIOWrite)]
+    io_reads = [node for node in nodes if isinstance(node, IRIORead)]
+
+    assert [node.port for node in io_writes] == [IO_PORT_NAME] * len(io_writes)
+    assert [node.port for node in io_reads] == [IO_PORT_NAME] * len(io_reads)
+
+    assert {node.mask for node in io_writes} == {0x2C03, 0x003F, 0x2669}
+    assert len(io_reads) == 1
+
+    raw_mnemonics = {
+        node.mnemonic for node in nodes if isinstance(node, IRRaw)
+    }
+    assert {"op_10_64", "op_10_F4", "op_3D_30", "op_11_28"}.isdisjoint(raw_mnemonics)
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
