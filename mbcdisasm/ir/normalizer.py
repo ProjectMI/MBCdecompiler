@@ -112,10 +112,19 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
-IO_READ_MNEMONICS = {"op_10_38"}
-IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
+IO_READ_MNEMONICS = {"op_10_38", "op_11_28"}
+IO_WRITE_MNEMONICS = {
+    "op_10_10",
+    "op_10_14",
+    "op_10_24",
+    "op_10_48",
+    "op_10_64",
+    "op_10_68",
+    "op_10_F4",
+}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
-IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00", "op_5C_08"}
+IO_HANDSHAKE_MNEMONICS = {"op_3D_30", "op_43_30"}
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
     IRCallCleanup,
@@ -1342,37 +1351,67 @@ class IRNormalizer:
             item = items[index]
             if not (
                 isinstance(item, RawInstruction)
-                and item.mnemonic == "op_3D_30"
+                and item.mnemonic in IO_HANDSHAKE_MNEMONICS
                 and item.operand == IO_SLOT
             ):
                 index += 1
                 continue
 
             candidate_index = self._find_io_candidate(items, index)
-            if candidate_index is None:
+            if candidate_index is not None:
+                candidate = items[candidate_index]
+                assert isinstance(candidate, RawInstruction)
+
+                node = self._build_io_node(items, candidate_index, candidate, allow_prefix=True)
+                if node is None:
+                    index += 1
+                    continue
+
+                self._transfer_ssa(candidate, node)
+                self._transfer_ssa(item, node)
+                start = min(index, candidate_index)
+                end = max(index, candidate_index) + 1
+                items.replace_slice(start, end, [node])
+                index = start + 1
+                continue
+
+            node = self._build_io_node(items, index, item)
+            if node is not None:
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            index += 1
+
+        direct_candidates = IO_READ_MNEMONICS | IO_WRITE_MNEMONICS
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (
+                isinstance(item, RawInstruction)
+                and item.mnemonic in direct_candidates
+            ):
                 index += 1
                 continue
 
-            candidate = items[candidate_index]
-            assert isinstance(candidate, RawInstruction)
+            if self._find_io_handshake(items, index) is not None:
+                index += 1
+                continue
 
-            node = self._build_io_node(items, candidate_index, candidate)
+            node = self._build_io_node(items, index, item)
             if node is None:
                 index += 1
                 continue
 
-            self._transfer_ssa(candidate, node)
             self._transfer_ssa(item, node)
-            start = min(index, candidate_index)
-            end = max(index, candidate_index) + 1
-            items.replace_slice(start, end, [node])
-            index = start + 1
+            items.replace_slice(index, index + 1, [node])
+            continue
 
     def _find_io_candidate(self, items: _ItemList, handshake_index: int) -> Optional[int]:
         for direction in (-1, 1):
             scan = handshake_index + direction
             steps = 0
-            while 0 <= scan < len(items) and steps < 6:
+            while 0 <= scan < len(items) and steps < 8:
                 node = items[scan]
                 if isinstance(node, RawInstruction):
                     if self._is_io_bridge_instruction(node):
@@ -1386,6 +1425,10 @@ class IRNormalizer:
                     scan += direction
                     steps += 1
                     continue
+                if isinstance(node, IRStringConstant):
+                    scan += direction
+                    steps += 1
+                    continue
                 if isinstance(node, IO_BRIDGE_NODE_TYPES):
                     scan += direction
                     steps += 1
@@ -1394,12 +1437,24 @@ class IRNormalizer:
         return None
 
     def _build_io_node(
-        self, items: _ItemList, index: int, instruction: RawInstruction
+        self,
+        items: _ItemList,
+        index: int,
+        instruction: RawInstruction,
+        *,
+        allow_prefix: bool = False,
     ) -> Optional[IRNode]:
         mnemonic = instruction.mnemonic
+        if mnemonic in IO_HANDSHAKE_MNEMONICS:
+            if instruction.operand != IO_SLOT:
+                return None
+            mask = self._io_mask_value(items, index)
+            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
         if mnemonic in IO_READ_MNEMONICS:
             return IRIORead(port=IO_PORT_NAME)
-        if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
+        if mnemonic in IO_WRITE_MNEMONICS or (
+            allow_prefix and mnemonic.startswith("op_10_")
+        ):
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
@@ -1415,7 +1470,8 @@ class IRNormalizer:
                 return node.value
             if isinstance(node, RawInstruction):
                 if self._is_io_bridge_instruction(node) or (
-                    node.mnemonic == "op_3D_30" and node.operand == IO_SLOT
+                    node.mnemonic in IO_HANDSHAKE_MNEMONICS
+                    and node.operand == IO_SLOT
                 ):
                     scan -= 1
                     steps += 1
@@ -1423,6 +1479,10 @@ class IRNormalizer:
                 if node.mnemonic.startswith("op_10_"):
                     break
             elif isinstance(node, IRLiteralChunk):
+                scan -= 1
+                steps += 1
+                continue
+            elif isinstance(node, IRStringConstant):
                 scan -= 1
                 steps += 1
                 continue
@@ -2183,7 +2243,10 @@ class IRNormalizer:
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
-                if candidate.mnemonic == "op_3D_30" and candidate.operand == IO_SLOT:
+                if (
+                    candidate.mnemonic in IO_HANDSHAKE_MNEMONICS
+                    and candidate.operand == IO_SLOT
+                ):
                     return scan
                 if candidate.mnemonic.startswith("op_10_"):
                     break
