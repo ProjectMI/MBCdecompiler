@@ -11,7 +11,9 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
+    IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
     IRIf,
@@ -32,7 +34,13 @@ from mbcdisasm.ir.model import (
     IRIORead,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
-from mbcdisasm.constants import IO_SLOT, IO_PORT_NAME, RET_MASK, CALL_SHUFFLE_STANDARD
+from mbcdisasm.constants import (
+    IO_SLOT,
+    IO_PORT_NAME,
+    PAGE_REGISTER,
+    RET_MASK,
+    CALL_SHUFFLE_STANDARD,
+)
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
@@ -1040,6 +1048,64 @@ def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
     )
     assert any(
         isinstance(node, (IRCall, IRCallReturn, IRTailcallReturn)) for node in block.nodes
+    )
+
+
+def test_normalizer_recognises_page_register_write(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x54, 0x06, 0x0000),
+        build_word(4, 0x31, 0x30, PAGE_REGISTER),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    page = next(node for node in block.nodes if isinstance(node, IRPageRegister))
+    assert page.register == PAGE_REGISTER
+    assert page.value is None
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic in {"op_31_30", "op_54_06"}
+        for node in block.nodes
+    )
+
+
+def test_normalizer_recognises_literal_page_register_write(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x41A6),
+        build_word(4, 0x00, 0x00, 0x1045),
+        build_word(8, 0x49, 0xA6, 0x0000),
+        build_word(12, 0x31, 0x30, PAGE_REGISTER),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    page = next(node for node in block.nodes if isinstance(node, IRPageRegister))
+    assert page.register == PAGE_REGISTER
+    assert page.value == 0x1045
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic in {"op_31_30", "op_49_A6"}
+        for node in block.nodes
+    )
+    assert not any(
+        isinstance(node, IRLiteral) and node.value == 0x1045
+        for node in block.nodes
     )
 
 

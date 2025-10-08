@@ -160,6 +160,17 @@ IO_BRIDGE_NODE_TYPES = (
     IRTailcallFrame,
 )
 
+PAGE_REGISTER_LITERAL_HANDSHAKES = {"op_49_A6"}
+PAGE_REGISTER_HANDSHAKES = {
+    "op_18_53",
+    "op_38_06",
+    "op_54_06",
+    "op_74_05",
+    "op_B8_E4",
+    "op_E4_06",
+    "op_E4_07",
+}
+
 
 @dataclass(frozen=True)
 class RawInstruction:
@@ -670,14 +681,75 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if (
-                isinstance(item, RawInstruction)
-                and item.mnemonic == "op_6C_01"
-                and item.operand == PAGE_REGISTER
-            ):
-                node = IRPageRegister(register=item.operand)
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            mnemonic = item.mnemonic
+            operand = item.operand
+
+            if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:
+                node = IRPageRegister(register=operand)
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
+                continue
+
+            if mnemonic == "op_31_30" and operand == PAGE_REGISTER:
+                handshake_indexes: List[int] = []
+                literal_index: Optional[int] = None
+                literal_value: Optional[int] = None
+
+                scan = index - 1
+                while scan >= 0:
+                    candidate = items[scan]
+                    if isinstance(candidate, IRCallCleanup):
+                        scan -= 1
+                        continue
+                    if isinstance(candidate, IRLiteralChunk):
+                        scan -= 1
+                        continue
+                    if isinstance(candidate, RawInstruction):
+                        if candidate.mnemonic in PAGE_REGISTER_HANDSHAKES:
+                            handshake_indexes.append(scan)
+                            scan -= 1
+                            continue
+                        if candidate.mnemonic in PAGE_REGISTER_LITERAL_HANDSHAKES:
+                            handshake_indexes.append(scan)
+                            lit_scan = scan - 1
+                            while lit_scan >= 0:
+                                literal_node = items[lit_scan]
+                                if isinstance(literal_node, IRLiteral):
+                                    literal_index = lit_scan
+                                    literal_value = literal_node.value
+                                    break
+                                if isinstance(literal_node, IRCallCleanup):
+                                    lit_scan -= 1
+                                    continue
+                                if isinstance(literal_node, IRLiteralChunk):
+                                    lit_scan -= 1
+                                    continue
+                                break
+                            scan -= 1
+                            continue
+                    break
+
+                removal_indexes = sorted({index, *handshake_indexes})
+                if literal_index is not None:
+                    removal_indexes.append(literal_index)
+                removal_indexes = sorted(set(removal_indexes))
+
+                if not removal_indexes:
+                    removal_indexes = [index]
+
+                insert_at = removal_indexes[0]
+                for position in sorted(removal_indexes, reverse=True):
+                    removed = items.pop(position)
+                    self._ssa_bindings.pop(id(removed), None)
+
+                node = IRPageRegister(register=operand, value=literal_value)
+                self._transfer_ssa(item, node)
+                items.insert(insert_at, node)
+                index = insert_at + 1
                 continue
             index += 1
 
@@ -3615,6 +3687,7 @@ class IRNormalizer:
         instruction: RawInstruction,
     ) -> Tuple[Optional[MemRef], int]:
         components: List[Tuple[int, int]] = []
+        page_override: Optional[int] = None
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -3623,6 +3696,11 @@ class IRNormalizer:
                 if value is None:
                     break
                 components.append((scan, value))
+                scan -= 1
+                continue
+            if isinstance(candidate, IRPageRegister):
+                if candidate.value is not None:
+                    page_override = candidate.value
                 scan -= 1
                 continue
             if self._is_memref_bridge(candidate):
@@ -3638,7 +3716,7 @@ class IRNormalizer:
         index -= len(removal_indexes)
 
         components.reverse()
-        bank = components[0][1] if components else None
+        bank = page_override if page_override is not None else (components[0][1] if components else None)
         base_value = components[1][1] if len(components) > 1 else None
         page = instruction.operand >> 8
         offset = instruction.operand & 0xFF

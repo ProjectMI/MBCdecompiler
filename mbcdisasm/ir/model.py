@@ -721,12 +721,12 @@ class IRPageRegister(IRNode):
     """Interaction with the VM page register latch."""
 
     register: int
-    value: Optional[str] = None
+    value: Optional[int] = None
 
     def describe(self) -> str:
         operand = _format_operand(self.register)
-        if self.value:
-            return f"page_register {operand}={self.value}"
+        if self.value is not None:
+            return f"page_register {operand}={_format_operand(self.value)}"
         return f"page_register[{operand}]"
 
 
