@@ -161,6 +161,17 @@ IO_BRIDGE_NODE_TYPES = (
 )
 
 
+INDIRECT_PAGE_REGISTER_MNEMONICS = {
+    "op_D4_06": 0x06D4,
+    "op_C8_06": 0x06C8,
+    "op_BC_06": 0x06BC,
+}
+
+INDIRECT_CONFIGURATION_BRIDGES = {"op_3D_30", "op_43_30"}
+
+INDIRECT_MASK_MNEMONICS = {"op_01_DC"}
+
+
 @dataclass(frozen=True)
 class RawInstruction:
     """Wrapper that couples a profile with stack tracking details."""
@@ -3477,6 +3488,7 @@ class IRNormalizer:
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
+                self._consume_indirect_configuration(items, index, node)
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
@@ -3506,10 +3518,13 @@ class IRNormalizer:
                     pointer=pointer_alias,
                 )
                 items.replace_slice(index, index + 1, [node])
+                self._consume_indirect_configuration(items, index, node)
                 metrics.stores += 1
                 continue
 
             index += 1
+
+        self._sweep_indirect_configuration(items)
 
     # ------------------------------------------------------------------
     # description helpers
@@ -3709,6 +3724,239 @@ class IRNormalizer:
             self._ssa_aliases[base_name] = symbol
 
         return memref, index
+
+    def _consume_indirect_configuration(
+        self,
+        items: _ItemList,
+        index: int,
+        node: Union[IRIndirectLoad, IRIndirectStore],
+    ) -> None:
+        scan = index + 1
+        pending_literal_index: Optional[int] = None
+        pending_literal: Optional[IRNode] = None
+        pending_value: Optional[str] = None
+        pending_literal_value: Optional[int] = None
+        pending_ssa: Optional[Tuple[str, ...]] = None
+        pending_kinds: Optional[Tuple[SSAValueKind, ...]] = None
+
+        while scan < len(items):
+            candidate = items[scan]
+
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                pending_literal_index = scan
+                pending_literal = candidate
+                pending_value = candidate.describe()
+                pending_literal_value = candidate.value & 0xFFFF if isinstance(candidate, IRLiteral) else None
+                stored = self._ssa_bindings.get(id(candidate))
+                if stored:
+                    pending_ssa = stored
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in stored)
+                else:
+                    pending_ssa = None
+                    pending_kinds = None
+                scan += 1
+                continue
+
+            if isinstance(candidate, IRPageRegister):
+                pending_value = candidate.value
+                pending_literal_value = candidate.literal
+                pending_literal_index = None
+                pending_literal = None
+                pending_ssa = self._ssa_bindings.get(id(candidate))
+                if pending_ssa:
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in pending_ssa)
+                else:
+                    pending_kinds = None
+                scan += 1
+                continue
+
+            if isinstance(candidate, IO_BRIDGE_NODE_TYPES):
+                scan += 1
+                continue
+
+            if isinstance(candidate, IRConditionMask):
+                scan += 1
+                continue
+
+            if isinstance(candidate, RawInstruction):
+                mnemonic = candidate.mnemonic
+
+                if mnemonic in INDIRECT_PAGE_REGISTER_MNEMONICS:
+                    register = INDIRECT_PAGE_REGISTER_MNEMONICS[mnemonic]
+                    value_repr = pending_value
+                    literal_value = pending_literal_value
+                    literal_names = pending_ssa
+                    literal_kinds = pending_kinds
+
+                    if pending_literal is not None and pending_literal_index is not None:
+                        removed = items.pop(pending_literal_index)
+                        self._ssa_bindings.pop(id(removed), None)
+                        if pending_literal_index < scan:
+                            scan -= 1
+                        pending_literal_index = None
+                        pending_literal = None
+                        pending_ssa = None
+                        pending_kinds = None
+
+                    page_node = IRPageRegister(
+                        register=register,
+                        value=value_repr,
+                        literal=literal_value,
+                    )
+
+                    if literal_names:
+                        self._record_ssa(page_node, literal_names, kinds=literal_kinds)
+                    else:
+                        names = self._ssa_bindings.get(id(candidate)) or candidate.ssa_values
+                        if names:
+                            kinds = tuple(
+                                self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+                                for name in names
+                            )
+                            self._record_ssa(page_node, names, kinds=kinds)
+                        else:
+                            self._record_ssa(page_node, tuple())
+
+                    self._ssa_bindings.pop(id(candidate), None)
+                    items.replace_slice(scan, scan + 1, [page_node])
+                    pending_value = value_repr
+                    pending_literal_value = literal_value
+                    pending_ssa = None
+                    pending_kinds = None
+                    scan += 1
+                    continue
+
+                if mnemonic in INDIRECT_MASK_MNEMONICS:
+                    mask_node = IRConditionMask(source=mnemonic, mask=candidate.operand)
+                    self._transfer_ssa(candidate, mask_node)
+                    items.replace_slice(scan, scan + 1, [mask_node])
+                    scan += 1
+                    continue
+
+                if mnemonic in INDIRECT_CONFIGURATION_BRIDGES:
+                    pending_literal_index = None
+                    pending_literal = None
+                    pending_ssa = None
+                    pending_kinds = None
+                    pending_value = f"lit(0x{candidate.operand:04X})"
+                    pending_literal_value = candidate.operand & 0xFFFF
+                    scan += 1
+                    continue
+
+            break
+
+    def _sweep_indirect_configuration(self, items: _ItemList) -> None:
+        index = 0
+        pending_literal_index: Optional[int] = None
+        pending_literal: Optional[IRNode] = None
+        pending_value: Optional[str] = None
+        pending_literal_value: Optional[int] = None
+        pending_ssa: Optional[Tuple[str, ...]] = None
+        pending_kinds: Optional[Tuple[SSAValueKind, ...]] = None
+
+        while index < len(items):
+            candidate = items[index]
+
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                pending_literal_index = index
+                pending_literal = candidate
+                pending_value = candidate.describe()
+                pending_literal_value = candidate.value & 0xFFFF if isinstance(candidate, IRLiteral) else None
+                stored = self._ssa_bindings.get(id(candidate))
+                if stored:
+                    pending_ssa = stored
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in stored)
+                else:
+                    pending_ssa = None
+                    pending_kinds = None
+                index += 1
+                continue
+
+            if isinstance(candidate, IRPageRegister):
+                pending_value = candidate.value
+                pending_literal_value = candidate.literal
+                pending_literal_index = None
+                pending_literal = None
+                pending_ssa = self._ssa_bindings.get(id(candidate))
+                if pending_ssa:
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in pending_ssa)
+                else:
+                    pending_kinds = None
+                index += 1
+                continue
+
+            if isinstance(candidate, RawInstruction):
+                mnemonic = candidate.mnemonic
+
+                if mnemonic in INDIRECT_PAGE_REGISTER_MNEMONICS:
+                    register = INDIRECT_PAGE_REGISTER_MNEMONICS[mnemonic]
+                    value_repr = pending_value
+                    literal_value = pending_literal_value
+                    literal_names = pending_ssa
+                    literal_kinds = pending_kinds
+
+                    if pending_literal is not None and pending_literal_index is not None:
+                        removed = items.pop(pending_literal_index)
+                        self._ssa_bindings.pop(id(removed), None)
+                        if pending_literal_index < index:
+                            index -= 1
+                        pending_literal_index = None
+                        pending_literal = None
+                        pending_ssa = None
+                        pending_kinds = None
+
+                    page_node = IRPageRegister(
+                        register=register,
+                        value=value_repr,
+                        literal=literal_value,
+                    )
+
+                    if literal_names:
+                        self._record_ssa(page_node, literal_names, kinds=literal_kinds)
+                    else:
+                        names = self._ssa_bindings.get(id(candidate)) or candidate.ssa_values
+                        if names:
+                            kinds = tuple(
+                                self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+                                for name in names
+                            )
+                            self._record_ssa(page_node, names, kinds=kinds)
+                        else:
+                            self._record_ssa(page_node, tuple())
+
+                    self._ssa_bindings.pop(id(candidate), None)
+                    items.replace_slice(index, index + 1, [page_node])
+                    pending_value = value_repr
+                    pending_literal_value = literal_value
+                    pending_ssa = None
+                    pending_kinds = None
+                    index += 1
+                    continue
+
+                if mnemonic in INDIRECT_MASK_MNEMONICS:
+                    mask_node = IRConditionMask(source=mnemonic, mask=candidate.operand)
+                    self._transfer_ssa(candidate, mask_node)
+                    items.replace_slice(index, index + 1, [mask_node])
+                    index += 1
+                    continue
+
+                if mnemonic in INDIRECT_CONFIGURATION_BRIDGES:
+                    pending_literal_index = None
+                    pending_literal = None
+                    pending_ssa = None
+                    pending_kinds = None
+                    pending_value = f"lit(0x{candidate.operand:04X})"
+                    pending_literal_value = candidate.operand & 0xFFFF
+                    index += 1
+                    continue
+
+            pending_literal_index = None
+            pending_literal = None
+            pending_value = None
+            pending_literal_value = None
+            pending_ssa = None
+            pending_kinds = None
+            index += 1
 
     @staticmethod
     def _is_memref_bridge(node: Union[RawInstruction, IRNode]) -> bool:
