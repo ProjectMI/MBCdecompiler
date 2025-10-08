@@ -256,9 +256,12 @@ class IRNormalizer:
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
-    _OPCODE_TABLE_MIN_RUN = 8
+    _OPCODE_TABLE_MIN_RUN = 4
     _OPCODE_TABLE_MAX_AFFIX = 2
     _OPCODE_TABLE_MODES = {
+        0x00,
+        0x01,
+        0x02,
         0x2A,
         0x2B,
         0x32,
@@ -271,6 +274,8 @@ class IRNormalizer:
         0x50,
         0x51,
     }
+    _OPCODE_TABLE_BODY_OPERANDS = {0x0000, 0x0008}
+    _OPCODE_TABLE_AFFIX_MNEMONICS = {"op_08_00"}
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -1766,7 +1771,7 @@ class IRNormalizer:
             return False
         if item.profile.mode != mode:
             return False
-        if item.operand != 0:
+        if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
             return False
         if self._is_annotation_only(item):
             return False
@@ -1778,7 +1783,10 @@ class IRNormalizer:
         if not isinstance(item, RawInstruction):
             return False
         if item.profile.mode != mode:
-            return False
+            if item.mnemonic not in self._OPCODE_TABLE_AFFIX_MNEMONICS:
+                return False
+            if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
+                return False
         if self._is_annotation_only(item):
             return False
         return self._has_trivial_stack_effect(item)
