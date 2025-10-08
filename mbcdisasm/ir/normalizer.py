@@ -119,10 +119,56 @@ CALL_CLEANUP_MNEMONICS = {
     "stack_shuffle",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
-CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
+CALL_PREDICATE_SKIP_MNEMONICS = {
+    "op_29_10",
+    "op_70_29",
+    "op_0B_29",
+    "op_06_66",
+    "op_64_20",
+    "op_65_30",
+    "op_3D_30",
+    "op_3D_4A",
+    "op_4A_3B",
+    "op_4B_05",
+    "op_21_4B",
+    "op_E8_4B",
+}
 
-TAILCALL_HELPERS = {0x00F0}
-TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
+TAILCALL_HELPERS = {0x00F0, 0x00E1}
+TAILCALL_POSTLUDE = {
+    "op_70_29",
+    "op_0B_29",
+    "op_06_66",
+    "op_64_20",
+    "op_65_30",
+    "op_4A_3B",
+    "op_4B_05",
+    "op_21_4B",
+    "op_3D_30",
+    "op_3D_4A",
+    "op_E8_4B",
+}
+
+DISPATCH_GLUE_MNEMONICS = {
+    "op_64_20",
+    "op_64_29",
+    "op_64_04",
+    "op_65_30",
+    "op_79_30",
+    "op_CA_05",
+    "op_EC_01",
+    "op_B0_01",
+    "op_54_0A",
+    "op_28_10",
+    "op_08_00",
+    "op_20_1C",
+    "op_AA_00",
+    "op_3D_30",
+    "op_3D_4A",
+    "op_E8_4B",
+    "op_4B_05",
+    "op_21_4B",
+}
 
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
@@ -1818,7 +1864,20 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            operations: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            prefix: List[Tuple[str, int]] = []
+            start = index
+            probe = index - 1
+            while probe >= 0:
+                candidate = items[probe]
+                if isinstance(candidate, RawInstruction) and candidate.mnemonic in DISPATCH_GLUE_MNEMONICS:
+                    prefix.append((candidate.mnemonic, candidate.operand))
+                    start = probe
+                    probe -= 1
+                    continue
+                break
+            prefix.reverse()
+
+            operations: List[Tuple[str, int]] = prefix + [(item.mnemonic, item.operand)]
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
@@ -1830,14 +1889,18 @@ class IRNormalizer:
                         operations.append((candidate.mnemonic, candidate.operand))
                         scan += 1
                         continue
-                    if candidate.mnemonic in {"fanout", "stack_teardown_4", "stack_teardown_5"}:
+                    if candidate.mnemonic in {
+                        "fanout",
+                        "stack_teardown_4",
+                        "stack_teardown_5",
+                    } or candidate.mnemonic in DISPATCH_GLUE_MNEMONICS:
                         operations.append((candidate.mnemonic, candidate.operand))
                         scan += 1
                         continue
                 break
 
-            items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
-            index += 1
+            items.replace_slice(start, scan, [IRTablePatch(operations=tuple(operations))])
+            index = start + 1
 
     def _pass_table_dispatch(self, items: _ItemList) -> None:
         index = 0
@@ -1892,6 +1955,9 @@ class IRNormalizer:
                 continue
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
+                continue
+            if mnemonic in DISPATCH_GLUE_MNEMONICS:
+                continue
         return cases, default_target
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
