@@ -544,7 +544,7 @@ def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
     assert [node.port for node in io_writes] == [IO_PORT_NAME] * len(io_writes)
     assert [node.port for node in io_reads] == [IO_PORT_NAME] * len(io_reads)
 
-    assert {node.mask for node in io_writes} == {0x2C03, 0x003F, 0x2669}
+    assert {node.mask for node in io_writes} == {0x2810, 0x003F, 0x2669}
     assert len(io_reads) == 1
 
     raw_mnemonics = {
@@ -882,6 +882,62 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
     )
 
+
+def test_normalizer_groups_bank_call_helpers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    cleanup_words = [
+        build_word(0, 0x28, 0x00, 0x0042),  # call_dispatch
+        build_word(4, 0x10, 0x0E, 0x2910),  # op_10_0E cleanup helper
+        build_word(8, 0x14, 0x07, 0x0000),  # op_14_07 cleanup helper
+        build_word(12, 0x0C, 0x00, 0x0000),  # op_0C_00 cleanup helper
+        build_word(16, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    preparation_words = [
+        build_word(0, 0x5C, 0x08, 0x0000),  # op_5C_08 preparation helper
+        build_word(4, 0x74, 0x08, 0x0000),  # op_74_08 preparation helper
+        build_word(8, 0x28, 0x10, 0xC000),  # op_28_10 preparation helper
+        build_word(12, 0x28, 0x00, 0x0050),  # call_dispatch
+        build_word(16, 0x30, 0x00, 0x0001),  # return_values
+    ]
+
+    cleanup_data = encode_instructions(cleanup_words)
+    prep_data = encode_instructions(preparation_words)
+
+    segments = [
+        Segment(SegmentDescriptor(0, 0, len(cleanup_data)), cleanup_data),
+        Segment(
+            SegmentDescriptor(1, len(cleanup_data), len(cleanup_data) + len(prep_data)),
+            prep_data,
+        ),
+    ]
+
+    container = MbcContainer(Path("dummy"), segments)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    cleanup_block = program.segments[0].blocks[0]
+    call_return = next(node for node in cleanup_block.nodes if isinstance(node, IRCallReturn))
+    cleanup_helpers = {step.mnemonic for step in call_return.cleanup}
+    assert {"op_10_0E", "op_14_07", "op_0C_00"}.issubset(cleanup_helpers)
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_10_0E", "op_14_07", "op_0C_00"}
+        for node in cleanup_block.nodes
+    )
+
+    prep_block = program.segments[1].blocks[0]
+    call_return = next(node for node in prep_block.nodes if isinstance(node, IRCallReturn))
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_5C_08", "op_74_08", "op_28_10"}
+        for node in prep_block.nodes
+    )
+    assert not any(
+        step.mnemonic in {"op_5C_08", "op_74_08", "op_28_10"}
+        for step in call_return.cleanup
+    )
 
 def test_normalizer_lifts_branch_predicate_from_call(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)

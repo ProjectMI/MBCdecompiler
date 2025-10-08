@@ -76,7 +76,12 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
-CALL_PREPARATION_MNEMONICS = {"op_3C_02"}
+CALL_PREPARATION_MNEMONICS = {
+    "op_3C_02",
+    "op_5C_08",
+    "op_74_08",
+    "op_28_10",
+}
 CALL_CLEANUP_MNEMONICS = {
     "call_helpers",
     "op_32_29",
@@ -93,6 +98,18 @@ CALL_CLEANUP_MNEMONICS = {
     "op_C4_06",
     "op_D0_06",
     "op_01_2E",
+    "op_01_2C",
+    "op_01_6C",
+    "op_02_2A",
+    "op_0A_F1",
+    "op_10_0E",
+    "op_10_12",
+    "op_10_5C",
+    "op_10_64",
+    "op_14_07",
+    "op_0C_00",
+    "op_58_08",
+    "op_60_08",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
