@@ -76,23 +76,47 @@ RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
-CALL_PREPARATION_MNEMONICS = {"op_3C_02"}
+CALL_PREPARATION_MNEMONICS = {
+    "op_01_2C",
+    "op_02_2A",
+    "op_02_F1",
+    "op_09_29",
+    "op_0A_F1",
+    "op_0C_2C",
+    "op_28_10",
+    "op_3C_02",
+    "op_3D_30",
+    "op_4D_30",
+    "op_5C_08",
+    "op_60_04",
+    "op_60_08",
+    "op_74_08",
+    "op_AC_01",
+}
 CALL_CLEANUP_MNEMONICS = {
     "call_helpers",
+    "fanout",
+    "op_01_2C",
+    "op_01_2E",
+    "op_01_6C",
+    "op_05_00",
+    "op_10_0E",
+    "op_10_12",
+    "op_10_5C",
+    "op_10_E8",
+    "op_14_07",
+    "op_0C_00",
     "op_32_29",
     "op_52_05",
-    "op_05_00",
-    "stack_shuffle",
-    "fanout",
-    "op_10_E8",
-    "op_F0_4B",
-    "op_6C_01",
+    "op_58_08",
     "op_5E_29",
-    "op_D0_04",
-    "op_D8_04",
+    "op_6C_01",
     "op_C4_06",
+    "op_D0_04",
     "op_D0_06",
-    "op_01_2E",
+    "op_D8_04",
+    "op_F0_4B",
+    "stack_shuffle",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
 CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
@@ -3081,6 +3105,10 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         if mnemonic in CALL_CLEANUP_MNEMONICS:
             return True
+        if mnemonic.startswith("op_10_") and (
+            mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
+        ):
+            return False
         return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
 
     @staticmethod
