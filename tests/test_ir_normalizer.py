@@ -36,7 +36,7 @@ from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
 from mbcdisasm.analyzer.instruction_profile import InstructionProfile
-from mbcdisasm.analyzer.stack import StackTracker
+from mbcdisasm.analyzer.stack import StackEvent, StackTracker
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -550,6 +550,110 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert constant.data == b"A\x00B\x00\x00C\x00D"
     assert constant.segments == (constant.data,)
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_merges_ascii_mixed_chunks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        InstructionWord(0, int.from_bytes(b"text", "big")),
+        InstructionWord(4, int.from_bytes(b"\x01abc", "big")),
+        InstructionWord(8, int.from_bytes(b"tail", "big")),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    pool = {const.name: const for const in program.string_pool}
+    assert header.chunks and len(header.chunks) == 1
+    symbol = header.chunks[0]
+    assert symbol in pool
+    assert pool[symbol].data == b"text\x01abctail"
+
+
+def test_ascii_mixed_pass_converts_adjacent_raw(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    def build_raw(word_bytes: bytes) -> RawInstruction:
+        word = InstructionWord(0, int.from_bytes(word_bytes, "big"))
+        profile = InstructionProfile.from_word(word, knowledge)
+        event = StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=profile.kind,
+        )
+        return RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+
+    left_chunk = normalizer._literal_from_instruction(build_raw(b"text"))
+    assert isinstance(left_chunk, IRLiteralChunk)
+    right_chunk = normalizer._literal_from_instruction(build_raw(b"tail"))
+    assert isinstance(right_chunk, IRLiteralChunk)
+
+    mixed_instruction = build_raw(b"\x01abc")
+
+    items = _ItemList([left_chunk, mixed_instruction, right_chunk])
+    metrics = NormalizerMetrics()
+    normalizer._pass_ascii_mixed(items, metrics)
+
+    assert isinstance(items[1], IRLiteralChunk)
+    assert items[1].data == b"\x01abc"
+    assert "ascii_mixed" in items[1].annotations
+    assert metrics.literal_chunks == 1
+
+
+def test_literal_chunk_canonicalises_null_padding(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    leading = normalizer._make_literal_chunk(
+        b"\x00foo", "ascii_inline", tuple(), span=(0, 4)
+    )
+    trailing = normalizer._make_literal_chunk(
+        b"foo\x00", "ascii_inline", tuple(), span=(4, 8)
+    )
+
+    assert leading.symbol == trailing.symbol
+    assert "leading_null" in leading.annotations
+    assert "trailing_null" in trailing.annotations
+    assert len(normalizer._string_pool_order) == 1
+
+
+def test_ascii_stitch_merges_ascii_like_literals(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    left = normalizer._make_literal_chunk(b"pict", "ascii_inline", tuple(), span=(0, 4))
+    gap = normalizer._make_literal_chunk(
+        b"\x00\x00\x00\x00", "ascii_inline", tuple(), span=(4, 8)
+    )
+    right = normalizer._make_literal_chunk(b"tail", "ascii_inline", tuple(), span=(8, 12))
+
+    items = _ItemList([left, gap, right])
+    normalizer._pass_ascii_stitch(items)
+
+    assert len(items) == 1
+    merged = items[0]
+    assert isinstance(merged, IRLiteralChunk)
+    assert merged.data == b"pict\x00\x00\x00\x00tail"
+    assert merged.source == "ascii_stitch"
 
 
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:

@@ -24,7 +24,11 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
 
 from ..constants import RET_MASK
-from .instruction_profile import InstructionKind, InstructionProfile
+from .instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    is_ascii_mixed_word,
+)
 from .stack import StackSummary
 
 
@@ -142,10 +146,34 @@ class AsciiRunSignature(SignatureRule):
     ) -> Optional[SignatureMatch]:
         if len(profiles) < 3:
             return None
-        if not all(profile.kind is InstructionKind.ASCII_CHUNK for profile in profiles):
+
+        ascii_like = 0
+        silent_profiles: list[InstructionProfile] = []
+
+        for profile in profiles:
+            if profile.kind is InstructionKind.ASCII_CHUNK:
+                ascii_like += 1
+                continue
+            if is_ascii_mixed_word(profile.word):
+                ascii_like += 1
+                continue
+
+            silent_profiles.append(profile)
+
+        if ascii_like < 3:
             return None
+
+        silent = len(silent_profiles)
+        if silent:
+            allowed = max(1, len(profiles) // 4)
+            if silent > allowed:
+                return None
+            if any(candidate.stack_hint.nominal != 0 for candidate in silent_profiles):
+                return None
+
         notes = (
-            f"ascii_run length={len(profiles)}",
+            f"ascii_like={ascii_like}",
+            f"silent={silent}",
             f"stackΔ={stack.change:+d}",
         )
         return SignatureMatch(self.name, self.category, self.base_confidence, notes)
@@ -314,14 +342,25 @@ class ReduceAsciiPrologSignature(SignatureRule):
         if second.label != "00:4F":
             return None
 
-        ascii_after = sum(
-            1 for profile in profiles[2:] if profile.kind is InstructionKind.ASCII_CHUNK
-        )
+        ascii_after = 0
+        silent = 0
+        for profile in profiles[2:]:
+            if profile.kind is InstructionKind.ASCII_CHUNK or is_ascii_mixed_word(profile.word):
+                ascii_after += 1
+                continue
+            silent += 1
+
         if ascii_after == 0:
             return None
 
+        if silent:
+            allowed = 1 if len(profiles) < 8 else 2
+            if silent > allowed:
+                return None
+
         notes = (
             f"ascii_after={ascii_after}",
+            f"silent={silent}",
             f"stackΔ={stack.change:+d}",
         )
         confidence = min(0.88, self.base_confidence + 0.05 * min(ascii_after, 3))

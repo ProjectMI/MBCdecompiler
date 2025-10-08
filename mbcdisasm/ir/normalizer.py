@@ -15,7 +15,11 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    is_ascii_mixed_word,
+)
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -252,6 +256,8 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._literal_spans: Dict[int, Tuple[int, int]] = {}
+        self._literal_payloads: Dict[int, bytes] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -411,12 +417,16 @@ class IRNormalizer:
         self._ssa_types.clear()
         self._ssa_aliases.clear()
         self._ssa_counters.clear()
+        self._literal_spans.clear()
+        self._literal_payloads.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_mixed(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
+        self._pass_ascii_stitch(items)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -607,6 +617,15 @@ class IRNormalizer:
             elif isinstance(literal, IRLiteralChunk):
                 metrics.literal_chunks += 1
 
+            payload = item.profile.word.raw.to_bytes(4, "big")
+            self._literal_payloads[id(literal)] = payload
+
+            if isinstance(literal, IRLiteral):
+                self._literal_spans[id(literal)] = (
+                    item.offset,
+                    item.offset + 4,
+                )
+
             self._transfer_ssa(item, literal)
             if isinstance(literal, IRLiteral):
                 self._annotate_literal_ssa(literal)
@@ -622,6 +641,46 @@ class IRNormalizer:
             return
         for name in names:
             self._promote_ssa_kind(name, kind)
+
+    def _pass_ascii_mixed(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not is_ascii_mixed_word(item.profile.word):
+                index += 1
+                continue
+
+            has_literal_neighbor = False
+            if index > 0 and isinstance(items[index - 1], IRLiteralChunk):
+                has_literal_neighbor = True
+            if (
+                index + 1 < len(items)
+                and isinstance(items[index + 1], IRLiteralChunk)
+            ):
+                has_literal_neighbor = True
+
+            if not has_literal_neighbor:
+                index += 1
+                continue
+
+            data = item.profile.word.raw.to_bytes(4, "big")
+            annotations = list(item.annotations)
+            if "ascii_mixed" not in annotations:
+                annotations.append("ascii_mixed")
+            chunk = self._make_literal_chunk(
+                data,
+                "ascii_mixed",
+                annotations,
+                span=(item.offset, item.offset + 4),
+            )
+            self._transfer_ssa(item, chunk)
+            items.replace_slice(index, index + 1, [chunk])
+            metrics.literal_chunks += 1
+            index += 1
 
     def _literal_ssa_kind(self, node: IRLiteral) -> Optional[SSAValueKind]:
         value = node.value & 0xFFFF
@@ -697,15 +756,79 @@ class IRNormalizer:
         return constant
 
     def _make_literal_chunk(
-        self, data: bytes, source: str, annotations: Sequence[str]
+        self,
+        data: bytes,
+        source: str,
+        annotations: Sequence[str],
+        span: Optional[Tuple[int, int]] = None,
     ) -> IRLiteralChunk:
-        constant = self._intern_string_constant(data, source)
-        return IRLiteralChunk(
+        leading_nulls = 0
+        trailing_nulls = 0
+        length = len(data)
+        while leading_nulls < length and data[leading_nulls] == 0:
+            leading_nulls += 1
+        while (
+            trailing_nulls < length - leading_nulls
+            and data[length - 1 - trailing_nulls] == 0
+        ):
+            trailing_nulls += 1
+
+        if leading_nulls or trailing_nulls:
+            core_start = leading_nulls
+            core_end = length - trailing_nulls if trailing_nulls else length
+            core = data[core_start:core_end] if core_start < core_end else b""
+        else:
+            core = data
+
+        constant = self._intern_string_constant(core, source)
+        notes: List[str] = list(annotations)
+        seen = set(notes)
+        if leading_nulls:
+            tag = "leading_null" if leading_nulls == 1 else f"leading_null[{leading_nulls}]"
+            if tag not in seen:
+                notes.append(tag)
+                seen.add(tag)
+        if trailing_nulls:
+            tag = "trailing_null" if trailing_nulls == 1 else f"trailing_null[{trailing_nulls}]"
+            if tag not in seen:
+                notes.append(tag)
+                seen.add(tag)
+        chunk = IRLiteralChunk(
             data=data,
             source=source,
-            annotations=tuple(annotations),
+            annotations=tuple(notes),
             symbol=constant.name,
         )
+        if span is not None:
+            self._literal_spans[id(chunk)] = span
+        self._literal_payloads[id(chunk)] = data
+        return chunk
+
+    def _is_ascii_like_payload(
+        self, payload: bytes, annotations: Sequence[str], source: str
+    ) -> bool:
+        if not payload:
+            return False
+        ascii_hint = source.startswith("ascii") or any(
+            note.startswith("ascii") for note in annotations
+        )
+        printable = 0
+        silent = 0
+        for byte in payload:
+            if 0x20 <= byte <= 0x7E or byte in {0x09, 0x0A, 0x0D}:
+                printable += 1
+            elif byte <= 0x0F:
+                silent += 1
+            elif byte < 0x20:
+                return False
+            else:
+                return False
+
+        if printable >= 3:
+            return True
+        if ascii_hint and printable >= 2 and (printable + silent) >= len(payload):
+            return True
+        return False
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
@@ -726,7 +849,12 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
-            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+            return self._make_literal_chunk(
+                data,
+                profile.mnemonic,
+                instruction.annotations,
+                span=(instruction.offset, instruction.offset + 4),
+            )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -801,10 +929,21 @@ class IRNormalizer:
             start = index
             data_parts: List[bytes] = []
             annotations: List[str] = []
+            span_start: Optional[int] = None
+            span_end: Optional[int] = None
 
             while index < len(items):
                 candidate = items[index]
                 if isinstance(candidate, IRLiteralChunk):
+                    span = self._literal_spans.get(id(candidate))
+                    if span is None:
+                        break
+                    if span_start is None:
+                        span_start, span_end = span
+                    elif span[0] != span_end:
+                        break
+                    else:
+                        span_end = span[1]
                     data_parts.append(candidate.data)
                     annotations.extend(candidate.annotations)
                     index += 1
@@ -820,11 +959,97 @@ class IRNormalizer:
                 index = start + 1
                 continue
 
+            if span_start is None or span_end is None:
+                index = start + 1
+                continue
+
+            merged_nodes = [items[pos] for pos in range(start, index)]
+            for node in merged_nodes:
+                node_id = id(node)
+                self._literal_spans.pop(node_id, None)
+                self._literal_payloads.pop(node_id, None)
+
             chunk = self._make_literal_chunk(
-                b"".join(data_parts), "ascii_run", annotations
+                b"".join(data_parts), "ascii_run", annotations, span=(span_start, span_end)
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
+
+    def _pass_ascii_stitch(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, (IRLiteralChunk, IRLiteral)):
+                index += 1
+                continue
+
+            span = self._literal_spans.get(id(node))
+            payload = self._literal_payloads.get(id(node))
+            if span is None or payload is None:
+                index += 1
+                continue
+
+            annotations = list(getattr(node, "annotations", ()))
+            if not self._is_ascii_like_payload(payload, annotations, getattr(node, "source", "")):
+                index += 1
+                continue
+
+            seen = set(annotations)
+            parts: List[bytes] = [payload]
+            start_offset, current_end = span
+            scan = index + 1
+
+            while scan < len(items):
+                candidate = items[scan]
+                if not isinstance(candidate, (IRLiteralChunk, IRLiteral)):
+                    break
+
+                cand_span = self._literal_spans.get(id(candidate))
+                cand_payload = self._literal_payloads.get(id(candidate))
+                if cand_span is None or cand_payload is None:
+                    break
+
+                gap = cand_span[0] - current_end
+                if gap < 0:
+                    break
+                if gap > 0 and gap > 4:
+                    break
+
+                candidate_annotations = list(getattr(candidate, "annotations", ()))
+                if not self._is_ascii_like_payload(
+                    cand_payload, candidate_annotations, getattr(candidate, "source", "")
+                ):
+                    if any(byte != 0 for byte in cand_payload):
+                        break
+
+                if gap > 0:
+                    parts.append(b"\x00" * gap)
+                    current_end += gap
+
+                for note in candidate_annotations:
+                    if note not in seen:
+                        seen.add(note)
+                        annotations.append(note)
+
+                parts.append(cand_payload)
+                current_end = cand_span[1]
+                scan += 1
+
+            if len(parts) <= 1:
+                index += 1
+                continue
+
+            merged_nodes = [items[pos] for pos in range(index, scan)]
+            for old in merged_nodes:
+                node_id = id(old)
+                self._literal_spans.pop(node_id, None)
+                self._literal_payloads.pop(node_id, None)
+
+            combined = self._make_literal_chunk(
+                b"".join(parts), "ascii_stitch", annotations, span=(start_offset, current_end)
+            )
+            items.replace_slice(index, scan, [combined])
+            index = index + 1
 
     def _pass_ascii_glue(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -877,7 +1102,24 @@ class IRNormalizer:
                     merged_annotations.append(note)
 
             data = b"".join(chunk.data for chunk in chunk_nodes)
-            combined = self._make_literal_chunk(data, "ascii_glue", merged_annotations)
+            span_start = self._literal_spans.get(id(chunk_nodes[0]))
+            span_end = self._literal_spans.get(id(chunk_nodes[-1]))
+            if span_start is not None and span_end is not None:
+                span = (span_start[0], span_end[1])
+            else:
+                span = None
+
+            for removed in removed_items:
+                node_id = id(removed)
+                self._literal_spans.pop(node_id, None)
+                self._literal_payloads.pop(node_id, None)
+
+            combined = self._make_literal_chunk(
+                data,
+                "ascii_glue",
+                merged_annotations,
+                span=span,
+            )
             self._transfer_ssa(source, combined)
 
             for removed in removed_items:
