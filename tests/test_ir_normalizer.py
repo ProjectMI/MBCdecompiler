@@ -12,6 +12,7 @@ from mbcdisasm.ir.model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
     IRIf,
@@ -32,7 +33,13 @@ from mbcdisasm.ir.model import (
     IRIORead,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
-from mbcdisasm.constants import IO_SLOT, IO_PORT_NAME, RET_MASK, CALL_SHUFFLE_STANDARD
+from mbcdisasm.constants import (
+    IO_SLOT,
+    IO_PORT_NAME,
+    PAGE_REGISTER,
+    RET_MASK,
+    CALL_SHUFFLE_STANDARD,
+)
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
@@ -1233,3 +1240,54 @@ def test_normalizer_collapses_opcode_table_sequences() -> None:
     assert len(node.operations) == len(raw_instructions)
     assert node.annotations and node.annotations[0] == "opcode_table"
     assert any(note == "mode=0x2A" for note in node.annotations)
+
+
+def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase({"31:30": OpcodeInfo(mnemonic="op_31_30")})
+    normalizer = IRNormalizer(knowledge)
+
+    words = [build_word(0, 0x31, 0x30, PAGE_REGISTER)]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRPageRegister)
+    assert node.register == PAGE_REGISTER
+    assert node.value is None
+    assert node.literal is None
+
+
+def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> None:
+    annotations = {
+        "00:00": OpcodeInfo(mnemonic="push_literal", category="literal", stack_push=1),
+        "31:30": OpcodeInfo(mnemonic="op_31_30", stack_pop=1),
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_load", stack_push=1),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x4B10),
+        build_word(4, 0x31, 0x30, PAGE_REGISTER),
+        build_word(8, 0x69, 0x01, 0xDC05),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_memref", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    page_node = next(node for node in block.nodes if isinstance(node, IRPageRegister))
+    assert page_node.register == PAGE_REGISTER
+    assert page_node.value == "lit(0x4B10)"
+    assert page_node.literal == 0x4B10
+
+    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+    assert load_node.ref is not None
+    assert load_node.ref.bank == 0x4B10

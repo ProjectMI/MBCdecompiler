@@ -670,16 +670,47 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if (
-                isinstance(item, RawInstruction)
-                and item.mnemonic == "op_6C_01"
-                and item.operand == PAGE_REGISTER
-            ):
-                node = IRPageRegister(register=item.operand)
-                self._transfer_ssa(item, node)
-                items.replace_slice(index, index + 1, [node])
+            if not isinstance(item, RawInstruction):
+                index += 1
                 continue
-            index += 1
+
+            if item.operand != PAGE_REGISTER:
+                index += 1
+                continue
+
+            if item.event.delta > 0:
+                index += 1
+                continue
+
+            value_name: Optional[str] = None
+            value_repr: Optional[str] = None
+            literal_value: Optional[int] = None
+
+            sources = self._stack_sources(items, index, 1)
+            if sources:
+                value_name, source_node = sources[0]
+                self._promote_ssa_kind(value_name, SSAValueKind.PAGE_REGISTER)
+                if isinstance(source_node, IRLiteral):
+                    value_repr = source_node.describe()
+                    literal_value = source_node.value & 0xFFFF
+                elif isinstance(source_node, IRLiteralChunk):
+                    value_repr = source_node.describe()
+                else:
+                    value_repr = self._render_ssa(value_name)
+            else:
+                previous = items[index - 1] if index > 0 else None
+                if isinstance(previous, IRLiteral):
+                    value_repr = previous.describe()
+                    literal_value = previous.value & 0xFFFF
+
+            node = IRPageRegister(
+                register=item.operand,
+                value=value_repr,
+                literal=literal_value,
+            )
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            continue
 
     def _pass_stack_manipulation(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -3614,7 +3645,7 @@ class IRNormalizer:
         base_name: Optional[str],
         instruction: RawInstruction,
     ) -> Tuple[Optional[MemRef], int]:
-        components: List[Tuple[int, int]] = []
+        components: List[Tuple[int, int, bool]] = []
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -3622,7 +3653,13 @@ class IRNormalizer:
                 value = self._memref_component(candidate)
                 if value is None:
                     break
-                components.append((scan, value))
+                components.append((scan, value, True))
+                scan -= 1
+                continue
+            if isinstance(candidate, IRPageRegister):
+                value = self._page_register_component(candidate)
+                if value is not None:
+                    components.append((scan, value, False))
                 scan -= 1
                 continue
             if self._is_memref_bridge(candidate):
@@ -3630,7 +3667,7 @@ class IRNormalizer:
                 continue
             break
 
-        removal_indexes = [position for position, _ in components]
+        removal_indexes = [position for position, _, remove in components if remove]
         removal_indexes.sort(reverse=True)
         for position in removal_indexes:
             removed = items.pop(position)
@@ -3638,8 +3675,9 @@ class IRNormalizer:
         index -= len(removal_indexes)
 
         components.reverse()
-        bank = components[0][1] if components else None
-        base_value = components[1][1] if len(components) > 1 else None
+        values = [value for _, value, _ in components]
+        bank = values[0] if values else None
+        base_value = values[1] if len(values) > 1 else None
         page = instruction.operand >> 8
         offset = instruction.operand & 0xFF
         region_override: Optional[str] = None
@@ -3693,6 +3731,17 @@ class IRNormalizer:
         except ValueError:
             return None
         return (high << 8) | low
+
+    def _page_register_component(self, node: IRPageRegister) -> Optional[int]:
+        if node.register != PAGE_REGISTER:
+            return None
+        if node.literal is not None:
+            return node.literal
+        if node.value:
+            parsed = self._flag_literal_value(node.value)
+            if parsed is not None:
+                return parsed
+        return None
 
     def _memref_region(
         self, base_slot: Optional[IRSlot], bank: Optional[int], page: Optional[int]
