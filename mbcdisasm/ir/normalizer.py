@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from typing import Dict, FrozenSet, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
@@ -73,6 +73,23 @@ from .model import (
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
+
+
+@dataclass(frozen=True)
+class _OpcodeTableRule:
+    """Heuristics that describe how to recognise opcode tables for a mode."""
+
+    mnemonics: Optional[FrozenSet[str]] = None
+    allow_nonzero_operands: bool = False
+
+    def allows_mnemonic(self, mnemonic: str) -> bool:
+        allowed = self.mnemonics
+        if allowed is None:
+            return True
+        return mnemonic in allowed
+
+    def allows_operand(self, operand: int) -> bool:
+        return self.allow_nonzero_operands or operand == 0
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
@@ -256,20 +273,23 @@ class IRNormalizer:
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
-    _OPCODE_TABLE_MIN_RUN = 8
-    _OPCODE_TABLE_MAX_AFFIX = 2
-    _OPCODE_TABLE_MODES = {
-        0x2A,
-        0x2B,
-        0x32,
-        0x33,
-        0x46,
-        0x47,
-        0x48,
-        0x4E,
-        0x4F,
-        0x50,
-        0x51,
+    _OPCODE_TABLE_MIN_RUN = 4
+    _OPCODE_TABLE_MAX_AFFIX = 4
+    _OPCODE_TABLE_RULES: Dict[int, _OpcodeTableRule] = {
+        0x00: _OpcodeTableRule(
+            mnemonics=frozenset({"op_08_00"}), allow_nonzero_operands=True
+        ),
+        0x2A: _OpcodeTableRule(),
+        0x2B: _OpcodeTableRule(),
+        0x32: _OpcodeTableRule(),
+        0x33: _OpcodeTableRule(),
+        0x46: _OpcodeTableRule(),
+        0x47: _OpcodeTableRule(),
+        0x48: _OpcodeTableRule(),
+        0x4E: _OpcodeTableRule(),
+        0x4F: _OpcodeTableRule(),
+        0x50: _OpcodeTableRule(),
+        0x51: _OpcodeTableRule(),
     }
 
     _SSA_PRIORITY = {
@@ -1755,18 +1775,21 @@ class IRNormalizer:
         if not isinstance(item, RawInstruction):
             return False
         mode = item.profile.mode
-        if mode not in self._OPCODE_TABLE_MODES:
-            return False
         return self._is_opcode_table_body(item, mode)
 
     def _is_opcode_table_body(
         self, item: Union[RawInstruction, IRNode], mode: int
     ) -> bool:
+        rule = self._OPCODE_TABLE_RULES.get(mode)
+        if rule is None:
+            return False
         if not isinstance(item, RawInstruction):
             return False
         if item.profile.mode != mode:
             return False
-        if item.operand != 0:
+        if not rule.allows_mnemonic(item.mnemonic):
+            return False
+        if not rule.allows_operand(item.operand):
             return False
         if self._is_annotation_only(item):
             return False
@@ -1775,9 +1798,16 @@ class IRNormalizer:
     def _is_opcode_table_affix(
         self, item: Union[RawInstruction, IRNode], mode: int
     ) -> bool:
+        rule = self._OPCODE_TABLE_RULES.get(mode)
+        if rule is None:
+            return False
         if not isinstance(item, RawInstruction):
             return False
         if item.profile.mode != mode:
+            return False
+        if not rule.allows_mnemonic(item.mnemonic):
+            return False
+        if not rule.allows_operand(item.operand):
             return False
         if self._is_annotation_only(item):
             return False

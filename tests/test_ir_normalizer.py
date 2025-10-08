@@ -1242,6 +1242,43 @@ def test_normalizer_collapses_opcode_table_sequences() -> None:
     assert any(note == "mode=0x2A" for note in node.annotations)
 
 
+def test_normalizer_collapses_mode_00_opcode_tables() -> None:
+    annotations = {"08:00": OpcodeInfo(mnemonic="op_08_00", stack_delta=0)}
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    operands = [0x0100, 0x0104, 0x0108, 0x010C, 0x0110, 0x0114]
+    words = [
+        build_word(index * 4, 0x08, 0x00, operand)
+        for index, operand in enumerate(operands)
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 0
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert len(node.operations) == len(raw_instructions)
+    assert node.annotations and node.annotations[0] == "opcode_table"
+    assert any(note == "mode=0x00" for note in node.annotations)
+
+
 def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
     knowledge = KnowledgeBase({"31:30": OpcodeInfo(mnemonic="op_31_30")})
     normalizer = IRNormalizer(knowledge)
