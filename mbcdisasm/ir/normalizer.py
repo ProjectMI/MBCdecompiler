@@ -3477,6 +3477,7 @@ class IRNormalizer:
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
+                self._consume_indirect_setup(items, index)
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
@@ -3506,6 +3507,7 @@ class IRNormalizer:
                     pointer=pointer_alias,
                 )
                 items.replace_slice(index, index + 1, [node])
+                self._consume_indirect_setup(items, index)
                 metrics.stores += 1
                 continue
 
@@ -3709,6 +3711,91 @@ class IRNormalizer:
             self._ssa_aliases[base_name] = symbol
 
         return memref, index
+
+    def _consume_indirect_setup(self, items: _ItemList, index: int) -> None:
+        self._consume_trailing_indirect_setup(items, index)
+
+    def _consume_trailing_indirect_setup(self, items: _ItemList, index: int) -> None:
+        scan = index + 1
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
+                scan += 1
+                continue
+            if not isinstance(candidate, RawInstruction):
+                break
+            if not self._convert_indirect_setup_instruction(items, scan, candidate):
+                break
+            # After replacement the current index now holds an IR node.
+            scan += 1
+
+    def _convert_indirect_setup_instruction(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic in {"op_D4_06", "op_C8_06"}:
+            node = self._page_register_from_stack(items, index, instruction)
+            if node is None:
+                return False
+            items.replace_slice(index, index + 1, [node])
+            return True
+        if mnemonic == "op_01_DC":
+            node = self._condition_mask_from_instruction(items, index, instruction)
+            if node is None:
+                return False
+            items.replace_slice(index, index + 1, [node])
+            return True
+        return False
+
+    def _page_register_from_stack(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> Optional[IRPageRegister]:
+        value_repr: Optional[str] = None
+        literal_value: Optional[int] = None
+
+        sources = self._stack_sources(items, index, 1)
+        if sources:
+            value_name, source_node = sources[0]
+            self._promote_ssa_kind(value_name, SSAValueKind.PAGE_REGISTER)
+            if isinstance(source_node, IRLiteral):
+                value_repr = source_node.describe()
+                literal_value = source_node.value & 0xFFFF
+            elif isinstance(source_node, IRLiteralChunk):
+                value_repr = source_node.describe()
+            else:
+                value_repr = self._render_ssa(value_name)
+        else:
+            previous = items[index - 1] if index > 0 else None
+            if isinstance(previous, IRLiteral):
+                value_repr = previous.describe()
+                literal_value = previous.value & 0xFFFF
+
+        register = PAGE_REGISTER
+        node = IRPageRegister(register=register, value=value_repr, literal=literal_value)
+        self._transfer_ssa(instruction, node)
+        return node
+
+    def _condition_mask_from_instruction(
+        self, items: _ItemList, index: int, instruction: RawInstruction
+    ) -> Optional[IRConditionMask]:
+        mask_value: Optional[int] = None
+        sources = self._stack_sources(items, index, 1)
+        if sources:
+            _, source_node = sources[0]
+            if isinstance(source_node, IRLiteral):
+                mask_value = source_node.value & 0xFFFF
+            elif isinstance(source_node, IRLiteralChunk):
+                parsed = self._flag_literal_value(source_node.describe())
+                if parsed is not None:
+                    mask_value = parsed
+        if mask_value is None:
+            operand = instruction.operand
+            mask_value = operand if operand else None
+        if mask_value is None:
+            return None
+        node = IRConditionMask(source=instruction.mnemonic, mask=mask_value)
+        self._transfer_ssa(instruction, node)
+        return node
 
     @staticmethod
     def _is_memref_bridge(node: Union[RawInstruction, IRNode]) -> bool:
