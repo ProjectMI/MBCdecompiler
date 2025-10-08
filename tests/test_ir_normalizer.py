@@ -1291,3 +1291,46 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
     load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B10
+
+
+def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
+    annotations = {
+        "00:00": OpcodeInfo(mnemonic="push_literal", category="literal", stack_push=1),
+        "4B:0C": OpcodeInfo(mnemonic="op_4B_0C", stack_delta=0),
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_load", stack_push=1),
+        "D4:06": OpcodeInfo(mnemonic="op_D4_06", stack_delta=0),
+        "3D:30": OpcodeInfo(mnemonic="op_3D_30", stack_delta=0),
+        "C8:06": OpcodeInfo(mnemonic="op_C8_06", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x4B0C),
+        build_word(4, 0x4B, 0x0C, 0x0000),
+        build_word(8, 0x69, 0x01, 0xC806),
+        build_word(12, 0x00, 0x00, 0x6901),
+        build_word(16, 0xD4, 0x06, 0x0000),
+        build_word(20, 0x3D, 0x30, 0x6901),
+        build_word(24, 0xC8, 0x06, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_indirect", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+    page_nodes = [node for node in block.nodes if isinstance(node, IRPageRegister)]
+
+    assert load_node.ref is not None
+    assert load_node.ref.bank == 0x4B0C
+    assert any(page.register == 0x06D4 for page in page_nodes)
+    assert any(page.register == 0x06C8 for page in page_nodes)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
+        for node in block.nodes
+    )
+
