@@ -142,13 +142,25 @@ class AsciiRunSignature(SignatureRule):
     ) -> Optional[SignatureMatch]:
         if len(profiles) < 3:
             return None
-        if not all(profile.kind is InstructionKind.ASCII_CHUNK for profile in profiles):
+
+        ascii_like = [profile for profile in profiles if _is_ascii_payload(profile)]
+        if len(ascii_like) < 3:
             return None
+
+        silent = [profile for profile in profiles if not _is_ascii_payload(profile)]
+        if any(not _is_silent_ascii_gap(profile) for profile in silent):
+            return None
+
+        if len(silent) > _limit_silent_allowance(len(ascii_like)):
+            return None
+
         notes = (
-            f"ascii_run length={len(profiles)}",
+            f"ascii_payload={len(ascii_like)}",
+            f"silent={len(silent)}",
             f"stackΔ={stack.change:+d}",
         )
-        return SignatureMatch(self.name, self.category, self.base_confidence, notes)
+        confidence = self.base_confidence + 0.02 * max(0, len(ascii_like) - 3)
+        return SignatureMatch(self.name, self.category, confidence, notes)
 
 
 class HeaderAsciiCtrlSeqSignature(SignatureRule):
@@ -314,17 +326,26 @@ class ReduceAsciiPrologSignature(SignatureRule):
         if second.label != "00:4F":
             return None
 
-        ascii_after = sum(
-            1 for profile in profiles[2:] if profile.kind is InstructionKind.ASCII_CHUNK
-        )
-        if ascii_after == 0:
+        tail = profiles[2:]
+        ascii_after = [profile for profile in tail if _is_ascii_payload(profile)]
+        if not ascii_after:
+            return None
+
+        silent = [profile for profile in tail if not _is_ascii_payload(profile)]
+        if any(not _is_silent_ascii_gap(profile) for profile in silent):
+            return None
+
+        if len(silent) > _limit_silent_allowance(len(ascii_after)):
             return None
 
         notes = (
-            f"ascii_after={ascii_after}",
+            f"ascii_after={len(ascii_after)}",
+            f"silent={len(silent)}",
             f"stackΔ={stack.change:+d}",
         )
-        confidence = min(0.88, self.base_confidence + 0.05 * min(ascii_after, 3))
+        confidence = min(
+            0.88, self.base_confidence + 0.05 * min(len(ascii_after), 3)
+        )
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
@@ -1965,3 +1986,39 @@ class SignatureDetector:
             if match is not None:
                 return match
         return None
+def _printable_ascii_count(profile: InstructionProfile) -> int:
+    data = profile.word.raw.to_bytes(4, "big")
+    return sum(1 for byte in data if 0x20 <= byte <= 0x7E)
+
+
+def _is_ascii_payload(profile: InstructionProfile) -> bool:
+    if profile.kind is InstructionKind.ASCII_CHUNK:
+        return True
+    if profile.kind not in {InstructionKind.LITERAL, InstructionKind.PUSH}:
+        return False
+    return _printable_ascii_count(profile) >= 3
+
+
+def _is_silent_ascii_gap(profile: InstructionProfile) -> bool:
+    if profile.kind in {
+        InstructionKind.ASCII_CHUNK,
+        InstructionKind.LITERAL,
+        InstructionKind.PUSH,
+    }:
+        return False
+    if profile.kind in {
+        InstructionKind.RETURN,
+        InstructionKind.BRANCH,
+        InstructionKind.CALL,
+        InstructionKind.TAILCALL,
+        InstructionKind.TERMINATOR,
+    }:
+        return False
+    return profile.stack_hint.nominal == 0
+
+
+def _limit_silent_allowance(ascii_count: int) -> int:
+    if ascii_count <= 0:
+        return 0
+    return max(1, ascii_count // 3)
+

@@ -696,14 +696,50 @@ class IRNormalizer:
         self._string_pool_order.append(constant)
         return constant
 
+    @staticmethod
+    def _ascii_printable_stats(data: bytes) -> Tuple[int, int]:
+        printable = sum(1 for byte in data if 0x20 <= byte <= 0x7E)
+        return printable, len(data)
+
+    @classmethod
+    def _is_ascii_heavy(cls, data: bytes) -> bool:
+        printable, total = cls._ascii_printable_stats(data)
+        if not total:
+            return False
+        return printable * 4 >= 3 * total and printable > 0
+
+    @classmethod
+    def _should_mark_ascii_mixed(cls, data: bytes) -> bool:
+        printable, total = cls._ascii_printable_stats(data)
+        if not total:
+            return False
+        if printable >= total:
+            return False
+        return printable * 4 >= 3 * total and printable > 0
+
+    @staticmethod
+    def _merge_annotations(*groups: Sequence[str]) -> Tuple[str, ...]:
+        merged: List[str] = []
+        seen: set[str] = set()
+        for group in groups:
+            for note in group:
+                if not note or note in seen:
+                    continue
+                seen.add(note)
+                merged.append(note)
+        return tuple(merged)
+
     def _make_literal_chunk(
         self, data: bytes, source: str, annotations: Sequence[str]
     ) -> IRLiteralChunk:
         constant = self._intern_string_constant(data, source)
+        merged = list(self._merge_annotations(annotations))
+        if self._should_mark_ascii_mixed(data) and "ascii_mixed" not in merged:
+            merged.append("ascii_mixed")
         return IRLiteralChunk(
             data=data,
             source=source,
-            annotations=tuple(annotations),
+            annotations=tuple(merged),
             symbol=constant.name,
         )
 
@@ -727,6 +763,14 @@ class IRNormalizer:
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
             return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+
+        if (
+            profile.kind in {InstructionKind.LITERAL, InstructionKind.PUSH}
+            and instruction.pushes_value()
+        ):
+            data = instruction.profile.word.raw.to_bytes(4, "big")
+            if self._is_ascii_heavy(data):
+                return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -2355,14 +2399,26 @@ class IRNormalizer:
             index += 1
         if len(chunk_nodes) >= 2:
             names = [chunk.symbol or chunk.describe() for chunk in chunk_nodes]
-            items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(names))])
+            annotations = self._merge_annotations(
+                *(chunk.annotations for chunk in chunk_nodes)
+            )
+            items.replace_slice(
+                0,
+                index,
+                [IRAsciiHeader(chunks=tuple(names), annotations=annotations)],
+            )
             return
 
         if len(chunk_nodes) == 1:
             literal = chunk_nodes[0]
             symbol = literal.symbol
             if symbol:
-                items.replace_slice(0, 1, [IRAsciiHeader(chunks=(symbol,))])
+                annotations = self._merge_annotations(literal.annotations)
+                items.replace_slice(
+                    0,
+                    1,
+                    [IRAsciiHeader(chunks=(symbol,), annotations=annotations)],
+                )
                 return
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
@@ -2374,7 +2430,16 @@ class IRNormalizer:
                         )
                         parts.append(piece.symbol or piece.describe())
                     if len(parts) >= 2:
-                        items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
+                        annotations = self._merge_annotations(literal.annotations)
+                        items.replace_slice(
+                            0,
+                            1,
+                            [
+                                IRAsciiHeader(
+                                    chunks=tuple(parts), annotations=annotations
+                                )
+                            ],
+                        )
 
     def _pass_call_return_templates(self, items: _ItemList) -> None:
         index = 0

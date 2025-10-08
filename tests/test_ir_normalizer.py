@@ -552,6 +552,33 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert "lit(0x6704)" in descriptions
 
 
+def test_normalizer_marks_ascii_mixed_chunks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        InstructionWord(0, int.from_bytes(b"TEXT", "big")),
+        InstructionWord(4, int.from_bytes(b"\x00AB!", "big")),
+        InstructionWord(8, int.from_bytes(b"TAIL", "big")),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert "ascii_mixed" in header.annotations
+
+    pool = {const.name: const for const in program.string_pool}
+    assert header.chunks[0] in pool
+    constant = pool[header.chunks[0]]
+    assert constant.data == b"TEXT\x00AB!TAIL"
+    assert all(not isinstance(node, IRRaw) for node in block.nodes)
+
+
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

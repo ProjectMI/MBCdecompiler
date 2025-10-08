@@ -60,6 +60,21 @@ def test_signature_detector_matches_ascii_run():
     assert match.category == "literal"
 
 
+def test_signature_detector_matches_ascii_run_with_mixed_chunks():
+    knowledge = KnowledgeBase({})
+    words = [
+        InstructionWord(0, int.from_bytes(b"head", "big")),
+        InstructionWord(4, int.from_bytes(b"tail", "big")),
+        InstructionWord(8, int.from_bytes(b"\x00AB!", "big")),
+        InstructionWord(12, int.from_bytes(b"data", "big")),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "ascii_run"
+
+
 def test_signature_detector_matches_literal_run():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [make_word(0x00, 0x00, operand, idx * 4) for idx, operand in enumerate([0x10, 0x11, 0x12, 0x13, 0x14])]
@@ -318,6 +333,21 @@ def test_signature_detector_matches_ascii_inline():
         make_word(0x00, 0x4F, 0x0110, 4),
         InstructionWord(8, int.from_bytes(b"text", "big")),
         InstructionWord(12, int.from_bytes(b"DATA", "big")),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "ascii_inline"
+
+
+def test_signature_detector_matches_ascii_inline_with_mixed_chunks():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x04, 0x00, 0x0000, 0),
+        make_word(0x00, 0x4F, 0x0110, 4),
+        InstructionWord(8, int.from_bytes(b"text", "big")),
+        InstructionWord(12, int.from_bytes(b"\x00AB!", "big")),
     ]
     profiles, summary = profiles_from_words(words, knowledge)
     detector = SignatureDetector()

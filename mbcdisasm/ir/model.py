@@ -735,10 +735,14 @@ class IRAsciiHeader(IRNode):
     """Captures dense ASCII banners embedded at block boundaries."""
 
     chunks: Tuple[str, ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         rendered = ", ".join(self.chunks)
-        return f"ascii_header[{rendered}]"
+        note = f"ascii_header[{rendered}]"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
 
 
 @dataclass(frozen=True)
