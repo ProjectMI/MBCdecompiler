@@ -619,6 +619,73 @@ def test_ascii_mixed_pass_converts_adjacent_raw(tmp_path: Path) -> None:
     assert metrics.literal_chunks == 1
 
 
+def test_ascii_consolidate_absorbs_zero_words(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase({})
+    words = [
+        InstructionWord(0, int.from_bytes(b"text", "big")),
+        InstructionWord(4, int.from_bytes(b"\x00\x00\x00\x00", "big")),
+        InstructionWord(8, int.from_bytes(b"tail", "big")),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert all(not isinstance(node, IRRaw) for node in block.nodes)
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert header.chunks and len(header.chunks) == 1
+    assert header.chunk_annotations and len(header.chunk_annotations[0]) >= 1
+    assert "zero_gap" in header.chunk_annotations[0]
+
+    pool = {const.name: const for const in program.string_pool}
+    symbol = header.chunks[0]
+    assert pool[symbol].data == b"texttail"
+
+
+def test_string_pool_canonicalizes_null_affixes(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase({})
+
+    leading = InstructionWord(0, int.from_bytes(b"\x00foo", "big"))
+    trailing = InstructionWord(4, int.from_bytes(b"foo\x00", "big"))
+
+    data_a = encode_instructions([leading])
+    data_b = encode_instructions([trailing])
+
+    segment_a = Segment(SegmentDescriptor(0, 0, len(data_a)), data_a)
+    segment_b = Segment(
+        SegmentDescriptor(1, len(data_a), len(data_a) + len(data_b)),
+        data_b,
+    )
+
+    container = MbcContainer(Path("dummy"), [segment_a, segment_b])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    pool = {const.name: const for const in program.string_pool}
+    assert len(pool) == 1
+
+    headers = []
+    for segment in program.segments:
+        block = segment.blocks[0]
+        header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+        headers.append(header)
+
+    assert len(headers) == 2
+    assert headers[0].chunks and headers[1].chunks
+    assert headers[0].chunks[0] == headers[1].chunks[0]
+    symbol = headers[0].chunks[0]
+    assert pool[symbol].data == b"foo"
+    assert "leading_null" in headers[0].chunk_annotations[0]
+    assert "trailing_null" in headers[1].chunk_annotations[0]
+
+
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

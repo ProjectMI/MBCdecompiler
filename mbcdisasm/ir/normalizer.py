@@ -16,6 +16,7 @@ from ..constants import (
     RET_MASK,
 )
 from ..analyzer.instruction_profile import (
+    ASCII_ALLOWED,
     InstructionKind,
     InstructionProfile,
     is_ascii_mixed_word,
@@ -256,6 +257,7 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._node_spans: Dict[int, Tuple[int, int]] = {}
 
     # ------------------------------------------------------------------
     # public entry points
@@ -415,11 +417,13 @@ class IRNormalizer:
         self._ssa_types.clear()
         self._ssa_aliases.clear()
         self._ssa_counters.clear()
+        self._node_spans.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
         self._pass_ascii_mixed(items, metrics)
+        self._pass_ascii_consolidate(items)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
@@ -657,10 +661,107 @@ class IRNormalizer:
             annotations = list(item.annotations)
             if "ascii_mixed" not in annotations:
                 annotations.append("ascii_mixed")
-            chunk = self._make_literal_chunk(data, "ascii_mixed", annotations)
+            span = (item.offset, item.offset + len(data))
+            chunk = self._make_literal_chunk(
+                data, "ascii_mixed", annotations, span=span
+            )
             self._transfer_ssa(item, chunk)
             items.replace_slice(index, index + 1, [chunk])
             metrics.literal_chunks += 1
+            index += 1
+
+    def _pass_ascii_consolidate(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRLiteralChunk):
+                index += 1
+                continue
+
+            span = self._node_spans.get(id(item))
+            if span is None:
+                index += 1
+                continue
+
+            start_span = span[0]
+            last_end = span[1]
+            scan = index + 1
+
+            chunk_nodes: List[IRLiteralChunk] = [item]
+            gap_nodes: List[Union[RawInstruction, IRLiteral]] = []
+            data_parts: List[bytes] = [item.data]
+            annotations: List[str] = list(item.annotations)
+
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, IRLiteralChunk):
+                    candidate_span = self._node_spans.get(id(candidate))
+                    if candidate_span is None or candidate_span[0] != last_end:
+                        break
+                    chunk_nodes.append(candidate)
+                    data_parts.append(candidate.data)
+                    annotations.extend(candidate.annotations)
+                    last_end = candidate_span[1]
+                    scan += 1
+                    continue
+
+                if isinstance(candidate, RawInstruction) and self._is_silent_ascii_word(candidate, last_end):
+                    gap_nodes.append(candidate)
+                    data = candidate.profile.word.raw.to_bytes(4, "big")
+                    data_parts.append(data)
+                    annotations.extend(candidate.annotations)
+                    annotations.append("zero_gap")
+                    last_end = candidate.offset + 4
+                    scan += 1
+                    continue
+
+                if isinstance(candidate, IRLiteral) and self._is_silent_literal(candidate, last_end):
+                    gap_nodes.append(candidate)
+                    annotations.extend(candidate.annotations)
+                    annotations.append("zero_gap")
+                    literal_span = self._node_spans.get(id(candidate))
+                    if literal_span is not None:
+                        last_end = literal_span[1]
+                    scan += 1
+                    continue
+
+                break
+
+            if len(chunk_nodes) + len(gap_nodes) <= 1:
+                index += 1
+                continue
+
+            merged_annotations = self._deduplicate_annotations(annotations)
+            merged_data = b"".join(data_parts)
+
+            ssa_sources: List[Union[RawInstruction, IRLiteralChunk, IRLiteral]] = []
+            for node in chunk_nodes:
+                if self._ssa_bindings.get(id(node)):
+                    ssa_sources.append(node)
+                self._forget_span(node)
+            for gap in gap_nodes:
+                if self._ssa_bindings.get(id(gap)):
+                    ssa_sources.append(gap)
+                if isinstance(gap, IRLiteral):
+                    self._forget_span(gap)
+
+            new_chunk = self._make_literal_chunk(
+                merged_data,
+                "ascii_consolidated",
+                merged_annotations,
+                span=(start_span, last_end),
+            )
+
+            for source in reversed(ssa_sources):
+                self._transfer_ssa(source, new_chunk)
+                break
+
+            for node in chunk_nodes:
+                self._ssa_bindings.pop(id(node), None)
+            for gap in gap_nodes:
+                self._ssa_bindings.pop(id(gap), None)
+
+            items.replace_slice(index, scan, [new_chunk])
             index += 1
 
     def _literal_ssa_kind(self, node: IRLiteral) -> Optional[SSAValueKind]:
@@ -737,15 +838,94 @@ class IRNormalizer:
         return constant
 
     def _make_literal_chunk(
-        self, data: bytes, source: str, annotations: Sequence[str]
+        self,
+        data: bytes,
+        source: str,
+        annotations: Sequence[str],
+        *,
+        span: Optional[Tuple[int, int]] = None,
     ) -> IRLiteralChunk:
-        constant = self._intern_string_constant(data, source)
-        return IRLiteralChunk(
+        canonical, leading_nulls, trailing_nulls = self._canonicalize_ascii_data(data)
+        constant = self._intern_string_constant(canonical, source)
+
+        merged = list(annotations)
+        seen = set(merged)
+        if leading_nulls:
+            flag = "leading_null" if leading_nulls == 1 else f"leading_null[{leading_nulls}]"
+            if flag not in seen:
+                merged.append(flag)
+                seen.add(flag)
+        if trailing_nulls:
+            flag = "trailing_null" if trailing_nulls == 1 else f"trailing_null[{trailing_nulls}]"
+            if flag not in seen:
+                merged.append(flag)
+                seen.add(flag)
+
+        chunk = IRLiteralChunk(
             data=data,
             source=source,
-            annotations=tuple(annotations),
+            annotations=tuple(merged),
             symbol=constant.name,
         )
+        if span is not None:
+            self._record_span(chunk, span[0], span[1])
+        return chunk
+
+    @staticmethod
+    def _canonicalize_ascii_data(data: bytes) -> Tuple[bytes, int, int]:
+        if not data:
+            return data, 0, 0
+
+        start = 0
+        end = len(data)
+
+        while start < end and data[start] == 0:
+            start += 1
+        while end > start and data[end - 1] == 0:
+            end -= 1
+
+        leading = start
+        trailing = len(data) - end
+        canonical = data[start:end] if start < end else b""
+        return canonical, leading, trailing
+
+    def _record_span(self, node: IRNode, start: int, end: int) -> None:
+        self._node_spans[id(node)] = (start, end)
+
+    def _forget_span(self, node: IRNode) -> None:
+        self._node_spans.pop(id(node), None)
+
+    @staticmethod
+    def _deduplicate_annotations(annotations: Sequence[str]) -> List[str]:
+        merged: List[str] = []
+        seen: set[str] = set()
+        for note in annotations:
+            if note in seen:
+                continue
+            seen.add(note)
+            merged.append(note)
+        return merged
+
+    def _is_silent_ascii_word(self, instruction: RawInstruction, expected_start: int) -> bool:
+        if instruction.offset != expected_start:
+            return False
+        if instruction.profile.info is not None:
+            return False
+
+        data = instruction.profile.word.raw.to_bytes(4, "big")
+        if not data:
+            return False
+
+        if any(byte and byte not in ASCII_ALLOWED for byte in data):
+            return False
+
+        return all(byte == 0 for byte in data)
+
+    def _is_silent_literal(self, literal: IRLiteral, expected_start: int) -> bool:
+        span = self._node_spans.get(id(literal))
+        if span is None or span[0] != expected_start:
+            return False
+        return literal.value == 0
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
@@ -766,15 +946,20 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
-            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+            span = (instruction.offset, instruction.offset + len(data))
+            return self._make_literal_chunk(
+                data, profile.mnemonic, instruction.annotations, span=span
+            )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
-            return IRLiteral(
+            node = IRLiteral(
                 value=instruction.operand,
                 mode=profile.mode,
                 source=profile.mnemonic,
                 annotations=instruction.annotations,
             )
+            self._record_span(node, instruction.offset, instruction.offset + 4)
+            return node
 
         return None
 
@@ -841,12 +1026,22 @@ class IRNormalizer:
             start = index
             data_parts: List[bytes] = []
             annotations: List[str] = []
+            chunk_nodes: List[IRLiteralChunk] = []
+            first_span: Optional[Tuple[int, int]] = None
+            last_end: Optional[int] = None
 
             while index < len(items):
                 candidate = items[index]
                 if isinstance(candidate, IRLiteralChunk):
+                    span = self._node_spans.get(id(candidate))
+                    if span is None:
+                        break
                     data_parts.append(candidate.data)
                     annotations.extend(candidate.annotations)
+                    chunk_nodes.append(candidate)
+                    if first_span is None:
+                        first_span = span
+                    last_end = span[1]
                     index += 1
                     continue
 
@@ -860,9 +1055,20 @@ class IRNormalizer:
                 index = start + 1
                 continue
 
+            if first_span is None or last_end is None:
+                index = start + 1
+                continue
+
+            merged_annotations = self._deduplicate_annotations(annotations)
             chunk = self._make_literal_chunk(
-                b"".join(data_parts), "ascii_run", annotations
+                b"".join(data_parts),
+                "ascii_run",
+                merged_annotations,
+                span=(first_span[0], last_end),
             )
+            for node in chunk_nodes:
+                self._forget_span(node)
+                self._ssa_bindings.pop(id(node), None)
             items.replace_slice(start, index, [chunk])
             index = start + 1
 
@@ -899,6 +1105,10 @@ class IRNormalizer:
                     break
                 break
 
+            all_reducers = list(reducers)
+            if reducers and len(chunk_nodes) == len(reducers):
+                reducers = reducers[:-1]
+
             if not reducers or len(chunk_nodes) != len(reducers) + 1:
                 index += 1
                 continue
@@ -926,7 +1136,7 @@ class IRNormalizer:
                 self._ssa_bindings.pop(id(removed), None)
 
             items.replace_slice(start, removal_end, [combined])
-            metrics.reduce_replaced += len(reducers)
+            metrics.reduce_replaced += len(all_reducers)
             index = start + 1
 
     def _collect_call_arguments(
@@ -2395,26 +2605,63 @@ class IRNormalizer:
             index += 1
         if len(chunk_nodes) >= 2:
             names = [chunk.symbol or chunk.describe() for chunk in chunk_nodes]
-            items.replace_slice(0, index, [IRAsciiHeader(chunks=tuple(names))])
+            annotations = [chunk.annotations for chunk in chunk_nodes]
+            for chunk in chunk_nodes:
+                self._forget_span(chunk)
+                self._ssa_bindings.pop(id(chunk), None)
+            items.replace_slice(
+                0,
+                index,
+                [
+                    IRAsciiHeader(
+                        chunks=tuple(names),
+                        chunk_annotations=tuple(annotations),
+                    )
+                ],
+            )
             return
 
         if len(chunk_nodes) == 1:
             literal = chunk_nodes[0]
             symbol = literal.symbol
             if symbol:
-                items.replace_slice(0, 1, [IRAsciiHeader(chunks=(symbol,))])
+                self._forget_span(literal)
+                self._ssa_bindings.pop(id(literal), None)
+                items.replace_slice(
+                    0,
+                    1,
+                    [
+                        IRAsciiHeader(
+                            chunks=(symbol,),
+                            chunk_annotations=(literal.annotations,),
+                        )
+                    ],
+                )
                 return
             if isinstance(literal, IRLiteralChunk) and len(literal.data) >= 8:
                 if len(literal.data) % 4 == 0:
                     parts = []
+                    annotations: List[Tuple[str, ...]] = []
                     for pos in range(0, len(literal.data), 4):
                         segment = literal.data[pos : pos + 4]
                         piece = self._make_literal_chunk(
                             segment, literal.source, literal.annotations
                         )
                         parts.append(piece.symbol or piece.describe())
+                        annotations.append(piece.annotations)
                     if len(parts) >= 2:
-                        items.replace_slice(0, 1, [IRAsciiHeader(chunks=tuple(parts))])
+                        self._forget_span(literal)
+                        self._ssa_bindings.pop(id(literal), None)
+                        items.replace_slice(
+                            0,
+                            1,
+                            [
+                                IRAsciiHeader(
+                                    chunks=tuple(parts),
+                                    chunk_annotations=tuple(annotations),
+                                )
+                            ],
+                        )
 
     def _pass_call_return_templates(self, items: _ItemList) -> None:
         index = 0
