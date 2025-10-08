@@ -1078,6 +1078,33 @@ def test_normalizer_extracts_table_dispatch(tmp_path: Path) -> None:
     assert targets == {0x6623, 0x6624}
 
 
+def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x64, 0x20, 0x0800),
+        build_word(4, 0x2C, 0x04, 0x6634),
+        build_word(8, 0x10, 0x8C, 0x0900),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(isinstance(node, IRRaw) for node in block.nodes)
+    assert isinstance(block.nodes[0], IRCallCleanup)
+    assert isinstance(block.nodes[1], IRSwitchDispatch)
+    return_node = block.nodes[2]
+    assert isinstance(return_node, IRReturn)
+    assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
+
+
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
     normalizer = IRNormalizer(knowledge)
