@@ -103,6 +103,7 @@ CALL_CLEANUP_MNEMONICS = {
     "op_10_0E",
     "op_10_12",
     "op_10_5C",
+    "op_10_8C",
     "op_10_E8",
     "op_14_07",
     "op_0C_00",
@@ -110,6 +111,8 @@ CALL_CLEANUP_MNEMONICS = {
     "op_52_05",
     "op_58_08",
     "op_5E_29",
+    "op_64_20",
+    "op_65_30",
     "op_6C_01",
     "op_C4_06",
     "op_D0_04",
@@ -119,10 +122,20 @@ CALL_CLEANUP_MNEMONICS = {
     "stack_shuffle",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
-CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
+CALL_PREDICATE_SKIP_MNEMONICS = {
+    "op_06_66",
+    "op_10_8C",
+    "op_29_10",
+    "op_64_20",
+    "op_65_30",
+    "op_70_29",
+}
 
 TAILCALL_HELPERS = {0x00F0}
-TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
+TAILCALL_POSTLUDE = {"op_06_66", "op_0B_29", "op_10_8C", "op_64_20", "op_65_30", "op_70_29"}
+
+DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
+DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
 
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
@@ -481,6 +494,7 @@ class IRNormalizer:
         self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
+        self._pass_dispatch_wrappers(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
@@ -1385,7 +1399,9 @@ class IRNormalizer:
             steps = self._coalesce_epilogue_steps(steps)
 
             prev_index = start - 1
-            while prev_index >= 0 and isinstance(items[prev_index], (IRLiteral, IRLiteralChunk)):
+            while prev_index >= 0 and isinstance(
+                items[prev_index], (IRLiteral, IRLiteralChunk, IRStringConstant)
+            ):
                 prev_index -= 1
 
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
@@ -1394,7 +1410,9 @@ class IRNormalizer:
                 continue
 
             next_index = end
-            while next_index < len(items) and isinstance(items[next_index], (IRLiteral, IRLiteralChunk)):
+            while next_index < len(items) and isinstance(
+                items[next_index], (IRLiteral, IRLiteralChunk, IRStringConstant)
+            ):
                 next_index += 1
 
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
@@ -1873,6 +1891,71 @@ class IRNormalizer:
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
+
+    def _pass_dispatch_wrappers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, IRSwitchDispatch):
+                index += 1
+                continue
+
+            prefix_start = index
+            while prefix_start > 0:
+                candidate = items[prefix_start - 1]
+                if (
+                    isinstance(candidate, RawInstruction)
+                    and candidate.mnemonic in DISPATCH_PREFIX_MNEMONICS
+                ):
+                    prefix_start -= 1
+                    continue
+                break
+
+            if prefix_start < index:
+                raw_prefix = [
+                    items[position]
+                    for position in range(prefix_start, index)
+                    if isinstance(items[position], RawInstruction)
+                ]
+                if raw_prefix:
+                    steps = tuple(
+                        self._call_cleanup_effect(instruction)
+                        for instruction in raw_prefix
+                    )
+                    cleanup = IRCallCleanup(steps=steps)
+                    items.replace_slice(prefix_start, index, [cleanup])
+                    index = prefix_start + 1
+                    node = items[index]
+
+            follow = index + 1
+            suffix_end = follow
+            while suffix_end < len(items):
+                candidate = items[suffix_end]
+                if (
+                    isinstance(candidate, RawInstruction)
+                    and candidate.mnemonic in DISPATCH_SUFFIX_MNEMONICS
+                ):
+                    suffix_end += 1
+                    continue
+                break
+
+            if suffix_end > follow:
+                raw_suffix = [
+                    items[position]
+                    for position in range(follow, suffix_end)
+                    if isinstance(items[position], RawInstruction)
+                ]
+                if raw_suffix:
+                    steps = tuple(
+                        self._call_cleanup_effect(instruction)
+                        for instruction in raw_suffix
+                    )
+                    cleanup = IRCallCleanup(steps=steps)
+                    items.replace_slice(follow, suffix_end, [cleanup])
+                    index = follow + 1
+                    continue
+
+            index = follow
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]
