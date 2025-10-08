@@ -1131,6 +1131,31 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_collapses_extended_f0_tailcall(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x00, 0x00F0),  # tailcall_dispatch -> helper F0
+        build_word(4, 0x4B, 0x05, 0x0000),  # additional postlude step
+        build_word(8, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    tail_node = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert any(step.mnemonic == "op_4B_05" for step in tail_node.cleanup)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_4B_05" for node in block.nodes
+    )
+
+
 def test_normalizer_collapses_inline_tail_dispatch() -> None:
     knowledge = KnowledgeBase.load(Path("knowledge"))
 
@@ -1180,6 +1205,33 @@ def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
 
     assert any(isinstance(node, IRTestSetBranch) for node in block.nodes)
     assert not any(isinstance(node, IRIf) for node in block.nodes)
+
+
+def test_normalizer_attaches_predicate_through_noise(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x1234),  # call_dispatch
+        build_word(4, 0x10, 0x0F, 0x0000),  # raw noise between call and branch
+        build_word(8, 0x27, 0x00, 0x2000),  # testset_branch
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_node = next(node for node in block.nodes if isinstance(node, IRCall))
+    assert call_node.predicate is not None
+    assert call_node.predicate.kind == "testset"
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_10_0F" for node in block.nodes
+    )
 
 
 def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:

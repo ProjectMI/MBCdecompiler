@@ -119,10 +119,51 @@ CALL_CLEANUP_MNEMONICS = {
     "stack_shuffle",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
-CALL_PREDICATE_SKIP_MNEMONICS = {"op_29_10", "op_70_29", "op_0B_29", "op_06_66"}
+CALL_PREDICATE_SKIP_MNEMONICS = {
+    "op_29_10",
+    "op_70_29",
+    "op_0B_29",
+    "op_06_66",
+    "op_10_0F",
+    "op_64_10",
+    "op_F0_E8",
+    "op_9B_22",
+    "op_0E_69",
+    "op_2D_19",
+    "op_37_19",
+    "op_53_19",
+    "op_5D_19",
+    "op_79_19",
+    "op_81_19",
+    "op_8F_19",
+    "op_A8_19",
+    "op_BE_19",
+    "op_CC_19",
+    "op_D7_19",
+    "op_E7_19",
+    "op_F0_19",
+    "op_FD_19",
+    "reduce_passthrough",
+}
 
 TAILCALL_HELPERS = {0x00F0}
-TAILCALL_POSTLUDE = {"op_70_29", "op_0B_29", "op_06_66"}
+TAILCALL_POSTLUDE = {
+    "op_70_29",
+    "op_0B_29",
+    "op_06_66",
+    "op_4B_1D",
+    "op_08_00",
+    "op_4B_05",
+    "op_B1_FE",
+    "op_01_74",
+    "op_EC_01",
+    "op_4B_10",
+    "op_10_54",
+    "op_E8_4B",
+    "op_33_03",
+    "op_4D_18",
+    "op_10_50",
+}
 
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
@@ -2663,10 +2704,16 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            predicate, branch_index, alias = extracted
+            predicate, branch_index, alias, skipped_indices = extracted
             updated = self._call_with_predicate(call, predicate)
             self._transfer_ssa(call, updated)
             items.replace_slice(index, index + 1, [updated])
+
+            for skip_index in reversed(skipped_indices):
+                if 0 <= skip_index < len(items):
+                    items.pop(skip_index)
+                    if skip_index < branch_index:
+                        branch_index -= 1
 
             branch = items[branch_index]
             if isinstance(branch, IRTestSetBranch) and branch.expr != alias:
@@ -2705,14 +2752,16 @@ class IRNormalizer:
 
     def _extract_call_predicate(
         self, items: _ItemList, index: int
-    ) -> Optional[Tuple[CallPredicate, int, str]]:
+    ) -> Optional[Tuple[CallPredicate, int, str, List[int]]]:
         scan = index + 1
+        skipped: List[int] = []
         while scan < len(items):
             candidate = items[scan]
             if isinstance(candidate, (IRCallCleanup, IRConditionMask)):
                 scan += 1
                 continue
             if isinstance(candidate, RawInstruction) and candidate.mnemonic in CALL_PREDICATE_SKIP_MNEMONICS:
+                skipped.append(scan)
                 scan += 1
                 continue
             break
@@ -2736,7 +2785,7 @@ class IRNormalizer:
                 then_target=branch.then_target,
                 else_target=branch.else_target,
             )
-            return predicate, scan, alias
+            return predicate, scan, alias, skipped
 
         if isinstance(branch, IRTestSetBranch):
             predicate = CallPredicate(
@@ -2746,7 +2795,7 @@ class IRNormalizer:
                 then_target=branch.then_target,
                 else_target=branch.else_target,
             )
-            return predicate, scan, alias
+            return predicate, scan, alias, skipped
 
         return None
 
