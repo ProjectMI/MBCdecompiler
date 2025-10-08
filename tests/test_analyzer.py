@@ -212,3 +212,30 @@ def test_listing_summary_counts_unknowns():
     assert summary.unknown_patterns == 1
     assert summary.unknown_dominant == 1
     assert summary.warning_count == 1
+
+
+def test_fanout_return_pattern_detection():
+    analyzer = PipelineAnalyzer(KnowledgeBase({}))
+    instructions = [
+        make_word(0, 0x69, 0x10, 0x0000),
+        make_word(4, 0x00, 0x00, 0x0000),
+        make_word(8, 0x02, 0x66, 0x0000),
+        make_word(12, 0x30, 0x41, 0x0000),
+        make_word(16, 0x00, 0x00, 0x0000),
+        make_word(20, 0x69, 0x10, 0x0000),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    names = [block.pattern.pattern.name for block in report.blocks if block.pattern]
+    assert "fanout_return" in names
+
+
+def test_fanout_tail_return_pattern_detection():
+    analyzer = PipelineAnalyzer(KnowledgeBase({}))
+    instructions = [
+        make_word(0, 0xFD, 0x4A, 0x9D01),
+        make_word(4, 0x30, 0x69, 0x108C),
+        make_word(8, 0x09, 0x00, 0x0029),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    names = [block.pattern.pattern.name for block in report.blocks if block.pattern]
+    assert "fanout_tail_return" in names

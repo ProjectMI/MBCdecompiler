@@ -148,6 +148,12 @@ def default_patterns() -> PatternRegistry:
             call_preparation_pipeline(),
             return_pipeline(),
             indirect_load_pipeline(),
+            fanout_setup_pipeline(),
+            fanout_slot_pipeline(),
+            fanout_dispatch_pipeline(),
+            fanout_return_pipeline(),
+            fanout_guard_pipeline(),
+            fanout_tail_return_pipeline(),
         ]
     )
     return registry
@@ -450,6 +456,296 @@ def indirect_load_pipeline() -> PipelinePattern:
             max_delta=0,
             description="indirect read",
         ),
+    )
+
+    return PipelinePattern(
+        name="indirect_load",
+        category="indirect",
+        tokens=tokens,
+        allow_extra=True,
+        description="Load values via indirect access",
+    )
+
+
+def fanout_setup_pipeline() -> PipelinePattern:
+    """Match helper prologues that prepare fanout dispatch blocks."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.ARITHMETIC, InstructionKind.UNKNOWN),
+            min_delta=-1,
+            max_delta=1,
+            description="setup arithmetic",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="slot literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="fanout helper",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="page register",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="flag literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="target literal",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_setup",
+        category="call",
+        tokens=tokens,
+        description="Helper prologue that prepares fanout arguments",
+    )
+
+
+def fanout_slot_pipeline() -> PipelinePattern:
+    """Return the pattern that captures fanout slot initialisation."""
+
+    tokens = (
+        PatternToken(
+            kinds=(
+                InstructionKind.INDIRECT,
+                InstructionKind.INDIRECT_LOAD,
+                InstructionKind.INDIRECT_STORE,
+                InstructionKind.TABLE_LOOKUP,
+            ),
+            min_delta=-1,
+            max_delta=1,
+            description="slot access",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="mask literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=-1,
+            max_delta=1,
+            description="marker literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.STACK_TEARDOWN,),
+            min_delta=-3,
+            max_delta=-1,
+            description="slot teardown",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="value literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=-1,
+            max_delta=1,
+            description="trailing literal",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_slot_setup",
+        category="call",
+        tokens=tokens,
+        description="Fanout slot initialisation and teardown",
+    )
+
+
+def fanout_dispatch_pipeline() -> PipelinePattern:
+    """Match fanout dispatch helpers that duplicate stack entries."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.CALL, InstructionKind.UNKNOWN, InstructionKind.META),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="dispatch helper",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=-1,
+            max_delta=1,
+            description="descriptor literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.STACK_COPY,),
+            min_delta=-1,
+            max_delta=1,
+            description="fanout copy",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.INDIRECT,),
+            min_delta=0,
+            max_delta=1,
+            description="slot load",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="value literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="trailing helper",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_dispatch",
+        category="call",
+        tokens=tokens,
+        allow_extra=True,
+        description="Fanout call helper with inline dispatch",
+    )
+
+
+def fanout_return_pipeline() -> PipelinePattern:
+    """Match return sequences guarded by fanout helpers."""
+
+    tokens = (
+        PatternToken(
+            kinds=(
+                InstructionKind.INDIRECT,
+                InstructionKind.INDIRECT_LOAD,
+                InstructionKind.INDIRECT_STORE,
+                InstructionKind.TABLE_LOOKUP,
+            ),
+            min_delta=0,
+            max_delta=2,
+            description="slot fetch",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="fanout literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.PUSH, InstructionKind.STACK_COPY),
+            min_delta=0,
+            max_delta=1,
+            description="fanout spread",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.RETURN, InstructionKind.TERMINATOR),
+            min_delta=-1,
+            max_delta=1,
+            description="return dispatch",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="post literal",
+        ),
+        PatternToken(
+            kinds=(
+                InstructionKind.INDIRECT,
+                InstructionKind.INDIRECT_LOAD,
+                InstructionKind.INDIRECT_STORE,
+                InstructionKind.TABLE_LOOKUP,
+            ),
+            min_delta=0,
+            max_delta=2,
+            description="trailing access",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_return",
+        category="return",
+        tokens=tokens,
+        description="Fanout-assisted return sequence",
+    )
+
+
+def fanout_guard_pipeline() -> PipelinePattern:
+    """Return a pattern for fanout guard terminators."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.LITERAL,),
+            min_delta=0,
+            max_delta=1,
+            description="guard literal",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="fanout guard",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.TERMINATOR, InstructionKind.UNKNOWN),
+            min_delta=-1,
+            max_delta=0,
+            allow_unknown=True,
+            description="terminator",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_guard",
+        category="return",
+        tokens=tokens,
+        description="Guarded terminator fed by fanout helpers",
+    )
+
+
+def fanout_tail_return_pipeline() -> PipelinePattern:
+    """Match compact fanout teardowns followed by a multi-value return."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="fanout teardown",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.RETURN, InstructionKind.TERMINATOR),
+            min_delta=-12,
+            max_delta=0,
+            description="multi return",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.UNKNOWN),
+            min_delta=0,
+            max_delta=1,
+            allow_unknown=True,
+            description="return marker",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_tail_return",
+        category="return",
+        tokens=tokens,
+        description="Fanout teardown feeding the final return",
     )
     return PipelinePattern(
         name="indirect_lookup",
