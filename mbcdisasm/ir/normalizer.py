@@ -113,9 +113,26 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 
 
 IO_READ_MNEMONICS = {"op_10_38"}
-IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
+IO_WRITE_MNEMONICS = {
+    "op_10_10",
+    "op_10_14",
+    "op_10_24",
+    "op_10_48",
+    "op_10_64",
+    "op_10_68",
+    "op_10_F4",
+}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
-IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_MNEMONICS = {
+    "op_01_3D",
+    "op_F1_3D",
+    "op_38_00",
+    "op_4C_00",
+    "op_11_28",
+    "op_5C_08",
+}
+IO_DIRECT_PORT = 0x3D30
+IO_HANDSHAKE_OPERANDS = {IO_SLOT, IO_DIRECT_PORT}
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
     IRCallCleanup,
@@ -722,9 +739,16 @@ class IRNormalizer:
                 )
             return None
 
-        if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
-            "inline_ascii_chunk"
+        if (
+            profile.kind is InstructionKind.ASCII_CHUNK
+            or profile.mnemonic.startswith("inline_ascii_chunk")
         ):
+            if (
+                profile.word.opcode == 0x3D
+                and profile.word.mode == 0x30
+                and instruction.operand in IO_HANDSHAKE_OPERANDS
+            ):
+                return None
             data = instruction.profile.word.raw.to_bytes(4, "big")
             return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
 
@@ -1342,8 +1366,7 @@ class IRNormalizer:
             item = items[index]
             if not (
                 isinstance(item, RawInstruction)
-                and item.mnemonic == "op_3D_30"
-                and item.operand == IO_SLOT
+                and self._is_io_handshake_instruction(item)
             ):
                 index += 1
                 continue
@@ -1363,12 +1386,17 @@ class IRNormalizer:
 
             self._transfer_ssa(candidate, node)
             self._transfer_ssa(item, node)
-            start = min(index, candidate_index)
-            end = max(index, candidate_index) + 1
+            start, end = self._io_replacement_range(items, index, candidate_index)
             items.replace_slice(start, end, [node])
             index = start + 1
 
     def _find_io_candidate(self, items: _ItemList, handshake_index: int) -> Optional[int]:
+        handshake = items[handshake_index]
+        assert isinstance(handshake, RawInstruction)
+
+        if self._is_direct_io_write(handshake):
+            return handshake_index
+
         for direction in (-1, 1):
             scan = handshake_index + direction
             steps = 0
@@ -1379,7 +1407,7 @@ class IRNormalizer:
                         scan += direction
                         steps += 1
                         continue
-                    if node.mnemonic.startswith("op_10_"):
+                    if self._is_io_candidate_instruction(node):
                         return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
@@ -1393,18 +1421,71 @@ class IRNormalizer:
                 break
         return None
 
+    def _is_io_candidate_instruction(self, instruction: RawInstruction) -> bool:
+        if self._is_direct_io_write(instruction):
+            return True
+        if instruction.mnemonic in IO_READ_MNEMONICS:
+            return True
+        if instruction.mnemonic in IO_WRITE_MNEMONICS:
+            return True
+        if instruction.mnemonic.startswith("op_10_"):
+            return True
+        return False
+
+    def _is_io_handshake_instruction(self, instruction: RawInstruction) -> bool:
+        word = instruction.profile.word
+        if word.opcode != 0x3D or word.mode != 0x30:
+            return False
+        return instruction.operand in IO_HANDSHAKE_OPERANDS
+
+    def _is_direct_io_write(self, instruction: RawInstruction) -> bool:
+        word = instruction.profile.word
+        return (
+            word.opcode == 0x3D
+            and word.mode == 0x30
+            and instruction.operand == IO_DIRECT_PORT
+        )
+
     def _build_io_node(
         self, items: _ItemList, index: int, instruction: RawInstruction
     ) -> Optional[IRNode]:
         mnemonic = instruction.mnemonic
         if mnemonic in IO_READ_MNEMONICS:
             return IRIORead(port=IO_PORT_NAME)
+        if self._is_direct_io_write(instruction):
+            mask = self._io_mask_value(items, index)
+            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
             return IRIOWrite(mask=mask, port=IO_PORT_NAME)
         return None
+
+    def _io_replacement_range(
+        self, items: _ItemList, handshake_index: int, candidate_index: int
+    ) -> Tuple[int, int]:
+        start = min(handshake_index, candidate_index)
+        end = max(handshake_index, candidate_index) + 1
+
+        while start > 0 and self._is_io_bridge_node(items[start - 1]):
+            start -= 1
+
+        while end < len(items) and self._is_io_bridge_node(items[end]):
+            end += 1
+
+        return start, end
+
+    def _is_io_bridge_node(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, RawInstruction):
+            if self._is_io_handshake_instruction(node):
+                return False
+            return self._is_io_bridge_instruction(node)
+        if isinstance(node, IRLiteralChunk):
+            return True
+        if isinstance(node, IO_BRIDGE_NODE_TYPES):
+            return True
+        return False
 
     def _io_mask_value(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
@@ -1414,9 +1495,7 @@ class IRNormalizer:
             if isinstance(node, IRLiteral):
                 return node.value
             if isinstance(node, RawInstruction):
-                if self._is_io_bridge_instruction(node) or (
-                    node.mnemonic == "op_3D_30" and node.operand == IO_SLOT
-                ):
+                if self._is_io_bridge_instruction(node) or self._is_io_handshake_instruction(node):
                     scan -= 1
                     steps += 1
                     continue
@@ -2183,7 +2262,7 @@ class IRNormalizer:
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
-                if candidate.mnemonic == "op_3D_30" and candidate.operand == IO_SLOT:
+                if self._is_io_handshake_instruction(candidate):
                     return scan
                 if candidate.mnemonic.startswith("op_10_"):
                     break

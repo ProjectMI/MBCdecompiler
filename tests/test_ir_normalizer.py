@@ -702,6 +702,49 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     assert all(write.port == "io.port_6910" for write in writes)
 
 
+def test_normalizer_handles_direct_io_port(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0xDEAD),
+        build_word(4, 0x11, 0x28, 0x0000),
+        build_word(8, 0x3D, 0x30, 0x3D30),
+        build_word(12, 0x5C, 0x08, 0x0000),
+    ]
+
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    items = _ItemList(
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    )
+
+    normalizer = IRNormalizer(knowledge)
+    metrics = NormalizerMetrics()
+    normalizer._pass_literals(items, metrics)
+    normalizer._pass_io_operations(items)
+
+    nodes = items.to_tuple()
+    writes = [node for node in nodes if isinstance(node, IRIOWrite)]
+    assert len(writes) == 1
+    write = writes[0]
+    assert write.mask == 0xDEAD
+    assert write.port == "io.port_6910"
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_3D_30", "op_11_28", "op_5C_08"}
+        for node in nodes
+    )
+
+
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
