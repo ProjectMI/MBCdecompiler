@@ -148,6 +148,8 @@ def default_patterns() -> PatternRegistry:
             call_preparation_pipeline(),
             return_pipeline(),
             indirect_load_pipeline(),
+            fanout_expansion_pipeline(),
+            fanout_teardown_pipeline(),
         ]
     )
     return registry
@@ -456,4 +458,75 @@ def indirect_load_pipeline() -> PipelinePattern:
         category="indirect",
         tokens=tokens,
         description="Push base/key then resolve table entry",
+    )
+
+
+def fanout_expansion_pipeline() -> PipelinePattern:
+    """Return a pattern matching multi-value fanout helpers."""
+
+    tokens = (
+        PatternToken(
+            kinds=(
+                InstructionKind.STACK_COPY,
+                InstructionKind.META,
+                InstructionKind.UNKNOWN,
+            ),
+            min_delta=-1,
+            max_delta=2,
+            allow_unknown=True,
+            description="fanout prologue",
+        ),
+        PatternToken(
+            kinds=(
+                InstructionKind.INDIRECT_STORE,
+                InstructionKind.INDIRECT_LOAD,
+                InstructionKind.LITERAL,
+                InstructionKind.META,
+            ),
+            min_delta=-2,
+            max_delta=2,
+            allow_unknown=True,
+            description="fanout payload",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.RETURN,),
+            min_delta=-16,
+            max_delta=16,
+            allow_unknown=True,
+            description="fanout return",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_return",
+        category="call",
+        tokens=tokens,
+        allow_extra=True,
+        description="Helpers that duplicate stack values and return multiple results",
+    )
+
+
+def fanout_teardown_pipeline() -> PipelinePattern:
+    """Return a pattern matching the teardown phase of fanout helpers."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.META, InstructionKind.UNKNOWN),
+            min_delta=-4,
+            max_delta=1,
+            allow_unknown=True,
+            description="fanout teardown",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.TERMINATOR, InstructionKind.RETURN),
+            min_delta=-4,
+            max_delta=1,
+            allow_unknown=True,
+            description="fanout terminator",
+        ),
+    )
+    return PipelinePattern(
+        name="fanout_teardown",
+        category="call",
+        tokens=tokens,
+        description="Final mask/teardown emitted after fanout sequences",
     )

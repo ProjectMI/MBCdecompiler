@@ -45,6 +45,25 @@ def build_knowledge() -> KnowledgeBase:
             category="return",
             stack_delta=-1,
         ),
+        "32:00": OpcodeInfo(
+            mnemonic="terminator",
+            summary="end", 
+            control_flow="terminator",
+            category="terminator",
+            stack_delta=0,
+        ),
+        "40:00": OpcodeInfo(
+            mnemonic="fanout",
+            summary="fanout helper",
+            category="stack_copy",
+            stack_delta=0,
+        ),
+        "41:00": OpcodeInfo(
+            mnemonic="fanout_meta",
+            summary="fanout bookkeeping",
+            category="meta",
+            stack_delta=0,
+        ),
     }
     return KnowledgeBase(annotations)
 
@@ -104,6 +123,32 @@ def test_guarded_return_pipeline_detection():
     assert block.category == "return"
     assert block.pattern is not None
     assert block.pattern.pattern.name == "guarded_return"
+
+
+def test_fanout_pipeline_detection():
+    analyzer = PipelineAnalyzer(build_knowledge())
+    instructions = [
+        make_word(0, 0x40),
+        make_word(4, 0x10),
+        make_word(8, 0x31),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    assert report.blocks
+    block = report.blocks[0]
+    assert block.pattern is not None
+    assert block.pattern.pattern.name == "fanout_return"
+    assert block.category == "call"
+
+
+def test_fanout_teardown_pattern_detection():
+    analyzer = PipelineAnalyzer(build_knowledge())
+    instructions = [
+        make_word(0, 0x41),
+        make_word(4, 0x32),
+    ]
+    report = analyzer.analyse_segment(instructions)
+    names = [block.pattern.pattern.name for block in report.blocks if block.pattern]
+    assert "fanout_teardown" in names
 
 
 def test_segment_context_captures_test_and_return_boundaries():

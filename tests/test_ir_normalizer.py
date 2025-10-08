@@ -81,7 +81,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": -1,
         },
         "tailcall_dispatch": {
-            "opcodes": ["0x2B:0x00"],
+            "opcodes": ["0x2B:0x00", "0x29:0x10"],
             "name": "tailcall_dispatch",
             "category": "call_dispatch",
             "stack_delta": -1,
@@ -209,6 +209,67 @@ def write_manual(path: Path) -> KnowledgeBase:
             ],
             "postlude": [
                 {"kind": "raw", "mnemonic": "op_D0_06", "optional": True},
+            ],
+        },
+        "0x0929": {
+            "tail": True,
+            "cleanup_mask": "0x2910",
+            "prelude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_B4_09",
+                    "effect": {"mnemonic": "fanout_write", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_05_F0",
+                    "effect": {"mnemonic": "fanout", "inherit_operand": True},
+                    "optional": True,
+                },
+            ],
+            "postlude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_10_0E",
+                    "effect": {
+                        "mnemonic": "fanout",
+                        "inherit_operand": True,
+                        "operand_role": "mask",
+                        "operand_alias": "RET_MASK",
+                    },
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_FD_4A",
+                    "effect": {"mnemonic": "fanout_teardown", "inherit_operand": True},
+                    "optional": True,
+                },
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_63_9B",
+                    "effect": {"mnemonic": "fanout_teardown", "inherit_operand": True},
+                    "optional": True,
+                },
+            ],
+        },
+        "0x026C": {
+            "tail": True,
+            "prelude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_FD_4A",
+                    "effect": {"mnemonic": "fanout_teardown", "inherit_operand": True},
+                    "optional": True,
+                }
+            ],
+            "postlude": [
+                {
+                    "kind": "raw",
+                    "mnemonic": "op_63_9B",
+                    "effect": {"mnemonic": "fanout_teardown", "inherit_operand": True},
+                    "optional": True,
+                }
             ],
         },
     }
@@ -792,6 +853,46 @@ def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic in {"op_D0_04", "op_D0_06"}
         for node in block.nodes
     )
+
+
+def test_fanout_call_signature_produces_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x05, 0xF0, 0x4B76),
+        build_word(4, 0xB4, 0x09, 0x0000),
+        build_word(8, 0x2B, 0x00, 0x0929),
+        build_word(12, 0x10, 0x0E, RET_MASK),
+        build_word(16, 0xFD, 0x4A, 0x9D01),
+        build_word(20, 0x63, 0x9B, 0xDAFF),
+        build_word(24, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_like = next(node for node in block.nodes if isinstance(node, (IRCall, IRTailCall)))
+    if isinstance(call_like, IRTailCall):
+        target = call_like.target
+        cleanup_mnemonics = [step.mnemonic for step in call_like.cleanup]
+    else:
+        target = call_like.target
+        cleanup_mnemonics = [step.mnemonic for step in call_like.cleanup]
+
+    assert target == 0x0929
+    assert "fanout" in cleanup_mnemonics
+    assert "fanout_teardown" in cleanup_mnemonics
+    assert "fanout_write" in cleanup_mnemonics
+
+    raw_mnemonics = [node.mnemonic for node in block.nodes if isinstance(node, IRRaw)]
+    assert "op_05_F0" not in raw_mnemonics
+    assert "op_63_9B" not in raw_mnemonics
 
 
 def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:

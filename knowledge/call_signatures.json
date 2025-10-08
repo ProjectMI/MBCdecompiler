@@ -58,5 +58,84 @@
     "postlude": [
       {"kind": "raw", "mnemonic": "op_D0_06", "optional": true}
     ]
+  },
+  "0x0929": {
+    "tail": true,
+    "cleanup_mask": "0x2910",
+    "prelude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_B4_09",
+        "effect": {
+          "mnemonic": "fanout_write",
+          "inherit_operand": true
+        },
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_05_F0",
+        "effect": {
+          "mnemonic": "fanout",
+          "inherit_operand": true
+        },
+        "optional": true
+      }
+    ],
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_10_0E",
+        "effect": {
+          "mnemonic": "fanout",
+          "inherit_operand": true,
+          "operand_role": "mask",
+          "operand_alias": "RET_MASK"
+        }
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_FD_4A",
+        "effect": {
+          "mnemonic": "fanout_teardown",
+          "inherit_operand": true
+        },
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_63_9B",
+        "effect": {
+          "mnemonic": "fanout_teardown",
+          "inherit_operand": true
+        },
+        "optional": true
+      }
+    ]
+  },
+  "0x026C": {
+    "tail": true,
+    "prelude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_FD_4A",
+        "effect": {
+          "mnemonic": "fanout_teardown",
+          "inherit_operand": true
+        },
+        "optional": true
+      }
+    ],
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_63_9B",
+        "effect": {
+          "mnemonic": "fanout_teardown",
+          "inherit_operand": true
+        },
+        "optional": true
+      }
+    ]
   }
 }
