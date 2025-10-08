@@ -702,6 +702,36 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     assert all(write.port == "io.port_6910" for write in writes)
 
 
+def test_normalizer_handles_direct_io_port_write(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x1234),
+        build_word(4, 0x3D, 0x30, IO_SLOT),
+        build_word(8, 0x11, 0x28, 0x0000),
+        build_word(12, 0x5C, 0x08, 0x0000),
+        build_word(16, 0x3D, 0x30, 0x0000),
+        build_word(20, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+
+    assert any(write.mask == 0x1234 for write in writes)
+    assert all(write.port == "io.port_6910" for write in writes)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
+    )
+
+
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

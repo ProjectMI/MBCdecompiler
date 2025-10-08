@@ -113,9 +113,24 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 
 
 IO_READ_MNEMONICS = {"op_10_38"}
-IO_WRITE_MNEMONICS = {"op_10_24", "op_10_48"}
+IO_WRITE_MNEMONICS = {
+    "op_10_10",
+    "op_10_14",
+    "op_10_24",
+    "op_10_48",
+    "op_10_64",
+    "op_10_68",
+    "op_10_F4",
+}
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
-IO_BRIDGE_MNEMONICS = {"op_01_3D", "op_F1_3D", "op_38_00", "op_4C_00"}
+IO_BRIDGE_MNEMONICS = {
+    "op_01_3D",
+    "op_11_28",
+    "op_38_00",
+    "op_4C_00",
+    "op_5C_08",
+    "op_F1_3D",
+}
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
     IRCallCleanup,
@@ -1379,6 +1394,8 @@ class IRNormalizer:
                         scan += direction
                         steps += 1
                         continue
+                    if node.mnemonic == "op_3D_30" and node.operand != IO_SLOT:
+                        return scan
                     if node.mnemonic.startswith("op_10_"):
                         return scan
                     break
@@ -1399,6 +1416,11 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         if mnemonic in IO_READ_MNEMONICS:
             return IRIORead(port=IO_PORT_NAME)
+        if mnemonic == "op_3D_30" and instruction.operand != IO_SLOT:
+            mask = self._io_mask_value(items, index)
+            if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
+                mask = instruction.operand
+            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
@@ -2202,6 +2224,8 @@ class IRNormalizer:
         return None
 
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic == "op_3D_30":
+            return instruction.operand == IO_SLOT
         if instruction.mnemonic in IO_BRIDGE_MNEMONICS:
             return True
         if instruction.mnemonic.startswith("op_10_"):
