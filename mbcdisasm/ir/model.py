@@ -722,6 +722,7 @@ class IRPageRegister(IRNode):
 
     register: int
     value: Optional[str] = None
+    literal: Optional[int] = None
 
     def describe(self) -> str:
         operand = _format_operand(self.register)
