@@ -75,7 +75,7 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
-CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout"}
+CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
 CALL_PREPARATION_MNEMONICS = {
     "op_01_2C",
     "op_02_2A",
@@ -98,6 +98,8 @@ CALL_PREPARATION_MNEMONICS = {
     "op_60_08",
     "op_74_08",
     "op_AC_01",
+    "op_4B_91",
+    "op_72_23",
 }
 CALL_CLEANUP_MNEMONICS = {
     "call_helpers",
@@ -132,8 +134,10 @@ CALL_CLEANUP_MNEMONICS = {
     "op_D8_04",
     "op_F0_4B",
     "stack_shuffle",
+    "op_4B_91",
+    "op_E4_01",
 }
-CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_")
+CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_06_66",
     "op_10_8C",
@@ -184,7 +188,12 @@ TAILCALL_POSTLUDE = {
     "op_D0_06",
     "op_D8_04",
     "op_F0_4B",
+    "op_4B_91",
+    "op_E4_01",
+    "op_59_FE",
+    "op_95_FE",
 }
+TAILCALL_POSTLUDE_PREFIXES = ("op_59_FE", "op_95_FE")
 
 DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
@@ -2730,7 +2739,13 @@ class IRNormalizer:
                     if (
                         isinstance(candidate, RawInstruction)
                         and call.target in TAILCALL_HELPERS
-                        and candidate.mnemonic in TAILCALL_POSTLUDE
+                        and (
+                            candidate.mnemonic in TAILCALL_POSTLUDE
+                            or any(
+                                candidate.mnemonic.startswith(prefix)
+                                for prefix in TAILCALL_POSTLUDE_PREFIXES
+                            )
+                        )
                     ):
                         cleanup_steps.append(self._call_cleanup_effect(candidate))
                         offset += 1
