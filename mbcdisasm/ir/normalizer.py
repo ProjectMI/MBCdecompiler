@@ -15,7 +15,11 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import (
+    ASCII_ALLOWED,
+    InstructionKind,
+    InstructionProfile,
+)
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -190,7 +194,36 @@ DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
 
 
-ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
+ASCII_HELPER_IDS = {
+    0x0023,
+    0x005C,
+    0x0100,
+    0x0A00,
+    0x1014,
+    0x2910,
+    0x2C00,
+    0x2C02,
+    0x2C03,
+    0x2C06,
+    0x3C4B,
+    0x3D23,
+    0x3D30,
+    0x3D4A,
+    0x3E4B,
+    0x3EEB,
+    0x6910,
+    0x7223,
+    0x7230,
+    0x724A,
+    0xE14B,
+    0xED4B,
+    0xF04B,
+    0xF04D,
+    0xF0EB,
+    0xF13D,
+    0xF172,
+    0xF1ED,
+}
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -541,6 +574,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_spillover(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
@@ -739,6 +773,98 @@ class IRNormalizer:
                 self._annotate_literal_ssa(literal)
             items.replace_slice(index, index + 1, [literal])
             index += 1
+
+    def _pass_ascii_spillover(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        changed = True
+        while changed:
+            changed = False
+            index = 0
+            while index < len(items):
+                item = items[index]
+                if not isinstance(item, RawInstruction):
+                    index += 1
+                    continue
+
+                ascii_bytes = self._ascii_bytes_from_instruction(item)
+                if ascii_bytes is None:
+                    index += 1
+                    continue
+
+                if not self._has_ascii_context(items, index):
+                    index += 1
+                    continue
+
+                chunk = self._make_literal_chunk(
+                    ascii_bytes, item.mnemonic, item.annotations
+                )
+                self._transfer_ssa(item, chunk)
+                items.replace_slice(index, index + 1, [chunk])
+                metrics.literal_chunks += 1
+                changed = True
+                index += 1
+
+    def _ascii_bytes_from_instruction(self, instruction: RawInstruction) -> Optional[bytes]:
+        event = instruction.event
+        if event.delta != 0:
+            return None
+        if event.popped_types or event.pushed_types:
+            return None
+
+        mnemonic = instruction.mnemonic
+        if not mnemonic.startswith("op_"):
+            return None
+
+        parts = mnemonic.split("_")
+        if len(parts) != 3:
+            return None
+
+        high, low = parts[1], parts[2]
+        if len(high) != 2 or len(low) != 2:
+            return None
+
+        try:
+            first = int(high, 16)
+            second = int(low, 16)
+        except ValueError:
+            return None
+
+        pair = bytes((first, second))
+        if pair == b"\x00\x00":
+            return None
+
+        seen_ascii = False
+        for byte in pair:
+            if byte == 0:
+                continue
+            if byte not in ASCII_ALLOWED:
+                return None
+            seen_ascii = True
+
+        if not seen_ascii:
+            return None
+
+        return pair
+
+    def _has_ascii_context(self, items: _ItemList, index: int) -> bool:
+        return self._scan_for_ascii_anchor(items, index, -1) or self._scan_for_ascii_anchor(
+            items, index, 1
+        )
+
+    def _scan_for_ascii_anchor(
+        self, items: _ItemList, index: int, direction: int
+    ) -> bool:
+        scan = index + direction
+        while 0 <= scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, IRLiteralChunk):
+                return True
+            if isinstance(candidate, RawInstruction):
+                if self._ascii_bytes_from_instruction(candidate) is None:
+                    return False
+                scan += direction
+                continue
+            return False
+        return False
 
     def _annotate_literal_ssa(self, node: IRLiteral) -> None:
         names = self._ssa_bindings.get(id(node))
