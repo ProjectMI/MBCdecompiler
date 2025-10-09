@@ -34,7 +34,13 @@ from mbcdisasm.ir.model import (
     NormalizerMetrics,
     IRIORead,
 )
-from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
+from mbcdisasm.ir.normalizer import (
+    ASCII_HELPER_IDS,
+    ASCII_FRAGMENT_ANNOTATION,
+    RawBlock,
+    RawInstruction,
+    _ItemList,
+)
 from mbcdisasm.constants import (
     IO_SLOT,
     IO_PORT_NAME,
@@ -512,7 +518,9 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
     assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
 
     ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
-    assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
+    assert ascii_finalize and all(
+        node.helper in ASCII_HELPER_IDS for node in ascii_finalize
+    )
 
 
 def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
@@ -658,6 +666,73 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     assert symbol in pool
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
+
+
+def test_normalizer_merges_ascii_fragments(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_ascii_word(0, "HEAD"),
+        build_word(4, 0x65, 0x72, 0x0000),  # "er"
+        build_ascii_word(8, "TAIL"),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert len(header.chunks) == 1
+    chunk_name = header.chunks[0]
+
+    pool = {const.name: const for const in program.string_pool}
+    assert chunk_name in pool
+    constant = pool[chunk_name]
+    assert constant.data == b"HEADerTAIL"
+    assert constant.source == "ascii_run"
+
+    assert not any(isinstance(node, RawInstruction) for node in block.nodes)
+
+
+def test_normalizer_finalizes_extended_ascii_helpers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    helper_operand = 0x0100
+    words = [
+        build_ascii_word(0, "NOTE"),
+        build_word(4, 0x2E, 0x20, 0x0000),  # ". "
+        build_ascii_word(8, "END!"),
+        build_word(12, 0x10, 0xE8, helper_operand),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    header = next(node for node in block.nodes if isinstance(node, IRAsciiHeader))
+    assert len(header.chunks) == 1
+    chunk_name = header.chunks[0]
+
+    pool = {const.name: const for const in program.string_pool}
+    constant = pool[chunk_name]
+    assert constant.data == b"NOTE. END!"
+    assert constant.source == "ascii_run"
+
+    finalize = [node for node in block.nodes if isinstance(node, IRAsciiFinalize)]
+    assert len(finalize) == 1
+    node = finalize[0]
+    assert node.helper == helper_operand
+    assert node.summary == f"str({chunk_name}) {ASCII_FRAGMENT_ANNOTATION}"
     assert constant.segments == (constant.data,)
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import ASCII_ALLOWED, InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -190,7 +190,41 @@ DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
 
 
-ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
+ASCII_HELPER_IDS = {
+    0x0100,
+    0x3C4B,
+    0x3CE8,
+    0x3CEB,
+    0x3D23,
+    0x3D30,
+    0x3E4B,
+    0x3E4C,
+    0x3E4D,
+    0x3EE8,
+    0x3EEB,
+    0x7223,
+    0x7230,
+    0x724A,
+    0xE14B,
+    0xE14D,
+    0xE1E8,
+    0xECE8,
+    0xECEB,
+    0xED4B,
+    0xED4D,
+    0xEDE8,
+    0xEDEB,
+    0xF04B,
+    0xF04C,
+    0xF04D,
+    0xF0E8,
+    0xF0EB,
+    0xF13D,
+    0xF172,
+    0xF1ED,
+}
+
+ASCII_FRAGMENT_ANNOTATION = "inline_ascii_fragment"
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -953,35 +987,132 @@ class IRNormalizer:
 
             index += 1
 
+    def _ascii_fragment_bytes(self, instruction: RawInstruction) -> Optional[bytes]:
+        event = instruction.event
+        if event.delta != 0:
+            return None
+        if event.popped_types or event.pushed_types:
+            return None
+
+        mnemonic = instruction.mnemonic
+        if not mnemonic.startswith("op_"):
+            return None
+
+        word_bytes = instruction.profile.word.raw.to_bytes(4, "big")
+        data = bytearray()
+        ascii_seen = False
+
+        for offset in range(0, 4, 2):
+            hi = word_bytes[offset]
+            lo = word_bytes[offset + 1]
+            if hi == 0 and lo == 0:
+                continue
+
+            pair: List[int] = []
+            for value in (hi, lo):
+                if value == 0:
+                    continue
+                if value not in ASCII_ALLOWED:
+                    return None
+                pair.append(value)
+
+            if not pair:
+                continue
+
+            ascii_seen = True
+            data.extend(pair)
+
+        if not ascii_seen:
+            return None
+
+        return bytes(data)
+
     def _pass_ascii_runs(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
-            start = index
-            data_parts: List[bytes] = []
-            annotations: List[str] = []
-
-            while index < len(items):
-                candidate = items[index]
-                if isinstance(candidate, IRLiteralChunk):
-                    data_parts.append(candidate.data)
-                    annotations.extend(candidate.annotations)
-                    index += 1
-                    continue
-
-                break
-
-            if not data_parts:
+            current = items[index]
+            if not isinstance(current, IRLiteralChunk):
                 index += 1
                 continue
 
-            if len(data_parts) <= 1:
-                index = start + 1
+            start = index
+            while start > 0:
+                candidate = items[start - 1]
+                if isinstance(candidate, IRLiteralChunk):
+                    start -= 1
+                    continue
+                if isinstance(candidate, RawInstruction) and self._ascii_fragment_bytes(candidate):
+                    start -= 1
+                    continue
+                break
+
+            end = index + 1
+            while end < len(items):
+                candidate = items[end]
+                if isinstance(candidate, IRLiteralChunk):
+                    end += 1
+                    continue
+                if isinstance(candidate, RawInstruction) and self._ascii_fragment_bytes(candidate):
+                    end += 1
+                    continue
+                break
+
+            cluster = [items[pos] for pos in range(start, end)]
+            literal_nodes = [
+                node for node in cluster if isinstance(node, IRLiteralChunk)
+            ]
+
+            data_parts: List[bytes] = []
+            annotation_sources: List[Tuple[str, ...]] = []
+            valid_cluster = True
+
+            for node in cluster:
+                if isinstance(node, IRLiteralChunk):
+                    data_parts.append(node.data)
+                    annotation_sources.append(node.annotations)
+                    continue
+
+                if isinstance(node, RawInstruction):
+                    fragment = self._ascii_fragment_bytes(node)
+                    if fragment is None:
+                        valid_cluster = False
+                        break
+                    data_parts.append(fragment)
+                    annotation_sources.append(
+                        node.annotations + (ASCII_FRAGMENT_ANNOTATION,)
+                    )
+                    continue
+
+                valid_cluster = False
+                break
+
+            if not valid_cluster or not literal_nodes or len(data_parts) <= 1:
+                index = max(index + 1, end)
                 continue
 
+            merged_annotations: List[str] = []
+            seen_annotations: Set[str] = set()
+            for notes in annotation_sources:
+                for note in notes:
+                    if note in seen_annotations:
+                        continue
+                    seen_annotations.add(note)
+                    merged_annotations.append(note)
+
+            combined_data = b"".join(data_parts)
             chunk = self._make_literal_chunk(
-                b"".join(data_parts), "ascii_run", annotations
+                combined_data, "ascii_run", merged_annotations
             )
-            items.replace_slice(start, index, [chunk])
+
+            source = literal_nodes[0]
+            self._transfer_ssa(source, chunk)
+
+            for node in cluster:
+                if node is source:
+                    continue
+                self._ssa_bindings.pop(id(node), None)
+
+            items.replace_slice(start, end, [chunk])
             index = start + 1
 
     def _pass_ascii_glue(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
