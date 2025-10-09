@@ -15,7 +15,7 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import ASCII_ALLOWED, InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -4270,6 +4270,21 @@ class IRNormalizer:
                 return True
             if note.startswith("op_") and instruction.profile.kind is InstructionKind.LITERAL:
                 return True
+        if instruction.mnemonic.startswith("op_"):
+            parts = instruction.mnemonic.split("_")
+            if len(parts) == 3:
+                try:
+                    opcode = int(parts[1], 16)
+                    mode = int(parts[2], 16)
+                except ValueError:
+                    pass
+                else:
+                    if (
+                        instruction.operand == 0
+                        and opcode in ASCII_ALLOWED
+                        and mode in ASCII_ALLOWED
+                    ):
+                        return True
         return False
 
     def _format_annotation(self, instruction: RawInstruction) -> str:

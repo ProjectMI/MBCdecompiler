@@ -37,6 +37,11 @@ ASCII_HEURISTIC_SUMMARY = (
     "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
 )
 
+ASCII_PAIR_ALLOWED = set(range(0x30, 0x3A))  # digits
+ASCII_PAIR_ALLOWED.update(range(0x41, 0x5B))  # uppercase letters
+ASCII_PAIR_ALLOWED.update(range(0x61, 0x7B))  # lowercase letters
+ASCII_PAIR_ALLOWED.add(0x5F)  # underscore often appears in tags
+
 
 class InstructionKind(Enum):
     """High level classification of an opcode.
@@ -449,26 +454,58 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     if all(byte == 0 for byte in raw):
         return False
 
-    printable = 0
-    for pair_start in range(0, 4, 2):
-        pair = raw[pair_start : pair_start + 2]
-        if pair == b"\x00\x00":
+    ascii_positions = []
+    pair_ascii: Tuple[list, list] = ([], [])
+    pairs = (raw[0:2], raw[2:4])
+    for index, byte in enumerate(raw):
+        if byte == 0:
+            continue
+        if byte not in ASCII_ALLOWED:
             return False
+        ascii_positions.append(index)
+        pair_ascii[index // 2].append((index % 2, byte))
 
-        seen_ascii = False
-        for byte in pair:
-            if byte == 0:
-                continue
-            if byte not in ASCII_ALLOWED:
-                return False
-            seen_ascii = True
-            if 0x20 <= byte <= 0x7E:
-                printable += 1
+    if not ascii_positions:
+        return False
 
-        if not seen_ascii:
+    high_ascii = len(pair_ascii[0])
+    low_ascii = len(pair_ascii[1])
+
+    if len(ascii_positions) >= 3:
+        # Avoid mistaking control opcodes for literals: if the operand only
+        # contributes a trailing byte (``0x00`` followed by ASCII) the pattern
+        # tends to encode a return mask rather than a literal chunk.
+        if low_ascii == 0:
             return False
+        if (
+            low_ascii == 1
+            and pairs[1][0] == 0
+            and pairs[1][1] != 0
+            and high_ascii == 2
+        ):
+            return False
+        return True
 
-    return printable > 0
+    if len(ascii_positions) == 2:
+        # Pair fragments occur frequently in inline ASCII pools, either as
+        # narrow character pairs (e.g. ``th``) or as wide-character encodings
+        # where the zero padding has not been stripped yet.  Treat them as
+        # chunks when they reside within the same 16-bit pair or follow the
+        # ``0x00 + ASCII`` wide-character layout.
+        first, second = ascii_positions
+        if first // 2 == second // 2:
+            pair_index = first // 2
+            pair = pairs[pair_index]
+            if all(byte in ASCII_PAIR_ALLOWED for byte in pair if byte != 0):
+                return True
+            return False
+        if first == 1 and second == 3 and raw[0] == 0 and raw[2] == 0:
+            return True
+        if first == 0 and second == 2 and raw[1] == 0 and raw[3] == 0:
+            return True
+        return False
+
+    return False
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:

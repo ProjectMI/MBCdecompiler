@@ -36,6 +36,18 @@ def test_ascii_detection_marks_inline_chunk():
     assert profile.traits.get("heuristic")
 
 
+def test_ascii_detection_accepts_ascii_pairs_with_padding():
+    knowledge = KnowledgeBase({})
+    # The operand carries padding zeros which previously caused the heuristic
+    # to reject the instruction even though the opcode/mode represent a text
+    # fragment.
+    word = InstructionWord(0, int.from_bytes(b"th\x00\x00", "big"))
+    assert looks_like_ascii_chunk(word)
+    profile = InstructionProfile.from_word(word, knowledge)
+    assert profile.mnemonic == "inline_ascii_chunk"
+    assert profile.kind is InstructionKind.ASCII_CHUNK
+
+
 def test_ascii_detection_accepts_wide_pairs():
     wide_be = InstructionWord(0, int.from_bytes(b"\x00A\x00B", "big"))
     wide_le = InstructionWord(4, int.from_bytes(b"A\x00B\x00", "big"))
