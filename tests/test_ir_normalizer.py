@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
@@ -158,6 +160,15 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x0020": "call_helper_20",
         "0x0072": "tail_helper_72",
         "0x00F0": "tail_helper_f0",
+        "0x003E": "tail_helper_3e",
+        "0x00ED": "tail_helper_ed",
+        "0x013D": "tail_helper_13d",
+        "0x01EC": "tail_helper_1ec",
+        "0x01F1": "tail_helper_1f1",
+        "0x032C": "tail_helper_32c",
+        "0x0BF0": "tail_helper_bf0",
+        "0x0FF0": "tail_helper_ff0",
+        "0x16F0": "tail_helper_16f0",
         "0x6623": "dispatch_helper_6623",
         "0x6624": "dispatch_helper_6624",
     }
@@ -1156,6 +1167,67 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
     )
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        0x003E,
+        0x00ED,
+        0x013D,
+        0x01EC,
+        0x01F1,
+        0x032C,
+        0x0BF0,
+        0x0FF0,
+        0x16F0,
+    ],
+)
+def test_normalizer_collapses_extended_tail_helpers(target: int) -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge"))
+
+    words = [
+        build_word(0, 0x2B, 0x00, target),
+        build_word(4, 0x10, 0x0E, 0x0000),
+        build_word(8, 0x5E, 0x29, RET_MASK),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x64, 0x20, 0x0000),
+        build_word(20, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_node = next(
+        node
+        for node in block.nodes
+        if isinstance(node, (IRTailCall, IRTailcallReturn, IRCallReturn))
+    )
+
+    if isinstance(call_node, IRTailCall):
+        cleanup = call_node.cleanup
+        cleanup_mask = call_node.cleanup_mask
+    else:
+        cleanup = call_node.cleanup
+        cleanup_mask = call_node.cleanup_mask
+
+    mnemonics = {step.mnemonic for step in cleanup}
+    assert {"op_10_0E", "op_5E_29", "op_64_20"}.issubset(mnemonics)
+    assert cleanup_mask in (None, RET_MASK)
+
+    lingering = {
+        node.mnemonic
+        for node in block.nodes
+        if isinstance(node, IRRaw)
+        and node.mnemonic in {"op_10_0E", "op_5E_29", "op_64_20"}
+    }
+    assert not lingering
 
 
 def test_normalizer_collapses_inline_tail_dispatch() -> None:

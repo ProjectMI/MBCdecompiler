@@ -131,8 +131,44 @@ CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_70_29",
 }
 
-TAILCALL_HELPERS = {0x00F0}
-TAILCALL_POSTLUDE = {"op_06_66", "op_0B_29", "op_10_8C", "op_64_20", "op_65_30", "op_70_29"}
+TAILCALL_HELPERS = {
+    0x003E,
+    0x00ED,
+    0x00F0,
+    0x013D,
+    0x01EC,
+    0x01F1,
+    0x032C,
+    0x0BF0,
+    0x0FF0,
+    0x16F0,
+}
+TAILCALL_POSTLUDE = {
+    "op_01_6C",
+    "op_05_00",
+    "op_06_66",
+    "op_0B_29",
+    "op_0C_00",
+    "op_10_0E",
+    "op_10_12",
+    "op_10_5C",
+    "op_10_8C",
+    "op_10_E8",
+    "op_14_07",
+    "op_32_29",
+    "op_52_05",
+    "op_58_08",
+    "op_5E_29",
+    "op_64_20",
+    "op_65_30",
+    "op_6C_01",
+    "op_70_29",
+    "op_C4_06",
+    "op_D0_04",
+    "op_D0_06",
+    "op_D8_04",
+    "op_F0_4B",
+}
 
 DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
