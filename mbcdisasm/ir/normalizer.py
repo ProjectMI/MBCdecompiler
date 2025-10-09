@@ -173,18 +173,12 @@ IO_BRIDGE_MNEMONICS = {
     "op_A4_1B",
     "op_61_10",
 }
-IO_HANDSHAKE_MNEMONICS = {
-    "op_01_30",
-    "op_04_30",
-    "op_0A_30",
-    "op_3D_30",
-    "op_43_30",
-}
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRReturn,
     IRTailCall,
     IRTailcallReturn,
     IRSwitchDispatch,
@@ -1489,14 +1483,14 @@ class IRNormalizer:
 
             index += 1
 
-        direct_candidates = IO_READ_MNEMONICS | IO_WRITE_MNEMONICS
         index = 0
         while index < len(items):
             item = items[index]
             if not (
                 isinstance(item, RawInstruction)
                 and (
-                    item.mnemonic in direct_candidates
+                    item.mnemonic in IO_READ_MNEMONICS
+                    or item.mnemonic in IO_WRITE_MNEMONICS
                     or (
                         item.mnemonic.startswith("op_10_")
                         and item.operand == IO_SLOT
@@ -1582,7 +1576,7 @@ class IRNormalizer:
     def _io_mask_value(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
         steps = 0
-        while scan >= 0 and steps < 20:
+        while scan >= 0 and steps < 32:
             node = items[scan]
             if isinstance(node, IRLiteral):
                 return node.value
@@ -2454,8 +2448,6 @@ class IRNormalizer:
 
     def _is_io_handshake_instruction(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
-        if mnemonic in IO_HANDSHAKE_MNEMONICS:
-            return instruction.operand == IO_SLOT
         return (
             mnemonic.startswith("op_")
             and mnemonic.endswith("_30")
