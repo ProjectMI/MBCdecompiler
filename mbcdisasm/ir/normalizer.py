@@ -212,6 +212,14 @@ IO_WRITE_MNEMONICS = {
     "op_10_64",
     "op_10_68",
     "op_10_F4",
+    "op_14_10",
+    "op_19_10",
+    "op_24_10",
+    "op_2C_10",
+    "op_38_10",
+    "op_48_10",
+    "op_64_10",
+    "op_F4_10",
 }
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
 IO_BRIDGE_MNEMONICS = {
@@ -224,6 +232,8 @@ IO_BRIDGE_MNEMONICS = {
     "op_F0_1B",
     "op_A4_1B",
     "op_61_10",
+    "op_68_10",
+    "op_F0_E8",
 }
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
@@ -1523,6 +1533,24 @@ class IRNormalizer:
                 self._transfer_ssa(item, node)
                 start = min(index, candidate_index)
                 end = max(index, candidate_index) + 1
+                while start > 0:
+                    previous = items[start - 1]
+                    if isinstance(previous, RawInstruction) and self._is_io_bridge_instruction(previous):
+                        start -= 1
+                        continue
+                    if isinstance(previous, IO_BRIDGE_NODE_TYPES):
+                        start -= 1
+                        continue
+                    break
+                while end < len(items):
+                    following = items[end]
+                    if isinstance(following, RawInstruction) and self._is_io_bridge_instruction(following):
+                        end += 1
+                        continue
+                    if isinstance(following, IO_BRIDGE_NODE_TYPES):
+                        end += 1
+                        continue
+                    break
                 items.replace_slice(start, end, [node])
                 index = start + 1
                 continue
@@ -1576,7 +1604,7 @@ class IRNormalizer:
                         scan += direction
                         steps += 1
                         continue
-                    if node.mnemonic.startswith("op_10_"):
+                    if self._is_io_candidate_instruction(node):
                         return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
@@ -1637,7 +1665,7 @@ class IRNormalizer:
                     scan -= 1
                     steps += 1
                     continue
-                if node.mnemonic.startswith("op_10_"):
+                if self._is_io_candidate_instruction(node):
                     break
             elif isinstance(node, IRLiteralChunk):
                 scan -= 1
@@ -2509,12 +2537,14 @@ class IRNormalizer:
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
         if instruction.mnemonic in IO_BRIDGE_MNEMONICS:
             return True
+        if instruction.mnemonic in IO_WRITE_MNEMONICS:
+            return False
+        if instruction.mnemonic in IO_READ_MNEMONICS:
+            return False
         if instruction.mnemonic.startswith("op_10_"):
             return False
         event = instruction.event
         if event.delta != 0:
-            return False
-        if event.popped_types or event.pushed_types:
             return False
         kind = instruction.profile.kind
         if kind in {
@@ -2527,7 +2557,24 @@ class IRNormalizer:
             InstructionKind.CONTROL,
         }:
             return False
+        if event.popped_types or event.pushed_types:
+            if len(event.popped_types) != len(event.pushed_types):
+                return False
+            allowed_types = {StackValueType.UNKNOWN, StackValueType.SLOT}
+            types = set(event.popped_types) | set(event.pushed_types)
+            if not types.issubset(allowed_types):
+                return False
         return True
+
+    def _is_io_candidate_instruction(self, instruction: RawInstruction) -> bool:
+        if self._is_io_handshake_instruction(instruction):
+            return False
+        mnemonic = instruction.mnemonic
+        if mnemonic in IO_READ_MNEMONICS or mnemonic in IO_WRITE_MNEMONICS:
+            return True
+        if mnemonic.startswith("op_10_") and instruction.operand == IO_SLOT:
+            return True
+        return False
 
     def _update_tail_helper_hints(self, block: RawBlock) -> None:
         if not block.instructions:

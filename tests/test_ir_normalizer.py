@@ -777,6 +777,67 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     assert all(write.port == "io.port_6910" for write in writes)
 
 
+def test_normalizer_handles_mirrored_io_write(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x4455),
+        build_word(4, 0x64, 0x10, 0x0000),
+        build_word(8, 0x3D, 0x30, IO_SLOT),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    writes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRIOWrite)
+    ]
+
+    assert len(writes) == 1
+    assert writes[0].mask == 0x4455
+    assert writes[0].port == IO_PORT_NAME
+
+
+def test_normalizer_skips_mirrored_io_bridge(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x5566),
+        build_word(4, 0x68, 0x10, 0x0000),
+        build_word(8, 0x10, 0x24, 0x0000),
+        build_word(12, 0x3D, 0x30, IO_SLOT),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert len(writes) == 1
+    assert writes[0].mask == 0x5566
+    assert writes[0].port == IO_PORT_NAME
+
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_68_10" for node in block.nodes
+    )
+
+
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
