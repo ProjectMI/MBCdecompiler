@@ -152,6 +152,18 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "op_70_29",
             "category": "call_cleanup",
         },
+        "io_bridge_alt": {
+            "opcodes": ["0xF0:0xE8"],
+            "name": "io_bridge_alt",
+            "category": "bridge",
+            "stack_delta": 0,
+        },
+        "io_write_mirror": {
+            "opcodes": ["0x64:0x10"],
+            "name": "io_write_mirror",
+            "category": "io_write",
+            "stack_delta": 0,
+        },
     }
     manual_path = path / "manual_annotations.json"
     manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
@@ -775,6 +787,40 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     masks = sorted(write.mask for write in writes)
     assert masks == [0x1234, 0x2910]
     assert all(write.port == "io.port_6910" for write in writes)
+
+
+def test_normalizer_handles_mirrored_io_forms(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x4444),
+        build_word(4, 0xF0, 0xE8, 0x0000),
+        build_word(8, 0x3D, 0x30, IO_SLOT),
+        build_word(12, 0xF0, 0xE8, 0x0000),
+        build_word(16, 0x64, 0x10, IO_SLOT),
+        build_word(20, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert len(writes) == 1
+    write = writes[0]
+    assert write.mask == 0x4444
+    assert write.port == IO_PORT_NAME
+
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_3D_30", "op_64_10"}
+        for node in block.nodes
+    )
 
 
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
