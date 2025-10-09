@@ -46,6 +46,15 @@ def test_ascii_detection_accepts_wide_pairs():
     assert looks_like_ascii_chunk(pair_le)
 
 
+def test_ascii_detection_accepts_padded_pairs():
+    padded = InstructionWord(0, int.from_bytes(b"th\x00\x00", "big"))
+    assert looks_like_ascii_chunk(padded)
+    knowledge = KnowledgeBase({})
+    profile = InstructionProfile.from_word(padded, knowledge)
+    assert profile.kind is InstructionKind.ASCII_CHUNK
+    assert profile.mnemonic == "inline_ascii_chunk"
+
+
 def test_signature_detector_matches_ascii_run():
     knowledge = KnowledgeBase({})
     words = [

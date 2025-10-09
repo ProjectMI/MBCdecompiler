@@ -450,10 +450,15 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
         return False
 
     printable = 0
+    ascii_pairs = 0
+    zero_pairs = 0
+
     for pair_start in range(0, 4, 2):
         pair = raw[pair_start : pair_start + 2]
+
         if pair == b"\x00\x00":
-            return False
+            zero_pairs += 1
+            continue
 
         seen_ascii = False
         for byte in pair:
@@ -468,7 +473,32 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
         if not seen_ascii:
             return False
 
-    return printable > 0
+        ascii_pairs += 1
+
+    first_pair_letters = all(
+        0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A
+        for byte in raw[:2]
+        if byte != 0
+    )
+
+    if ascii_pairs == 0:
+        return False
+
+    if zero_pairs:
+        # Allow a single padding pair (commonly trailing) but avoid overly
+        # permissive matches where the word is otherwise zero.
+        if zero_pairs > 1:
+            return False
+        if raw[:2] == b"\x00\x00":
+            return False
+
+    if ascii_pairs == 1:
+        if zero_pairs != 1:
+            return False
+        if not first_pair_letters:
+            return False
+
+    return printable >= 2
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
