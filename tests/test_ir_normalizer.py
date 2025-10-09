@@ -99,6 +99,36 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "call_dispatch",
             "stack_delta": -1,
         },
+        "op_59_FE": {
+            "opcodes": ["0x59:0xFE"],
+            "name": "op_59_FE",
+            "category": "call_wrapper",
+            "stack_delta": 0,
+        },
+        "op_72_23": {
+            "opcodes": ["0x72:0x23"],
+            "name": "op_72_23",
+            "category": "call_wrapper",
+            "stack_delta": 0,
+        },
+        "op_4B_91": {
+            "opcodes": ["0x4B:0x91"],
+            "name": "op_4B_91",
+            "category": "call_wrapper",
+            "stack_delta": 0,
+        },
+        "op_E4_01": {
+            "opcodes": ["0xE4:0x01"],
+            "name": "op_E4_01",
+            "category": "call_wrapper",
+            "stack_delta": 0,
+        },
+        "op_95_FE": {
+            "opcodes": ["0x95:0xFE"],
+            "name": "op_95_FE",
+            "category": "call_wrapper",
+            "stack_delta": 0,
+        },
         "call_helpers": {
             "opcodes": ["0x10:0xE8"],
             "name": "call_helpers",
@@ -931,6 +961,44 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "stack_shuffle" for node in block.nodes
+    )
+
+
+def test_normalizer_absorbs_zero_stack_call_wrappers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x59, 0xFE, 0x1111),
+        build_word(4, 0x72, 0x23, 0x2222),
+        build_word(8, 0x4B, 0x91, 0x3333),
+        build_word(12, 0x28, 0x00, 0x0042),
+        build_word(16, 0xE4, 0x01, 0x4444),
+        build_word(20, 0x95, 0xFE, 0x5555),
+        build_word(24, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    call_return = block.nodes[0]
+    assert isinstance(call_return, IRCallReturn)
+
+    cleanup_steps = list(call_return.cleanup)
+    assert any(step.mnemonic == "op_E4_01" and step.operand == 0x4444 for step in cleanup_steps)
+    assert any(step.mnemonic.startswith("op_95_FE") and step.operand == 0x5555 for step in cleanup_steps)
+    assert not any(step.mnemonic in {"op_59_FE", "op_72_23", "op_4B_91"} for step in cleanup_steps)
+
+    assert not any(
+        isinstance(node, IRRaw)
+        and node.mnemonic in {"op_59_FE", "op_72_23", "op_4B_91", "op_E4_01", "op_95_FE"}
+        for node in block.nodes
     )
 
 
