@@ -202,6 +202,17 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 
 
 IO_READ_MNEMONICS = {"op_10_38", "op_11_28"}
+_MIRRORED_IO_WRITE_MNEMONICS = {
+    "op_14_10",
+    "op_19_10",
+    "op_24_10",
+    "op_2C_10",
+    "op_48_10",
+    "op_64_10",
+    "op_68_10",
+    "op_F4_10",
+}
+
 IO_WRITE_MNEMONICS = {
     "op_10_10",
     "op_10_14",
@@ -212,7 +223,7 @@ IO_WRITE_MNEMONICS = {
     "op_10_64",
     "op_10_68",
     "op_10_F4",
-}
+} | _MIRRORED_IO_WRITE_MNEMONICS
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
 IO_BRIDGE_MNEMONICS = {
     "op_01_3D",
@@ -224,7 +235,8 @@ IO_BRIDGE_MNEMONICS = {
     "op_F0_1B",
     "op_A4_1B",
     "op_61_10",
-}
+    "op_F0_E8",
+} | _MIRRORED_IO_WRITE_MNEMONICS
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
     IRCallCleanup,
@@ -1572,12 +1584,12 @@ class IRNormalizer:
             while 0 <= scan < len(items) and steps < 12:
                 node = items[scan]
                 if isinstance(node, RawInstruction):
+                    if self._is_io_write_candidate(node):
+                        return scan
                     if self._is_io_bridge_instruction(node):
                         scan += direction
                         steps += 1
                         continue
-                    if node.mnemonic.startswith("op_10_"):
-                        return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
                     scan += direction
@@ -1597,6 +1609,12 @@ class IRNormalizer:
                     continue
                 break
         return None
+
+    def _is_io_write_candidate(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic in IO_WRITE_MNEMONICS:
+            return True
+        return mnemonic.startswith("op_10_")
 
     def _build_io_node(
         self,
@@ -2507,10 +2525,10 @@ class IRNormalizer:
         )
 
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic in IO_WRITE_MNEMONICS or self._is_io_handshake_instruction(instruction):
+            return False
         if instruction.mnemonic in IO_BRIDGE_MNEMONICS:
             return True
-        if instruction.mnemonic.startswith("op_10_"):
-            return False
         event = instruction.event
         if event.delta != 0:
             return False
