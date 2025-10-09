@@ -203,6 +203,7 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 
 IO_READ_MNEMONICS = {"op_10_38", "op_11_28"}
 IO_WRITE_MNEMONICS = {
+    # Canonical op_10_* accessors.
     "op_10_10",
     "op_10_14",
     "op_10_19",
@@ -212,6 +213,15 @@ IO_WRITE_MNEMONICS = {
     "op_10_64",
     "op_10_68",
     "op_10_F4",
+    # Mirrored encodings observed in several scripts.
+    "op_14_10",
+    "op_19_10",
+    "op_24_10",
+    "op_2C_10",
+    "op_48_10",
+    "op_64_10",
+    "op_68_10",
+    "op_F4_10",
 }
 IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
 IO_BRIDGE_MNEMONICS = {
@@ -224,6 +234,9 @@ IO_BRIDGE_MNEMONICS = {
     "op_F0_1B",
     "op_A4_1B",
     "op_61_10",
+    "op_E8_4D",
+    "op_F0_4D",
+    "op_F0_E8",
 }
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
@@ -1576,7 +1589,10 @@ class IRNormalizer:
                         scan += direction
                         steps += 1
                         continue
-                    if node.mnemonic.startswith("op_10_"):
+                    if self._is_io_handshake_instruction(node):
+                        break
+                    candidate = self._build_io_node(items, scan, node, allow_prefix=True)
+                    if candidate is not None:
                         return scan
                     break
                 if isinstance(node, (IRLiteral, IRLiteralChunk)):
@@ -2509,6 +2525,10 @@ class IRNormalizer:
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
         if instruction.mnemonic in IO_BRIDGE_MNEMONICS:
             return True
+        if instruction.mnemonic in IO_WRITE_MNEMONICS or instruction.mnemonic in IO_READ_MNEMONICS:
+            return False
+        if self._is_io_handshake_instruction(instruction):
+            return False
         if instruction.mnemonic.startswith("op_10_"):
             return False
         event = instruction.event

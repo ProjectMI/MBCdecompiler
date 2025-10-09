@@ -777,6 +777,48 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     assert all(write.port == "io.port_6910" for write in writes)
 
 
+def test_normalizer_merges_mirrored_io_sequence(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0xAAAA),
+        build_word(4, 0x3D, 0x30, IO_SLOT),
+        build_word(8, 0xF0, 0xE8, 0x0000),
+        build_word(12, 0x64, 0x10, 0xAAAA),
+        build_word(16, 0x00, 0x00, 0xBBBB),
+        build_word(20, 0x3D, 0x30, IO_SLOT),
+        build_word(24, 0x61, 0x10, 0x0000),
+        build_word(28, 0x68, 0x10, 0xBBBB),
+        build_word(32, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    writes = [
+        node
+        for node in block.nodes
+        if isinstance(node, IRIOWrite)
+    ]
+
+    masks = sorted(write.mask for write in writes)
+    assert masks == [0xAAAA, 0xBBBB]
+
+    raw_mnemonics = {
+        node.mnemonic
+        for node in block.nodes
+        if isinstance(node, IRRaw)
+    }
+
+    assert {"op_64_10", "op_68_10", "op_F0_E8", "op_61_10"}.isdisjoint(raw_mnemonics)
+
+
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
