@@ -15,7 +15,7 @@ from ..constants import (
     MEMORY_PAGE_ALIASES,
     RET_MASK,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import ASCII_ALLOWED, InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -378,6 +378,7 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._detected_ascii_helpers: Set[int] = set()
 
     # ------------------------------------------------------------------
     # public entry points
@@ -541,6 +542,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_ascii_pairs(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
@@ -738,6 +740,29 @@ class IRNormalizer:
             if isinstance(literal, IRLiteral):
                 self._annotate_literal_ssa(literal)
             items.replace_slice(index, index + 1, [literal])
+            index += 1
+
+    def _pass_ascii_pairs(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            data = self._ascii_pair_bytes(item)
+            if data is None:
+                index += 1
+                continue
+
+            if not self._has_ascii_context(items, index):
+                index += 1
+                continue
+
+            chunk = self._make_literal_chunk(data, item.mnemonic, item.annotations)
+            self._transfer_ssa(item, chunk)
+            items.replace_slice(index, index + 1, [chunk])
+            metrics.literal_chunks += 1
             index += 1
 
     def _annotate_literal_ssa(self, node: IRLiteral) -> None:
@@ -1046,6 +1071,56 @@ class IRNormalizer:
             items.replace_slice(start, removal_end, [combined])
             metrics.reduce_replaced += len(reducers)
             index = start + 1
+
+    def _ascii_pair_bytes(self, instruction: RawInstruction) -> Optional[bytes]:
+        event = instruction.event
+        if event.depth_before != event.depth_after:
+            return None
+        if event.popped_types or event.pushed_types:
+            return None
+
+        profile = instruction.profile
+        if profile.kind is InstructionKind.ASCII_CHUNK:
+            return None
+
+        mnemonic = profile.mnemonic
+        if not mnemonic.startswith("op_"):
+            return None
+
+        parts = mnemonic.split("_")
+        if len(parts) != 3 or parts[0] != "op":
+            return None
+
+        try:
+            hi = int(parts[1], 16)
+            lo = int(parts[2], 16)
+        except ValueError:
+            return None
+
+        data = bytes([hi, lo])
+        if not any(data):
+            return None
+        for byte in data:
+            if byte not in ASCII_ALLOWED and byte != 0x00:
+                return None
+        return data
+
+    def _has_ascii_context(self, items: _ItemList, index: int) -> bool:
+        for direction in (-1, 1):
+            scan = index + direction
+            while 0 <= scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                    scan += direction
+                    continue
+                if isinstance(candidate, (IRLiteralChunk, IRAsciiHeader, IRAsciiPreamble)):
+                    return True
+                if isinstance(candidate, RawInstruction):
+                    if self._ascii_pair_bytes(candidate) is not None:
+                        scan += direction
+                        continue
+                break
+        return False
 
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int
@@ -2540,41 +2615,24 @@ class IRNormalizer:
             if instruction.mnemonic == "op_08_00":
                 self._pending_tail_targets[0x0072].append(instruction.operand & 0xFFFF)
                 break
-            if instruction.mnemonic == "call_helpers" and instruction.operand in ASCII_HELPER_IDS:
-                self._pending_tail_targets[0x003D].append(instruction.operand & 0xFFFF)
-                break
+            if instruction.mnemonic == "call_helpers":
+                operand = instruction.operand & 0xFFFF
+                if self._is_known_ascii_helper(instruction.operand) or self._looks_like_ascii_finalize_call(instruction):
+                    self._register_ascii_helper(instruction.operand)
+                    self._pending_tail_targets[0x003D].append(operand)
+                    break
 
     def _pass_ascii_finalize(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
-            helper_operand: Optional[int] = None
-            if isinstance(item, RawInstruction):
-                if item.mnemonic == "call_helpers" and item.operand in ASCII_HELPER_IDS:
-                    helper_operand = item.operand
-            elif isinstance(item, IRCallCleanup):
-                ascii_steps = [
-                    step
-                    for step in item.steps
-                    if step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS
-                ]
-                if ascii_steps:
-                    helper_operand = ascii_steps[0].operand
-            if helper_operand is None:
+            summary = self._ascii_finalize_summary(items, index)
+            if not summary:
                 index += 1
                 continue
 
-            summary = ""
-            if index > 0:
-                previous = items[index - 1]
-                if isinstance(previous, IRLiteralChunk):
-                    summary = previous.describe()
-                elif isinstance(previous, IRLiteral):
-                    summary = previous.describe()
-                elif isinstance(previous, IRAsciiPreamble):
-                    summary = previous.describe()
-
-            if not summary:
+            helper_operand, matched_steps = self._ascii_finalize_helper(items, index, summary)
+            if helper_operand is None:
                 index += 1
                 continue
 
@@ -2582,11 +2640,7 @@ class IRNormalizer:
             self._transfer_ssa(item, finalize)
 
             if isinstance(item, IRCallCleanup):
-                remaining_steps = tuple(
-                    step
-                    for step in item.steps
-                    if not (step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS)
-                )
+                remaining_steps = tuple(step for step in item.steps if step not in matched_steps)
                 if remaining_steps:
                     updated_cleanup = IRCallCleanup(steps=remaining_steps)
                     items.replace_slice(index, index + 1, [finalize, updated_cleanup])
@@ -2598,6 +2652,97 @@ class IRNormalizer:
 
             items.replace_slice(index, index + 1, [finalize])
             index += 1
+
+    def _ascii_finalize_summary(self, items: _ItemList, index: int) -> str:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                scan -= 1
+                continue
+            if isinstance(candidate, (IRLiteralChunk, IRAsciiPreamble, IRAsciiHeader)):
+                return candidate.describe()
+            if isinstance(candidate, IRLiteral):
+                value = candidate.value & 0xFFFF
+                hi = (value >> 8) & 0xFF
+                lo = value & 0xFF
+                parts = []
+                if hi:
+                    parts.append(hi)
+                parts.append(lo)
+                if parts and not all(part == 0 for part in parts):
+                    if all(part in ASCII_ALLOWED or part == 0x00 for part in parts):
+                        return candidate.describe()
+            break
+        return ""
+
+    def _ascii_finalize_helper(
+        self, items: _ItemList, index: int, summary: str
+    ) -> Tuple[Optional[int], Tuple[IRStackEffect, ...]]:
+        item = items[index]
+        if isinstance(item, RawInstruction):
+            operand = self._ascii_finalize_operand_from_instruction(item, summary)
+            if operand is None:
+                return None, tuple()
+            return operand, tuple()
+
+        if isinstance(item, IRCallCleanup):
+            matched: List[IRStackEffect] = []
+            operand: Optional[int] = None
+            for step in item.steps:
+                if step.mnemonic != "call_helpers":
+                    continue
+                candidate = step.operand
+                if self._is_known_ascii_helper(candidate) or (summary and step.pops == 0):
+                    operand = candidate
+                    matched.append(step)
+                    break
+            if operand is not None:
+                self._register_ascii_helper(operand)
+                return operand, tuple(matched)
+        return None, tuple()
+
+    def _ascii_finalize_operand_from_instruction(
+        self, instruction: RawInstruction, summary: str
+    ) -> Optional[int]:
+        if instruction.mnemonic != "call_helpers":
+            return None
+
+        operand = instruction.operand
+        if self._is_known_ascii_helper(operand):
+            self._register_ascii_helper(operand)
+            return operand
+
+        if summary and self._looks_like_ascii_finalize_call(instruction):
+            self._register_ascii_helper(operand)
+            return operand
+        return None
+
+    def _is_known_ascii_helper(self, operand: int) -> bool:
+        return operand in ASCII_HELPER_IDS or operand in self._detected_ascii_helpers
+
+    def _register_ascii_helper(self, operand: int) -> None:
+        self._detected_ascii_helpers.add(operand)
+
+    @staticmethod
+    def _looks_like_ascii_finalize_call(instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.depth_before != event.depth_after:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        kind = instruction.profile.kind
+        if kind in {
+            InstructionKind.BRANCH,
+            InstructionKind.RETURN,
+            InstructionKind.TERMINATOR,
+            InstructionKind.CALL,
+            InstructionKind.TAILCALL,
+            InstructionKind.TEST,
+            InstructionKind.CONTROL,
+        }:
+            return False
+        return True
 
     def _pass_flag_checks(self, items: _ItemList) -> None:
         index = 0

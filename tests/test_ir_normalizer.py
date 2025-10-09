@@ -571,6 +571,62 @@ def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
     assert {"op_10_64", "op_10_F4", "op_3D_30", "op_11_28"}.isdisjoint(raw_mnemonics)
 
 
+def test_normalizer_merges_inline_ascii_pairs(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_ascii_word(0, "stri"),
+        build_word(4, 0x6E, 0x67, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    nodes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    header = next((node for node in nodes if isinstance(node, IRAsciiHeader)), None)
+    assert header is not None
+    assert any(constant.data == b"string" for constant in program.string_pool)
+
+
+def test_normalizer_detects_additional_ascii_finalize_helpers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    helper_id = 0x7430
+
+    words = [
+        build_ascii_word(0, "text"),
+        build_word(4, 0x10, 0xE8, helper_id),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    nodes = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+    ]
+
+    finalize_nodes = [node for node in nodes if isinstance(node, IRAsciiFinalize)]
+    assert finalize_nodes and finalize_nodes[0].helper == helper_id
+
+
 def test_normalizer_structural_templates(tmp_path: Path) -> None:
     container, knowledge = build_template_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
