@@ -17,6 +17,7 @@ from ..constants import (
     RET_MASK,
 )
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.patterns import PatternToken
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -72,12 +73,38 @@ from .model import (
 )
 
 
+@dataclass(frozen=True)
+class MacroInstructionRule:
+    """Describe a single instruction that can participate in a macro template."""
+
+    token: PatternToken
+    mnemonics: Tuple[str, ...] = tuple()
+    prefixes: Tuple[str, ...] = tuple()
+    allow_positive_delta: bool = False
+
+    def matches(self, instruction: "RawInstruction") -> bool:
+        event = instruction.event
+        if not self.allow_positive_delta and event.delta > 0:
+            return False
+        if not self.allow_positive_delta and event.pushed_types:
+            return False
+        if not self.token.matches(event):
+            return False
+        if not self.mnemonics and not self.prefixes:
+            return True
+        mnemonic = instruction.mnemonic
+        if self.mnemonics and mnemonic in self.mnemonics:
+            return True
+        if self.prefixes and any(mnemonic.startswith(prefix) for prefix in self.prefixes):
+            return True
+        return False
+
+
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
-CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
-CALL_PREPARATION_MNEMONICS = {
+CALL_PREPARATION_MNEMONICS = (
     "op_01_2C",
     "op_02_2A",
     "op_02_F0",
@@ -101,8 +128,9 @@ CALL_PREPARATION_MNEMONICS = {
     "op_AC_01",
     "op_4B_91",
     "op_72_23",
-}
-CALL_CLEANUP_MNEMONICS = {
+    "op_4A_05",
+)
+CALL_CLEANUP_MNEMONICS = (
     "call_helpers",
     "fanout",
     "op_01_2C",
@@ -137,8 +165,51 @@ CALL_CLEANUP_MNEMONICS = {
     "stack_shuffle",
     "op_4B_91",
     "op_E4_01",
-}
-CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
+)
+CALL_PREPARATION_RULES: Tuple[MacroInstructionRule, ...] = (
+    MacroInstructionRule(
+        token=PatternToken(
+            kinds=(InstructionKind.STACK_TEARDOWN,),
+            min_delta=-8,
+            max_delta=-1,
+            description="call pre teardown",
+        ),
+    ),
+    MacroInstructionRule(
+        token=PatternToken(
+            kinds=(),
+            min_delta=0,
+            max_delta=4,
+            allow_unknown=True,
+            description="call pre literal",
+        ),
+        mnemonics=CALL_PREPARATION_MNEMONICS,
+        prefixes=("stack_shuffle", "fanout", "op_59_FE"),
+        allow_positive_delta=True,
+    ),
+)
+CALL_CLEANUP_RULES: Tuple[MacroInstructionRule, ...] = (
+    MacroInstructionRule(
+        token=PatternToken(
+            kinds=(InstructionKind.STACK_TEARDOWN,),
+            min_delta=-8,
+            max_delta=-1,
+            description="call cleanup teardown",
+        ),
+        prefixes=("stack_teardown_",),
+    ),
+    MacroInstructionRule(
+        token=PatternToken(
+            kinds=(),
+            min_delta=-2,
+            max_delta=0,
+            allow_unknown=True,
+            description="call cleanup neutral",
+        ),
+        mnemonics=CALL_CLEANUP_MNEMONICS,
+        prefixes=("op_4A_", "op_95_FE"),
+    ),
+)
 CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_06_66",
     "op_10_8C",
@@ -195,9 +266,30 @@ TAILCALL_POSTLUDE = {
     "op_95_FE",
 }
 TAILCALL_POSTLUDE_PREFIXES = ("op_59_FE", "op_95_FE")
-
-DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
-DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
+DISPATCH_PREFIX_RULES: Tuple[MacroInstructionRule, ...] = (
+    MacroInstructionRule(
+        token=PatternToken(
+            kinds=(),
+            min_delta=-1,
+            max_delta=0,
+            allow_unknown=True,
+            description="dispatch prefix",
+        ),
+        mnemonics=("op_08_00", "op_64_20", "op_65_30"),
+    ),
+)
+DISPATCH_SUFFIX_RULES: Tuple[MacroInstructionRule, ...] = (
+    MacroInstructionRule(
+        token=PatternToken(
+            kinds=(),
+            min_delta=-2,
+            max_delta=0,
+            allow_unknown=True,
+            description="dispatch suffix",
+        ),
+        mnemonics=("op_10_8C",),
+    ),
+)
 
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
@@ -2089,7 +2181,7 @@ class IRNormalizer:
                 candidate = items[prefix_start - 1]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and candidate.mnemonic in DISPATCH_PREFIX_MNEMONICS
+                    and self._matches_macro_rules(DISPATCH_PREFIX_RULES, candidate)
                 ):
                     prefix_start -= 1
                     continue
@@ -2117,7 +2209,7 @@ class IRNormalizer:
                 candidate = items[suffix_end]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and candidate.mnemonic in DISPATCH_SUFFIX_MNEMONICS
+                    and self._matches_macro_rules(DISPATCH_SUFFIX_RULES, candidate)
                 ):
                     suffix_end += 1
                     continue
@@ -3429,15 +3521,31 @@ class IRNormalizer:
         return node
 
     @staticmethod
-    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic in CALL_CLEANUP_MNEMONICS:
-            return True
-        if mnemonic.startswith("op_10_") and (
-            mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
+    def _matches_macro_rules(
+        rules: Sequence[MacroInstructionRule], instruction: RawInstruction
+    ) -> bool:
+        for rule in rules:
+            if rule.matches(instruction):
+                return True
+        return False
+
+    @classmethod
+    def _is_call_cleanup_instruction(cls, instruction: RawInstruction) -> bool:
+        if instruction.profile.kind is InstructionKind.TAILCALL:
+            return False
+        if instruction.mnemonic.startswith("literal"):
+            return False
+        if instruction.mnemonic.startswith("op_10_") and (
+            instruction.mnemonic in IO_WRITE_MNEMONICS
+            or instruction.mnemonic in IO_READ_MNEMONICS
         ):
             return False
-        return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+        if not cls._matches_macro_rules(CALL_CLEANUP_RULES, instruction):
+            return False
+        event = instruction.event
+        if event.delta == 0 and event.pushed_types:
+            return False
+        return True
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -3448,16 +3556,17 @@ class IRNormalizer:
                 return ("stack_teardown", pops)
         return (mnemonic, instruction.operand)
 
-    @staticmethod
-    def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic == "op_4A_05":
-            return True
-        if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
-            return True
-        if mnemonic in CALL_PREPARATION_MNEMONICS:
-            return True
-        return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
+    @classmethod
+    def _is_call_preparation_instruction(cls, instruction: RawInstruction) -> bool:
+        if instruction.profile.kind in {
+            InstructionKind.TAILCALL,
+            InstructionKind.RETURN,
+            InstructionKind.BRANCH,
+        }:
+            return False
+        if not cls._matches_macro_rules(CALL_PREPARATION_RULES, instruction):
+            return False
+        return True
 
     def _call_convention_effect(self, operand: int) -> IRStackEffect:
         alias = "CALL_SHUFFLE_STD" if operand == CALL_SHUFFLE_STANDARD else None
