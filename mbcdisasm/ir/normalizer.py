@@ -334,6 +334,96 @@ class RawBlock:
     instructions: Tuple[RawInstruction, ...]
 
 
+@dataclass(frozen=True)
+class InstructionTemplate:
+    """Simple pattern used to classify raw instructions."""
+
+    name: str
+    mnemonics: Tuple[str, ...] = tuple()
+    prefixes: Tuple[str, ...] = tuple()
+    kinds: Tuple[InstructionKind, ...] = tuple()
+    min_delta: int = -999
+    max_delta: int = 999
+
+    def matches(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if self.mnemonics and mnemonic not in self.mnemonics:
+            return False
+        if self.prefixes and not any(mnemonic.startswith(prefix) for prefix in self.prefixes):
+            return False
+
+        kind = instruction.event.kind
+        if self.kinds and kind not in self.kinds:
+            return False
+
+        delta = instruction.event.delta
+        if delta < self.min_delta or delta > self.max_delta:
+            return False
+        return True
+
+
+CALL_PREPARATION_TEMPLATES: Tuple[InstructionTemplate, ...] = (
+    InstructionTemplate(
+        name="prep_teardown",
+        kinds=(InstructionKind.STACK_TEARDOWN,),
+        max_delta=-1,
+    ),
+    InstructionTemplate(
+        name="prep_mnemonics",
+        mnemonics=tuple(CALL_PREPARATION_MNEMONICS),
+    ),
+    InstructionTemplate(
+        name="prep_prefix",
+        prefixes=tuple(CALL_PREPARATION_PREFIXES),
+    ),
+)
+
+
+CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
+    InstructionTemplate(
+        name="cleanup_teardown",
+        kinds=(InstructionKind.STACK_TEARDOWN,),
+        max_delta=-1,
+    ),
+    InstructionTemplate(
+        name="cleanup_mnemonics",
+        mnemonics=tuple(CALL_CLEANUP_MNEMONICS),
+    ),
+    InstructionTemplate(
+        name="cleanup_prefix",
+        prefixes=tuple(CALL_CLEANUP_PREFIXES),
+    ),
+)
+
+
+TAILCALL_POSTLUDE_TEMPLATES: Tuple[InstructionTemplate, ...] = (
+    InstructionTemplate(
+        name="tail_mnemonics",
+        mnemonics=tuple(TAILCALL_POSTLUDE),
+    ),
+    InstructionTemplate(
+        name="tail_prefix",
+        prefixes=tuple(TAILCALL_POSTLUDE_PREFIXES),
+    ),
+)
+
+
+DISPATCH_PREFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
+    InstructionTemplate(
+        name="dispatch_prefix",
+        mnemonics=tuple(DISPATCH_PREFIX_MNEMONICS),
+    ),
+)
+
+
+DISPATCH_SUFFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
+    InstructionTemplate(
+        name="dispatch_suffix",
+        mnemonics=tuple(DISPATCH_SUFFIX_MNEMONICS),
+    ),
+)
+
+
 CallLike = Union[IRCall, IRCallReturn, IRTailcallReturn, IRTailCall]
 
 
@@ -2089,7 +2179,7 @@ class IRNormalizer:
                 candidate = items[prefix_start - 1]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and candidate.mnemonic in DISPATCH_PREFIX_MNEMONICS
+                    and self._matches_templates(candidate, DISPATCH_PREFIX_TEMPLATES)
                 ):
                     prefix_start -= 1
                     continue
@@ -2117,7 +2207,7 @@ class IRNormalizer:
                 candidate = items[suffix_end]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and candidate.mnemonic in DISPATCH_SUFFIX_MNEMONICS
+                    and self._matches_templates(candidate, DISPATCH_SUFFIX_TEMPLATES)
                 ):
                     suffix_end += 1
                     continue
@@ -2816,13 +2906,7 @@ class IRNormalizer:
                     if (
                         isinstance(candidate, RawInstruction)
                         and call.target in TAILCALL_HELPERS
-                        and (
-                            candidate.mnemonic in TAILCALL_POSTLUDE
-                            or any(
-                                candidate.mnemonic.startswith(prefix)
-                                for prefix in TAILCALL_POSTLUDE_PREFIXES
-                            )
-                        )
+                        and self._matches_templates(candidate, TAILCALL_POSTLUDE_TEMPLATES)
                     ):
                         cleanup_steps.append(self._call_cleanup_effect(candidate))
                         offset += 1
@@ -3429,15 +3513,18 @@ class IRNormalizer:
         return node
 
     @staticmethod
-    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
+    def _matches_templates(
+        instruction: RawInstruction, templates: Sequence[InstructionTemplate]
+    ) -> bool:
+        return any(template.matches(instruction) for template in templates)
+
+    def _is_call_cleanup_instruction(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
-        if mnemonic in CALL_CLEANUP_MNEMONICS:
-            return True
         if mnemonic.startswith("op_10_") and (
             mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
         ):
             return False
-        return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+        return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -3448,16 +3535,10 @@ class IRNormalizer:
                 return ("stack_teardown", pops)
         return (mnemonic, instruction.operand)
 
-    @staticmethod
-    def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic == "op_4A_05":
+    def _is_call_preparation_instruction(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic == "op_4A_05":
             return True
-        if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
-            return True
-        if mnemonic in CALL_PREPARATION_MNEMONICS:
-            return True
-        return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
+        return self._matches_templates(instruction, CALL_PREPARATION_TEMPLATES)
 
     def _call_convention_effect(self, operand: int) -> IRStackEffect:
         alias = "CALL_SHUFFLE_STD" if operand == CALL_SHUFFLE_STANDARD else None
