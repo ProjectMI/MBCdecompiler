@@ -563,6 +563,12 @@ class IRNormalizer:
         "op_2C_46": {0x0000},
         "op_2B_47": {0x0000},
     }
+    _ADAPTIVE_TABLE_MIN_RUN = 8
+    _ADAPTIVE_TABLE_KINDS = {
+        InstructionKind.UNKNOWN,
+        InstructionKind.TABLE_LOOKUP,
+        InstructionKind.META,
+    }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -2049,80 +2055,103 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if not self._is_opcode_table_seed(item):
-                index += 1
-                continue
+            if self._is_opcode_table_seed(item):
+                assert isinstance(item, RawInstruction)
+                mode = item.profile.mode
+                start = index
+                scan = index
+                body_ops: List[Tuple[str, int]] = []
+                body_annotations: List[str] = []
 
-            assert isinstance(item, RawInstruction)
-            mode = item.profile.mode
-            start = index
-            scan = index
-            body_ops: List[Tuple[str, int]] = []
-            body_annotations: List[str] = []
-
-            while scan < len(items):
-                candidate = items[scan]
-                if self._is_opcode_table_body(candidate, mode):
-                    assert isinstance(candidate, RawInstruction)
-                    body_ops.append((candidate.mnemonic, candidate.operand))
-                    body_annotations.extend(candidate.annotations)
-                    scan += 1
-                    continue
-                break
-
-            if len(body_ops) < self._OPCODE_TABLE_MIN_RUN:
-                index += 1
-                continue
-
-            prefix = start
-            prefix_ops: List[Tuple[str, int]] = []
-            prefix_annotations: List[str] = []
-            affix = 0
-            while prefix > 0 and affix < self._OPCODE_TABLE_MAX_AFFIX:
-                candidate = items[prefix - 1]
-                if not self._is_opcode_table_affix(candidate, mode):
-                    break
-                assert isinstance(candidate, RawInstruction)
-                prefix -= 1
-                prefix_ops.insert(0, (candidate.mnemonic, candidate.operand))
-                prefix_annotations.extend(candidate.annotations)
-                affix += 1
-
-            suffix = scan
-            suffix_ops: List[Tuple[str, int]] = []
-            suffix_annotations: List[str] = []
-            affix = 0
-            while suffix < len(items) and affix < self._OPCODE_TABLE_MAX_AFFIX:
-                candidate = items[suffix]
-                if not self._is_opcode_table_affix(candidate, mode):
-                    break
-                assert isinstance(candidate, RawInstruction)
-                suffix_ops.append((candidate.mnemonic, candidate.operand))
-                suffix_annotations.extend(candidate.annotations)
-                suffix += 1
-                affix += 1
-
-            operations = prefix_ops + body_ops + suffix_ops
-            annotations = ["opcode_table", f"mode=0x{mode:02X}"]
-            seen_annotations = set(annotations)
-            for pool in (prefix_annotations, body_annotations, suffix_annotations):
-                for note in pool:
-                    if not note or note in seen_annotations:
+                while scan < len(items):
+                    candidate = items[scan]
+                    if self._is_opcode_table_body(candidate, mode):
+                        assert isinstance(candidate, RawInstruction)
+                        body_ops.append((candidate.mnemonic, candidate.operand))
+                        body_annotations.extend(candidate.annotations)
+                        scan += 1
                         continue
-                    annotations.append(note)
-                    seen_annotations.add(note)
+                    break
 
-            items.replace_slice(
-                prefix,
-                suffix,
-                [
-                    IRTablePatch(
-                        operations=tuple(operations),
-                        annotations=tuple(annotations),
-                    )
-                ],
-            )
-            index = prefix + 1
+                if len(body_ops) < self._OPCODE_TABLE_MIN_RUN:
+                    index += 1
+                    continue
+
+                prefix = start
+                prefix_ops: List[Tuple[str, int]] = []
+                prefix_annotations: List[str] = []
+                affix = 0
+                while prefix > 0 and affix < self._OPCODE_TABLE_MAX_AFFIX:
+                    candidate = items[prefix - 1]
+                    if not self._is_opcode_table_affix(candidate, mode):
+                        break
+                    assert isinstance(candidate, RawInstruction)
+                    prefix -= 1
+                    prefix_ops.insert(0, (candidate.mnemonic, candidate.operand))
+                    prefix_annotations.extend(candidate.annotations)
+                    affix += 1
+
+                suffix = scan
+                suffix_ops: List[Tuple[str, int]] = []
+                suffix_annotations: List[str] = []
+                affix = 0
+                while suffix < len(items) and affix < self._OPCODE_TABLE_MAX_AFFIX:
+                    candidate = items[suffix]
+                    if not self._is_opcode_table_affix(candidate, mode):
+                        break
+                    assert isinstance(candidate, RawInstruction)
+                    suffix_ops.append((candidate.mnemonic, candidate.operand))
+                    suffix_annotations.extend(candidate.annotations)
+                    suffix += 1
+                    affix += 1
+
+                operations = prefix_ops + body_ops + suffix_ops
+                annotations = ["opcode_table", f"mode=0x{mode:02X}"]
+                seen_annotations = set(annotations)
+                for pool in (prefix_annotations, body_annotations, suffix_annotations):
+                    for note in pool:
+                        if not note or note in seen_annotations:
+                            continue
+                        annotations.append(note)
+                        seen_annotations.add(note)
+
+                for position in range(prefix, suffix):
+                    removed = items[position]
+                    self._ssa_bindings.pop(id(removed), None)
+
+                items.replace_slice(
+                    prefix,
+                    suffix,
+                    [
+                        IRTablePatch(
+                            operations=tuple(operations),
+                            annotations=tuple(annotations),
+                        )
+                    ],
+                )
+                index = prefix + 1
+                continue
+
+            adaptive = self._match_adaptive_table_run(items, index)
+            if adaptive is not None:
+                start, end, operations, annotations = adaptive
+                for position in range(start, end):
+                    removed = items[position]
+                    self._ssa_bindings.pop(id(removed), None)
+                items.replace_slice(
+                    start,
+                    end,
+                    [
+                        IRTablePatch(
+                            operations=tuple(operations),
+                            annotations=annotations,
+                        )
+                    ],
+                )
+                index = start + 1
+                continue
+
+            index += 1
 
     def _is_opcode_table_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
         if not isinstance(item, RawInstruction):
@@ -2164,6 +2193,65 @@ class IRNormalizer:
             return False
         if item.mnemonic in self._OPCODE_TABLE_NONTRIVIAL_AFFIX:
             return True
+        return self._has_trivial_stack_effect(item)
+
+    def _match_adaptive_table_run(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[int, int, Tuple[Tuple[str, int], ...], Tuple[str, ...]]]:
+        seed = items[index]
+        if not self._is_adaptive_table_seed(seed):
+            return None
+        assert isinstance(seed, RawInstruction)
+        mode = seed.profile.mode
+        kind = seed.profile.kind
+        start = index
+        scan = index
+        operations: List[Tuple[str, int]] = []
+        annotations = ["adaptive_table", f"mode=0x{mode:02X}", f"kind={kind.name.lower()}"]
+        seen_annotations = set(annotations)
+
+        while scan < len(items):
+            candidate = items[scan]
+            if not self._is_adaptive_table_body(candidate, mode, kind):
+                break
+            assert isinstance(candidate, RawInstruction)
+            operations.append((candidate.mnemonic, candidate.operand))
+            for note in candidate.annotations:
+                if not note or note in seen_annotations:
+                    continue
+                annotations.append(note)
+                seen_annotations.add(note)
+            scan += 1
+
+        if len(operations) < self._ADAPTIVE_TABLE_MIN_RUN:
+            return None
+
+        return start, scan, tuple(operations), tuple(annotations)
+
+    def _is_adaptive_table_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if item.profile.mode in self._OPCODE_TABLE_MODES:
+            return False
+        if item.profile.kind not in self._ADAPTIVE_TABLE_KINDS:
+            return False
+        return self._is_adaptive_table_body(
+            item, item.profile.mode, item.profile.kind
+        )
+
+    def _is_adaptive_table_body(
+        self, item: Union[RawInstruction, IRNode], mode: int, kind: InstructionKind
+    ) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if item.profile.mode != mode:
+            return False
+        if item.profile.kind != kind:
+            return False
+        if not item.profile.mnemonic.startswith("op_"):
+            return False
+        if self._is_annotation_only(item):
+            return False
         return self._has_trivial_stack_effect(item)
 
     @staticmethod

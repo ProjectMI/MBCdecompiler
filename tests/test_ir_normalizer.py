@@ -1816,6 +1816,41 @@ def test_normalizer_extends_table_patch_with_affixes() -> None:
     ]
 
 
+def test_normalizer_collapses_adaptive_unknown_tables() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(index * 4, 0x55 + index, 0x6E, 0x8000 + index)
+        for index in range(10)
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, _ = normalizer._normalise_block(block)
+
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert len(node.operations) == len(words)
+    assert node.annotations[0] == "adaptive_table"
+    assert f"mode=0x{words[0].mode:02X}" in node.annotations
+    assert any(note == "kind=unknown" for note in node.annotations)
+
+
 def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
     knowledge = KnowledgeBase({"31:30": OpcodeInfo(mnemonic="op_31_30")})
     normalizer = IRNormalizer(knowledge)
