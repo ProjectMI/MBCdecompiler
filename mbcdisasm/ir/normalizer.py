@@ -9,7 +9,9 @@ from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
     IO_PORT_NAME,
+    IO_PORT_SLOTS,
     IO_SLOT,
+    IO_SLOT_ALIASES,
     PAGE_REGISTER,
     MEMORY_BANK_ALIASES,
     MEMORY_PAGE_ALIASES,
@@ -233,7 +235,7 @@ IO_WRITE_MNEMONICS = {
     "op_10_68",
     "op_10_F4",
 } | _MIRRORED_IO_WRITE_MNEMONICS
-IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
+IO_ACCEPTED_OPERANDS = {0} | set(IO_PORT_SLOTS)
 IO_BRIDGE_MNEMONICS = {
     "op_01_3D",
     "op_F1_3D",
@@ -793,7 +795,7 @@ class IRNormalizer:
         value = node.value & 0xFFFF
         if value == PAGE_REGISTER:
             return SSAValueKind.PAGE_REGISTER
-        if value == IO_SLOT:
+        if value in IO_SLOT_ALIASES:
             return SSAValueKind.IO
         if value <= 0xFF:
             return SSAValueKind.BYTE
@@ -1584,7 +1586,7 @@ class IRNormalizer:
                     or item.mnemonic in IO_WRITE_MNEMONICS
                     or (
                         item.mnemonic.startswith("op_10_")
-                        and item.operand == IO_SLOT
+                        and item.operand in IO_PORT_SLOTS
                     )
                 )
             ):
@@ -1660,7 +1662,7 @@ class IRNormalizer:
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
             if (
                 mnemonic not in IO_WRITE_MNEMONICS
-                and instruction.operand != IO_SLOT
+                and instruction.operand not in IO_PORT_SLOTS
                 and not allow_prefix
             ):
                 return None
@@ -2558,7 +2560,7 @@ class IRNormalizer:
         return (
             mnemonic.startswith("op_")
             and mnemonic.endswith("_30")
-            and instruction.operand == IO_SLOT
+            and instruction.operand in IO_PORT_SLOTS
         )
 
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
@@ -3936,7 +3938,7 @@ class IRNormalizer:
         page_alias_override: Optional[str] = None
         symbol_override: Optional[str] = None
         if instruction.profile.opcode == 0x69 and bank is None and base_slot is None:
-            if instruction.operand == IO_SLOT:
+            if instruction.operand in IO_PORT_SLOTS:
                 region_override = "io"
                 page_alias_override = IO_PORT_NAME
                 symbol_override = IO_PORT_NAME

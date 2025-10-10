@@ -12,7 +12,13 @@ from typing import Dict
 # codebase readable – the raw hexadecimal numbers migrate between patterns
 # which makes it hard to reason about them in isolation.
 RET_MASK = 0x2910
-IO_SLOT = 0x6910
+IO_SLOT_PRIMARY = 0x6910
+IO_SLOT_SECONDARY = 0x6901
+IO_SLOT_MASK = 0x3069
+IO_SLOT_RET_MASK = 0x2961
+IO_SLOT = IO_SLOT_PRIMARY
+IO_PORT_SLOTS = frozenset({IO_SLOT_PRIMARY, IO_SLOT_SECONDARY})
+IO_SLOT_ALIASES = frozenset({IO_SLOT_PRIMARY, IO_SLOT_SECONDARY, IO_SLOT_MASK, IO_SLOT_RET_MASK})
 IO_PORT_NAME = "io.port_6910"
 PAGE_REGISTER = 0x6C01
 FANOUT_FLAGS_A = 0x2C02
@@ -23,6 +29,9 @@ CALL_SHUFFLE_STANDARD = 0x4B08
 OPERAND_ALIASES: Dict[int, str] = {
     RET_MASK: "RET_MASK",
     IO_SLOT: "IO_SLOT",
+    IO_SLOT_SECONDARY: "IO_SLOT",
+    IO_SLOT_MASK: "IO_SLOT_MASK",
+    IO_SLOT_RET_MASK: "IO_SLOT_RET_MASK",
     PAGE_REGISTER: "PAGE_REG",
     FANOUT_FLAGS_A: "FANOUT_FLAGS",
     FANOUT_FLAGS_B: "FANOUT_FLAGS",
@@ -52,6 +61,12 @@ MEMORY_PAGE_ALIASES = {
 __all__ = [
     "RET_MASK",
     "IO_SLOT",
+    "IO_SLOT_PRIMARY",
+    "IO_SLOT_SECONDARY",
+    "IO_SLOT_MASK",
+    "IO_SLOT_RET_MASK",
+    "IO_PORT_SLOTS",
+    "IO_SLOT_ALIASES",
     "IO_PORT_NAME",
     "PAGE_REGISTER",
     "FANOUT_FLAGS_A",

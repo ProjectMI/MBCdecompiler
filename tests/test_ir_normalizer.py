@@ -13,6 +13,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -37,6 +38,8 @@ from mbcdisasm.ir.model import (
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
     IO_SLOT,
+    IO_SLOT_MASK,
+    IO_SLOT_SECONDARY,
     IO_PORT_NAME,
     PAGE_REGISTER,
     RET_MASK,
@@ -1404,6 +1407,34 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
+
+
+def test_normalizer_accepts_secondary_io_slot(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, IO_SLOT_MASK),  # io mask literal alias
+        build_word(4, 0x3D, 0x30, IO_SLOT_SECONDARY),  # io handshake in alternate slot
+        build_word(8, 0x10, 0x24, 0x0000),  # masked write with implicit mask
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    io_nodes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert len(io_nodes) == 1
+    io_node = io_nodes[0]
+    assert io_node.mask == IO_SLOT_MASK
+    assert io_node.port == IO_PORT_NAME
+
+    literal_nodes = [node for node in block.nodes if isinstance(node, IRLiteral)]
+    assert literal_nodes and literal_nodes[0].value == IO_SLOT_MASK
 
 
 def test_normalizer_collapses_opcode_table_sequences() -> None:
