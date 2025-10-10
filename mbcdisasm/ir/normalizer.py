@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 from ..constants import (
@@ -160,42 +160,6 @@ TAILCALL_HELPERS = {
     0x0FF0,
     0x16F0,
 }
-TAILCALL_POSTLUDE = {
-    "op_01_6C",
-    "op_05_00",
-    "op_06_66",
-    "op_0B_29",
-    "op_0C_00",
-    "op_0F_00",
-    "op_10_0E",
-    "op_10_12",
-    "op_10_5C",
-    "op_10_8C",
-    "op_10_DC",
-    "op_10_E8",
-    "op_14_07",
-    "op_32_29",
-    "op_4F_01",
-    "op_4F_02",
-    "op_52_05",
-    "op_58_08",
-    "op_5E_29",
-    "op_64_20",
-    "op_65_30",
-    "op_6C_01",
-    "op_70_29",
-    "op_C4_06",
-    "op_D0_04",
-    "op_D0_06",
-    "op_D8_04",
-    "op_F0_4B",
-    "op_4B_91",
-    "op_E4_01",
-    "op_59_FE",
-    "op_95_FE",
-}
-TAILCALL_POSTLUDE_PREFIXES = ("op_59_FE", "op_95_FE")
-
 DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
 
@@ -433,20 +397,6 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
         prefixes=tuple(CALL_CLEANUP_PREFIXES),
     ),
 )
-
-
-TAILCALL_POSTLUDE_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="tail_mnemonics",
-        mnemonics=tuple(TAILCALL_POSTLUDE),
-    ),
-    InstructionTemplate(
-        name="tail_prefix",
-        prefixes=tuple(TAILCALL_POSTLUDE_PREFIXES),
-    ),
-)
-
-
 DISPATCH_PREFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
     InstructionTemplate(
         name="dispatch_prefix",
@@ -1716,7 +1666,11 @@ class IRNormalizer:
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
-                    steps.append(self._call_cleanup_effect(candidate))
+                    effect_details = self._call_cleanup_details(candidate)
+                    if effect_details is None:
+                        break
+                    effect, _ = effect_details
+                    steps.append(effect)
                     end = scan + 1
                     scan += 1
                     continue
@@ -2867,12 +2821,10 @@ class IRNormalizer:
         return None
 
     def _is_io_handshake_instruction(self, instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        return (
-            mnemonic.startswith("op_")
-            and mnemonic.endswith("_30")
-            and self._operand_is_io_slot(instruction.operand)
-        )
+        if not self._operand_is_io_slot(instruction.operand):
+            return False
+        mode = instruction.profile.mode
+        return mode in {0x20, 0x30}
 
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
         if instruction.mnemonic in IO_WRITE_MNEMONICS or self._is_io_handshake_instruction(instruction):
@@ -3067,34 +3019,6 @@ class IRNormalizer:
                         offset += 1
                         consumed += 1
                         continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and candidate.mnemonic == "op_29_10"
-                        and candidate.operand == RET_MASK
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        cleanup_mask = RET_MASK
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and self._matches_templates(candidate, TAILCALL_POSTLUDE_TEMPLATES)
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and candidate.mnemonic == "op_F0_4B"
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
                     if isinstance(candidate, IRConditionMask):
                         effect = IRStackEffect(
                             mnemonic=candidate.source,
@@ -3106,6 +3030,19 @@ class IRNormalizer:
                         offset += 1
                         consumed += 1
                         continue
+                    if isinstance(candidate, RawInstruction):
+                        tail_context = call.target in TAILCALL_HELPERS
+                        effect_details = self._call_cleanup_details(
+                            candidate, tail_context=tail_context
+                        )
+                        if effect_details is not None:
+                            effect, mask_hint = effect_details
+                            cleanup_steps.append(effect)
+                            if mask_hint == RET_MASK:
+                                cleanup_mask = RET_MASK
+                            offset += 1
+                            consumed += 1
+                            continue
                     if (
                         call.target in TAILCALL_HELPERS
                         and isinstance(candidate, (IRTestSetBranch, IRIf))
@@ -3739,6 +3676,58 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=instruction.profile.operand_alias(),
         )
+
+    def _call_cleanup_details(
+        self, instruction: RawInstruction, *, tail_context: bool = False
+    ) -> Optional[Tuple[IRStackEffect, Optional[int]]]:
+        matches_templates = self._is_call_cleanup_instruction(instruction)
+        extra_tail = False
+        if tail_context:
+            opcode = instruction.profile.opcode
+            mode = instruction.profile.mode
+            extra_tail = (
+                self._is_ret_mask_instruction(instruction)
+                or self._is_io_mask_cleanup_instruction(instruction)
+                or (opcode == 0xF0 and mode == 0x4B)
+            )
+
+        if not matches_templates and not (tail_context and extra_tail):
+            return None
+
+        effect = self._call_cleanup_effect(instruction)
+        mask_hint: Optional[int] = None
+
+        if self._is_ret_mask_instruction(instruction):
+            mask_hint = RET_MASK
+            if tail_context and effect.operand_role is None:
+                effect = replace(effect, operand_role="mask")
+        elif (
+            tail_context
+            and self._is_io_mask_cleanup_instruction(instruction)
+            and effect.operand_role is None
+        ):
+            role = instruction.profile.operand_role() or "io_mask"
+            effect = replace(effect, operand_role=role)
+
+        return effect, mask_hint
+
+    @staticmethod
+    def _is_ret_mask_instruction(instruction: RawInstruction) -> bool:
+        if instruction.operand == RET_MASK:
+            return True
+        alias = instruction.profile.operand_alias()
+        if alias is None:
+            return False
+        return str(alias).upper() == "RET_MASK"
+
+    def _is_io_mask_cleanup_instruction(self, instruction: RawInstruction) -> bool:
+        if self._is_io_handshake_instruction(instruction):
+            return True
+        mnemonic = instruction.mnemonic
+        if mnemonic in IO_WRITE_MNEMONICS:
+            return True
+        opcode = instruction.profile.opcode
+        return opcode == 0x10
 
     @staticmethod
     def _coalesce_epilogue_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:
