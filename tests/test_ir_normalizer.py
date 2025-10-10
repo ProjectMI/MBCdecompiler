@@ -1770,6 +1770,54 @@ def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
     ]
 
 
+def test_normalizer_collapses_uniform_unknown_runs() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    raw_instructions = [
+        make_stack_neutral_instruction(
+            offset=index * 4,
+            mnemonic=f"op_{0x20 + index:02X}_6E",
+            operand=0x3000 + index,
+        )
+        for index in range(6)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 0
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert len(node.operations) == len(raw_instructions)
+    assert node.annotations and node.annotations[0] == "uniform_table"
+    assert any(note == "mode=0x6E" for note in node.annotations)
+    assert any(note == "kind=unknown" for note in node.annotations)
+
+
+def test_normalizer_preserves_short_uniform_runs() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    raw_instructions = [
+        make_stack_neutral_instruction(
+            offset=index * 4,
+            mnemonic=f"op_{0x10 + index:02X}_42",
+            operand=0x2000 + index,
+        )
+        for index in range(4)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == len(ir_block.nodes)
+    assert not any(isinstance(node, IRTablePatch) for node in ir_block.nodes)
+    for node in ir_block.nodes:
+        assert isinstance(node, IRRaw)
+
+
 def test_normalizer_extends_table_patch_with_affixes() -> None:
     annotations = {
         "2C:10": OpcodeInfo(mnemonic="op_2C_10", stack_delta=0),
