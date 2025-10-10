@@ -691,6 +691,40 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     assert constant.data == b"HEAD ER  TEX"
     assert constant.segments == (constant.data,)
 
+
+def test_normalizer_ignores_ascii_bridge_annotations() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_ascii_word(0, "TEXT"),
+        build_word(4, 0xAA, 0x00, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 0
+    assert ir_block.annotations and any("op_AA_00" in note for note in ir_block.annotations)
+    assert any(
+        isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
+    )
+
+
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
