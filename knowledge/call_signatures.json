@@ -3,47 +3,72 @@
     "arity": 2,
     "cleanup_mask": "0x2910",
     "cleanup": [
-      {"mnemonic": "stack_teardown", "pops": 1}
+      {
+        "mnemonic": "stack_teardown",
+        "pops": 1
+      }
     ],
     "shuffle": "0x4B08",
-    "shuffle_options": ["0x4B08", "0x3032", "0x7223"],
+    "shuffle_options": [
+      "0x4B08",
+      "0x3032",
+      "0x7223"
+    ],
     "prelude": [
       {
         "kind": "raw",
         "mnemonic": "op_F0_4B",
         "operand": "0x4B08",
-        "effect": {"mnemonic": "op_F0_4B", "operand": "0x4B08"}
+        "effect": {
+          "mnemonic": "op_F0_4B",
+          "operand": "0x4B08"
+        }
       },
       {
         "kind": "raw",
         "mnemonic": "op_5E_29",
         "operand": "0x2910",
-        "effect": {"mnemonic": "op_5E_29", "operand": "0x2910"}
+        "effect": {
+          "mnemonic": "op_5E_29",
+          "operand": "0x2910"
+        }
       },
       {
         "kind": "raw",
         "mnemonic": "op_6C_01",
         "operand": "0x6C01",
-        "effect": {"mnemonic": "page_register", "operand": "0x6C01"}
+        "effect": {
+          "mnemonic": "page_register",
+          "operand": "0x6C01"
+        }
       }
     ],
     "postlude": [
       {
         "kind": "raw",
         "mnemonic": "op_70_29",
-        "effect": {"mnemonic": "op_70_29", "inherit_operand": true},
+        "effect": {
+          "mnemonic": "op_70_29",
+          "inherit_operand": true
+        },
         "optional": true
       },
       {
         "kind": "raw",
         "mnemonic": "op_0B_29",
-        "effect": {"mnemonic": "op_0B_29", "inherit_operand": true},
+        "effect": {
+          "mnemonic": "op_0B_29",
+          "inherit_operand": true
+        },
         "optional": true
       },
       {
         "kind": "raw",
         "mnemonic": "op_06_66",
-        "effect": {"mnemonic": "op_06_66", "inherit_operand": true},
+        "effect": {
+          "mnemonic": "op_06_66",
+          "inherit_operand": true
+        },
         "optional": true
       }
     ]
@@ -51,12 +76,60 @@
   "0x3D30": {
     "tail": true,
     "prelude": [
-      {"kind": "raw", "mnemonic": "op_D0_04", "optional": true},
-      {"kind": "raw", "mnemonic": "op_D8_04", "optional": true},
-      {"kind": "raw", "mnemonic": "op_C4_06", "optional": true}
+      {
+        "kind": "raw",
+        "mnemonic": "op_D0_04",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_D8_04",
+        "optional": true
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "op_C4_06",
+        "optional": true
+      }
     ],
     "postlude": [
-      {"kind": "raw", "mnemonic": "op_D0_06", "optional": true}
+      {
+        "kind": "raw",
+        "mnemonic": "op_D0_06",
+        "optional": true
+      }
+    ]
+  },
+  "0x06F0": {
+    "tail": true,
+    "cleanup_mask": "0x2910"
+  },
+  "0x136C": {
+    "tail": true,
+    "cleanup_mask": "0x2910"
+  },
+  "0x2429": {
+    "tail": true,
+    "cleanup_mask": "0x2910",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "call_helpers",
+        "operand": "0x2C00",
+        "effect": {
+          "mnemonic": "call_helpers",
+          "operand": "0x2C00"
+        }
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "fanout",
+        "operand": "0x2910",
+        "effect": {
+          "mnemonic": "fanout",
+          "operand": "0x2910"
+        }
+      }
     ]
   }
 }

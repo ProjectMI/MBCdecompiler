@@ -14,5 +14,8 @@
   "0x4B10": "sys.helper",
   "0x3D30": "io.write",
   "0x1234": "test_helper_1234",
-  "0x0020": "call_helper_20"
+  "0x0020": "call_helper_20",
+  "0x06F0": "tail_helper_6f0",
+  "0x136C": "tail_helper_136c",
+  "0x2429": "tail_helper_2429"
 }
