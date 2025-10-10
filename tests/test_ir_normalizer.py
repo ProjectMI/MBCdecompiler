@@ -46,8 +46,12 @@ from mbcdisasm.constants import (
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
-from mbcdisasm.analyzer.instruction_profile import InstructionProfile
-from mbcdisasm.analyzer.stack import StackTracker
+from mbcdisasm.analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    StackEffectHint,
+)
+from mbcdisasm.analyzer.stack import StackEvent, StackTracker
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -62,6 +66,54 @@ def build_ascii_word(offset: int, text: str) -> InstructionWord:
 
 def encode_instructions(words: list[InstructionWord]) -> bytes:
     return b"".join(word.raw.to_bytes(4, "big") for word in words)
+
+
+def make_stack_neutral_instruction(
+    offset: int,
+    mnemonic: str,
+    *,
+    operand: int = 0,
+    kind: InstructionKind = InstructionKind.UNKNOWN,
+    annotations: tuple[str, ...] = tuple(),
+) -> RawInstruction:
+    opcode = 0
+    mode = 0
+    if mnemonic.startswith("op_") and len(mnemonic) >= 8:
+        try:
+            opcode = int(mnemonic[3:5], 16)
+            mode = int(mnemonic[6:8], 16)
+        except ValueError:
+            pass
+    raw_value = (opcode << 24) | (mode << 16) | (operand & 0xFFFF)
+    word = InstructionWord(offset=offset, raw=raw_value)
+    profile = InstructionProfile(
+        word=word,
+        info=None,
+        mnemonic=mnemonic,
+        summary=None,
+        category=None,
+        control_flow=None,
+        stack_hint=StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=1.0),
+        kind=kind,
+        traits={},
+    )
+    event = StackEvent(
+        profile=profile,
+        delta=0,
+        minimum=0,
+        maximum=0,
+        confidence=1.0,
+        depth_before=0,
+        depth_after=0,
+        kind=kind,
+    )
+    return RawInstruction(
+        profile=profile,
+        event=event,
+        annotations=annotations,
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
 
 
 def write_manual(path: Path) -> KnowledgeBase:
@@ -699,6 +751,7 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     words = [
         build_ascii_word(0, "TEXT"),
         build_word(4, 0xAA, 0x00, 0x0000),
+        build_ascii_word(8, "MORE"),
     ]
     profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
     tracker = StackTracker()
@@ -723,6 +776,68 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     assert any(
         isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
     )
+
+
+def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_ascii_word(0, "TEXT"),
+        build_word(4, 0xAA, 0x00, IO_SLOT),
+        build_ascii_word(8, "TAIL"),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 1
+    assert any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_AA_00" for node in ir_block.nodes
+    )
+
+
+def test_stack_neutral_bridge_rejects_edge_positions() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    ascii_node = IRLiteralChunk(data=b"TEXT", source="ascii")
+    bridge = make_stack_neutral_instruction(4, "op_AA_00")
+    trailing = make_stack_neutral_instruction(8, "op_AB_00")
+
+    items_first = [bridge, ascii_node, trailing]
+    assert not normalizer._is_stack_neutral_bridge(bridge, items_first, 0)
+
+    items_last = [ascii_node, trailing, bridge]
+    assert not normalizer._is_stack_neutral_bridge(bridge, items_last, 2)
+
+
+def test_stack_neutral_bridge_respects_control_boundary() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    ascii_node = IRLiteralChunk(data=b"TEXT", source="ascii")
+    bridge = make_stack_neutral_instruction(4, "op_AA_00")
+    control = make_stack_neutral_instruction(
+        8, "op_23_00", kind=InstructionKind.BRANCH
+    )
+    benign = make_stack_neutral_instruction(12, "op_AB_00")
+
+    items = [ascii_node, bridge, control]
+    assert not normalizer._is_stack_neutral_bridge(bridge, items, 1)
+
+    safe_items = [ascii_node, bridge, benign]
+    assert normalizer._is_stack_neutral_bridge(bridge, safe_items, 1)
 
 
 def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:

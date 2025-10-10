@@ -276,6 +276,14 @@ STACK_NEUTRAL_CONTROL_KINDS = {
     InstructionKind.TAILCALL,
 }
 
+SIDE_EFFECT_KIND_HINTS = {
+    InstructionKind.INDIRECT,
+    InstructionKind.INDIRECT_STORE,
+    InstructionKind.TABLE_LOOKUP,
+}
+
+SIDE_EFFECT_KEYWORDS = ("io", "port", "memory", "store", "write", "page", "mode", "status", "flag")
+
 
 INDIRECT_PAGE_REGISTER_MNEMONICS = {
     "op_D4_06": 0x06D4,
@@ -4353,9 +4361,51 @@ class IRNormalizer:
             return False
         if instruction.profile.is_control():
             return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        if self._is_bridge_edge_position(items, index):
+            return False
         if self._is_io_bridge_instruction(instruction):
             return True
         return self._has_ascii_neighbor(items, index)
+
+    def _has_profile_side_effects(self, instruction: RawInstruction) -> bool:
+        profile = instruction.profile
+        if profile.kind in SIDE_EFFECT_KIND_HINTS:
+            return True
+        operand = instruction.operand
+        if operand in IO_SLOT_ALIASES or operand == PAGE_REGISTER:
+            return True
+        alias = profile.operand_alias()
+        if alias and any(keyword in alias.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        role = profile.operand_role()
+        if role and any(keyword in role.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        category = profile.category
+        if category and any(keyword in category.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        summary = profile.summary
+        if summary and any(keyword in summary.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        mnemonic = profile.mnemonic.lower()
+        if any(keyword in mnemonic for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        return False
+
+    def _is_bridge_edge_position(
+        self,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        if index == 0 or index == len(items) - 1:
+            return True
+        next_item = items[index + 1]
+        if isinstance(next_item, RawInstruction):
+            next_kind = next_item.profile.kind
+            if next_kind in STACK_NEUTRAL_CONTROL_KINDS or next_item.profile.is_control():
+                return True
+        return False
 
     def _has_ascii_neighbor(
         self,
