@@ -160,41 +160,6 @@ TAILCALL_HELPERS = {
     0x0FF0,
     0x16F0,
 }
-TAILCALL_POSTLUDE = {
-    "op_01_6C",
-    "op_05_00",
-    "op_06_66",
-    "op_0B_29",
-    "op_0C_00",
-    "op_0F_00",
-    "op_10_0E",
-    "op_10_12",
-    "op_10_5C",
-    "op_10_8C",
-    "op_10_DC",
-    "op_10_E8",
-    "op_14_07",
-    "op_32_29",
-    "op_4F_01",
-    "op_4F_02",
-    "op_52_05",
-    "op_58_08",
-    "op_5E_29",
-    "op_64_20",
-    "op_65_30",
-    "op_6C_01",
-    "op_70_29",
-    "op_C4_06",
-    "op_D0_04",
-    "op_D0_06",
-    "op_D8_04",
-    "op_F0_4B",
-    "op_4B_91",
-    "op_E4_01",
-    "op_59_FE",
-    "op_95_FE",
-}
-TAILCALL_POSTLUDE_PREFIXES = ("op_59_FE", "op_95_FE")
 
 DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
@@ -315,6 +280,8 @@ STACK_NEUTRAL_CONTROL_KINDS = {
     InstructionKind.TAILCALL,
 }
 
+MASK_OPERAND_ALIASES = {"RET_MASK", "IO_SLOT", "FANOUT_FLAGS"}
+
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
     InstructionKind.INDIRECT_STORE,
@@ -431,18 +398,6 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
     InstructionTemplate(
         name="cleanup_prefix",
         prefixes=tuple(CALL_CLEANUP_PREFIXES),
-    ),
-)
-
-
-TAILCALL_POSTLUDE_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="tail_mnemonics",
-        mnemonics=tuple(TAILCALL_POSTLUDE),
-    ),
-    InstructionTemplate(
-        name="tail_prefix",
-        prefixes=tuple(TAILCALL_POSTLUDE_PREFIXES),
     ),
 )
 
@@ -3067,34 +3022,6 @@ class IRNormalizer:
                         offset += 1
                         consumed += 1
                         continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and candidate.mnemonic == "op_29_10"
-                        and candidate.operand == RET_MASK
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        cleanup_mask = RET_MASK
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and self._matches_templates(candidate, TAILCALL_POSTLUDE_TEMPLATES)
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and candidate.mnemonic == "op_F0_4B"
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
                     if isinstance(candidate, IRConditionMask):
                         effect = IRStackEffect(
                             mnemonic=candidate.source,
@@ -3103,6 +3030,28 @@ class IRNormalizer:
                         )
                         cleanup_steps.append(effect)
                         cleanup_mask = candidate.mask
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and self._is_neutral_cleanup_step(candidate)
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        if self._uses_ret_mask(candidate):
+                            cleanup_mask = RET_MASK
+                        offset += 1
+                        consumed += 1
+                        continue
+                    if (
+                        isinstance(candidate, RawInstruction)
+                        and call.target in TAILCALL_HELPERS
+                        and candidate.event.delta <= 0
+                        and not candidate.event.pushed_types
+                    ):
+                        cleanup_steps.append(self._call_cleanup_effect(candidate))
+                        if self._uses_ret_mask(candidate):
+                            cleanup_mask = RET_MASK
                         offset += 1
                         consumed += 1
                         continue
@@ -3691,6 +3640,48 @@ class IRNormalizer:
         instruction: RawInstruction, templates: Sequence[InstructionTemplate]
     ) -> bool:
         return any(template.matches(instruction) for template in templates)
+
+    @staticmethod
+    def _uses_ret_mask(instruction: RawInstruction) -> bool:
+        alias = instruction.profile.operand_alias()
+        if alias == "RET_MASK":
+            return True
+        return instruction.operand == RET_MASK
+
+    @staticmethod
+    def _has_mask_operand(instruction: RawInstruction) -> bool:
+        alias = instruction.profile.operand_alias()
+        if alias and alias in MASK_OPERAND_ALIASES:
+            return True
+        operand = instruction.operand
+        if operand == RET_MASK or operand in IO_SLOT_ALIASES:
+            return True
+        role = instruction.profile.operand_role()
+        if role:
+            lowered = role.lower()
+            if "mask" in lowered or "flag" in lowered:
+                return True
+        return False
+
+    @staticmethod
+    def _is_stack_teardown_step(instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.kind is InstructionKind.STACK_TEARDOWN:
+            return True
+        profile_kind = instruction.profile.kind
+        if profile_kind is InstructionKind.STACK_TEARDOWN:
+            return True
+        return event.delta < 0
+
+    def _is_neutral_cleanup_step(self, instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.delta > 0:
+            return False
+        if event.pushed_types:
+            return False
+        if self._is_stack_teardown_step(instruction):
+            return True
+        return self._has_mask_operand(instruction)
 
     def _is_call_cleanup_instruction(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
