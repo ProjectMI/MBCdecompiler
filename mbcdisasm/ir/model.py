@@ -43,6 +43,7 @@ class MemRef:
     """Symbolic description of an indirect memory reference."""
 
     region: str
+    space: Optional[MemSpace] = None
     bank: Optional[int] = None
     base: Optional[int] = None
     page: Optional[int] = None
@@ -51,7 +52,12 @@ class MemRef:
     page_alias: Optional[str] = None
 
     def describe(self) -> str:
-        region = self.page_alias or self.region or "mem"
+        region = self.page_alias or self.region
+        if region is None and self.space is not None:
+            region = self.space.name.lower()
+        if region is None:
+            region = "mem"
+
         prefix = region
         if not prefix.startswith(("mem", "io")) and prefix not in {"frame", "global", "const"}:
             prefix = f"mem.{prefix}"
@@ -82,7 +88,11 @@ class MemRef:
         return None
 
     def _has_region_alias(self) -> bool:
-        return bool(self.region and not self.region.startswith("mem"))
+        if not self.region:
+            return False
+        if self.region in {"frame", "global", "const"}:
+            return False
+        return not self.region.startswith("mem")
 
 
 def _render_ascii(data: bytes) -> str:

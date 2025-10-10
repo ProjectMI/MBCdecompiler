@@ -4295,20 +4295,36 @@ class IRNormalizer:
         region_override: Optional[str] = None
         page_alias_override: Optional[str] = None
         symbol_override: Optional[str] = None
+        space_override: Optional[MemSpace] = None
+        space_override_set = False
+        if base_value is not None and self._operand_is_io_slot(base_value):
+            region_override = "io"
+            page_alias_override = IO_PORT_NAME
+            symbol_override = IO_PORT_NAME
+            space_override = None
+            space_override_set = True
         if instruction.profile.opcode == 0x69 and bank is None and base_slot is None:
             if self._operand_is_io_slot(instruction.operand):
                 region_override = "io"
                 page_alias_override = IO_PORT_NAME
                 symbol_override = IO_PORT_NAME
+                space_override = None
+                space_override_set = True
 
-        region, page_alias = self._memref_region(base_slot, bank, page)
+        space = self._memref_space(base_slot, bank, base_value)
+        region, page_alias = self._memref_region(base_slot, bank, page, base_value, space)
         if region_override is not None:
             region = region_override
         if page_alias_override is not None:
             page_alias = page_alias_override
+        if space_override_set:
+            space = space_override
+        if space is None:
+            space = self._memref_space_from_region(region)
         symbol = symbol_override or self._memref_symbol(region, bank, page, offset)
         memref = MemRef(
             region=region,
+            space=space,
             bank=bank,
             base=base_value,
             page=page,
@@ -4589,11 +4605,22 @@ class IRNormalizer:
         return None
 
     def _memref_region(
-        self, base_slot: Optional[IRSlot], bank: Optional[int], page: Optional[int]
+        self,
+        base_slot: Optional[IRSlot],
+        bank: Optional[int],
+        page: Optional[int],
+        base_value: Optional[int],
+        space: Optional[MemSpace],
     ) -> Tuple[str, Optional[str]]:
         if base_slot is not None:
             return base_slot.space.name.lower(), None
+        if base_value is not None:
+            inferred = self._memref_space_from_value(base_value)
+            if inferred is not None:
+                return inferred.name.lower(), None
         if bank is None:
+            if space is not None:
+                return space.name.lower(), None
             return "mem", None
 
         normalized = bank & 0xFFF0
@@ -4607,6 +4634,42 @@ class IRNormalizer:
             label = f"bank_{bank:04X}"
             self._memref_regions[bank] = label
         return label, page_alias
+
+    def _memref_space(
+        self,
+        base_slot: Optional[IRSlot],
+        bank: Optional[int],
+        base_value: Optional[int],
+    ) -> Optional[MemSpace]:
+        if base_slot is not None:
+            return base_slot.space
+        for candidate in (base_value, bank):
+            inferred = self._memref_space_from_value(candidate)
+            if inferred is not None:
+                return inferred
+        return None
+
+    @staticmethod
+    def _memref_space_from_region(region: Optional[str]) -> Optional[MemSpace]:
+        if not region:
+            return None
+        mapping = {
+            "frame": MemSpace.FRAME,
+            "global": MemSpace.GLOBAL,
+            "const": MemSpace.CONST,
+        }
+        return mapping.get(region)
+
+    @staticmethod
+    def _memref_space_from_value(value: Optional[int]) -> Optional[MemSpace]:
+        if value is None:
+            return None
+        normalized = value & 0xFFFF
+        if normalized < 0x1000:
+            return MemSpace.FRAME
+        if normalized < 0x8000:
+            return MemSpace.GLOBAL
+        return MemSpace.CONST
 
     def _memref_page_alias(
         self, bank: Optional[int], page: Optional[int]

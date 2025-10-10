@@ -33,6 +33,7 @@ from mbcdisasm.ir.model import (
     IRTablePatch,
     NormalizerMetrics,
     IRIORead,
+    MemSpace,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1905,6 +1906,7 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
     load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B10
+    assert load_node.ref.space is MemSpace.GLOBAL
 
 
 def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
@@ -1941,10 +1943,42 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
 
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B0C
+    assert load_node.ref.space is MemSpace.GLOBAL
     assert any(page.register == 0x06D4 for page in page_nodes)
     assert any(page.register == 0x06C8 for page in page_nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
         for node in block.nodes
     )
+
+
+def test_normalizer_assigns_page_alias_to_memref(tmp_path: Path) -> None:
+    annotations = {
+        "00:00": OpcodeInfo(mnemonic="push_literal", category="literal", stack_push=1),
+        "31:30": OpcodeInfo(mnemonic="op_31_30", stack_pop=1),
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_load", stack_push=1),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x3D30),
+        build_word(4, 0x31, 0x30, PAGE_REGISTER),
+        build_word(8, 0x69, 0x01, 0xDC05),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_memref_page_alias", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+
+    assert load_node.ref is not None
+    assert load_node.ref.bank == 0x3D30
+    assert load_node.ref.page_alias == "io"
+    assert load_node.ref.region == "io.helpers"
+    assert load_node.ref.space is MemSpace.GLOBAL
 
