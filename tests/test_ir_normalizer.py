@@ -1530,6 +1530,111 @@ def test_normalizer_absorbs_zero_mode_affixes_for_opcode_tables() -> None:
     assert len(node.operations) == len(raw_instructions)
 
 
+def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
+    annotations = {
+        "04:00": OpcodeInfo(mnemonic="reduce_pair", stack_delta=0),
+        "04:02": OpcodeInfo(mnemonic="op_04_02", stack_delta=0),
+        "08:03": OpcodeInfo(mnemonic="op_08_03", stack_delta=0),
+    }
+    annotations.update(
+        {
+            f"{opcode:02X}:01": OpcodeInfo(
+                mnemonic=f"op_{opcode:02X}_01",
+                stack_delta=0,
+            )
+            for opcode in range(0x10, 0x14)
+        }
+    )
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x04, 0x00, 0x0000),
+        *[
+            build_word(4 + index * 4, opcode, 0x01, 0x0000)
+            for index, opcode in enumerate(range(0x10, 0x14))
+        ],
+        build_word(20, 0x04, 0x02, 0x0000),
+        build_word(24, 0x08, 0x03, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, _ = normalizer._normalise_block(block)
+
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert [op for op, _ in node.operations] == [
+        "reduce_pair",
+        "op_10_01",
+        "op_11_01",
+        "op_12_01",
+        "op_13_01",
+        "op_04_02",
+        "op_08_03",
+    ]
+
+
+def test_normalizer_extends_table_patch_with_affixes() -> None:
+    annotations = {
+        "2C:10": OpcodeInfo(mnemonic="op_2C_10", stack_delta=0),
+        "2C:11": OpcodeInfo(mnemonic="op_2C_11", stack_delta=0),
+        "04:00": OpcodeInfo(mnemonic="reduce_pair", stack_delta=0),
+        "04:02": OpcodeInfo(mnemonic="op_04_02", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x2C, 0x10, 0x6600),
+        build_word(4, 0x2C, 0x11, 0x6608),
+        build_word(8, 0x04, 0x00, 0x0000),
+        build_word(12, 0x04, 0x02, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    items = _ItemList(list(block.instructions))
+    normalizer._pass_table_patches(items)
+
+    assert len(items) == 1
+    node = items[0]
+    assert isinstance(node, IRTablePatch)
+    assert [op for op, _ in node.operations] == [
+        "op_2C_10",
+        "op_2C_11",
+        "reduce_pair",
+        "op_04_02",
+    ]
+
+
 def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
     knowledge = KnowledgeBase({"31:30": OpcodeInfo(mnemonic="op_31_30")})
     normalizer = IRNormalizer(knowledge)

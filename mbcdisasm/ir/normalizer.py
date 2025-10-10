@@ -364,6 +364,10 @@ class IRNormalizer:
         0x2B,
         0x32,
         0x33,
+        0x42,
+        0x43,
+        0x44,
+        0x45,
         0x46,
         0x47,
         0x48,
@@ -374,6 +378,20 @@ class IRNormalizer:
     }
     _OPCODE_TABLE_BODY_OPERANDS = {0x0000, 0x0008}
     _OPCODE_TABLE_AFFIX_MNEMONICS = {"op_08_00"}
+    _OPCODE_TABLE_AFFIX_OPERANDS = {
+        "reduce_pair": {0x0000},
+        "op_04_02": {0x0000},
+        "op_08_03": {0x0000},
+    }
+    _OPCODE_TABLE_NONTRIVIAL_AFFIX = {"reduce_pair", "op_04_02", "op_08_03"}
+    _TABLE_PATCH_EXTRA_MNEMONICS = {
+        "fanout": None,
+        "stack_teardown_4": None,
+        "stack_teardown_5": None,
+        "reduce_pair": {0x0000},
+        "op_04_02": {0x0000},
+        "op_08_03": {0x0000},
+    }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -1908,12 +1926,19 @@ class IRNormalizer:
         if not isinstance(item, RawInstruction):
             return False
         if item.profile.mode != mode:
-            if item.mnemonic not in self._OPCODE_TABLE_AFFIX_MNEMONICS:
-                return False
-            if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
-                return False
+            allowed_operands = self._OPCODE_TABLE_AFFIX_OPERANDS.get(item.mnemonic)
+            if allowed_operands is not None:
+                if item.operand not in allowed_operands:
+                    return False
+            else:
+                if item.mnemonic not in self._OPCODE_TABLE_AFFIX_MNEMONICS:
+                    return False
+                if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
+                    return False
         if self._is_annotation_only(item):
             return False
+        if item.mnemonic in self._OPCODE_TABLE_NONTRIVIAL_AFFIX:
+            return True
         return self._has_trivial_stack_effect(item)
 
     @staticmethod
@@ -1955,7 +1980,10 @@ class IRNormalizer:
                         operations.append((candidate.mnemonic, candidate.operand))
                         scan += 1
                         continue
-                    if candidate.mnemonic in {"fanout", "stack_teardown_4", "stack_teardown_5"}:
+                    extra = self._TABLE_PATCH_EXTRA_MNEMONICS.get(candidate.mnemonic)
+                    if extra is not None:
+                        if extra and candidate.operand not in extra:
+                            break
                         operations.append((candidate.mnemonic, candidate.operand))
                         scan += 1
                         continue
