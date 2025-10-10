@@ -1434,6 +1434,8 @@ def test_normalizer_collapses_opcode_table_sequences() -> None:
     ir_block, metrics = normalizer._normalise_block(block)
 
     assert metrics.raw_remaining == 0
+    assert metrics.raw_meta == 0
+    assert metrics.raw_unknown == 0
     assert len(ir_block.nodes) == 1
     node = ir_block.nodes[0]
     assert isinstance(node, IRTablePatch)
@@ -1472,12 +1474,51 @@ def test_normalizer_collapses_zero_mode_opcode_tables() -> None:
     ir_block, metrics = normalizer._normalise_block(block)
 
     assert metrics.raw_remaining == 0
+    assert metrics.raw_meta == 0
+    assert metrics.raw_unknown == 0
     assert len(ir_block.nodes) == 1
     node = ir_block.nodes[0]
     assert isinstance(node, IRTablePatch)
     assert len(node.operations) == len(raw_instructions)
     assert node.annotations and node.annotations[0] == "opcode_table"
     assert any(note == "mode=0x00" for note in node.annotations)
+
+
+def test_normalizer_reports_residual_categories() -> None:
+    knowledge = KnowledgeBase(
+        {
+            "AA:00": OpcodeInfo(mnemonic="meta_helper", summary="Helper", stack_delta=0),
+            "AB:00": OpcodeInfo(mnemonic="mystery_push", summary="mystery", stack_delta=1),
+        }
+    )
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0x00, 0xAA, 0x00, 0x0000),
+        build_word(0x04, 0xAB, 0x00, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert all(isinstance(node, IRRaw) for node in ir_block.nodes)
+    assert metrics.raw_remaining == 2
+    assert metrics.raw_meta == 1
+    assert metrics.raw_unknown == 1
 
 
 def test_normalizer_absorbs_zero_mode_affixes_for_opcode_tables() -> None:

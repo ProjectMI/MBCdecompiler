@@ -376,6 +376,14 @@ class IRNormalizer:
         0x50,
         0x51,
     }
+    _CONTROL_FLOW_KINDS = {
+        InstructionKind.CONTROL,
+        InstructionKind.BRANCH,
+        InstructionKind.CALL,
+        InstructionKind.TAILCALL,
+        InstructionKind.RETURN,
+        InstructionKind.TERMINATOR,
+    }
     _OPCODE_TABLE_BODY_OPERANDS = {0x0000, 0x0008}
     _OPCODE_TABLE_AFFIX_MNEMONICS = {"op_08_00"}
     _OPCODE_TABLE_AFFIX_OPERANDS = {
@@ -626,6 +634,10 @@ class IRNormalizer:
                         block_annotations.append(annotation)
                     continue
                 metrics.raw_remaining += 1
+                if self._is_cosmetic_residual(item):
+                    metrics.raw_meta += 1
+                elif self._is_suspicious_residual(item):
+                    metrics.raw_unknown += 1
                 nodes.append(
                     IRRaw(
                         mnemonic=item.mnemonic,
@@ -4313,6 +4325,33 @@ class IRNormalizer:
                 return True
             if note.startswith("op_") and instruction.profile.kind is InstructionKind.LITERAL:
                 return True
+        return False
+
+    def _is_cosmetic_residual(self, instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.uncertain:
+            return False
+        if event.delta != 0 or event.minimum != 0 or event.maximum != 0:
+            return False
+        if instruction.profile.kind in self._CONTROL_FLOW_KINDS:
+            return False
+        control_flow = (instruction.profile.control_flow or "").lower()
+        if control_flow and any(
+            token in control_flow for token in {"branch", "call", "jump", "return", "stop"}
+        ):
+            return False
+        return True
+
+    def _is_suspicious_residual(self, instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.uncertain:
+            return True
+        if event.delta != 0:
+            return True
+        if event.minimum < 0 or event.maximum > 0:
+            return True
+        if instruction.profile.kind is InstructionKind.UNKNOWN:
+            return True
         return False
 
     def _format_annotation(self, instruction: RawInstruction) -> str:
