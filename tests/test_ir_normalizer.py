@@ -235,6 +235,21 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "op_70_29",
             "category": "call_cleanup",
         },
+        "op_12_34": {
+            "opcodes": ["0x12:0x34"],
+            "name": "op_12_34",
+            "stack_delta": 0,
+        },
+        "op_56_78": {
+            "opcodes": ["0x56:0x78"],
+            "name": "op_56_78",
+            "stack_delta": 0,
+        },
+        "op_9A_BC": {
+            "opcodes": ["0x9A:0xBC"],
+            "name": "op_9A_BC",
+            "stack_delta": 0,
+        },
     }
     manual_path = path / "manual_annotations.json"
     manual_path.write_text(json.dumps(manual, indent=2), "utf-8")
@@ -1365,6 +1380,43 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     return_node = block.nodes[2]
     assert isinstance(return_node, IRReturn)
     assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
+
+
+def test_normalizer_dispatch_helper_skips_wrapper_instructions(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    prefix = make_stack_neutral_instruction(0, "op_12_34", operand=0x1111)
+    bridge_a = make_stack_neutral_instruction(4, "op_56_78", operand=0x2222)
+    bridge_b = make_stack_neutral_instruction(8, "op_9A_BC", operand=0x3333)
+
+    table_patch = IRTablePatch(
+        operations=(
+            ("op_2C_01", 0x6623),
+            ("op_2C_02", 0x6624),
+        )
+    )
+
+    call = IRCallReturn(target=0x6623, args=tuple(), tail=False, returns=tuple())
+
+    items = _ItemList([prefix, table_patch, bridge_a, bridge_b, call])
+
+    normalizer._pass_table_dispatch(items)
+    normalizer._pass_dispatch_wrappers(items)
+
+    assert isinstance(items[0], IRCallCleanup)
+    prefix_steps = {step.mnemonic for step in items[0].steps}
+    assert "op_12_34" in prefix_steps
+
+    dispatch = items[1]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == 0x6623
+
+    assert isinstance(items[2], IRCallCleanup)
+    bridge_steps = {step.mnemonic for step in items[2].steps}
+    assert bridge_steps == {"op_56_78", "op_9A_BC"}
+
+    assert isinstance(items[3], IRCallReturn)
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:

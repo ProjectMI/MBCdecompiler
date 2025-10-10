@@ -161,10 +161,6 @@ TAILCALL_HELPERS = {
     0x16F0,
 }
 
-DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
-DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
-
-
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
@@ -398,22 +394,6 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
     InstructionTemplate(
         name="cleanup_prefix",
         prefixes=tuple(CALL_CLEANUP_PREFIXES),
-    ),
-)
-
-
-DISPATCH_PREFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="dispatch_prefix",
-        mnemonics=tuple(DISPATCH_PREFIX_MNEMONICS),
-    ),
-)
-
-
-DISPATCH_SUFFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="dispatch_suffix",
-        mnemonics=tuple(DISPATCH_SUFFIX_MNEMONICS),
     ),
 )
 
@@ -2273,13 +2253,24 @@ class IRNormalizer:
             follow = index + 1
             while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
                 follow += 1
-            if follow < len(items):
-                candidate = items[follow]
+            scan = follow
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, IRCallCleanup):
+                    scan += 1
+                    continue
+                if (
+                    isinstance(candidate, RawInstruction)
+                    and self._is_dispatch_wrapper_instruction(candidate)
+                ):
+                    scan += 1
+                    continue
                 if isinstance(candidate, CallLike):
                     target = getattr(candidate, "target", None)
                     if isinstance(target, int) and target in {0x6623, 0x6624}:
                         helper_target = target
                         helper_symbol = self.knowledge.lookup_address(target)
+                break
 
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
@@ -2308,7 +2299,7 @@ class IRNormalizer:
                 candidate = items[prefix_start - 1]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and self._matches_templates(candidate, DISPATCH_PREFIX_TEMPLATES)
+                    and self._is_dispatch_wrapper_instruction(candidate)
                 ):
                     prefix_start -= 1
                     continue
@@ -2336,7 +2327,7 @@ class IRNormalizer:
                 candidate = items[suffix_end]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and self._matches_templates(candidate, DISPATCH_SUFFIX_TEMPLATES)
+                    and self._is_dispatch_wrapper_instruction(candidate)
                 ):
                     suffix_end += 1
                     continue
@@ -3690,6 +3681,20 @@ class IRNormalizer:
         ):
             return False
         return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
+
+    def _is_dispatch_wrapper_instruction(self, instruction: RawInstruction) -> bool:
+        if instruction.pushes_value():
+            return False
+        if instruction.event.delta > 0:
+            return False
+        if instruction.profile.kind in {
+            InstructionKind.CALL,
+            InstructionKind.RETURN,
+            InstructionKind.TAILCALL,
+            InstructionKind.TERMINATOR,
+        }:
+            return False
+        return True
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
