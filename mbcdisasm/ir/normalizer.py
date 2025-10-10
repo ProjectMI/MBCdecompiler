@@ -72,6 +72,16 @@ from .model import (
 
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
+RAW_CONTROL_FLOW_KINDS = {
+    InstructionKind.CONTROL,
+    InstructionKind.TERMINATOR,
+    InstructionKind.BRANCH,
+    InstructionKind.CALL,
+    InstructionKind.TAILCALL,
+    InstructionKind.RETURN,
+    InstructionKind.TEST,
+    InstructionKind.UNKNOWN,
+}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
@@ -626,6 +636,15 @@ class IRNormalizer:
                         block_annotations.append(annotation)
                     continue
                 metrics.raw_remaining += 1
+                event = item.event
+                if (
+                    event.delta == 0
+                    and not event.uncertain
+                    and event.kind not in RAW_CONTROL_FLOW_KINDS
+                ):
+                    metrics.raw_meta += 1
+                else:
+                    metrics.raw_unknown += 1
                 nodes.append(
                     IRRaw(
                         mnemonic=item.mnemonic,

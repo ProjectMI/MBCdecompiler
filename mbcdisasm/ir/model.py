@@ -920,6 +920,8 @@ class NormalizerMetrics:
     stores: int = 0
     reduce_replaced: int = 0
     raw_remaining: int = 0
+    raw_meta: int = 0
+    raw_unknown: int = 0
 
     def observe(self, other: "NormalizerMetrics") -> None:
         """Accumulate values from ``other`` into this instance."""
@@ -936,6 +938,8 @@ class NormalizerMetrics:
         self.stores += other.stores
         self.reduce_replaced += other.reduce_replaced
         self.raw_remaining += other.raw_remaining
+        self.raw_meta += other.raw_meta
+        self.raw_unknown += other.raw_unknown
 
     def describe(self) -> str:
         """Return a stable textual summary of the metrics."""
@@ -953,6 +957,8 @@ class NormalizerMetrics:
             f"stores={self.stores}",
             f"reduce_replaced={self.reduce_replaced}",
             f"raw_remaining={self.raw_remaining}",
+            f"raw_meta={self.raw_meta}",
+            f"raw_unknown={self.raw_unknown}",
         ]
         return " ".join(parts)
 

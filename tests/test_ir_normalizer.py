@@ -1727,3 +1727,51 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
         for node in block.nodes
     )
 
+
+def test_normalizer_metrics_split_raw_residue() -> None:
+    annotations = {
+        "AA:00": OpcodeInfo(
+            mnemonic="raw_meta_diag",
+            category="meta_helper",
+            stack_delta=0,
+        ),
+        "BB:00": OpcodeInfo(
+            mnemonic="raw_semantic_diag",
+            stack_delta=1,
+        ),
+        "CC:00": OpcodeInfo(
+            mnemonic="raw_control_diag",
+            control_flow="control",
+            stack_delta=0,
+        ),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0xAA, 0x00, 0x0000),
+        build_word(4, 0xBB, 0x00, 0x0000),
+        build_word(8, 0xCC, 0x00, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    tracker = StackTracker()
+    events = tracker.process_sequence(profiles)
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    _, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 3
+    assert metrics.raw_meta == 1
+    assert metrics.raw_unknown == 2
+
