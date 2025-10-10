@@ -102,43 +102,6 @@ CALL_PREPARATION_MNEMONICS = {
     "op_4B_91",
     "op_72_23",
 }
-CALL_CLEANUP_MNEMONICS = {
-    "call_helpers",
-    "fanout",
-    "op_01_2C",
-    "op_01_2E",
-    "op_01_6C",
-    "op_05_00",
-    "op_10_0E",
-    "op_10_12",
-    "op_10_5C",
-    "op_10_8C",
-    "op_10_DC",
-    "op_10_E8",
-    "op_14_07",
-    "op_0C_00",
-    "op_0F_00",
-    "op_02_F0",
-    "op_11_B4",
-    "op_32_29",
-    "op_4F_01",
-    "op_4F_02",
-    "op_52_05",
-    "op_58_08",
-    "op_5E_29",
-    "op_64_20",
-    "op_65_30",
-    "op_6C_01",
-    "op_C4_06",
-    "op_D0_04",
-    "op_D0_06",
-    "op_D8_04",
-    "op_F0_4B",
-    "stack_shuffle",
-    "op_4B_91",
-    "op_E4_01",
-}
-CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_06_66",
     "op_10_8C",
@@ -147,6 +110,36 @@ CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_65_30",
     "op_70_29",
 }
+
+LEGACY_CALL_CLEANUP_MNEMONICS = {
+    "call_helpers",
+    "fanout",
+    "op_05_00",
+    "op_10_0E",
+    "op_10_12",
+    "op_10_5C",
+    "op_10_8C",
+    "op_10_DC",
+    "op_10_E8",
+    "op_11_B4",
+    "op_14_07",
+    "op_32_29",
+    "op_4B_91",
+    "op_4F_01",
+    "op_4F_02",
+    "op_52_05",
+    "op_58_08",
+    "op_5E_29",
+    "op_6C_01",
+    "op_C4_06",
+    "op_D0_04",
+    "op_D0_06",
+    "op_D8_04",
+    "op_E4_01",
+    "op_F0_4B",
+    "stack_shuffle",
+}
+LEGACY_CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 
 TAILCALL_HELPERS = {
     0x003E,
@@ -424,13 +417,16 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
         kinds=(InstructionKind.STACK_TEARDOWN,),
         max_delta=-1,
     ),
+)
+
+LEGACY_CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
     InstructionTemplate(
-        name="cleanup_mnemonics",
-        mnemonics=tuple(CALL_CLEANUP_MNEMONICS),
+        name="legacy_cleanup_mnemonics",
+        mnemonics=tuple(LEGACY_CALL_CLEANUP_MNEMONICS),
     ),
     InstructionTemplate(
-        name="cleanup_prefix",
-        prefixes=tuple(CALL_CLEANUP_PREFIXES),
+        name="legacy_cleanup_prefix",
+        prefixes=tuple(LEGACY_CALL_CLEANUP_PREFIXES),
     ),
 )
 
@@ -3116,7 +3112,11 @@ class IRNormalizer:
                     break
 
                 tail_hint = base_tail
-                if cleanup_mask == RET_MASK:
+                if (
+                    cleanup_mask == RET_MASK
+                    and consumed == 0
+                    and not cleanup_steps
+                ):
                     tail_hint = True
 
                 if offset < len(items) and isinstance(items[offset], IRReturn):
@@ -3144,7 +3144,13 @@ class IRNormalizer:
                         )
                     else:
                         tail = base_tail and consumed == 0 and not return_node.cleanup
-                        if not tail and cleanup_mask == RET_MASK and consumed == 0 and not return_node.cleanup:
+                        if (
+                            not tail
+                            and cleanup_mask == RET_MASK
+                            and consumed == 0
+                            and not return_node.cleanup
+                            and not cleanup_steps
+                        ):
                             tail = True
                         node = IRCallReturn(
                             target=call.target,
@@ -3173,6 +3179,10 @@ class IRNormalizer:
                 step = item.steps[0]
                 if step.mnemonic == "fanout" and step.operand == RET_MASK:
                     node = IRConditionMask(source="fanout", mask=step.operand)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+                if step.mnemonic in {"op_29_10", "terminator"} and step.operand == RET_MASK:
+                    node = IRConditionMask(source=step.mnemonic, mask=step.operand)
                     items.replace_slice(index, index + 1, [node])
                     continue
             if isinstance(item, RawInstruction):
@@ -3698,7 +3708,61 @@ class IRNormalizer:
             mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
         ):
             return False
-        return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
+        if self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES):
+            return True
+
+        event = instruction.event
+        if event.delta != 0:
+            return False
+
+        if self._is_condition_mask_cleanup_step(instruction):
+            return True
+        if self._is_ret_mask_cleanup_step(instruction):
+            return True
+        if self._is_io_mask_cleanup_step(instruction):
+            return True
+
+        if self._matches_templates(instruction, LEGACY_CALL_CLEANUP_TEMPLATES):
+            return True
+
+        return False
+
+    @staticmethod
+    def _is_condition_mask_cleanup_step(instruction: RawInstruction) -> bool:
+        role = instruction.profile.operand_role()
+        return role in {"flags", "mask"}
+
+    @staticmethod
+    def _is_ret_mask_cleanup_step(instruction: RawInstruction) -> bool:
+        return False
+
+    def _is_io_mask_cleanup_step(self, instruction: RawInstruction) -> bool:
+        word = instruction.profile.word
+        opcode = word.opcode & 0xFF
+        mode = word.mode & 0xFF
+
+        if (opcode & 0xFE) != 0x64:
+            return False
+
+        if (mode & 0xF0) not in {0x20, 0x30}:
+            return False
+
+        operand = instruction.operand
+        if operand and not self._operand_is_io_slot(operand):
+            return False
+
+        low = operand & 0xFF
+        high = (operand >> 8) & 0xFF
+        if {
+            opcode,
+            mode,
+            low,
+            high,
+        } & _IO_MASK_VALUES:
+            return True
+
+        role = instruction.profile.operand_role()
+        return role == "mask"
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -3817,7 +3881,14 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
+        for mnemonic in (
+            "op_29_10",
+            "fanout",
+            "op_52_05",
+            "op_32_29",
+            "terminator",
+            "epilogue",
+        ):
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand
