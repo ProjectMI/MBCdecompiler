@@ -73,6 +73,15 @@ from .model import (
 
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
+_CONTROL_FLOW_KINDS = {
+    InstructionKind.CONTROL,
+    InstructionKind.BRANCH,
+    InstructionKind.TERMINATOR,
+    InstructionKind.CALL,
+    InstructionKind.TAILCALL,
+    InstructionKind.RETURN,
+    InstructionKind.TEST,
+}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
@@ -4305,11 +4314,18 @@ class IRNormalizer:
     # annotation helpers
     # ------------------------------------------------------------------
     def _is_annotation_only(self, instruction: RawInstruction) -> bool:
+        profile = instruction.profile
         if instruction.offset in self._annotation_offsets:
             return True
-        if instruction.profile.is_literal_marker():
+        if profile.is_literal_marker():
             return True
         if not instruction.annotations:
+            event = instruction.event
+            if event.delta == 0 and profile.kind not in _CONTROL_FLOW_KINDS:
+                if self._is_annotation_io_bridge(instruction) or self._is_ascii_neighbour_instruction(
+                    instruction
+                ):
+                    return True
             return False
         for note in instruction.annotations:
             if note in ANNOTATION_MNEMONICS:
@@ -4318,6 +4334,47 @@ class IRNormalizer:
                 return True
             if note.startswith("op_") and instruction.profile.kind is InstructionKind.LITERAL:
                 return True
+            if "ascii" in note.lower():
+                return True
+        event = instruction.event
+        if event.delta == 0 and profile.kind not in _CONTROL_FLOW_KINDS:
+            if self._is_annotation_io_bridge(instruction) or self._is_ascii_neighbour_instruction(instruction):
+                return True
+        return False
+
+    @staticmethod
+    def _is_ascii_neighbour_instruction(instruction: RawInstruction) -> bool:
+        profile = instruction.profile
+        if profile.kind is InstructionKind.ASCII_CHUNK:
+            return True
+        sources = (profile.mnemonic, profile.summary, profile.category)
+        for source in sources:
+            if source and "ascii" in source.lower():
+                return True
+        traits = getattr(profile, "traits", {})
+        if traits:
+            for key, value in traits.items():
+                if isinstance(key, str) and "ascii" in key.lower():
+                    return True
+                if isinstance(value, str) and "ascii" in value.lower():
+                    return True
+                if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                    if any(isinstance(item, str) and "ascii" in item.lower() for item in value):
+                        return True
+        return False
+
+    def _is_annotation_io_bridge(self, instruction: RawInstruction) -> bool:
+        if not self._is_io_bridge_instruction(instruction):
+            return False
+        mnemonic = instruction.mnemonic
+        if mnemonic in IO_BRIDGE_MNEMONICS:
+            return True
+        profile = instruction.profile
+        for source in (profile.summary, profile.category):
+            if source and "io" in source.lower():
+                return True
+        if any("io" in note.lower() for note in instruction.annotations):
+            return True
         return False
 
     def _format_annotation(self, instruction: RawInstruction) -> str:
