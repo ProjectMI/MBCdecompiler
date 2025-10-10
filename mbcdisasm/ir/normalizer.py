@@ -76,69 +76,6 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
-CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
-CALL_PREPARATION_MNEMONICS = {
-    "op_01_2C",
-    "op_02_2A",
-    "op_02_F0",
-    "op_02_F1",
-    "op_09_29",
-    "op_0A_F1",
-    "op_0F_00",
-    "op_0C_2C",
-    "op_10_DC",
-    "op_11_B4",
-    "op_28_10",
-    "op_3C_02",
-    "op_3D_30",
-    "op_4F_01",
-    "op_4F_02",
-    "op_4D_30",
-    "op_5C_08",
-    "op_60_04",
-    "op_60_08",
-    "op_74_08",
-    "op_AC_01",
-    "op_4B_91",
-    "op_72_23",
-}
-CALL_CLEANUP_MNEMONICS = {
-    "call_helpers",
-    "fanout",
-    "op_01_2C",
-    "op_01_2E",
-    "op_01_6C",
-    "op_05_00",
-    "op_10_0E",
-    "op_10_12",
-    "op_10_5C",
-    "op_10_8C",
-    "op_10_DC",
-    "op_10_E8",
-    "op_14_07",
-    "op_0C_00",
-    "op_0F_00",
-    "op_02_F0",
-    "op_11_B4",
-    "op_32_29",
-    "op_4F_01",
-    "op_4F_02",
-    "op_52_05",
-    "op_58_08",
-    "op_5E_29",
-    "op_64_20",
-    "op_65_30",
-    "op_6C_01",
-    "op_C4_06",
-    "op_D0_04",
-    "op_D0_06",
-    "op_D8_04",
-    "op_F0_4B",
-    "stack_shuffle",
-    "op_4B_91",
-    "op_E4_01",
-}
-CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_06_66",
     "op_10_8C",
@@ -160,44 +97,6 @@ TAILCALL_HELPERS = {
     0x0FF0,
     0x16F0,
 }
-TAILCALL_POSTLUDE = {
-    "op_01_6C",
-    "op_05_00",
-    "op_06_66",
-    "op_0B_29",
-    "op_0C_00",
-    "op_0F_00",
-    "op_10_0E",
-    "op_10_12",
-    "op_10_5C",
-    "op_10_8C",
-    "op_10_DC",
-    "op_10_E8",
-    "op_14_07",
-    "op_32_29",
-    "op_4F_01",
-    "op_4F_02",
-    "op_52_05",
-    "op_58_08",
-    "op_5E_29",
-    "op_64_20",
-    "op_65_30",
-    "op_6C_01",
-    "op_70_29",
-    "op_C4_06",
-    "op_D0_04",
-    "op_D0_06",
-    "op_D8_04",
-    "op_F0_4B",
-    "op_4B_91",
-    "op_E4_01",
-    "op_59_FE",
-    "op_95_FE",
-}
-TAILCALL_POSTLUDE_PREFIXES = ("op_59_FE", "op_95_FE")
-
-DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
-DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
 
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
@@ -294,6 +193,360 @@ INDIRECT_PAGE_REGISTER_MNEMONICS = {
 INDIRECT_CONFIGURATION_BRIDGES = {"op_3D_30", "op_43_30"}
 
 INDIRECT_MASK_MNEMONICS = {"op_01_DC"}
+
+
+@dataclass(frozen=True)
+class MacroToken:
+    """Describe a single instruction class consumed by a macro rule."""
+
+    kinds: Tuple[InstructionKind, ...] = tuple()
+    category_keywords: Tuple[str, ...] = tuple()
+    mnemonic_prefixes: Tuple[str, ...] = tuple()
+    summary_keywords: Tuple[str, ...] = tuple()
+    min_delta: int = -999
+    max_delta: int = 999
+    allow_unknown: bool = False
+    requires_pops: bool = False
+    requires_pushes: bool = False
+    standalone: bool = False
+
+    def matches(self, instruction: "RawInstruction") -> bool:
+        event = instruction.event
+        if not self.allow_unknown and event.kind is InstructionKind.UNKNOWN:
+            return False
+        if self.kinds and event.kind not in self.kinds:
+            return False
+        if event.delta < self.min_delta or event.delta > self.max_delta:
+            return False
+        if self.requires_pops and not event.popped_types:
+            return False
+        if self.requires_pushes and not event.pushed_types:
+            return False
+
+        mnemonic = instruction.mnemonic
+        if self.mnemonic_prefixes and not any(
+            mnemonic.startswith(prefix) for prefix in self.mnemonic_prefixes
+        ):
+            return False
+
+        if self.category_keywords:
+            category = (instruction.profile.category or "").lower()
+            summary = (instruction.profile.summary or "").lower()
+            sources = [category, summary]
+            if not any(
+                source and any(keyword in source for keyword in self.category_keywords)
+                for source in sources
+            ):
+                return False
+
+        if self.summary_keywords:
+            summary = (instruction.profile.summary or "").lower()
+            if not any(keyword in summary for keyword in self.summary_keywords):
+                return False
+
+        return True
+
+
+@dataclass(frozen=True)
+class MacroRule:
+    """Group of :class:`MacroToken` entries describing a macro class."""
+
+    name: str
+    tokens: Tuple[MacroToken, ...]
+
+    def match_token(self, instruction: "RawInstruction") -> Optional[MacroToken]:
+        for token in self.tokens:
+            if token.matches(instruction):
+                return token
+        return None
+
+    def matches(self, instruction: "RawInstruction") -> bool:
+        return self.match_token(instruction) is not None
+
+
+CALL_PREPARATION_MACRO = MacroRule(
+    name="call_preparation",
+    tokens=(
+        MacroToken(
+            kinds=(InstructionKind.PUSH, InstructionKind.LITERAL, InstructionKind.TABLE_LOOKUP),
+            min_delta=0,
+            max_delta=4,
+        ),
+        MacroToken(
+            kinds=(InstructionKind.STACK_COPY,),
+            min_delta=-2,
+            max_delta=4,
+            allow_unknown=True,
+            category_keywords=("stack_shuffle", "fanout"),
+        ),
+        MacroToken(
+            kinds=(InstructionKind.STACK_TEARDOWN,),
+            min_delta=-8,
+            max_delta=-1,
+            allow_unknown=True,
+            mnemonic_prefixes=("stack_teardown",),
+        ),
+        MacroToken(
+            mnemonic_prefixes=(
+                "fanout",
+                "stack_shuffle",
+                "op_01_",
+                "op_02_",
+                "op_09_",
+                "op_0A_",
+                "op_0C_",
+                "op_0F_",
+                "op_10_",
+                "op_11_",
+                "op_28_",
+                "op_3C_",
+                "op_3D_",
+                "op_4D_",
+                "op_4F_",
+                "op_5C_",
+                "op_60_",
+                "op_74_",
+                "op_AC_",
+                "op_4B_",
+                "op_72_",
+                "op_59_",
+            ),
+            min_delta=-1,
+            max_delta=4,
+            allow_unknown=True,
+        ),
+    ),
+)
+
+
+CALL_CLEANUP_MACRO = MacroRule(
+    name="call_cleanup",
+    tokens=(
+        MacroToken(
+            kinds=(InstructionKind.STACK_TEARDOWN,),
+            min_delta=-8,
+            max_delta=0,
+            allow_unknown=True,
+            standalone=True,
+        ),
+        MacroToken(
+            kinds=(InstructionKind.STACK_COPY,),
+            min_delta=-2,
+            max_delta=2,
+            allow_unknown=True,
+            category_keywords=("stack_shuffle", "fanout"),
+            standalone=True,
+        ),
+        MacroToken(
+            mnemonic_prefixes=("fanout",),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            standalone=True,
+        ),
+        MacroToken(
+            mnemonic_prefixes=("op_10_", "op_5E_"),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+            standalone=True,
+        ),
+        MacroToken(
+            mnemonic_prefixes=("op_01_",),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+            standalone=True,
+        ),
+        MacroToken(
+            kinds=(InstructionKind.CALL, InstructionKind.META),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+            category_keywords=(
+                "call_helper",
+                "call_helpers",
+                "tailcall_dispatch",
+                "call_wrapper",
+            ),
+        ),
+        MacroToken(
+            kinds=(InstructionKind.PUSH, InstructionKind.LITERAL),
+            min_delta=-1,
+            max_delta=2,
+            allow_unknown=True,
+            summary_keywords=("cleanup", "epilogue", "return"),
+        ),
+        MacroToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-4,
+            max_delta=0,
+            allow_unknown=True,
+            requires_pops=True,
+        ),
+        MacroToken(
+            mnemonic_prefixes=(
+                "fanout",
+                "stack_shuffle",
+                "op_01_",
+                "op_02_",
+                "op_05_",
+                "op_06_",
+                "op_0B_",
+                "op_0C_",
+                "op_0F_",
+                "op_10_",
+                "op_11_",
+                "op_14_",
+                "op_32_",
+                "op_4F_",
+                "op_52_",
+                "op_58_",
+                "op_5E_",
+                "op_64_",
+                "op_65_",
+                "op_6C_",
+                "op_C4_",
+                "op_D0_",
+                "op_D8_",
+                "op_E4_",
+                "op_F0_",
+                "op_4B_",
+                "op_95_",
+            ),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+        ),
+    ),
+)
+
+
+TAILCALL_POSTLUDE_MACRO = MacroRule(
+    name="tailcall_postlude",
+    tokens=(
+        MacroToken(
+            kinds=(InstructionKind.STACK_TEARDOWN, InstructionKind.STACK_COPY),
+            min_delta=-8,
+            max_delta=2,
+            allow_unknown=True,
+            category_keywords=("stack_shuffle", "fanout"),
+        ),
+        MacroToken(
+            kinds=(InstructionKind.CALL, InstructionKind.META),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+            category_keywords=("call_helper", "call_helpers", "tailcall_dispatch"),
+        ),
+        MacroToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-4,
+            max_delta=0,
+            allow_unknown=True,
+            requires_pops=True,
+        ),
+        MacroToken(
+            mnemonic_prefixes=(
+                "fanout",
+                "stack_shuffle",
+                "op_01_",
+                "op_02_",
+                "op_05_",
+                "op_06_",
+                "op_0B_",
+                "op_0C_",
+                "op_0F_",
+                "op_10_",
+                "op_11_",
+                "op_14_",
+                "op_32_",
+                "op_4F_",
+                "op_52_",
+                "op_58_",
+                "op_5E_",
+                "op_64_",
+                "op_65_",
+                "op_6C_",
+                "op_C4_",
+                "op_D0_",
+                "op_D8_",
+                "op_E4_",
+                "op_F0_",
+                "op_4B_",
+                "op_59_",
+                "op_95_",
+            ),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+        ),
+    ),
+)
+
+
+DISPATCH_PREFIX_MACRO = MacroRule(
+    name="dispatch_prefix",
+    tokens=(
+        MacroToken(
+            kinds=(
+                InstructionKind.STACK_COPY,
+                InstructionKind.STACK_TEARDOWN,
+                InstructionKind.CALL,
+                InstructionKind.META,
+            ),
+            min_delta=-6,
+            max_delta=4,
+            allow_unknown=True,
+            category_keywords=("fanout", "stack_shuffle", "call_helper", "call_helpers"),
+        ),
+        MacroToken(
+            mnemonic_prefixes=("op_08_", "op_64_", "op_65_"),
+            min_delta=-2,
+            max_delta=1,
+            allow_unknown=True,
+        ),
+        MacroToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-4,
+            max_delta=0,
+            allow_unknown=True,
+            requires_pops=True,
+        ),
+    ),
+)
+
+
+DISPATCH_SUFFIX_MACRO = MacroRule(
+    name="dispatch_suffix",
+    tokens=(
+        MacroToken(
+            kinds=(
+                InstructionKind.CALL,
+                InstructionKind.META,
+                InstructionKind.STACK_COPY,
+                InstructionKind.STACK_TEARDOWN,
+            ),
+            min_delta=-4,
+            max_delta=2,
+            allow_unknown=True,
+            category_keywords=("call_helper", "call_helpers", "fanout", "stack_shuffle"),
+        ),
+        MacroToken(
+            mnemonic_prefixes=("op_10_8" ,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+        ),
+        MacroToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-4,
+            max_delta=0,
+            allow_unknown=True,
+            requires_pops=True,
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -1523,18 +1776,28 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            token = self._call_cleanup_token(item)
+            if token is None:
                 index += 1
                 continue
 
             steps: List[IRStackEffect] = []
+            tokens: List[MacroToken] = []
             start = index
             end = index
             scan = index
             while scan < len(items):
                 candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                if isinstance(candidate, RawInstruction):
+                    match = self._call_cleanup_token(candidate)
+                    if match is None:
+                        break
                     steps.append(self._call_cleanup_effect(candidate))
+                    tokens.append(match)
                     end = scan + 1
                     scan += 1
                     continue
@@ -1552,14 +1815,17 @@ class IRNormalizer:
             ):
                 prev_index -= 1
 
+            attached = False
             if prev_index >= 0 and isinstance(items[prev_index], IRCall):
                 items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
                 index = prev_index + 2
+                attached = True
                 continue
 
             next_index = end
             while next_index < len(items) and isinstance(
-                items[next_index], (IRLiteral, IRLiteralChunk, IRStringConstant)
+                items[next_index],
+                (IRLiteral, IRLiteralChunk, IRStringConstant, IRCallPreparation),
             ):
                 next_index += 1
 
@@ -1577,10 +1843,24 @@ class IRNormalizer:
                 next_index -= len(steps)
                 items.replace_slice(next_index, next_index + 1, [updated])
                 index = next_index + 1
+                attached = True
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            if not attached:
+                if next_index < len(items):
+                    follower = items[next_index]
+                    if isinstance(follower, RawInstruction) and follower.profile.kind in {
+                        InstructionKind.CALL,
+                        InstructionKind.TAILCALL,
+                    }:
+                        items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
+                        index = start + 1
+                        continue
+                if all(token.standalone for token in tokens):
+                    items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
+                    index = start + 1
+                    continue
+                index = end
 
     def _pass_io_operations(self, items: _ItemList) -> None:
         index = 0
@@ -2087,9 +2367,8 @@ class IRNormalizer:
             prefix_start = index
             while prefix_start > 0:
                 candidate = items[prefix_start - 1]
-                if (
-                    isinstance(candidate, RawInstruction)
-                    and candidate.mnemonic in DISPATCH_PREFIX_MNEMONICS
+                if isinstance(candidate, RawInstruction) and DISPATCH_PREFIX_MACRO.matches(
+                    candidate
                 ):
                     prefix_start -= 1
                     continue
@@ -2115,9 +2394,8 @@ class IRNormalizer:
             suffix_end = follow
             while suffix_end < len(items):
                 candidate = items[suffix_end]
-                if (
-                    isinstance(candidate, RawInstruction)
-                    and candidate.mnemonic in DISPATCH_SUFFIX_MNEMONICS
+                if isinstance(candidate, RawInstruction) and DISPATCH_SUFFIX_MACRO.matches(
+                    candidate
                 ):
                     suffix_end += 1
                     continue
@@ -2181,10 +2459,12 @@ class IRNormalizer:
 
             if helper_target == 0x0072:
                 self._rewrite_tail_helper_72(items, index, item, new_target)
+                index += 1
                 continue
 
             if helper_target in {0x003D, 0x00F0}:
                 self._rewrite_tail_helper_io(items, index, item, helper_target, new_target)
+                index += 1
                 continue
 
             index += 1
@@ -2324,7 +2604,8 @@ class IRNormalizer:
                         scan -= 1
                         continue
                 elif isinstance(candidate, IRLiteral):
-                    return candidate.value & 0xFFFF
+                    scan -= 1
+                    continue
                 elif isinstance(candidate, (IRLiteralChunk, IRAsciiPreamble)):
                     scan -= 1
                     continue
@@ -2334,7 +2615,7 @@ class IRNormalizer:
             hints = self._pending_tail_targets.get(helper)
             if hints:
                 return hints.pop(0)
-            return None
+            return helper
 
         if helper == 0x003D:
             scan = index + 1
@@ -2369,34 +2650,83 @@ class IRNormalizer:
         node: CallLike,
         target: int,
     ) -> None:
+        current_index = index
+
+        prefix_cleanup: List[IRStackEffect] = []
+        removal_positions: List[int] = []
+        scan = current_index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRCallCleanup):
+                prefix_cleanup = list(candidate.steps) + prefix_cleanup
+                removal_positions.append(scan)
+                scan -= 1
+                continue
+            if isinstance(candidate, RawInstruction):
+                token = self._call_cleanup_token(candidate)
+                if token is None:
+                    break
+                prefix_cleanup.insert(0, self._call_cleanup_effect(candidate))
+                removal_positions.append(scan)
+                scan -= 1
+                continue
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                scan -= 1
+                continue
+            break
+
+        if removal_positions:
+            for position in sorted(removal_positions):
+                items.pop(position)
+                if position < current_index:
+                    current_index -= 1
+
+        index = current_index
+
+        post_index = index + 1
+        if post_index < len(items):
+            follower = items[post_index]
+            if isinstance(follower, RawInstruction) and follower.mnemonic == "op_70_29":
+                mask_node = IRConditionMask(source=follower.mnemonic, mask=follower.operand)
+                items.replace_slice(post_index, post_index + 1, [mask_node])
+
         args = list(getattr(node, "args", tuple()))
         convention = getattr(node, "convention", None)
         if convention is not None and convention.mnemonic == "stack_shuffle":
             args = self._apply_call_shuffle(args, convention.operand)
 
+        call_object = getattr(node, "call", None)
+        if convention is None and call_object is not None:
+            convention = getattr(call_object, "convention", None)
+            if convention is not None and convention.mnemonic == "stack_shuffle":
+                args = self._apply_call_shuffle(args, convention.operand)
+
         cleanup_mask = getattr(node, "cleanup_mask", None)
         predicate = getattr(node, "predicate", None)
         arity = getattr(node, "arity", None)
 
-        cleanup_effects = list(getattr(node, "cleanup", tuple()))
+        call_cleanup_effects = (
+            list(getattr(call_object, "cleanup", tuple())) if call_object is not None else []
+        )
+        tail_cleanup_effects = list(getattr(node, "cleanup", tuple()))
+        combined_cleanup = call_cleanup_effects + tail_cleanup_effects
+
         teardown: Optional[IRStackEffect] = None
-        retained_cleanup: List[IRStackEffect] = []
-        for effect in cleanup_effects:
-            if (
-                teardown is None
-                and effect.mnemonic == "stack_teardown"
-                and effect.pops in {0, 1}
-            ):
-                pops = effect.pops if effect.pops else 1
+        retained_cleanup: List[IRStackEffect] = list(prefix_cleanup)
+        if combined_cleanup:
+            last = combined_cleanup[-1]
+            if last.mnemonic == "stack_teardown":
+                pops = last.pops if last.pops else 1
                 teardown = IRStackEffect(
                     mnemonic="stack_teardown",
-                    operand=effect.operand,
+                    operand=last.operand,
                     pops=pops,
-                    operand_role=effect.operand_role,
-                    operand_alias=effect.operand_alias,
+                    operand_role=last.operand_role,
+                    operand_alias=last.operand_alias,
                 )
-                continue
-            retained_cleanup.append(effect)
+                retained_cleanup.extend(combined_cleanup[:-1])
+            else:
+                retained_cleanup.extend(combined_cleanup)
 
         next_node: Optional[IRNode] = items[index + 1] if index + 1 < len(items) else None
         returns_node: Optional[IRReturn] = None
@@ -2426,24 +2756,28 @@ class IRNormalizer:
             returns = len(returns_node.values)
             varargs = returns_node.varargs
 
-        tailcall = IRTailcallReturn(
+        call_cleanup = tuple()
+        if teardown is not None:
+            call_cleanup = (teardown,)
+
+        call = IRCall(
             target=target,
             args=tuple(args),
-            returns=returns,
-            varargs=varargs,
-            cleanup=tuple(retained_cleanup),
             tail=True,
             arity=arity,
-            convention=None,
-            cleanup_mask=None,
+            convention=convention,
+            cleanup_mask=cleanup_mask,
+            cleanup=call_cleanup,
             symbol=symbol,
             predicate=predicate,
         )
-        self._transfer_ssa(node, tailcall)
-        items.replace_slice(index, index + 1, [tailcall])
+        self._transfer_ssa(node, call)
 
-        if teardown is not None:
-            self._attach_tail_helper_cleanup(items, index, teardown)
+        replacement: List[Union[IRCallCleanup, IRCall]] = [call]
+        if retained_cleanup:
+            replacement.insert(0, IRCallCleanup(steps=tuple(retained_cleanup)))
+
+        items.replace_slice(index, index + 1, replacement)
 
     def _rewrite_tail_helper_io(
         self,
@@ -2816,13 +3150,7 @@ class IRNormalizer:
                     if (
                         isinstance(candidate, RawInstruction)
                         and call.target in TAILCALL_HELPERS
-                        and (
-                            candidate.mnemonic in TAILCALL_POSTLUDE
-                            or any(
-                                candidate.mnemonic.startswith(prefix)
-                                for prefix in TAILCALL_POSTLUDE_PREFIXES
-                            )
-                        )
+                        and TAILCALL_POSTLUDE_MACRO.matches(candidate)
                     ):
                         cleanup_steps.append(self._call_cleanup_effect(candidate))
                         offset += 1
@@ -3429,15 +3757,15 @@ class IRNormalizer:
         return node
 
     @staticmethod
-    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic in CALL_CLEANUP_MNEMONICS:
-            return True
-        if mnemonic.startswith("op_10_") and (
-            mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
+    def _call_cleanup_token(instruction: RawInstruction) -> Optional[MacroToken]:
+        if instruction.mnemonic.startswith("op_10_") and (
+            instruction.mnemonic in IO_WRITE_MNEMONICS
+            or instruction.mnemonic in IO_READ_MNEMONICS
         ):
-            return False
-        return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+            return None
+        if instruction.mnemonic in IO_READ_MNEMONICS:
+            return None
+        return CALL_CLEANUP_MACRO.match_token(instruction)
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -3450,14 +3778,11 @@ class IRNormalizer:
 
     @staticmethod
     def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic == "op_4A_05":
+        if instruction.mnemonic == "op_4A_05":
             return True
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             return True
-        if mnemonic in CALL_PREPARATION_MNEMONICS:
-            return True
-        return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
+        return CALL_PREPARATION_MACRO.matches(instruction)
 
     def _call_convention_effect(self, operand: int) -> IRStackEffect:
         alias = "CALL_SHUFFLE_STD" if operand == CALL_SHUFFLE_STANDARD else None
