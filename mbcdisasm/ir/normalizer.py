@@ -59,6 +59,7 @@ from .model import (
     IRTablePatch,
     IRDispatchCase,
     IRSwitchDispatch,
+    IRDispatchAffix,
     IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
@@ -261,6 +262,7 @@ IO_BRIDGE_NODE_TYPES = (
     IRTailcallReturn,
     IRSwitchDispatch,
     IRTailcallFrame,
+    IRDispatchAffix,
 )
 
 ASCII_NEIGHBOR_NODE_TYPES = (
@@ -400,24 +402,6 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
         prefixes=tuple(CALL_CLEANUP_PREFIXES),
     ),
 )
-
-
-DISPATCH_PREFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="dispatch_prefix",
-        mnemonics=tuple(DISPATCH_PREFIX_MNEMONICS),
-    ),
-)
-
-
-DISPATCH_SUFFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="dispatch_suffix",
-        mnemonics=tuple(DISPATCH_SUFFIX_MNEMONICS),
-    ),
-)
-
-
 CallLike = Union[IRCall, IRCallReturn, IRTailcallReturn, IRTailCall]
 
 
@@ -2303,62 +2287,227 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            prefix_start = index
-            while prefix_start > 0:
-                candidate = items[prefix_start - 1]
-                if (
-                    isinstance(candidate, RawInstruction)
-                    and self._matches_templates(candidate, DISPATCH_PREFIX_TEMPLATES)
-                ):
-                    prefix_start -= 1
+            self._convert_dispatch_cleanup(items, index, prefix=True)
+            prefix_positions = self._collect_dispatch_affix_positions(
+                items, index, direction=-1, prefix=True
+            )
+            for position in prefix_positions:
+                instruction = items[position]
+                assert isinstance(instruction, RawInstruction)
+                affix = IRDispatchAffix(
+                    role="prefix",
+                    operations=((instruction.mnemonic, instruction.operand),),
+                    annotations=instruction.annotations,
+                )
+                self._transfer_ssa(instruction, affix)
+                items.replace_slice(position, position + 1, [affix])
+
+            self._convert_dispatch_cleanup(items, index, prefix=False)
+            suffix_positions = self._collect_dispatch_affix_positions(
+                items, index, direction=1, prefix=False
+            )
+            for position in suffix_positions:
+                instruction = items[position]
+                assert isinstance(instruction, RawInstruction)
+                affix = IRDispatchAffix(
+                    role="suffix",
+                    operations=((instruction.mnemonic, instruction.operand),),
+                    annotations=instruction.annotations,
+                )
+                self._transfer_ssa(instruction, affix)
+                items.replace_slice(position, position + 1, [affix])
+
+            self._split_dispatch_cleanup(items, index)
+            index += 1
+
+    def _collect_dispatch_affix_positions(
+        self,
+        items: _ItemList,
+        dispatch_index: int,
+        *,
+        direction: int,
+        prefix: bool,
+    ) -> List[int]:
+        positions: List[int] = []
+        scan = dispatch_index + direction
+        while 0 <= scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if self._is_dispatch_affix_instruction(candidate, prefix=prefix):
+                    positions.append(scan)
+                    scan += direction
                     continue
                 break
+            if self._is_dispatch_affix_separator(candidate):
+                scan += direction
+                continue
+            break
+        if direction < 0:
+            positions.reverse()
+        return positions
 
-            if prefix_start < index:
-                raw_prefix = [
-                    items[position]
-                    for position in range(prefix_start, index)
-                    if isinstance(items[position], RawInstruction)
-                ]
-                if raw_prefix:
-                    steps = tuple(
-                        self._call_cleanup_effect(instruction)
-                        for instruction in raw_prefix
-                    )
-                    cleanup = IRCallCleanup(steps=steps)
-                    items.replace_slice(prefix_start, index, [cleanup])
-                    index = prefix_start + 1
-                    node = items[index]
+    def _convert_dispatch_cleanup(
+        self, items: _ItemList, index: int, *, prefix: bool
+    ) -> None:
+        scan = index - 1 if prefix else index + 1
+        step = -1 if prefix else 1
+        while 0 <= scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, IRCallCleanup):
+                affix = self._dispatch_affix_from_cleanup(candidate, prefix=prefix)
+                if affix is None:
+                    break
+                items.replace_slice(scan, scan + 1, [affix])
+                scan += step
+                continue
+            if self._is_dispatch_affix_separator(candidate):
+                scan += step
+                continue
+            break
 
-            follow = index + 1
-            suffix_end = follow
-            while suffix_end < len(items):
-                candidate = items[suffix_end]
-                if (
-                    isinstance(candidate, RawInstruction)
-                    and self._matches_templates(candidate, DISPATCH_SUFFIX_TEMPLATES)
-                ):
-                    suffix_end += 1
-                    continue
+    def _dispatch_affix_from_cleanup(
+        self, cleanup: IRCallCleanup, *, prefix: bool
+    ) -> Optional[IRDispatchAffix]:
+        allowed = DISPATCH_PREFIX_MNEMONICS if prefix else DISPATCH_SUFFIX_MNEMONICS
+        operations: List[Tuple[str, int]] = []
+        for step in cleanup.steps:
+            if step.mnemonic not in allowed:
+                return None
+            operations.append((step.mnemonic, step.operand))
+        role = "prefix" if prefix else "suffix"
+        return IRDispatchAffix(role=role, operations=tuple(operations))
+
+    def _split_dispatch_cleanup(self, items: _ItemList, index: int) -> None:
+        position = index + 1
+        if not (0 <= position < len(items)):
+            return
+        candidate = items[position]
+        cleanup = getattr(candidate, "cleanup", None)
+        if not cleanup:
+            return
+        affix, consumed = self._extract_dispatch_affix_from_steps(cleanup, prefix=False)
+        if affix is None or not consumed:
+            return
+        remaining = cleanup[consumed:]
+        updated = self._update_node_cleanup(candidate, remaining)
+        if updated is None:
+            return
+        self._transfer_ssa(candidate, updated)
+        items.replace_slice(position, position + 1, [affix, updated])
+
+    def _extract_dispatch_affix_from_steps(
+        self, steps: Sequence[IRStackEffect], *, prefix: bool
+    ) -> Tuple[Optional[IRDispatchAffix], int]:
+        allowed = DISPATCH_PREFIX_MNEMONICS if prefix else DISPATCH_SUFFIX_MNEMONICS
+        operations: List[Tuple[str, int]] = []
+        count = 0
+        for step in steps:
+            if step.mnemonic not in allowed:
                 break
+            operations.append((step.mnemonic, step.operand))
+            count += 1
+        if not operations:
+            return None, 0
+        role = "prefix" if prefix else "suffix"
+        return IRDispatchAffix(role=role, operations=tuple(operations)), count
 
-            if suffix_end > follow:
-                raw_suffix = [
-                    items[position]
-                    for position in range(follow, suffix_end)
-                    if isinstance(items[position], RawInstruction)
-                ]
-                if raw_suffix:
-                    steps = tuple(
-                        self._call_cleanup_effect(instruction)
-                        for instruction in raw_suffix
-                    )
-                    cleanup = IRCallCleanup(steps=steps)
-                    items.replace_slice(follow, suffix_end, [cleanup])
-                    index = follow + 1
-                    continue
+    def _update_node_cleanup(
+        self, node: IRNode, cleanup: Sequence[IRStackEffect]
+    ) -> Optional[IRNode]:
+        new_cleanup = tuple(cleanup)
+        if isinstance(node, IRReturn):
+            return IRReturn(
+                values=node.values,
+                varargs=node.varargs,
+                cleanup=new_cleanup,
+                mask=node.mask,
+            )
+        if isinstance(node, IRCall):
+            return IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=node.cleanup_mask,
+                cleanup=new_cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+        if isinstance(node, IRCallReturn):
+            return IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=new_cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=node.cleanup_mask,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+        if isinstance(node, IRTailCall):
+            return IRTailCall(
+                call=node.call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=new_cleanup,
+                cleanup_mask=node.cleanup_mask,
+            )
+        if isinstance(node, IRTailcallReturn):
+            return IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=new_cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=node.cleanup_mask,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+        return None
 
-            index = follow
+    def _is_dispatch_affix_instruction(
+        self, instruction: RawInstruction, *, prefix: bool
+    ) -> bool:
+        mnemonic = instruction.mnemonic
+        if prefix and mnemonic in DISPATCH_PREFIX_MNEMONICS:
+            return True
+        if not prefix and mnemonic in DISPATCH_SUFFIX_MNEMONICS:
+            return True
+        if instruction.pushes_value():
+            if prefix and instruction.profile.kind in {InstructionKind.PUSH}:
+                return True
+            return False
+        kind = instruction.profile.kind
+        if kind in {
+            InstructionKind.CALL,
+            InstructionKind.TAILCALL,
+            InstructionKind.RETURN,
+            InstructionKind.TERMINATOR,
+        }:
+            return False
+        if not prefix and kind is InstructionKind.BRANCH:
+            return False
+        return True
+
+    @staticmethod
+    def _is_dispatch_affix_separator(item: Union[RawInstruction, IRNode]) -> bool:
+        return isinstance(
+            item,
+            (
+                IRLiteral,
+                IRLiteralChunk,
+                IRLiteralBlock,
+                IRStringConstant,
+                IRDispatchAffix,
+            ),
+        )
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]

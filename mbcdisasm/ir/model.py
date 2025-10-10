@@ -696,6 +696,23 @@ class IRSwitchDispatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRDispatchAffix(IRNode):
+    """Instructions that frame a dispatch helper invocation."""
+
+    role: str
+    operations: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        prefix = "dispatch_prefix" if self.role == "prefix" else "dispatch_suffix"
+        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        description = f"{prefix}[{rendered}]"
+        if self.annotations:
+            description += " " + ", ".join(self.annotations)
+        return description
+
+
+@dataclass(frozen=True)
 class IRAsciiFinalize(IRNode):
     """Normalises helper invocations that terminate ASCII aggregation blocks."""
 

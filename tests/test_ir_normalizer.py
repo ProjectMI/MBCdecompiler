@@ -31,6 +31,7 @@ from mbcdisasm.ir.model import (
     IRBuildArray,
     IRSwitchDispatch,
     IRTablePatch,
+    IRDispatchAffix,
     NormalizerMetrics,
     IRIORead,
 )
@@ -1360,11 +1361,15 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     assert not any(isinstance(node, IRRaw) for node in block.nodes)
-    assert isinstance(block.nodes[0], IRCallCleanup)
+    prefix = block.nodes[0]
+    assert isinstance(prefix, IRDispatchAffix)
+    assert prefix.role == "prefix"
     assert isinstance(block.nodes[1], IRSwitchDispatch)
-    return_node = block.nodes[2]
+    suffix = block.nodes[2]
+    assert isinstance(suffix, IRDispatchAffix)
+    assert suffix.role == "suffix"
+    return_node = block.nodes[3]
     assert isinstance(return_node, IRReturn)
-    assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
