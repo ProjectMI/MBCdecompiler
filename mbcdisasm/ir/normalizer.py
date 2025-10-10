@@ -259,6 +259,31 @@ IO_BRIDGE_NODE_TYPES = (
     IRTailcallFrame,
 )
 
+ASCII_NEIGHBOR_NODE_TYPES = (
+    IRLiteralChunk,
+    IRAsciiPreamble,
+    IRAsciiFinalize,
+    IRAsciiHeader,
+)
+
+STACK_NEUTRAL_CONTROL_KINDS = {
+    InstructionKind.CONTROL,
+    InstructionKind.TERMINATOR,
+    InstructionKind.BRANCH,
+    InstructionKind.RETURN,
+    InstructionKind.TEST,
+    InstructionKind.CALL,
+    InstructionKind.TAILCALL,
+}
+
+SIDE_EFFECT_KIND_HINTS = {
+    InstructionKind.INDIRECT,
+    InstructionKind.INDIRECT_STORE,
+    InstructionKind.TABLE_LOOKUP,
+}
+
+SIDE_EFFECT_KEYWORDS = ("io", "port", "memory", "store", "write", "page", "mode", "status", "flag")
+
 
 INDIRECT_PAGE_REGISTER_MNEMONICS = {
     "op_D4_06": 0x06D4,
@@ -617,11 +642,14 @@ class IRNormalizer:
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
 
+        final_items = list(items)
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
-        for item in items:
+        for index, item in enumerate(final_items):
             if isinstance(item, RawInstruction):
-                if self._is_annotation_only(item):
+                if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
+                    item, final_items, index
+                ):
                     annotation = self._format_annotation(item)
                     if annotation:
                         block_annotations.append(annotation)
@@ -4318,6 +4346,90 @@ class IRNormalizer:
                 return True
             if note.startswith("op_") and instruction.profile.kind is InstructionKind.LITERAL:
                 return True
+        return False
+
+    def _is_stack_neutral_bridge(
+        self,
+        instruction: RawInstruction,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if instruction.profile.kind in STACK_NEUTRAL_CONTROL_KINDS:
+            return False
+        if instruction.profile.is_control():
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        if self._is_bridge_edge_position(items, index):
+            return False
+        if self._is_io_bridge_instruction(instruction):
+            return True
+        return self._has_ascii_neighbor(items, index)
+
+    def _has_profile_side_effects(self, instruction: RawInstruction) -> bool:
+        profile = instruction.profile
+        if profile.kind in SIDE_EFFECT_KIND_HINTS:
+            return True
+        operand = instruction.operand
+        if operand in IO_SLOT_ALIASES or operand == PAGE_REGISTER:
+            return True
+        alias = profile.operand_alias()
+        if alias and any(keyword in alias.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        role = profile.operand_role()
+        if role and any(keyword in role.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        category = profile.category
+        if category and any(keyword in category.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        summary = profile.summary
+        if summary and any(keyword in summary.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        mnemonic = profile.mnemonic.lower()
+        if any(keyword in mnemonic for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+        return False
+
+    def _is_bridge_edge_position(
+        self,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        if index == 0 or index == len(items) - 1:
+            return True
+        next_item = items[index + 1]
+        if isinstance(next_item, RawInstruction):
+            next_kind = next_item.profile.kind
+            if next_kind in STACK_NEUTRAL_CONTROL_KINDS or next_item.profile.is_control():
+                return True
+        return False
+
+    def _has_ascii_neighbor(
+        self,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        if index > 0 and self._is_ascii_related(items[index - 1]):
+            return True
+        if index + 1 < len(items) and self._is_ascii_related(items[index + 1]):
+            return True
+        return False
+
+    def _is_ascii_related(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, ASCII_NEIGHBOR_NODE_TYPES):
+            return True
+        if isinstance(item, IRLiteral):
+            return any("ascii" in note for note in item.annotations)
+        if isinstance(item, RawInstruction):
+            profile = item.profile
+            if profile.kind is InstructionKind.ASCII_CHUNK:
+                return True
+            if profile.mnemonic.startswith("inline_ascii_chunk"):
+                return True
+            return any("ascii" in note for note in item.annotations)
         return False
 
     def _format_annotation(self, instruction: RawInstruction) -> str:
