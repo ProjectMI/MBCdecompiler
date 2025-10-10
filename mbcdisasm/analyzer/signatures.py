@@ -23,7 +23,7 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
 
-from ..constants import RET_MASK
+from ..constants import IO_SLOT_ALIASES, RET_MASK
 from .instruction_profile import InstructionKind, InstructionProfile
 from .stack import StackSummary
 
@@ -598,7 +598,7 @@ class MarkerFenceReduceSignature(SignatureRule):
         labels = [profile.label for profile in profiles]
         operands = [profile.operand for profile in profiles]
 
-        if labels[0] != "3D:30" or operands[0] != 0x3069:
+        if labels[0] != "3D:30" or operands[0] not in IO_SLOT_ALIASES:
             return None
         if labels[1] != "01:90":
             return None

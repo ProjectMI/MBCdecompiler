@@ -10,6 +10,7 @@ from ..constants import (
     CALL_SHUFFLE_STANDARD,
     IO_PORT_NAME,
     IO_SLOT,
+    IO_SLOT_ALIASES,
     PAGE_REGISTER,
     MEMORY_BANK_ALIASES,
     MEMORY_PAGE_ALIASES,
@@ -233,7 +234,7 @@ IO_WRITE_MNEMONICS = {
     "op_10_68",
     "op_10_F4",
 } | _MIRRORED_IO_WRITE_MNEMONICS
-IO_ACCEPTED_OPERANDS = {0, IO_SLOT}
+IO_ACCEPTED_OPERANDS = {0} | set(IO_SLOT_ALIASES)
 IO_BRIDGE_MNEMONICS = {
     "op_01_3D",
     "op_F1_3D",
@@ -793,7 +794,7 @@ class IRNormalizer:
         value = node.value & 0xFFFF
         if value == PAGE_REGISTER:
             return SSAValueKind.PAGE_REGISTER
-        if value == IO_SLOT:
+        if self._operand_is_io_slot(value):
             return SSAValueKind.IO
         if value <= 0xFF:
             return SSAValueKind.BYTE
@@ -1584,7 +1585,7 @@ class IRNormalizer:
                     or item.mnemonic in IO_WRITE_MNEMONICS
                     or (
                         item.mnemonic.startswith("op_10_")
-                        and item.operand == IO_SLOT
+                        and self._operand_is_io_slot(item.operand)
                     )
                 )
             ):
@@ -1660,7 +1661,7 @@ class IRNormalizer:
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
             if (
                 mnemonic not in IO_WRITE_MNEMONICS
-                and instruction.operand != IO_SLOT
+                and not self._operand_is_io_slot(instruction.operand)
                 and not allow_prefix
             ):
                 return None
@@ -1669,6 +1670,10 @@ class IRNormalizer:
                 mask = instruction.operand
             return IRIOWrite(mask=mask, port=IO_PORT_NAME)
         return None
+
+    @staticmethod
+    def _operand_is_io_slot(operand: int) -> bool:
+        return operand in IO_SLOT_ALIASES
 
     def _io_mask_value(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
@@ -2558,7 +2563,7 @@ class IRNormalizer:
         return (
             mnemonic.startswith("op_")
             and mnemonic.endswith("_30")
-            and instruction.operand == IO_SLOT
+            and self._operand_is_io_slot(instruction.operand)
         )
 
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
@@ -3936,7 +3941,7 @@ class IRNormalizer:
         page_alias_override: Optional[str] = None
         symbol_override: Optional[str] = None
         if instruction.profile.opcode == 0x69 and bank is None and base_slot is None:
-            if instruction.operand == IO_SLOT:
+            if self._operand_is_io_slot(instruction.operand):
                 region_override = "io"
                 page_alias_override = IO_PORT_NAME
                 symbol_override = IO_PORT_NAME
