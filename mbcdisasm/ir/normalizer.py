@@ -211,42 +211,81 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
-IO_READ_MNEMONICS = {"op_10_38", "op_11_28"}
-_MIRRORED_IO_WRITE_MNEMONICS = {
-    "op_14_10",
-    "op_19_10",
-    "op_24_10",
-    "op_2C_10",
-    "op_48_10",
-    "op_64_10",
-    "op_68_10",
-    "op_F4_10",
+def _io_slot_bytes() -> Set[int]:
+    values: Set[int] = set()
+    for alias in IO_SLOT_ALIASES:
+        values.add(alias & 0xFF)
+        values.add((alias >> 8) & 0xFF)
+    return values
+
+
+def _io_prefixes() -> Set[int]:
+    prefixes = {value & 0xF0 for value in _io_slot_bytes() if value & 0xF0}
+    prefixes.update({0x40, 0xF0})
+    return prefixes
+
+
+def _io_low_nibbles() -> Set[int]:
+    nibbles = {value & 0x0F for value in _io_slot_bytes()}
+    nibbles.update({0x0, 0x4, 0x8, 0x9, 0xC})
+    return nibbles
+
+
+def _io_mask_values() -> Set[int]:
+    masks: Set[int] = set()
+    for prefix in _io_prefixes():
+        for nibble in _io_low_nibbles():
+            value = prefix | nibble
+            if value:
+                masks.add(value & 0xFF)
+    masks.discard((RET_MASK >> 8) & 0xFF)
+    port_code = IO_SLOT & 0xFF
+    for value in _io_slot_bytes():
+        if value != port_code:
+            masks.discard(value & 0xFF)
+    masks = {value for value in masks if (value & 0xF0) != 0x30}
+    return masks
+
+
+def _mnemonics_for_pairs(
+    lhs: Set[int], rhs: Set[int], *, mirror: bool = False
+) -> Set[str]:
+    mnemonics: Set[str] = set()
+    for left in lhs:
+        for right in rhs:
+            mnemonics.add(f"op_{left:02X}_{right:02X}")
+            if mirror:
+                mnemonics.add(f"op_{right:02X}_{left:02X}")
+    return mnemonics
+
+
+_IO_PORT_CODES = {IO_SLOT & 0xFF}
+_IO_MASK_VALUES = _io_mask_values()
+_IO_READ_PORT_CODES = {min(_IO_PORT_CODES) & 0xFF, (min(_IO_PORT_CODES) + 1) & 0xFF}
+_IO_READ_MASK_PREFIXES = {prefix for prefix in _io_prefixes() if prefix in {0x20, 0x30}}
+_IO_READ_MASKS = {prefix | 0x08 for prefix in _IO_READ_MASK_PREFIXES}
+
+IO_READ_MNEMONICS = _mnemonics_for_pairs(_IO_READ_PORT_CODES, _IO_READ_MASKS)
+IO_WRITE_MNEMONICS = _mnemonics_for_pairs(_IO_PORT_CODES, _IO_MASK_VALUES, mirror=True)
+IO_ACCEPTED_OPERANDS = {0} | set(IO_SLOT_ALIASES)
+
+_IO_BRIDGE_FAMILIES = {
+    0x3D: {0x01, 0xF1},
+    0x00: {0x38, 0x4C},
+    0x08: {0x5C},
+    0x1C: {0x0C},
+    0x1B: {0xF0, 0xA4},
+    0x10: {0x61},
+    0xE8: {0xF0},
 }
 
-IO_WRITE_MNEMONICS = {
-    "op_10_10",
-    "op_10_14",
-    "op_10_19",
-    "op_10_24",
-    "op_10_2C",
-    "op_10_48",
-    "op_10_64",
-    "op_10_68",
-    "op_10_F4",
-} | _MIRRORED_IO_WRITE_MNEMONICS
-IO_ACCEPTED_OPERANDS = {0} | set(IO_SLOT_ALIASES)
-IO_BRIDGE_MNEMONICS = {
-    "op_01_3D",
-    "op_F1_3D",
-    "op_38_00",
-    "op_4C_00",
-    "op_5C_08",
-    "op_0C_1C",
-    "op_F0_1B",
-    "op_A4_1B",
-    "op_61_10",
-    "op_F0_E8",
-} | _MIRRORED_IO_WRITE_MNEMONICS
+IO_BRIDGE_MNEMONICS = set().union(
+    *(
+        _mnemonics_for_pairs({opcode}, {mode}, mirror=True)
+        for mode, opcodes in _IO_BRIDGE_FAMILIES.items()
+        for opcode in opcodes
+    )
+)
 IO_BRIDGE_NODE_TYPES = (
     IRCall,
     IRCallCleanup,
@@ -721,6 +760,7 @@ class IRNormalizer:
         self._pass_literal_block_reducers(items, metrics)
         self._pass_reduce_pair_constants(items, metrics)
         self._pass_ascii_preamble(items)
+        self._collapse_call_wrapper_sequences(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
         self._pass_io_operations(items)
@@ -1577,6 +1617,52 @@ class IRNormalizer:
                 items.replace_slice(index, index + 3, [node])
                 continue
             index += 1
+
+    def _collapse_call_wrapper_sequences(self, items: _ItemList) -> None:
+        self._collapse_call_preparation_sequences(items)
+
+    def _collapse_call_preparation_sequences(self, items: _ItemList) -> None:
+        prefixes = tuple(CALL_PREPARATION_PREFIXES)
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (
+                isinstance(item, RawInstruction)
+                and any(item.mnemonic.startswith(prefix) for prefix in prefixes)
+            ):
+                index += 1
+                continue
+
+            start = index
+            consumed: List[RawInstruction] = []
+            steps: List[Tuple[str, int]] = []
+            while index < len(items):
+                candidate = items[index]
+                if not (
+                    isinstance(candidate, RawInstruction)
+                    and any(candidate.mnemonic.startswith(prefix) for prefix in prefixes)
+                ):
+                    break
+                consumed.append(candidate)
+                steps.append(self._call_preparation_step(candidate))
+                index += 1
+
+            if not steps:
+                index = start + 1
+                continue
+
+            if not any(
+                step[0] == "stack_shuffle" or step[0].startswith("op_59_FE")
+                for step in steps
+            ):
+                index = start + 1
+                continue
+
+            node = IRCallPreparation(steps=tuple(steps))
+            for source in consumed:
+                self._transfer_ssa(source, node)
+            items.replace_slice(start, index, [node])
+            index = start + 1
 
     def _pass_call_preparation(self, items: _ItemList) -> None:
         index = 0
