@@ -373,7 +373,31 @@ class IRNormalizer:
         0x51,
     }
     _OPCODE_TABLE_BODY_OPERANDS = {0x0000, 0x0008}
-    _OPCODE_TABLE_AFFIX_MNEMONICS = {"op_08_00"}
+    _OPCODE_TABLE_AFFIX_MNEMONICS = {
+        "op_08_00",
+        "op_04_00",
+        "op_04_02",
+        "op_08_03",
+        "reduce_pair",
+    }
+    _OPCODE_TABLE_AFFIX_OPMODES = {
+        (0x04, 0x00),
+        (0x04, 0x02),
+        (0x08, 0x03),
+    }
+    _TABLE_PATCH_OPERAND_MIN = 0x6600
+    _TABLE_PATCH_OPERAND_MAX = 0x66FF
+    _TABLE_PATCH_BODY_PREFIXES = ("op_2C_", "op_44_", "op_45_", "op_47_")
+    _TABLE_PATCH_AFFIX_MNEMONICS = {
+        "fanout",
+        "stack_teardown_4",
+        "stack_teardown_5",
+    }
+    _TABLE_PATCH_AFFIX_OPMODES = {
+        (0x04, 0x00),
+        (0x04, 0x02),
+        (0x08, 0x03),
+    }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -1907,14 +1931,27 @@ class IRNormalizer:
     ) -> bool:
         if not isinstance(item, RawInstruction):
             return False
+        special_affix = self._matches_opcode_table_affix(item)
         if item.profile.mode != mode:
-            if item.mnemonic not in self._OPCODE_TABLE_AFFIX_MNEMONICS:
+            if not special_affix:
                 return False
             if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
                 return False
         if self._is_annotation_only(item):
             return False
+        if special_affix:
+            return True
         return self._has_trivial_stack_effect(item)
+
+    def _matches_opcode_table_affix(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic in self._OPCODE_TABLE_AFFIX_MNEMONICS:
+            return True
+        opmode = (instruction.profile.opcode, instruction.profile.mode)
+        if opmode in self._OPCODE_TABLE_AFFIX_OPMODES:
+            return True
+        if instruction.profile.opcode == 0x04 and instruction.operand == 0:
+            return True
+        return False
 
     @staticmethod
     def _has_trivial_stack_effect(instruction: RawInstruction) -> bool:
@@ -1931,38 +1968,83 @@ class IRNormalizer:
             return False
         return True
 
+    def _is_table_patch_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if not item.mnemonic.startswith("op_2C_"):
+            return False
+        return self._is_table_patch_body(item)
+
+    def _is_table_patch_body(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if not self._is_table_patch_operand(item.operand):
+            return False
+        if self._is_annotation_only(item):
+            return False
+        for prefix in self._TABLE_PATCH_BODY_PREFIXES:
+            if item.mnemonic.startswith(prefix):
+                return True
+        return False
+
+    def _is_table_patch_affix(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if self._is_annotation_only(item):
+            return False
+        if item.mnemonic in self._TABLE_PATCH_AFFIX_MNEMONICS:
+            return True
+        if self._matches_table_patch_affix(item):
+            return True
+        return False
+
+    def _matches_table_patch_affix(self, instruction: RawInstruction) -> bool:
+        opmode = (instruction.profile.opcode, instruction.profile.mode)
+        if opmode in self._TABLE_PATCH_AFFIX_OPMODES:
+            return True
+        if instruction.profile.opcode == 0x04 and instruction.operand == 0:
+            return True
+        return False
+
+    def _is_table_patch_operand(self, operand: int) -> bool:
+        return self._TABLE_PATCH_OPERAND_MIN <= operand <= self._TABLE_PATCH_OPERAND_MAX
+
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
-            if not (
-                isinstance(item, RawInstruction)
-                and item.mnemonic.startswith("op_2C_")
-                and 0x6600 <= item.operand <= 0x66FF
-            ):
+            if not self._is_table_patch_seed(item):
                 index += 1
                 continue
 
+            assert isinstance(item, RawInstruction)
+
+            start = index
             operations: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if self._is_table_patch_body(candidate) or self._is_table_patch_affix(candidate):
+                    assert isinstance(candidate, RawInstruction)
+                    operations.insert(0, (candidate.mnemonic, candidate.operand))
+                    scan -= 1
+                    continue
+                break
+            start = scan + 1
+
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
-                if isinstance(candidate, RawInstruction):
-                    if (
-                        candidate.mnemonic.startswith("op_2C_")
-                        and 0x6600 <= candidate.operand <= 0x66FF
-                    ):
-                        operations.append((candidate.mnemonic, candidate.operand))
-                        scan += 1
-                        continue
-                    if candidate.mnemonic in {"fanout", "stack_teardown_4", "stack_teardown_5"}:
-                        operations.append((candidate.mnemonic, candidate.operand))
-                        scan += 1
-                        continue
+                if self._is_table_patch_body(candidate) or self._is_table_patch_affix(candidate):
+                    assert isinstance(candidate, RawInstruction)
+                    operations.append((candidate.mnemonic, candidate.operand))
+                    scan += 1
+                    continue
                 break
 
-            items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
-            index += 1
+            items.replace_slice(start, scan, [IRTablePatch(operations=tuple(operations))])
+            index = start + 1
 
     def _pass_table_dispatch(self, items: _ItemList) -> None:
         index = 0
