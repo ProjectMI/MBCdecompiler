@@ -1587,6 +1587,33 @@ def test_normalizer_handles_io_slot_aliases(tmp_path: Path, operand: int) -> Non
     assert "op_10_24" not in raw_suffixes
 
 
+def test_normalizer_merges_io_call_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3D, 0x30, IO_SLOT),  # io handshake
+        build_word(4, 0x00, 0x00, 0x002C),  # literal mask
+        build_word(8, 0x66, 0x15, 0x4B08),  # stack_shuffle
+        build_word(12, 0x59, 0xFE, IO_SLOT),  # io barrier wrapper
+        build_word(16, 0x10, 0x24, 0x002C),  # masked write
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert io_writes and io_writes[0].mask == 0x002C
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_59_FE" for node in block.nodes
+    )
+
+
 def test_normalizer_collapses_opcode_table_sequences() -> None:
     annotations = {
         f"{opcode:02X}:2A": OpcodeInfo(mnemonic=f"op_{opcode:02X}_2A", stack_delta=0)

@@ -211,28 +211,50 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
 }
 
 
-IO_READ_MNEMONICS = {"op_10_38", "op_11_28"}
+def _opcode_mode_from_mnemonic(mnemonic: str) -> Optional[Tuple[int, int]]:
+    if not mnemonic.startswith("op_"):
+        return None
+    parts = mnemonic.split("_")
+    if len(parts) != 3:
+        return None
+    try:
+        opcode = int(parts[1], 16)
+        mode = int(parts[2], 16)
+    except ValueError:
+        return None
+    return opcode, mode
+
+
+def _format_opcode_mnemonic(opcode: int, mode: int) -> str:
+    return f"op_{opcode:02X}_{mode:02X}"
+
+
+_IO_PORT_MODE = IO_SLOT & 0x00FF
+_IO_WRITE_MASK_MODES = (
+    0x10,
+    0x14,
+    0x19,
+    0x24,
+    0x2C,
+    0x48,
+    0x64,
+    0x68,
+    0xF4,
+)
+
+IO_READ_MNEMONICS = {
+    _format_opcode_mnemonic(_IO_PORT_MODE, 0x38),
+    _format_opcode_mnemonic(_IO_PORT_MODE + 1, 0x28),
+}
+
 _MIRRORED_IO_WRITE_MNEMONICS = {
-    "op_14_10",
-    "op_19_10",
-    "op_24_10",
-    "op_2C_10",
-    "op_48_10",
-    "op_64_10",
-    "op_68_10",
-    "op_F4_10",
+    _format_opcode_mnemonic(mask, _IO_PORT_MODE)
+    for mask in _IO_WRITE_MASK_MODES
+    if mask != _IO_PORT_MODE
 }
 
 IO_WRITE_MNEMONICS = {
-    "op_10_10",
-    "op_10_14",
-    "op_10_19",
-    "op_10_24",
-    "op_10_2C",
-    "op_10_48",
-    "op_10_64",
-    "op_10_68",
-    "op_10_F4",
+    _format_opcode_mnemonic(_IO_PORT_MODE, mask) for mask in _IO_WRITE_MASK_MODES
 } | _MIRRORED_IO_WRITE_MNEMONICS
 IO_ACCEPTED_OPERANDS = {0} | set(IO_SLOT_ALIASES)
 IO_BRIDGE_MNEMONICS = {
@@ -2723,6 +2745,16 @@ class IRNormalizer:
             return False
         return True
 
+    @staticmethod
+    def _is_io_barrier_instruction(instruction: RawInstruction) -> bool:
+        parsed = _opcode_mode_from_mnemonic(instruction.mnemonic)
+        if parsed is None:
+            return False
+        _, mode = parsed
+        if mode != 0xFE:
+            return False
+        return instruction.operand in IO_SLOT_ALIASES
+
     def _update_tail_helper_hints(self, block: RawBlock) -> None:
         if not block.instructions:
             return
@@ -3524,7 +3556,9 @@ class IRNormalizer:
             mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
         ):
             return False
-        return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
+        if self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES):
+            return True
+        return self._is_io_barrier_instruction(instruction)
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -3538,7 +3572,9 @@ class IRNormalizer:
     def _is_call_preparation_instruction(self, instruction: RawInstruction) -> bool:
         if instruction.mnemonic == "op_4A_05":
             return True
-        return self._matches_templates(instruction, CALL_PREPARATION_TEMPLATES)
+        if self._matches_templates(instruction, CALL_PREPARATION_TEMPLATES):
+            return True
+        return self._is_io_barrier_instruction(instruction)
 
     def _call_convention_effect(self, operand: int) -> IRStackEffect:
         alias = "CALL_SHUFFLE_STD" if operand == CALL_SHUFFLE_STANDARD else None
@@ -3554,6 +3590,10 @@ class IRNormalizer:
         pops = 0
         if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:
             mnemonic = "page_register"
+        operand_role = instruction.profile.operand_role()
+        operand_alias = instruction.profile.operand_alias()
+        if operand in IO_SLOT_ALIASES:
+            operand_alias = "IO_SLOT"
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
@@ -3562,8 +3602,8 @@ class IRNormalizer:
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
-            operand_role=instruction.profile.operand_role(),
-            operand_alias=instruction.profile.operand_alias(),
+            operand_role=operand_role,
+            operand_alias=operand_alias,
         )
 
     @staticmethod
