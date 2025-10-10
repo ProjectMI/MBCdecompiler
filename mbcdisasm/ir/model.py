@@ -49,12 +49,17 @@ class MemRef:
     offset: Optional[int] = None
     symbol: Optional[str] = None
     page_alias: Optional[str] = None
+    space: Optional[MemSpace] = None
 
     def describe(self) -> str:
-        region = self.page_alias or self.region or "mem"
-        prefix = region
-        if not prefix.startswith(("mem", "io")) and prefix not in {"frame", "global", "const"}:
-            prefix = f"mem.{prefix}"
+        base_space = self.space.name.lower() if self.space is not None else None
+        prefix = self.page_alias or self.region or base_space or "mem"
+
+        if self.page_alias is None:
+            if base_space and prefix != base_space and not prefix.startswith(f"{base_space}."):
+                prefix = f"{base_space}.{prefix}"
+            elif not base_space and not prefix.startswith(("mem", "io")) and prefix not in {"frame", "global", "const"}:
+                prefix = f"mem.{prefix}"
 
         details = []
         location = self._format_location()
@@ -498,6 +503,7 @@ class IRIndirectLoad(IRNode):
     ref: Optional[MemRef] = None
     pointer: Optional[str] = None
     offset_source: Optional[str] = None
+    space: Optional[MemSpace] = None
 
     def describe(self) -> str:
         if self.ref is not None:
@@ -528,6 +534,7 @@ class IRIndirectStore(IRNode):
     ref: Optional[MemRef] = None
     pointer: Optional[str] = None
     offset_source: Optional[str] = None
+    space: Optional[MemSpace] = None
 
     def describe(self) -> str:
         if self.ref is not None:

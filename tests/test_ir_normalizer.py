@@ -33,6 +33,7 @@ from mbcdisasm.ir.model import (
     IRTablePatch,
     NormalizerMetrics,
     IRIORead,
+    MemSpace,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1234,6 +1235,8 @@ def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:
     assert store.offset == 0
     assert store.value.startswith("word")
     assert store.base.startswith("ptr")
+    assert store.ref is not None
+    assert store.ref.space == store.space
     assert cleanup.pops == 4
 
 
@@ -1905,6 +1908,8 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
     load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B10
+    assert load_node.space is MemSpace.GLOBAL
+    assert load_node.ref.space is MemSpace.GLOBAL
 
 
 def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
@@ -1941,6 +1946,8 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
 
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B0C
+    assert load_node.space is MemSpace.GLOBAL
+    assert load_node.ref.space is MemSpace.GLOBAL
     assert any(page.register == 0x06D4 for page in page_nodes)
     assert any(page.register == 0x06C8 for page in page_nodes)
     assert not any(

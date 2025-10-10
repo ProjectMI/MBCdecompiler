@@ -4082,6 +4082,7 @@ class IRNormalizer:
                     base_slot=base_slot,
                     ref=memref,
                     pointer=pointer_alias,
+                    space=memref.space if memref else None,
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
@@ -4113,6 +4114,7 @@ class IRNormalizer:
                     base_slot=base_slot,
                     ref=memref,
                     pointer=pointer_alias,
+                    space=memref.space if memref else None,
                 )
                 items.replace_slice(index, index + 1, [node])
                 self._consume_indirect_configuration(items, index, node)
@@ -4249,6 +4251,16 @@ class IRNormalizer:
             space = MemSpace.CONST
         return IRSlot(space=space, index=operand)
 
+    @staticmethod
+    def _classify_mem_space(operand: Optional[int]) -> Optional[MemSpace]:
+        if operand is None:
+            return None
+        if operand < 0x1000:
+            return MemSpace.FRAME
+        if operand < 0x8000:
+            return MemSpace.GLOBAL
+        return MemSpace.CONST
+
     def _collect_memref(
         self,
         items: _ItemList,
@@ -4301,9 +4313,10 @@ class IRNormalizer:
                 page_alias_override = IO_PORT_NAME
                 symbol_override = IO_PORT_NAME
 
-        region, page_alias = self._memref_region(base_slot, bank, page)
+        space, region, page_alias = self._memref_region(base_slot, bank, page, base_value)
         if region_override is not None:
             region = region_override
+            space = None
         if page_alias_override is not None:
             page_alias = page_alias_override
         symbol = symbol_override or self._memref_symbol(region, bank, page, offset)
@@ -4315,6 +4328,7 @@ class IRNormalizer:
             offset=offset,
             symbol=symbol,
             page_alias=page_alias,
+            space=space,
         )
 
         if base_name and symbol:
@@ -4589,24 +4603,38 @@ class IRNormalizer:
         return None
 
     def _memref_region(
-        self, base_slot: Optional[IRSlot], bank: Optional[int], page: Optional[int]
-    ) -> Tuple[str, Optional[str]]:
+        self,
+        base_slot: Optional[IRSlot],
+        bank: Optional[int],
+        page: Optional[int],
+        base_value: Optional[int],
+    ) -> Tuple[Optional[MemSpace], str, Optional[str]]:
         if base_slot is not None:
-            return base_slot.space.name.lower(), None
+            return base_slot.space, base_slot.space.name.lower(), None
+
+        space = self._classify_mem_space(base_value)
+
         if bank is None:
-            return "mem", None
+            region = space.name.lower() if space is not None else "mem"
+            page_alias = self._memref_page_alias(None, page)
+            return space, region, page_alias
 
         normalized = bank & 0xFFF0
         alias = MEMORY_BANK_ALIASES.get(normalized)
         page_alias = self._memref_page_alias(normalized, page)
         if alias is not None:
-            return alias, page_alias
+            region = alias
+        else:
+            label = self._memref_regions.get(bank)
+            if label is None:
+                label = f"bank_{bank:04X}"
+                self._memref_regions[bank] = label
+            region = label
 
-        label = self._memref_regions.get(bank)
-        if label is None:
-            label = f"bank_{bank:04X}"
-            self._memref_regions[bank] = label
-        return label, page_alias
+        if space is None:
+            space = MemSpace.GLOBAL
+
+        return space, region, page_alias
 
     def _memref_page_alias(
         self, bank: Optional[int], page: Optional[int]
