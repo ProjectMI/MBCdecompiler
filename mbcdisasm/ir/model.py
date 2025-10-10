@@ -494,6 +494,7 @@ class IRIndirectLoad(IRNode):
     base: str
     offset: int
     target: str
+    space: Optional[MemSpace] = None
     base_slot: Optional[IRSlot] = None
     ref: Optional[MemRef] = None
     pointer: Optional[str] = None
@@ -514,7 +515,8 @@ class IRIndirectLoad(IRNode):
                 prefix = slot
         ptr = self.pointer or prefix
         offset = self.offset_source or f"0x{self.offset:04X}"
-        return f"indirect_load ptr={ptr} offset={offset} -> {self.target}"
+        space = f" space={self.space.name.lower()}" if self.space is not None else ""
+        return f"indirect_load ptr={ptr} offset={offset}{space} -> {self.target}"
 
 
 @dataclass(frozen=True)
@@ -524,6 +526,7 @@ class IRIndirectStore(IRNode):
     base: str
     value: str
     offset: int
+    space: Optional[MemSpace] = None
     base_slot: Optional[IRSlot] = None
     ref: Optional[MemRef] = None
     pointer: Optional[str] = None
@@ -544,7 +547,8 @@ class IRIndirectStore(IRNode):
                 prefix = slot
         ptr = self.pointer or prefix
         offset = self.offset_source or f"0x{self.offset:04X}"
-        return f"indirect_store {self.value} -> ptr={ptr} offset={offset}"
+        space = f" space={self.space.name.lower()}" if self.space is not None else ""
+        return f"indirect_store {self.value} -> ptr={ptr} offset={offset}{space}"
 
 
 @dataclass(frozen=True)

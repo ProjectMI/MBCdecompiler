@@ -33,6 +33,7 @@ from mbcdisasm.ir.model import (
     IRTablePatch,
     NormalizerMetrics,
     IRIORead,
+    MemSpace,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1234,6 +1235,7 @@ def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:
     assert store.offset == 0
     assert store.value.startswith("word")
     assert store.base.startswith("ptr")
+    assert store.space == MemSpace.GLOBAL
     assert cleanup.pops == 4
 
 
@@ -1905,6 +1907,36 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
     load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B10
+    assert load_node.space == MemSpace.GLOBAL
+
+
+def test_normalizer_marks_frame_indirect_space(tmp_path: Path) -> None:
+    annotations = {
+        "03:66": OpcodeInfo(mnemonic="op_03_66", stack_push=1),
+        "69:01": OpcodeInfo(
+            mnemonic="op_69_01", category="indirect_access", stack_push=1
+        ),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x03, 0x66, 0x0002),
+        build_word(4, 0x69, 0x01, 0x0004),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_frame_space", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+
+    assert load_node.base_slot is not None
+    assert load_node.base_slot.space is MemSpace.FRAME
+    assert load_node.space is MemSpace.FRAME
 
 
 def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
@@ -1941,6 +1973,7 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
 
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B0C
+    assert load_node.space == MemSpace.GLOBAL
     assert any(page.register == 0x06D4 for page in page_nodes)
     assert any(page.register == 0x06C8 for page in page_nodes)
     assert not any(

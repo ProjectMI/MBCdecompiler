@@ -522,6 +522,7 @@ class IRNormalizer:
         self._ssa_bindings: Dict[int, Tuple[str, ...]] = {}
         self._ssa_types: Dict[str, SSAValueKind] = {}
         self._ssa_aliases: Dict[str, str] = {}
+        self._ssa_pointer_spaces: Dict[str, MemSpace] = {}
         self._ssa_counters: Dict[str, int] = defaultdict(int)
         self._memref_regions: Dict[int, str] = {}
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
@@ -687,6 +688,7 @@ class IRNormalizer:
         self._ssa_bindings.clear()
         self._ssa_types.clear()
         self._ssa_aliases.clear()
+        self._ssa_pointer_spaces.clear()
         self._ssa_counters.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
@@ -780,6 +782,16 @@ class IRNormalizer:
                     self._set_ssa_kind(name, kind)
         else:
             self._ssa_bindings.pop(id(item), None)
+
+    def _remember_pointer_space(self, name: Optional[str], space: Optional[MemSpace]) -> None:
+        if not name or space is None:
+            return
+        self._ssa_pointer_spaces[name] = space
+
+    def _lookup_pointer_space(self, name: Optional[str]) -> Optional[MemSpace]:
+        if not name:
+            return None
+        return self._ssa_pointer_spaces.get(name)
 
     def _transfer_ssa(
         self,
@@ -4071,7 +4083,9 @@ class IRNormalizer:
                 target_name = item.ssa_values[0] if item.ssa_values else None
                 target_alias = self._render_ssa(target_name) if target_name else "stack"
                 base_name = base_sources[0][0] if base_sources else None
-                memref, index = self._collect_memref(items, index, base_slot, base_name, item)
+                memref, space, index = self._collect_memref(
+                    items, index, base_slot, base_name, item
+                )
                 if base_name is not None:
                     base_alias = self._render_ssa(base_name)
                 pointer_alias = base_alias
@@ -4079,6 +4093,7 @@ class IRNormalizer:
                     base=base_alias,
                     offset=item.operand,
                     target=target_alias,
+                    space=space,
                     base_slot=base_slot,
                     ref=memref,
                     pointer=pointer_alias,
@@ -4102,7 +4117,9 @@ class IRNormalizer:
                     self._promote_ssa_kind(base_name, SSAValueKind.POINTER)
                 base_alias = self._render_ssa(base_name) if base_name else "stack"
                 value_alias = self._render_ssa(value_name) if value_name else "stack"
-                memref, index = self._collect_memref(items, index, base_slot, base_name, item)
+                memref, space, index = self._collect_memref(
+                    items, index, base_slot, base_name, item
+                )
                 if base_name:
                     base_alias = self._render_ssa(base_name)
                 pointer_alias = base_alias
@@ -4110,6 +4127,7 @@ class IRNormalizer:
                     base=base_alias,
                     value=value_alias,
                     offset=item.operand,
+                    space=space,
                     base_slot=base_slot,
                     ref=memref,
                     pointer=pointer_alias,
@@ -4256,7 +4274,7 @@ class IRNormalizer:
         base_slot: Optional[IRSlot],
         base_name: Optional[str],
         instruction: RawInstruction,
-    ) -> Tuple[Optional[MemRef], int]:
+    ) -> Tuple[Optional[MemRef], Optional[MemSpace], int]:
         components: List[Tuple[int, int, bool]] = []
         scan = index - 1
         while scan >= 0:
@@ -4307,6 +4325,8 @@ class IRNormalizer:
         if page_alias_override is not None:
             page_alias = page_alias_override
         symbol = symbol_override or self._memref_symbol(region, bank, page, offset)
+        space = self._infer_memspace(base_slot, region, bank, base_name)
+
         memref = MemRef(
             region=region,
             bank=bank,
@@ -4319,8 +4339,46 @@ class IRNormalizer:
 
         if base_name and symbol:
             self._ssa_aliases[base_name] = symbol
+        if base_name:
+            self._remember_pointer_space(base_name, space)
 
-        return memref, index
+        return memref, space, index
+
+    def _infer_memspace(
+        self,
+        base_slot: Optional[IRSlot],
+        region: str,
+        bank: Optional[int],
+        base_name: Optional[str],
+    ) -> Optional[MemSpace]:
+        if base_slot is not None:
+            return base_slot.space
+
+        cached = self._lookup_pointer_space(base_name)
+        if cached is not None:
+            return cached
+
+        region_space = self._space_from_region(region)
+        if region_space is not None:
+            return region_space
+
+        if region.startswith("mem"):
+            return MemSpace.GLOBAL
+
+        if bank is not None and not region.startswith("io"):
+            return MemSpace.GLOBAL
+
+        return None
+
+    @staticmethod
+    def _space_from_region(region: str) -> Optional[MemSpace]:
+        mapping = {
+            "frame": MemSpace.FRAME,
+            "global": MemSpace.GLOBAL,
+            "const": MemSpace.CONST,
+        }
+        key = region.split(".", 1)[0] if region else region
+        return mapping.get(key)
 
     def _consume_indirect_configuration(
         self,
