@@ -76,69 +76,6 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
-CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
-CALL_PREPARATION_MNEMONICS = {
-    "op_01_2C",
-    "op_02_2A",
-    "op_02_F0",
-    "op_02_F1",
-    "op_09_29",
-    "op_0A_F1",
-    "op_0F_00",
-    "op_0C_2C",
-    "op_10_DC",
-    "op_11_B4",
-    "op_28_10",
-    "op_3C_02",
-    "op_3D_30",
-    "op_4F_01",
-    "op_4F_02",
-    "op_4D_30",
-    "op_5C_08",
-    "op_60_04",
-    "op_60_08",
-    "op_74_08",
-    "op_AC_01",
-    "op_4B_91",
-    "op_72_23",
-}
-CALL_CLEANUP_MNEMONICS = {
-    "call_helpers",
-    "fanout",
-    "op_01_2C",
-    "op_01_2E",
-    "op_01_6C",
-    "op_05_00",
-    "op_10_0E",
-    "op_10_12",
-    "op_10_5C",
-    "op_10_8C",
-    "op_10_DC",
-    "op_10_E8",
-    "op_14_07",
-    "op_0C_00",
-    "op_0F_00",
-    "op_02_F0",
-    "op_11_B4",
-    "op_32_29",
-    "op_4F_01",
-    "op_4F_02",
-    "op_52_05",
-    "op_58_08",
-    "op_5E_29",
-    "op_64_20",
-    "op_65_30",
-    "op_6C_01",
-    "op_C4_06",
-    "op_D0_04",
-    "op_D0_06",
-    "op_D8_04",
-    "op_F0_4B",
-    "stack_shuffle",
-    "op_4B_91",
-    "op_E4_01",
-}
-CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_06_66",
     "op_10_8C",
@@ -160,10 +97,122 @@ TAILCALL_HELPERS = {
     0x0FF0,
     0x16F0,
 }
-TAILCALL_POSTLUDE = {
-    "op_01_6C",
-    "op_05_00",
-    "op_06_66",
+
+
+@dataclass(frozen=True)
+class _MacroToken:
+    """Describe one step of a normalization macro."""
+
+    kinds: Tuple[InstructionKind, ...] = tuple()
+    mnemonics: Tuple[str, ...] = tuple()
+    prefixes: Tuple[str, ...] = tuple()
+    min_delta: Optional[int] = None
+    max_delta: Optional[int] = None
+    allow_unknown: bool = False
+
+    def matches(self, instruction: "RawInstruction") -> bool:
+        kind = instruction.event.kind
+        if not self.allow_unknown and kind is InstructionKind.UNKNOWN:
+            return False
+        if self.kinds and kind not in self.kinds:
+            return False
+        if self.mnemonics and instruction.mnemonic not in self.mnemonics:
+            return False
+        if self.prefixes and not any(
+            instruction.mnemonic.startswith(prefix) for prefix in self.prefixes
+        ):
+            return False
+        delta = instruction.event.delta
+        if self.min_delta is not None and delta < self.min_delta:
+            return False
+        if self.max_delta is not None and delta > self.max_delta:
+            return False
+        return True
+
+
+@dataclass(frozen=True)
+class _NormalizationMacro:
+    """Declarative template that groups related normalization rules."""
+
+    name: str
+    role: str
+    tokens: Tuple[_MacroToken, ...]
+
+    def matches(self, instructions: Sequence["RawInstruction"]) -> bool:
+        if len(instructions) != len(self.tokens):
+            return False
+        return all(token.matches(instr) for token, instr in zip(self.tokens, instructions))
+
+
+def _group_by_opcode_prefix(mnemonics: Sequence[str]) -> Dict[str, Tuple[str, ...]]:
+    """Cluster ``mnemonics`` by their opcode prefix."""
+
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for mnemonic in mnemonics:
+        if mnemonic.startswith("op_"):
+            parts = mnemonic.split("_")
+            if len(parts) >= 3:
+                prefix = f"{parts[0]}_{parts[1]}_"
+            else:
+                prefix = mnemonic
+        else:
+            prefix = mnemonic
+        grouped[prefix].append(mnemonic)
+    return {key: tuple(sorted(values)) for key, values in grouped.items()}
+
+
+_CALL_PREPARATION_UNKNOWN = (
+    "op_09_29",
+    "op_0A_F1",
+    "op_0C_2C",
+    "op_0F_00",
+    "op_10_DC",
+    "op_11_B4",
+    "op_28_10",
+    "op_3C_02",
+    "op_3D_30",
+    "op_4B_91",
+    "op_4D_30",
+    "op_4F_01",
+    "op_4F_02",
+    "op_5C_08",
+    "op_60_04",
+    "op_60_08",
+    "op_72_23",
+    "op_74_08",
+    "op_AC_01",
+)
+
+_CALL_CLEANUP_UNKNOWN = (
+    "op_0C_00",
+    "op_0F_00",
+    "op_10_0E",
+    "op_10_12",
+    "op_10_5C",
+    "op_10_8C",
+    "op_10_DC",
+    "op_10_E8",
+    "op_11_B4",
+    "op_14_07",
+    "op_32_29",
+    "op_4B_91",
+    "op_4F_01",
+    "op_4F_02",
+    "op_52_05",
+    "op_58_08",
+    "op_5E_29",
+    "op_64_20",
+    "op_65_30",
+    "op_6C_01",
+    "op_C4_06",
+    "op_D0_04",
+    "op_D0_06",
+    "op_D8_04",
+    "op_E4_01",
+    "op_F0_4B",
+)
+
+_TAILCALL_POSTLUDE_UNKNOWN = (
     "op_0B_29",
     "op_0C_00",
     "op_0F_00",
@@ -175,6 +224,7 @@ TAILCALL_POSTLUDE = {
     "op_10_E8",
     "op_14_07",
     "op_32_29",
+    "op_4B_91",
     "op_4F_01",
     "op_4F_02",
     "op_52_05",
@@ -188,13 +238,239 @@ TAILCALL_POSTLUDE = {
     "op_D0_04",
     "op_D0_06",
     "op_D8_04",
-    "op_F0_4B",
-    "op_4B_91",
     "op_E4_01",
+    "op_F0_4B",
     "op_59_FE",
     "op_95_FE",
-}
-TAILCALL_POSTLUDE_PREFIXES = ("op_59_FE", "op_95_FE")
+)
+
+
+CALL_PREPARATION_MACROS: Tuple[_NormalizationMacro, ...] = (
+    _NormalizationMacro(
+        name="call_prelude_shuffle",
+        role="prelude",
+        tokens=(
+            _MacroToken(mnemonics=("stack_shuffle",), allow_unknown=True, min_delta=0, max_delta=0),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_prelude_fanout",
+        role="prelude",
+        tokens=(
+            _MacroToken(mnemonics=("fanout",), allow_unknown=True, min_delta=0, max_delta=0),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_prelude_wrapper_prefix",
+        role="prelude",
+        tokens=(
+            _MacroToken(
+                prefixes=("op_59_FE",),
+                allow_unknown=True,
+                min_delta=0,
+                max_delta=0,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_prelude_stack_teardown",
+        role="prelude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.STACK_TEARDOWN,),
+                mnemonics=("op_01_2C",),
+                min_delta=-1,
+                max_delta=-1,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_prelude_push_slot",
+        role="prelude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.PUSH,),
+                mnemonics=("op_02_2A", "op_02_F0", "op_02_F1"),
+                min_delta=1,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+)
+
+CALL_PREPARATION_MACROS += tuple(
+    _NormalizationMacro(
+        name=f"call_prelude_{prefix.lower()}",
+        role="prelude",
+        tokens=(
+            _MacroToken(
+                mnemonics=grouped,
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+            ),
+        ),
+    )
+    for prefix, grouped in _group_by_opcode_prefix(_CALL_PREPARATION_UNKNOWN).items()
+)
+
+
+CALL_CLEANUP_MACROS: Tuple[_NormalizationMacro, ...] = (
+    _NormalizationMacro(
+        name="call_postlude_helpers",
+        role="postlude",
+        tokens=(
+            _MacroToken(mnemonics=("call_helpers",), allow_unknown=True, min_delta=0, max_delta=0),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_postlude_fanout",
+        role="postlude",
+        tokens=(
+            _MacroToken(mnemonics=("fanout",), allow_unknown=True, min_delta=0, max_delta=0),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_postlude_stack_teardown",
+        role="postlude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.STACK_TEARDOWN,),
+                mnemonics=("op_01_2C", "op_01_2E", "op_01_6C"),
+                min_delta=-1,
+                max_delta=-1,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_postlude_teardown_prefix",
+        role="postlude",
+        tokens=(
+            _MacroToken(
+                prefixes=("stack_teardown_", "op_4A_", "op_95_FE"),
+                allow_unknown=True,
+                min_delta=-4,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_postlude_shuffle",
+        role="postlude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.STACK_COPY,),
+                mnemonics=("stack_shuffle",),
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_postlude_push_slot",
+        role="postlude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.PUSH,),
+                mnemonics=("op_02_F0",),
+                min_delta=1,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="call_postlude_arithmetic",
+        role="postlude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.ARITHMETIC,),
+                mnemonics=("op_05_00",),
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+)
+
+CALL_CLEANUP_MACROS += tuple(
+    _NormalizationMacro(
+        name=f"call_postlude_{prefix.lower()}",
+        role="postlude",
+        tokens=(
+            _MacroToken(
+                mnemonics=grouped,
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+            ),
+        ),
+    )
+    for prefix, grouped in _group_by_opcode_prefix(_CALL_CLEANUP_UNKNOWN).items()
+)
+
+
+TAILCALL_POSTLUDE_MACROS: Tuple[_NormalizationMacro, ...] = (
+    _NormalizationMacro(
+        name="tail_postlude_stack_teardown",
+        role="tail_postlude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.STACK_TEARDOWN,),
+                mnemonics=("op_01_6C",),
+                min_delta=-1,
+                max_delta=-1,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+    _NormalizationMacro(
+        name="tail_postlude_arithmetic",
+        role="tail_postlude",
+        tokens=(
+            _MacroToken(
+                kinds=(InstructionKind.ARITHMETIC,),
+                mnemonics=("op_05_00", "op_06_66"),
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+            ),
+        ),
+    ),
+)
+
+TAILCALL_POSTLUDE_MACROS += tuple(
+    _NormalizationMacro(
+        name=f"tail_postlude_{prefix.lower()}",
+        role="tail_postlude",
+        tokens=(
+            _MacroToken(
+                mnemonics=grouped,
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+            ),
+        ),
+    )
+    for prefix, grouped in _group_by_opcode_prefix(_TAILCALL_POSTLUDE_UNKNOWN).items()
+)
+
+TAILCALL_POSTLUDE_MACROS += (
+    _NormalizationMacro(
+        name="tail_postlude_wrapper_prefix",
+        role="tail_postlude",
+        tokens=(
+            _MacroToken(
+                prefixes=("op_59_FE", "op_95_FE"),
+                allow_unknown=True,
+                min_delta=0,
+                max_delta=0,
+            ),
+        ),
+    ),
+)
 
 DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
 DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
@@ -2816,22 +3092,7 @@ class IRNormalizer:
                     if (
                         isinstance(candidate, RawInstruction)
                         and call.target in TAILCALL_HELPERS
-                        and (
-                            candidate.mnemonic in TAILCALL_POSTLUDE
-                            or any(
-                                candidate.mnemonic.startswith(prefix)
-                                for prefix in TAILCALL_POSTLUDE_PREFIXES
-                            )
-                        )
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and candidate.mnemonic == "op_F0_4B"
+                        and self._is_tailcall_postlude_instruction(candidate)
                     ):
                         cleanup_steps.append(self._call_cleanup_effect(candidate))
                         offset += 1
@@ -3429,15 +3690,17 @@ class IRNormalizer:
         return node
 
     @staticmethod
-    def _is_call_cleanup_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic in CALL_CLEANUP_MNEMONICS:
-            return True
-        if mnemonic.startswith("op_10_") and (
-            mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
-        ):
-            return False
-        return any(mnemonic.startswith(prefix) for prefix in CALL_CLEANUP_PREFIXES)
+    def _matches_macro(
+        instruction: RawInstruction, macros: Sequence[_NormalizationMacro]
+    ) -> bool:
+        for macro in macros:
+            if macro.matches((instruction,)):
+                return True
+        return False
+
+    @classmethod
+    def _is_call_cleanup_instruction(cls, instruction: RawInstruction) -> bool:
+        return cls._matches_macro(instruction, CALL_CLEANUP_MACROS)
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -3448,16 +3711,17 @@ class IRNormalizer:
                 return ("stack_teardown", pops)
         return (mnemonic, instruction.operand)
 
-    @staticmethod
-    def _is_call_preparation_instruction(instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic == "op_4A_05":
+    @classmethod
+    def _is_call_preparation_instruction(cls, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic == "op_4A_05":
             return True
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             return True
-        if mnemonic in CALL_PREPARATION_MNEMONICS:
-            return True
-        return any(mnemonic.startswith(prefix) for prefix in CALL_PREPARATION_PREFIXES)
+        return cls._matches_macro(instruction, CALL_PREPARATION_MACROS)
+
+    @classmethod
+    def _is_tailcall_postlude_instruction(cls, instruction: RawInstruction) -> bool:
+        return cls._matches_macro(instruction, TAILCALL_POSTLUDE_MACROS)
 
     def _call_convention_effect(self, operand: int) -> IRStackEffect:
         alias = "CALL_SHUFFLE_STD" if operand == CALL_SHUFFLE_STANDARD else None
