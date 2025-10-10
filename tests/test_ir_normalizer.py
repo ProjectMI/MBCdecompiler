@@ -37,6 +37,7 @@ from mbcdisasm.ir.model import (
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
     IO_SLOT,
+    IO_SLOT_ALIASES,
     IO_PORT_NAME,
     PAGE_REGISTER,
     RET_MASK,
@@ -1404,6 +1405,37 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
+
+
+@pytest.mark.parametrize("operand", sorted(IO_SLOT_ALIASES - {IO_SLOT}))
+def test_normalizer_handles_io_slot_aliases(tmp_path: Path, operand: int) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x3D, 0x30, operand),  # io handshake via alias
+        build_word(4, 0x10, 0x24, operand),  # direct write using the same cell
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert len(io_writes) == 1
+    node = io_writes[0]
+    assert node.port == IO_PORT_NAME
+    raw_suffixes = {
+        getattr(candidate, "mnemonic", "")
+        for candidate in block.nodes
+        if isinstance(candidate, IRRaw)
+    }
+    assert "op_3D_30" not in raw_suffixes
+    assert "op_10_24" not in raw_suffixes
 
 
 def test_normalizer_collapses_opcode_table_sequences() -> None:
