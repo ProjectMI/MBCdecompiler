@@ -111,9 +111,11 @@ CALL_CLEANUP_MNEMONICS = {
     "op_10_0E",
     "op_10_12",
     "op_10_5C",
+    "op_10_54",
     "op_10_8C",
     "op_10_DC",
     "op_10_E8",
+    "op_10_70",
     "op_14_07",
     "op_0C_00",
     "op_0F_00",
@@ -169,9 +171,11 @@ TAILCALL_POSTLUDE = {
     "op_10_0E",
     "op_10_12",
     "op_10_5C",
+    "op_10_54",
     "op_10_8C",
     "op_10_DC",
     "op_10_E8",
+    "op_10_70",
     "op_14_07",
     "op_32_29",
     "op_4F_01",
@@ -3725,7 +3729,7 @@ class IRNormalizer:
                 )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
-                self._consume_indirect_configuration(items, index, node)
+                self._consume_indirect_configuration(items, index, node, metrics)
                 metrics.loads += 1
                 continue
             if kind is InstructionKind.INDIRECT_STORE:
@@ -3755,13 +3759,13 @@ class IRNormalizer:
                     pointer=pointer_alias,
                 )
                 items.replace_slice(index, index + 1, [node])
-                self._consume_indirect_configuration(items, index, node)
+                self._consume_indirect_configuration(items, index, node, metrics)
                 metrics.stores += 1
                 continue
 
             index += 1
 
-        self._sweep_indirect_configuration(items)
+        self._sweep_indirect_configuration(items, metrics)
 
     # ------------------------------------------------------------------
     # description helpers
@@ -3967,6 +3971,7 @@ class IRNormalizer:
         items: _ItemList,
         index: int,
         node: Union[IRIndirectLoad, IRIndirectStore],
+        metrics: NormalizerMetrics,
     ) -> None:
         scan = index + 1
         pending_literal_index: Optional[int] = None
@@ -4017,6 +4022,24 @@ class IRNormalizer:
 
             if isinstance(candidate, RawInstruction):
                 mnemonic = candidate.mnemonic
+
+                if mnemonic == "op_19_69":
+                    args, start = self._collect_call_arguments(items, scan)
+                    target = candidate.operand & 0xFFFF
+                    symbol = self.knowledge.lookup_address(target)
+                    call_node = IRCall(target=target, args=tuple(args), symbol=symbol)
+                    self._transfer_ssa(candidate, call_node)
+                    self._ssa_bindings.pop(id(candidate), None)
+                    items.replace_slice(start, scan + 1, [call_node])
+                    metrics.calls += 1
+                    pending_literal_index = None
+                    pending_literal = None
+                    pending_value = None
+                    pending_literal_value = None
+                    pending_ssa = None
+                    pending_kinds = None
+                    scan = start + 1
+                    continue
 
                 if mnemonic in INDIRECT_PAGE_REGISTER_MNEMONICS:
                     register = INDIRECT_PAGE_REGISTER_MNEMONICS[mnemonic]
@@ -4082,7 +4105,9 @@ class IRNormalizer:
 
             break
 
-    def _sweep_indirect_configuration(self, items: _ItemList) -> None:
+    def _sweep_indirect_configuration(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
         index = 0
         pending_literal_index: Optional[int] = None
         pending_literal: Optional[IRNode] = None
@@ -4124,6 +4149,24 @@ class IRNormalizer:
 
             if isinstance(candidate, RawInstruction):
                 mnemonic = candidate.mnemonic
+
+                if mnemonic == "op_19_69":
+                    args, start = self._collect_call_arguments(items, index)
+                    target = candidate.operand & 0xFFFF
+                    symbol = self.knowledge.lookup_address(target)
+                    call_node = IRCall(target=target, args=tuple(args), symbol=symbol)
+                    self._transfer_ssa(candidate, call_node)
+                    self._ssa_bindings.pop(id(candidate), None)
+                    items.replace_slice(start, index + 1, [call_node])
+                    metrics.calls += 1
+                    pending_literal_index = None
+                    pending_literal = None
+                    pending_value = None
+                    pending_literal_value = None
+                    pending_ssa = None
+                    pending_kinds = None
+                    index = start + 1
+                    continue
 
                 if mnemonic in INDIRECT_PAGE_REGISTER_MNEMONICS:
                     register = INDIRECT_PAGE_REGISTER_MNEMONICS[mnemonic]

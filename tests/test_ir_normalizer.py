@@ -1727,3 +1727,78 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
         for node in block.nodes
     )
 
+
+def test_normalizer_converts_indirect_call_helper(tmp_path: Path) -> None:
+    annotations = {
+        "00:00": OpcodeInfo(mnemonic="push_literal", category="literal", stack_push=1),
+        "4B:0C": OpcodeInfo(mnemonic="op_4B_0C", stack_delta=0),
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_load", stack_push=1),
+        "19:69": OpcodeInfo(mnemonic="op_19_69", stack_delta=0),
+        "1A:00": OpcodeInfo(mnemonic="test_branch", category="branch", stack_delta=-1),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x4B0C),
+        build_word(4, 0x4B, 0x0C, 0x0000),
+        build_word(8, 0x69, 0x01, 0xC806),
+        build_word(12, 0x00, 0x00, 0x2910),
+        build_word(16, 0x19, 0x69, 0x1058),
+        build_word(20, 0x1A, 0x00, 0x0004),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_indirect_call", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert any(isinstance(node, IRCall) and node.target == 0x1058 for node in block.nodes)
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_19_69" for node in block.nodes
+    )
+
+
+def test_normalizer_wraps_tailcall_helpers_cleanup(tmp_path: Path) -> None:
+    annotations = {
+        "10:70": OpcodeInfo(mnemonic="op_10_70", stack_delta=0),
+        "10:54": OpcodeInfo(mnemonic="op_10_54", stack_delta=0),
+        "29:10": OpcodeInfo(
+            mnemonic="tailcall_dispatch",
+            category="call_dispatch",
+            stack_delta=-1,
+        ),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x10, 0x70, RET_MASK),
+        build_word(4, 0x29, 0x10, 0x1000),
+        build_word(8, 0x10, 0x54, 0x1A00),
+        build_word(12, 0x29, 0x10, 0x002C),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_tail_helpers", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    cleanup_steps = []
+    for node in block.nodes:
+        if isinstance(node, IRCallCleanup):
+            cleanup_steps.extend(step.mnemonic for step in node.steps)
+        elif isinstance(node, (IRCall, IRCallReturn, IRTailCall, IRTailcallReturn)):
+            cleanup_steps.extend(step.mnemonic for step in getattr(node, "cleanup", tuple()))
+
+    assert "op_10_70" in cleanup_steps
+    assert "op_10_54" in cleanup_steps
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic in {"op_10_70", "op_10_54"}
+        for node in block.nodes
+    )
+
