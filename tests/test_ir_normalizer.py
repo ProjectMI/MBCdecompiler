@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Mapping, Optional
 
 import pytest
 
@@ -75,6 +76,8 @@ def make_stack_neutral_instruction(
     operand: int = 0,
     kind: InstructionKind = InstructionKind.UNKNOWN,
     annotations: tuple[str, ...] = tuple(),
+    delta: int = 0,
+    traits: Optional[Mapping[str, object]] = None,
 ) -> RawInstruction:
     opcode = 0
     mode = 0
@@ -93,15 +96,17 @@ def make_stack_neutral_instruction(
         summary=None,
         category=None,
         control_flow=None,
-        stack_hint=StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=1.0),
+        stack_hint=StackEffectHint(
+            nominal=delta, minimum=delta, maximum=delta, confidence=1.0
+        ),
         kind=kind,
-        traits={},
+        traits=dict(traits or {}),
     )
     event = StackEvent(
         profile=profile,
-        delta=0,
-        minimum=0,
-        maximum=0,
+        delta=delta,
+        minimum=delta,
+        maximum=delta,
         confidence=1.0,
         depth_before=0,
         depth_after=0,
@@ -504,7 +509,11 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         == ["page_register", "op_5E_29", "op_F0_4B"]
         for node in cleanup_nodes
     )
-    assert [step.mnemonic for step in contract_call.cleanup] == ["stack_teardown"]
+    assert [step.mnemonic for step in contract_call.cleanup] == [
+        "stack_teardown",
+        "op_29_10",
+        "op_70_29",
+    ]
     assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
@@ -1061,21 +1070,24 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert [step.mnemonic for step in call_return.cleanup] == [
+    call_node = next(
+        node for node in block.nodes if isinstance(node, (IRCallReturn, IRTailCall))
+    )
+    cleanup = call_node.cleanup
+    assert [step.mnemonic for step in cleanup] == [
         "call_helpers",
         "op_32_29",
         "op_29_10",
         "stack_teardown",
     ]
-    assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
-    assert call_return.cleanup[-1].pops == 4
-    assert call_return.target == 0x1234
-    assert call_return.symbol == "test_helper_1234"
-    assert call_return.convention is not None
-    assert call_return.convention.operand == 0x4B08
-    assert call_return.cleanup_mask == 0x2910
-    assert call_return.arity is None
+    assert [step.operand for step in cleanup[:3]] == [0x0001, 0x1000, 0x2910]
+    assert cleanup[-1].pops == 4
+    assert call_node.target == 0x1234
+    assert call_node.symbol == "test_helper_1234"
+    assert call_node.convention is not None
+    assert call_node.convention.operand == 0x4B08
+    assert call_node.cleanup_mask == 0x2910
+    assert call_node.arity is None
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
@@ -1084,6 +1096,50 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
         and node.mnemonic in {"op_4A_05", "op_32_29", "op_29_10", "stack_teardown_4"}
         for node in block.nodes
     )
+
+
+def test_call_cleanup_accepts_mask_operand(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    normalizer = IRNormalizer(knowledge)
+    mask_instruction = make_stack_neutral_instruction(
+        0,
+        "op_64_30",
+        operand=0x0040,
+        traits={"operand_role": "io_mask"},
+    )
+
+    items = _ItemList([mask_instruction])
+    normalizer._pass_call_cleanup(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    cleanup = nodes[0]
+    assert isinstance(cleanup, IRCallCleanup)
+    assert cleanup.steps and cleanup.steps[0].operand_role == "io_mask"
+
+
+def test_call_return_collects_mask_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    normalizer = IRNormalizer(knowledge)
+    call = IRCall(target=0x1234, args=tuple())
+    mask_instruction = make_stack_neutral_instruction(
+        4,
+        "op_64_30",
+        operand=0x0055,
+        traits={"operand_role": "condition_mask"},
+    )
+    return_node = IRReturn(values=tuple())
+
+    items = _ItemList([call, mask_instruction, return_node])
+    normalizer._pass_call_return_templates(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    call_return = nodes[0]
+    assert isinstance(call_return, IRCallReturn)
+    assert any(step.operand_role == "condition_mask" for step in call_return.cleanup)
 
 
 def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:

@@ -3064,37 +3064,40 @@ class IRNormalizer:
                     candidate = items[offset]
                     if isinstance(candidate, IRCallCleanup):
                         cleanup_steps.extend(candidate.steps)
+                        if cleanup_mask is None:
+                            mask = self._extract_cleanup_mask(candidate.steps)
+                            if mask is not None:
+                                cleanup_mask = mask
                         offset += 1
                         consumed += 1
                         continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and candidate.mnemonic == "op_29_10"
-                        and candidate.operand == RET_MASK
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        cleanup_mask = RET_MASK
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and self._matches_templates(candidate, TAILCALL_POSTLUDE_TEMPLATES)
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
-                    if (
-                        isinstance(candidate, RawInstruction)
-                        and call.target in TAILCALL_HELPERS
-                        and candidate.mnemonic == "op_F0_4B"
-                    ):
-                        cleanup_steps.append(self._call_cleanup_effect(candidate))
-                        offset += 1
-                        consumed += 1
-                        continue
+                    if isinstance(candidate, RawInstruction):
+                        if (
+                            call.target in TAILCALL_HELPERS
+                            and self._matches_templates(
+                                candidate, TAILCALL_POSTLUDE_TEMPLATES
+                            )
+                        ):
+                            cleanup_steps.append(self._call_cleanup_effect(candidate))
+                            offset += 1
+                            consumed += 1
+                            continue
+                        if (
+                            call.target in TAILCALL_HELPERS
+                            and candidate.mnemonic == "op_F0_4B"
+                        ):
+                            cleanup_steps.append(self._call_cleanup_effect(candidate))
+                            offset += 1
+                            consumed += 1
+                            continue
+                        if self._is_call_cleanup_instruction(candidate):
+                            effect = self._call_cleanup_effect(candidate)
+                            cleanup_steps.append(effect)
+                            if cleanup_mask is None and effect.operand == RET_MASK:
+                                cleanup_mask = RET_MASK
+                            offset += 1
+                            consumed += 1
+                            continue
                     if isinstance(candidate, IRConditionMask):
                         effect = IRStackEffect(
                             mnemonic=candidate.source,
@@ -3173,6 +3176,10 @@ class IRNormalizer:
                 step = item.steps[0]
                 if step.mnemonic == "fanout" and step.operand == RET_MASK:
                     node = IRConditionMask(source="fanout", mask=step.operand)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
+                if step.mnemonic == "op_29_10" and step.operand == RET_MASK:
+                    node = IRConditionMask(source=step.mnemonic, mask=step.operand)
                     items.replace_slice(index, index + 1, [node])
                     continue
             if isinstance(item, RawInstruction):
@@ -3693,11 +3700,20 @@ class IRNormalizer:
         return any(template.matches(instruction) for template in templates)
 
     def _is_call_cleanup_instruction(self, instruction: RawInstruction) -> bool:
-        mnemonic = instruction.mnemonic
-        if mnemonic.startswith("op_10_") and (
-            mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
-        ):
+        if instruction.event.delta > 0:
             return False
+
+        kind = instruction.profile.kind
+        if kind is InstructionKind.STACK_TEARDOWN:
+            return True
+
+        operand_role = instruction.profile.operand_role() or ""
+        if operand_role and "mask" in operand_role:
+            return True
+
+        if instruction.operand == RET_MASK:
+            return True
+
         return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
 
     @staticmethod
@@ -3817,7 +3833,7 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
+        for mnemonic in ("op_29_10", "fanout", "epilogue", "op_52_05", "op_32_29"):
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand
