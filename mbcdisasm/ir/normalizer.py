@@ -161,10 +161,6 @@ TAILCALL_HELPERS = {
     0x16F0,
 }
 
-DISPATCH_PREFIX_MNEMONICS = {"op_08_00", "op_64_20", "op_65_30"}
-DISPATCH_SUFFIX_MNEMONICS = {"op_10_8C"}
-
-
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
@@ -398,22 +394,6 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
     InstructionTemplate(
         name="cleanup_prefix",
         prefixes=tuple(CALL_CLEANUP_PREFIXES),
-    ),
-)
-
-
-DISPATCH_PREFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="dispatch_prefix",
-        mnemonics=tuple(DISPATCH_PREFIX_MNEMONICS),
-    ),
-)
-
-
-DISPATCH_SUFFIX_TEMPLATES: Tuple[InstructionTemplate, ...] = (
-    InstructionTemplate(
-        name="dispatch_suffix",
-        mnemonics=tuple(DISPATCH_SUFFIX_MNEMONICS),
     ),
 )
 
@@ -2308,27 +2288,59 @@ class IRNormalizer:
                 candidate = items[prefix_start - 1]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and self._matches_templates(candidate, DISPATCH_PREFIX_TEMPLATES)
+                    and self._is_dispatch_wrapper_instruction(candidate)
                 ):
+                    prefix_start -= 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
                     prefix_start -= 1
                     continue
                 break
 
-            if prefix_start < index:
-                raw_prefix = [
-                    items[position]
-                    for position in range(prefix_start, index)
-                    if isinstance(items[position], RawInstruction)
-                ]
-                if raw_prefix:
-                    steps = tuple(
-                        self._call_cleanup_effect(instruction)
-                        for instruction in raw_prefix
-                    )
-                    cleanup = IRCallCleanup(steps=steps)
-                    items.replace_slice(prefix_start, index, [cleanup])
-                    index = prefix_start + 1
+            if wrapper_positions := [
+                pos for pos in range(prefix_start, index) if isinstance(items[pos], (RawInstruction, IRCallCleanup))
+            ]:
+                steps: List[IRStackEffect] = []
+                for position in sorted(wrapper_positions):
+                    entry = items[position]
+                    if isinstance(entry, RawInstruction):
+                        steps.append(self._call_cleanup_effect(entry))
+                    elif isinstance(entry, IRCallCleanup):
+                        steps.extend(entry.steps)
+                if steps:
+                    cleanup = IRCallCleanup(steps=tuple(steps))
+                    first_index = min(wrapper_positions)
+                    wrapper_set = set(wrapper_positions)
+                    others = [
+                        items[position]
+                        for position in range(first_index, index)
+                        if position not in wrapper_set
+                    ]
+                    replacement = [cleanup] + others
+                    items.replace_slice(first_index, index, replacement)
+                    index = first_index + len(replacement)
                     node = items[index]
+
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if (
+                    isinstance(candidate, RawInstruction)
+                    and self._is_dispatch_wrapper_instruction(candidate)
+                ):
+                    cleanup = IRCallCleanup(steps=(self._call_cleanup_effect(candidate),))
+                    items.replace_slice(scan, scan + 1, [cleanup])
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                    scan -= 1
+                    continue
+                break
+
+            node = items[index]
 
             follow = index + 1
             suffix_end = follow
@@ -2336,27 +2348,56 @@ class IRNormalizer:
                 candidate = items[suffix_end]
                 if (
                     isinstance(candidate, RawInstruction)
-                    and self._matches_templates(candidate, DISPATCH_SUFFIX_TEMPLATES)
+                    and self._is_dispatch_wrapper_instruction(candidate)
                 ):
+                    suffix_end += 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
                     suffix_end += 1
                     continue
                 break
 
-            if suffix_end > follow:
-                raw_suffix = [
-                    items[position]
-                    for position in range(follow, suffix_end)
-                    if isinstance(items[position], RawInstruction)
-                ]
-                if raw_suffix:
-                    steps = tuple(
-                        self._call_cleanup_effect(instruction)
-                        for instruction in raw_suffix
-                    )
-                    cleanup = IRCallCleanup(steps=steps)
-                    items.replace_slice(follow, suffix_end, [cleanup])
-                    index = follow + 1
+            if wrapper_positions := [
+                pos for pos in range(follow, suffix_end) if isinstance(items[pos], (RawInstruction, IRCallCleanup))
+            ]:
+                steps: List[IRStackEffect] = []
+                for position in sorted(wrapper_positions):
+                    entry = items[position]
+                    if isinstance(entry, RawInstruction):
+                        steps.append(self._call_cleanup_effect(entry))
+                    elif isinstance(entry, IRCallCleanup):
+                        steps.extend(entry.steps)
+                if steps:
+                    cleanup = IRCallCleanup(steps=tuple(steps))
+                    wrapper_set = set(wrapper_positions)
+                    others = [
+                        items[position]
+                        for position in range(follow, suffix_end)
+                        if position not in wrapper_set
+                    ]
+                    replacement = others + [cleanup]
+                    items.replace_slice(follow, suffix_end, replacement)
+                    index = follow + len(replacement)
                     continue
+
+            scan = index
+            while scan < len(items):
+                candidate = items[scan]
+                if (
+                    isinstance(candidate, RawInstruction)
+                    and self._is_dispatch_wrapper_instruction(candidate)
+                ):
+                    cleanup = IRCallCleanup(steps=(self._call_cleanup_effect(candidate),))
+                    items.replace_slice(scan, scan + 1, [cleanup])
+                    scan += 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
+                    scan += 1
+                    continue
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                    scan += 1
+                    continue
+                break
 
             index = follow
 
@@ -3690,6 +3731,30 @@ class IRNormalizer:
         ):
             return False
         return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
+
+    def _is_dispatch_wrapper_instruction(self, instruction: RawInstruction) -> bool:
+        if self._is_annotation_only(instruction):
+            return False
+
+        event = instruction.event
+        if event.pushed_types or event.delta > 0:
+            return False
+
+        kind = instruction.profile.kind
+        if kind in {
+            InstructionKind.BRANCH,
+            InstructionKind.CALL,
+            InstructionKind.RETURN,
+            InstructionKind.TAILCALL,
+        }:
+            return False
+
+        mnemonic = instruction.mnemonic
+        if mnemonic.startswith("op_"):
+            return True
+        if self._is_stack_teardown_step(instruction):
+            return True
+        return False
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
