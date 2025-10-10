@@ -46,7 +46,7 @@ from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
 from mbcdisasm.analyzer.instruction_profile import InstructionProfile
-from mbcdisasm.analyzer.stack import StackTracker
+from mbcdisasm.analyzer.stack import StackEvent, StackTracker
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -1416,8 +1416,19 @@ def test_normalizer_collapses_opcode_table_sequences() -> None:
 
     words = [build_word(index * 4, opcode, 0x2A, 0x0000) for index, opcode in enumerate(range(0x10, 0x1C))]
     profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
-    tracker = StackTracker()
-    events = tracker.process_sequence(profiles)
+    events = [
+        StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=profile.kind,
+        )
+        for profile in profiles
+    ]
 
     raw_instructions = [
         RawInstruction(
@@ -1454,8 +1465,19 @@ def test_normalizer_collapses_zero_mode_opcode_tables() -> None:
         for index in range(6)
     ]
     profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
-    tracker = StackTracker()
-    events = tracker.process_sequence(profiles)
+    events = [
+        StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=profile.kind,
+        )
+        for profile in profiles
+    ]
 
     raw_instructions = [
         RawInstruction(
@@ -1505,8 +1527,19 @@ def test_normalizer_absorbs_zero_mode_affixes_for_opcode_tables() -> None:
         build_word(28, 0x08, 0x00, 0x0008),
     ]
     profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
-    tracker = StackTracker()
-    events = tracker.process_sequence(profiles)
+    events = [
+        StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=profile.kind,
+        )
+        for profile in profiles
+    ]
 
     raw_instructions = [
         RawInstruction(
@@ -1527,6 +1560,137 @@ def test_normalizer_absorbs_zero_mode_affixes_for_opcode_tables() -> None:
     assert isinstance(node, IRTablePatch)
     assert node.operations[0][0] == "op_08_00"
     assert node.operations[-1][0] == "op_08_00"
+    assert len(node.operations) == len(raw_instructions)
+
+
+def test_normalizer_captures_extended_table_patch_affixes() -> None:
+    annotations = {
+        "2C:10": OpcodeInfo(mnemonic="op_2C_10", stack_delta=0),
+        "2C:11": OpcodeInfo(mnemonic="op_2C_11", stack_delta=0),
+        "2C:12": OpcodeInfo(mnemonic="op_2C_12", stack_delta=0),
+        "04:02": OpcodeInfo(mnemonic="op_04_02", stack_delta=0),
+        "30:44": OpcodeInfo(mnemonic="op_30_44", stack_delta=0),
+        "04:00": OpcodeInfo(mnemonic="reduce_pair", stack_delta=0),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x2C, 0x10, 0x6600),
+        build_word(4, 0x04, 0x02, 0x0000),
+        build_word(8, 0x2C, 0x11, 0x6601),
+        build_word(12, 0x30, 0x44, 0x6602),
+        build_word(16, 0x2C, 0x12, 0x6603),
+        build_word(20, 0x04, 0x00, 0x0000),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    events = [
+        StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=profile.kind,
+        )
+        for profile in profiles
+    ]
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    items = _ItemList(raw_instructions)
+    normalizer._pass_table_patches(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    node = nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert [mnemonic for mnemonic, _ in node.operations] == [
+        "op_2C_10",
+        "op_04_02",
+        "op_2C_11",
+        "op_30_44",
+        "op_2C_12",
+        "reduce_pair",
+    ]
+
+
+def test_normalizer_absorbs_extended_opcode_table_affixes() -> None:
+    annotations = {
+        "04:02": OpcodeInfo(mnemonic="op_04_02", stack_delta=0),
+        "04:00": OpcodeInfo(mnemonic="reduce_pair", stack_delta=0),
+        "08:03": OpcodeInfo(mnemonic="op_08_03", stack_delta=0),
+    }
+    annotations.update(
+        {
+            f"{opcode:02X}:2A": OpcodeInfo(
+                mnemonic=f"op_{opcode:02X}_2A",
+                stack_delta=0,
+            )
+            for opcode in range(0x10, 0x14)
+        }
+    )
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x04, 0x02, 0x0008),
+        *[
+            build_word(4 + index * 4, opcode, 0x2A, 0x0000 if index % 2 == 0 else 0x0008)
+            for index, opcode in enumerate(range(0x10, 0x14))
+        ],
+        build_word(20, 0x04, 0x00, 0x0000),
+        build_word(24, 0x08, 0x03, 0x0008),
+    ]
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    events = [
+        StackEvent(
+            profile=profile,
+            delta=0,
+            minimum=0,
+            maximum=0,
+            confidence=1.0,
+            depth_before=0,
+            depth_after=0,
+            kind=profile.kind,
+        )
+        for profile in profiles
+    ]
+
+    raw_instructions = [
+        RawInstruction(
+            profile=profile,
+            event=event,
+            annotations=tuple(),
+            ssa_values=tuple(),
+            ssa_kinds=tuple(),
+        )
+        for profile, event in zip(profiles, events)
+    ]
+
+    items = _ItemList(raw_instructions)
+    normalizer._pass_opcode_tables(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    node = nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert [mnemonic for mnemonic, _ in node.operations][:1] == ["op_04_02"]
+    assert [mnemonic for mnemonic, _ in node.operations][-2:] == [
+        "reduce_pair",
+        "op_08_03",
+    ]
     assert len(node.operations) == len(raw_instructions)
 
 

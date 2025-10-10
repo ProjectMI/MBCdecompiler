@@ -373,7 +373,12 @@ class IRNormalizer:
         0x51,
     }
     _OPCODE_TABLE_BODY_OPERANDS = {0x0000, 0x0008}
-    _OPCODE_TABLE_AFFIX_MNEMONICS = {"op_08_00"}
+    _OPCODE_TABLE_AFFIX_MNEMONICS = {"op_08_00", "op_04_02", "op_08_03"}
+    _TABLE_PATCH_OPERAND_MIN = 0x6600
+    _TABLE_PATCH_OPERAND_MAX = 0x66FF
+    _TABLE_PATCH_AFFIX_MNEMONICS = {"fanout", "stack_teardown_4", "stack_teardown_5"}
+    _TABLE_PATCH_SEPARATOR_MNEMONICS = {"op_04_02", "op_08_03"}
+    _TABLE_PATCH_AFFIX_MODES = {0x44, 0x45, 0x47}
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -1907,12 +1912,15 @@ class IRNormalizer:
     ) -> bool:
         if not isinstance(item, RawInstruction):
             return False
-        if item.profile.mode != mode:
-            if item.mnemonic not in self._OPCODE_TABLE_AFFIX_MNEMONICS:
-                return False
-            if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
-                return False
+        if item.profile.mode == mode:
+            return self._is_opcode_table_body(item, mode)
         if self._is_annotation_only(item):
+            return False
+        if self._is_zero_operand_reduce(item):
+            return True
+        if item.mnemonic not in self._OPCODE_TABLE_AFFIX_MNEMONICS:
+            return False
+        if item.mnemonic == "op_08_00" and item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
             return False
         return self._has_trivial_stack_effect(item)
 
@@ -1931,15 +1939,44 @@ class IRNormalizer:
             return False
         return True
 
+    def _is_zero_operand_reduce(self, instruction: RawInstruction) -> bool:
+        if instruction.profile.word.opcode != 0x04:
+            return False
+        if instruction.profile.word.operand != 0:
+            return False
+        if self._is_annotation_only(instruction):
+            return False
+        return self._has_trivial_stack_effect(instruction)
+
+    def _is_table_patch_body(self, instruction: RawInstruction) -> bool:
+        if not instruction.mnemonic.startswith("op_2C_"):
+            return False
+        operand = instruction.operand
+        return self._TABLE_PATCH_OPERAND_MIN <= operand <= self._TABLE_PATCH_OPERAND_MAX
+
+    def _is_table_patch_affix(self, instruction: RawInstruction) -> bool:
+        if self._is_annotation_only(instruction):
+            return False
+        if instruction.mnemonic in self._TABLE_PATCH_AFFIX_MNEMONICS:
+            return True
+        if instruction.mnemonic in self._TABLE_PATCH_SEPARATOR_MNEMONICS:
+            return self._has_trivial_stack_effect(instruction)
+        word = instruction.profile.word
+        if (
+            word.mode in self._TABLE_PATCH_AFFIX_MODES
+            and self._TABLE_PATCH_OPERAND_MIN <= word.operand <= self._TABLE_PATCH_OPERAND_MAX
+            and self._has_trivial_stack_effect(instruction)
+        ):
+            return True
+        if self._is_zero_operand_reduce(instruction):
+            return True
+        return False
+
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
-            if not (
-                isinstance(item, RawInstruction)
-                and item.mnemonic.startswith("op_2C_")
-                and 0x6600 <= item.operand <= 0x66FF
-            ):
+            if not (isinstance(item, RawInstruction) and self._is_table_patch_body(item)):
                 index += 1
                 continue
 
@@ -1947,18 +1984,13 @@ class IRNormalizer:
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
-                if isinstance(candidate, RawInstruction):
-                    if (
-                        candidate.mnemonic.startswith("op_2C_")
-                        and 0x6600 <= candidate.operand <= 0x66FF
-                    ):
-                        operations.append((candidate.mnemonic, candidate.operand))
-                        scan += 1
-                        continue
-                    if candidate.mnemonic in {"fanout", "stack_teardown_4", "stack_teardown_5"}:
-                        operations.append((candidate.mnemonic, candidate.operand))
-                        scan += 1
-                        continue
+                if isinstance(candidate, RawInstruction) and (
+                    self._is_table_patch_body(candidate)
+                    or self._is_table_patch_affix(candidate)
+                ):
+                    operations.append((candidate.mnemonic, candidate.operand))
+                    scan += 1
+                    continue
                 break
 
             items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
