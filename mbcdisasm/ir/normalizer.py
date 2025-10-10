@@ -4309,6 +4309,23 @@ class IRNormalizer:
             return True
         if instruction.profile.is_literal_marker():
             return True
+        if instruction.event.delta == 0:
+            kind = instruction.profile.kind
+            if kind not in {
+                InstructionKind.BRANCH,
+                InstructionKind.RETURN,
+                InstructionKind.TERMINATOR,
+                InstructionKind.CALL,
+                InstructionKind.TAILCALL,
+                InstructionKind.CONTROL,
+            }:
+                if self._is_io_bridge_instruction(instruction) and (
+                    instruction.mnemonic in IO_BRIDGE_MNEMONICS
+                    or self._operand_is_io_slot(instruction.operand)
+                ):
+                    return True
+                if self._is_ascii_neighbor_instruction(instruction):
+                    return True
         if not instruction.annotations:
             return False
         for note in instruction.annotations:
@@ -4327,6 +4344,20 @@ class IRNormalizer:
         else:
             parts.append(instruction.mnemonic)
         return " ".join(parts)
+
+    @staticmethod
+    def _is_ascii_neighbor_instruction(instruction: RawInstruction) -> bool:
+        if not instruction.annotations:
+            return False
+        for note in instruction.annotations:
+            lowered = note.lower()
+            prefix = lowered.split("=", 1)[0]
+            if not prefix.startswith("ascii_"):
+                continue
+            if prefix in {"ascii_run", "ascii_glue", "ascii_chunk"}:
+                continue
+            return True
+        return False
 
     @staticmethod
     def _format_testset_var(instruction: RawInstruction) -> str:

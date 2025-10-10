@@ -47,7 +47,7 @@ from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
 from mbcdisasm.analyzer.instruction_profile import InstructionProfile
-from mbcdisasm.analyzer.stack import StackTracker
+from mbcdisasm.analyzer.stack import StackEvent, StackTracker
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -1665,6 +1665,72 @@ def test_normalizer_extends_table_patch_with_affixes() -> None:
         "reduce_pair",
         "op_04_02",
     ]
+
+
+def test_stack_neutral_ascii_neighbors_are_annotations() -> None:
+    knowledge = KnowledgeBase({"42:10": OpcodeInfo(mnemonic="op_42_10", category="meta", stack_delta=0)})
+    normalizer = IRNormalizer(knowledge)
+
+    word = build_word(0, 0x42, 0x10, 0x0000)
+    profile = InstructionProfile.from_word(word, knowledge)
+    event = StackEvent(
+        profile=profile,
+        delta=0,
+        minimum=0,
+        maximum=0,
+        confidence=1.0,
+        depth_before=0,
+        depth_after=0,
+        kind=profile.kind,
+    )
+
+    instruction = RawInstruction(
+        profile=profile,
+        event=event,
+        annotations=("ascii_tail=1",),
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+
+    block = RawBlock(index=0, start_offset=0, instructions=(instruction,))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 0
+    assert ir_block.nodes == ()
+    assert ir_block.annotations == ("0x000000 ascii_tail=1",)
+
+
+def test_stack_neutral_io_bridges_are_annotations() -> None:
+    knowledge = KnowledgeBase({"F0:E8": OpcodeInfo(mnemonic="op_F0_E8", category="meta", stack_delta=0)})
+    normalizer = IRNormalizer(knowledge)
+
+    word = build_word(0, 0xF0, 0xE8, 0x0000)
+    profile = InstructionProfile.from_word(word, knowledge)
+    event = StackEvent(
+        profile=profile,
+        delta=0,
+        minimum=0,
+        maximum=0,
+        confidence=1.0,
+        depth_before=0,
+        depth_after=0,
+        kind=profile.kind,
+    )
+
+    instruction = RawInstruction(
+        profile=profile,
+        event=event,
+        annotations=tuple(),
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+
+    block = RawBlock(index=0, start_offset=0, instructions=(instruction,))
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert metrics.raw_remaining == 0
+    assert ir_block.nodes == ()
+    assert ir_block.annotations == ("0x000000 op_F0_E8",)
 
 
 def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
