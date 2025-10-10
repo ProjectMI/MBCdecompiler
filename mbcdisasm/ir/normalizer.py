@@ -392,6 +392,15 @@ class IRNormalizer:
         "op_04_02": {0x0000},
         "op_08_03": {0x0000},
     }
+    _RAW_CONTROL_KINDS = {
+        InstructionKind.BRANCH,
+        InstructionKind.CALL,
+        InstructionKind.CONTROL,
+        InstructionKind.RETURN,
+        InstructionKind.TAILCALL,
+        InstructionKind.TERMINATOR,
+        InstructionKind.TEST,
+    }
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -626,6 +635,11 @@ class IRNormalizer:
                         block_annotations.append(annotation)
                     continue
                 metrics.raw_remaining += 1
+                category = self._classify_raw_instruction(item)
+                if category == "meta":
+                    metrics.raw_meta += 1
+                elif category == "unknown":
+                    metrics.raw_unknown += 1
                 nodes.append(
                     IRRaw(
                         mnemonic=item.mnemonic,
@@ -4322,6 +4336,17 @@ class IRNormalizer:
         else:
             parts.append(instruction.mnemonic)
         return " ".join(parts)
+
+    def _classify_raw_instruction(self, instruction: RawInstruction) -> str:
+        event = instruction.event
+        if event.uncertain:
+            return "unknown"
+        if event.delta != 0:
+            return "unknown"
+        kind = event.kind or instruction.profile.kind
+        if kind in self._RAW_CONTROL_KINDS or kind is InstructionKind.UNKNOWN:
+            return "unknown"
+        return "meta"
 
     @staticmethod
     def _format_testset_var(instruction: RawInstruction) -> str:
