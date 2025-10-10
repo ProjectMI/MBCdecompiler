@@ -522,6 +522,7 @@ class IRNormalizer:
         self._ssa_bindings: Dict[int, Tuple[str, ...]] = {}
         self._ssa_types: Dict[str, SSAValueKind] = {}
         self._ssa_aliases: Dict[str, str] = {}
+        self._ssa_slots: Dict[str, IRSlot] = {}
         self._ssa_counters: Dict[str, int] = defaultdict(int)
         self._memref_regions: Dict[int, str] = {}
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
@@ -687,6 +688,7 @@ class IRNormalizer:
         self._ssa_bindings.clear()
         self._ssa_types.clear()
         self._ssa_aliases.clear()
+        self._ssa_slots.clear()
         self._ssa_counters.clear()
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
@@ -843,6 +845,30 @@ class IRNormalizer:
             self._ssa_types[name] = kind
             self._ssa_aliases.pop(name, None)
 
+    def _annotate_ssa_slot(
+        self, item: Union[RawInstruction, IRNode], slot: Optional[IRSlot] = None
+    ) -> None:
+        if slot is None:
+            if isinstance(item, IRLoad):
+                slot = item.slot
+        if slot is None:
+            return
+        names = self._ssa_bindings.get(id(item))
+        if not names:
+            return
+        for name in names:
+            self._ssa_slots[name] = slot
+
+    def _inherit_ssa_slots(
+        self, target: Union[RawInstruction, IRNode], sources: Sequence[str]
+    ) -> None:
+        for source in sources:
+            slot = self._ssa_slots.get(source)
+            if slot is None:
+                continue
+            self._annotate_ssa_slot(target, slot)
+            break
+
     def _map_stack_type(self, value_type: StackValueType) -> SSAValueKind:
         if value_type is StackValueType.SLOT:
             return SSAValueKind.POINTER
@@ -972,9 +998,13 @@ class IRNormalizer:
             mnemonic = item.mnemonic
             if mnemonic == "op_02_66":
                 value = self._describe_stack_top(items, index)
+                sources = self._stack_sources(items, index, 1)
+                source_names = [name for name, _ in sources]
                 copies = max(1, item.event.depth_after - item.event.depth_before)
                 node = IRStackDuplicate(value=value, copies=copies + 1)
                 self._transfer_ssa(item, node)
+                if source_names:
+                    self._inherit_ssa_slots(node, source_names)
                 items.replace_slice(index, index + 1, [node])
                 continue
 
@@ -988,6 +1018,7 @@ class IRNormalizer:
                 slot = self._classify_slot(item.operand)
                 node = IRLoad(slot=slot)
                 self._transfer_ssa(item, node)
+                self._annotate_ssa_slot(node, slot)
                 items.replace_slice(index, index + 1, [node])
                 metrics.loads += 1
                 continue
@@ -4068,6 +4099,8 @@ class IRNormalizer:
                     base_alias = self._render_ssa(base_name)
                     if isinstance(base_node, IRLoad):
                         base_slot = base_node.slot
+                    if base_slot is None:
+                        base_slot = self._ssa_slots.get(base_name)
                 target_name = item.ssa_values[0] if item.ssa_values else None
                 target_alias = self._render_ssa(target_name) if target_name else "stack"
                 base_name = base_sources[0][0] if base_sources else None
@@ -4091,13 +4124,15 @@ class IRNormalizer:
             if kind is InstructionKind.INDIRECT_STORE:
                 base_sources = self._stack_sources(items, index, 2)
                 if base_sources:
-                    base_name, base_node = base_sources[0]
-                    value_name = base_sources[1][0] if len(base_sources) > 1 else None
+                    base_name, base_node = base_sources[-1]
+                    value_name = base_sources[0][0] if len(base_sources) > 1 else None
                 else:
                     base_name = None
                     base_node = None
                     value_name = None
                 base_slot = base_node.slot if isinstance(base_node, IRLoad) else None
+                if base_slot is None and base_name:
+                    base_slot = self._ssa_slots.get(base_name)
                 if base_name:
                     self._promote_ssa_kind(base_name, SSAValueKind.POINTER)
                 base_alias = self._render_ssa(base_name) if base_name else "stack"

@@ -33,6 +33,7 @@ from mbcdisasm.ir.model import (
     IRTablePatch,
     NormalizerMetrics,
     IRIORead,
+    MemSpace,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1947,4 +1948,68 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
         for node in block.nodes
     )
+
+
+def test_normalizer_preserves_memspace_for_indirect_load_after_duplicate(
+    tmp_path: Path,
+) -> None:
+    annotations = {
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_access"),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x03, 0x66, 0x0001),
+        build_word(4, 0x02, 0x66, 0x0000),
+        build_word(8, 0x69, 0x01, 0x1234),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_indirect_dup", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+
+    assert load_node.base_slot is not None
+    assert load_node.base_slot.space is MemSpace.FRAME
+    assert load_node.ref is not None
+    assert load_node.ref.region == "frame"
+
+
+def test_normalizer_preserves_memspace_for_indirect_store_after_duplicate(
+    tmp_path: Path,
+) -> None:
+    annotations = {
+        "00:00": OpcodeInfo(mnemonic="push_literal", category="literal", stack_push=1),
+        "01:F0": OpcodeInfo(mnemonic="stack_teardown_4", category="stack_teardown", stack_delta=-4),
+        "69:01": OpcodeInfo(mnemonic="op_69_01", category="indirect_access"),
+    }
+    knowledge = KnowledgeBase(annotations)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x03, 0x66, 0x0001),
+        build_word(4, 0x02, 0x66, 0x0000),
+        build_word(8, 0x00, 0x00, 0x0010),
+        build_word(12, 0x69, 0x01, 0x1234),
+        build_word(16, 0x01, 0xF0, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    container = MbcContainer(tmp_path / "container_indirect_store_dup", [segment])
+
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    store_node = next(node for node in block.nodes if isinstance(node, IRIndirectStore))
+
+    assert store_node.base_slot is not None
+    assert store_node.base_slot.space is MemSpace.FRAME
+    assert store_node.ref is not None
+    assert store_node.ref.region == "frame"
 
