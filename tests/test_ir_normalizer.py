@@ -1344,10 +1344,11 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
     words = [
-        build_word(0, 0x64, 0x20, 0x0800),
-        build_word(4, 0x2C, 0x04, 0x6634),
-        build_word(8, 0x10, 0x8C, 0x0900),
-        build_word(12, 0x30, 0x00, 0x0000),
+        build_word(0, 0x10, 0x50, 0x1B00),
+        build_word(4, 0x64, 0x20, 0x0800),
+        build_word(8, 0x2C, 0x04, 0x6634),
+        build_word(12, 0x10, 0x8C, 0x0900),
+        build_word(16, 0x30, 0x00, 0x0000),
     ]
 
     data = encode_instructions(words)
@@ -1361,6 +1362,10 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
 
     assert not any(isinstance(node, IRRaw) for node in block.nodes)
     assert isinstance(block.nodes[0], IRCallCleanup)
+    assert [step.mnemonic for step in block.nodes[0].steps] == [
+        "op_10_50",
+        "op_64_20",
+    ]
     assert isinstance(block.nodes[1], IRSwitchDispatch)
     return_node = block.nodes[2]
     assert isinstance(return_node, IRReturn)
