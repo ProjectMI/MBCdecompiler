@@ -48,6 +48,42 @@
       }
     ]
   },
+  "0x06F0": {
+    "tail": true,
+    "cleanup_mask": "0x2910",
+    "prelude": [
+      {
+        "kind": "raw",
+        "mnemonic": "op_09_F0",
+        "effect": {
+          "mnemonic": "op_09_F0",
+          "inherit_operand": true
+        }
+      }
+    ]
+  },
+  "0x2429": {
+    "tail": true,
+    "cleanup_mask": "0x2910",
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "call_helpers",
+        "effect": {
+          "mnemonic": "call_helpers",
+          "inherit_operand": true
+        }
+      },
+      {
+        "kind": "raw",
+        "mnemonic": "fanout",
+        "effect": {
+          "mnemonic": "fanout",
+          "inherit_operand": true
+        }
+      }
+    ]
+  },
   "0x3D30": {
     "tail": true,
     "prelude": [

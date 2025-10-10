@@ -155,9 +155,11 @@ TAILCALL_HELPERS = {
     0x01EC,
     0x01F1,
     0x032C,
+    0x06F0,
     0x0BF0,
     0x0FF0,
     0x16F0,
+    0x2429,
 }
 TAILCALL_POSTLUDE = {
     "op_01_6C",
