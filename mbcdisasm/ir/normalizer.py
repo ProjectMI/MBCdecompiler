@@ -408,8 +408,20 @@ class IRNormalizer:
         "reduce_pair": {0x0000},
         "op_04_02": {0x0000},
         "op_08_03": {0x0000},
+        "op_35_45": {0x0000},
+        "op_03_46": {0x0000},
+        "op_2C_46": {0x0000},
+        "op_2B_47": {0x0000},
     }
-    _OPCODE_TABLE_NONTRIVIAL_AFFIX = {"reduce_pair", "op_04_02", "op_08_03"}
+    _OPCODE_TABLE_NONTRIVIAL_AFFIX = {
+        "reduce_pair",
+        "op_04_02",
+        "op_08_03",
+        "op_35_45",
+        "op_03_46",
+        "op_2C_46",
+        "op_2B_47",
+    }
     _TABLE_PATCH_EXTRA_MNEMONICS = {
         "fanout": None,
         "stack_teardown_4": None,
@@ -417,6 +429,10 @@ class IRNormalizer:
         "reduce_pair": {0x0000},
         "op_04_02": {0x0000},
         "op_08_03": {0x0000},
+        "op_35_45": {0x0000},
+        "op_03_46": {0x0000},
+        "op_2C_46": {0x0000},
+        "op_2B_47": {0x0000},
     }
 
     _SSA_PRIORITY = {
