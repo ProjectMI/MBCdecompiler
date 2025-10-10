@@ -551,6 +551,8 @@ class IRNormalizer:
         "op_2C_46",
         "op_2B_47",
     }
+    _UNIFORM_TABLE_MIN_RUN = 6
+    _UNIFORM_TABLE_ALLOWED_KINDS = {InstructionKind.UNKNOWN}
     _TABLE_PATCH_EXTRA_MNEMONICS = {
         "fanout": None,
         "stack_teardown_4": None,
@@ -767,6 +769,7 @@ class IRNormalizer:
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_opcode_tables(items)
+        self._pass_uniform_table_runs(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_dispatch_wrappers(items)
@@ -2124,6 +2127,59 @@ class IRNormalizer:
             )
             index = prefix + 1
 
+    def _pass_uniform_table_runs(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not self._is_uniform_table_seed(item):
+                index += 1
+                continue
+
+            assert isinstance(item, RawInstruction)
+            mode = item.profile.mode
+            kind = item.event.kind
+            scan = index
+            operations: List[Tuple[str, int]] = []
+            pooled_annotations: List[str] = []
+
+            while scan < len(items):
+                candidate = items[scan]
+                if self._is_uniform_table_body(candidate, mode, kind):
+                    assert isinstance(candidate, RawInstruction)
+                    operations.append((candidate.mnemonic, candidate.operand))
+                    pooled_annotations.extend(candidate.annotations)
+                    scan += 1
+                    continue
+                break
+
+            if len(operations) < self._UNIFORM_TABLE_MIN_RUN:
+                index += 1
+                continue
+
+            annotations = [
+                "opcode_table_auto",
+                f"mode=0x{mode:02X}",
+                f"kind={kind.name.lower()}",
+            ]
+            seen = set(annotations)
+            for note in pooled_annotations:
+                if not note or note in seen:
+                    continue
+                annotations.append(note)
+                seen.add(note)
+
+            items.replace_slice(
+                index,
+                scan,
+                [
+                    IRTablePatch(
+                        operations=tuple(operations),
+                        annotations=tuple(annotations),
+                    )
+                ],
+            )
+            index += 1
+
     def _is_opcode_table_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
         if not isinstance(item, RawInstruction):
             return False
@@ -2131,6 +2187,21 @@ class IRNormalizer:
         if mode not in self._OPCODE_TABLE_MODES:
             return False
         return self._is_opcode_table_body(item, mode)
+
+    def _is_uniform_table_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if item.event.kind not in self._UNIFORM_TABLE_ALLOWED_KINDS:
+            return False
+        if not item.mnemonic.startswith("op_"):
+            return False
+        if item.event.uncertain:
+            return False
+        if self._is_annotation_only(item):
+            return False
+        if self._has_profile_side_effects(item):
+            return False
+        return self._has_trivial_stack_effect(item)
 
     def _is_opcode_table_body(
         self, item: Union[RawInstruction, IRNode], mode: int
@@ -2142,6 +2213,27 @@ class IRNormalizer:
         if item.operand not in self._OPCODE_TABLE_BODY_OPERANDS:
             return False
         if self._is_annotation_only(item):
+            return False
+        return self._has_trivial_stack_effect(item)
+
+    def _is_uniform_table_body(
+        self, item: Union[RawInstruction, IRNode], mode: int, kind: InstructionKind
+    ) -> bool:
+        if not isinstance(item, RawInstruction):
+            return False
+        if item.profile.mode != mode:
+            return False
+        if item.event.kind != kind:
+            return False
+        if kind not in self._UNIFORM_TABLE_ALLOWED_KINDS:
+            return False
+        if not item.mnemonic.startswith("op_"):
+            return False
+        if item.event.uncertain:
+            return False
+        if self._is_annotation_only(item):
+            return False
+        if self._has_profile_side_effects(item):
             return False
         return self._has_trivial_stack_effect(item)
 

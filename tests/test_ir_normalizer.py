@@ -1816,6 +1816,33 @@ def test_normalizer_extends_table_patch_with_affixes() -> None:
     ]
 
 
+def test_normalizer_collapses_uniform_unknown_table_runs() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    raw_instructions = [
+        make_stack_neutral_instruction(
+            index * 4,
+            mnemonic=f"op_{0x41 + index:02X}_6E",
+            operand=0x2000 + index,
+            annotations=("autonote",) if index == 0 else tuple(),
+        )
+        for index in range(8)
+    ]
+
+    block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
+    ir_block, _ = normalizer._normalise_block(block)
+
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert len(node.operations) == len(raw_instructions)
+    assert node.annotations[0] == "opcode_table_auto"
+    assert "mode=0x6E" in node.annotations
+    assert "kind=unknown" in node.annotations
+    assert "autonote" in node.annotations
+
+
 def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
     knowledge = KnowledgeBase({"31:30": OpcodeInfo(mnemonic="op_31_30")})
     normalizer = IRNormalizer(knowledge)
