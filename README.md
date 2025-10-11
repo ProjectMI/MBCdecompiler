@@ -48,3 +48,11 @@ Run the test suite with:
 ```
 pytest
 ```
+
+## Tools
+
+Check raw remaining:
+
+```
+python tools/raw_remaining_report.py
+```
