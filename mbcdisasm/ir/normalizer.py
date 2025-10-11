@@ -724,6 +724,7 @@ class IRNormalizer:
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
+        self._pass_literal_marker_clusters(items, metrics)
         self._pass_literals(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
@@ -930,6 +931,109 @@ class IRNormalizer:
                 self._annotate_literal_ssa(literal)
             items.replace_slice(index, index + 1, [literal])
             index += 1
+
+    def _pass_literal_marker_clusters(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
+        index = 0
+        while index < len(items):
+            start = index
+            loaders: List[Tuple[RawInstruction, Tuple[int, int, int]]] = []
+            annotations: List[str] = []
+
+            while index < len(items):
+                candidate = items[index]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                triplet = self._literal_marker_triplet(candidate)
+                if triplet is None:
+                    break
+                loaders.append((candidate, triplet))
+                annotations.extend(candidate.annotations)
+                index += 1
+
+            if not loaders:
+                index = start + 1
+                continue
+
+            if index >= len(items):
+                index = start + 1
+                continue
+
+            reducer = items[index]
+            if not (
+                isinstance(reducer, RawInstruction)
+                and reducer.mnemonic.startswith("reduce")
+            ):
+                index = start + 1
+                continue
+
+            all_annotations = annotations + list(reducer.annotations)
+            block = IRLiteralBlock(
+                triplets=tuple(triplet for _, triplet in loaders),
+                reducer=reducer.mnemonic,
+                reducer_operand=reducer.operand,
+                tail=tuple(),
+                annotations=tuple(self._dedupe_annotations(all_annotations)),
+            )
+
+            self._transfer_ssa(reducer, block)
+            for loader, _ in loaders:
+                self._ssa_bindings.pop(id(loader), None)
+
+            items.replace_slice(start, index + 1, [block])
+            metrics.reduce_replaced += 1
+            index = start + 1
+
+    @staticmethod
+    def _dedupe_annotations(notes: Sequence[str]) -> List[str]:
+        seen: Dict[str, None] = {}
+        ordered: List[str] = []
+        for note in notes:
+            if note in seen:
+                continue
+            seen[note] = None
+            ordered.append(note)
+        return ordered
+
+    def _literal_marker_triplet(
+        self, instruction: RawInstruction
+    ) -> Optional[Tuple[int, int, int]]:
+        profile = instruction.profile
+        if profile.opcode != 0x00:
+            return None
+
+        marker = self._marker_annotation_value(instruction.annotations)
+        if marker is None:
+            return None
+
+        mode_value = profile.mode & 0xFF
+        operand_value = instruction.operand & 0xFFFF
+        if mode_value not in LITERAL_MARKER_HINTS:
+            return None
+        if operand_value not in LITERAL_MARKER_HINTS:
+            return None
+
+        return (mode_value, operand_value, marker)
+
+    def _marker_annotation_value(self, notes: Sequence[str]) -> Optional[int]:
+        for note in reversed(notes):
+            value = self._parse_literal_marker_annotation(note)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _parse_literal_marker_annotation(note: str) -> Optional[int]:
+        if not note.startswith("op_"):
+            return None
+        parts = note[3:].split("_")
+        if len(parts) != 2:
+            return None
+        try:
+            return int("".join(parts), 16)
+        except ValueError:
+            return None
 
     def _annotate_literal_ssa(self, node: IRLiteral) -> None:
         names = self._ssa_bindings.get(id(node))

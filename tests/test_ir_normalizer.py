@@ -27,6 +27,7 @@ from mbcdisasm.ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
+    IRLiteralBlock,
     IRConditionMask,
     IRIOWrite,
     IRBuildTuple,
@@ -849,6 +850,40 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert constant.data == b"A\x00B\x00\x00C\x00D"
     assert constant.segments == (constant.data,)
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_compacts_literal_marker_clusters(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    words = [
+        build_word(0, 0x67, 0x04, 0x0000),
+        build_word(4, 0x00, 0x67, 0x0400),
+        build_word(8, 0x67, 0x04, 0x0000),
+        build_word(12, 0x00, 0x67, 0x0110),
+        build_word(16, 0x04, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRLiteralBlock)
+    assert node.triplets == (
+        (0x0067, 0x0400, 0x6704),
+        (0x0067, 0x0110, 0x6704),
+    )
+    assert node.reducer == "reduce_pair"
+    assert not any(
+        isinstance(candidate, IRRaw)
+        and candidate.mnemonic in {"op_67_04", "op_00_67"}
+        for candidate in block.nodes
+    )
 
 
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
