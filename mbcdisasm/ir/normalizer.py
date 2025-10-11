@@ -69,6 +69,7 @@ from .model import (
     IRIndirectStore,
     IRIORead,
     IRIOWrite,
+    IRIOFacade,
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
@@ -85,6 +86,7 @@ CALL_PREPARATION_MNEMONICS = {
     "op_02_2A",
     "op_02_F0",
     "op_02_F1",
+    "op_05_F0",
     "op_09_29",
     "op_0A_F1",
     "op_0F_00",
@@ -118,6 +120,9 @@ CALL_CLEANUP_MNEMONICS = {
     "op_10_8C",
     "op_10_DC",
     "op_10_E8",
+    "op_05_F0",
+    "op_10_E4",
+    "op_10_32",
     "op_14_07",
     "op_0C_00",
     "op_0F_00",
@@ -133,6 +138,7 @@ CALL_CLEANUP_MNEMONICS = {
     "op_65_30",
     "op_6C_01",
     "op_C4_06",
+    "op_FD_4A",
     "op_D0_04",
     "op_D0_06",
     "op_D8_04",
@@ -260,6 +266,7 @@ IO_BRIDGE_NODE_TYPES = (
     IRTailcallReturn,
     IRSwitchDispatch,
     IRTailcallFrame,
+    IRIOFacade,
 )
 
 ASCII_NEIGHBOR_NODE_TYPES = (
@@ -280,6 +287,9 @@ STACK_NEUTRAL_CONTROL_KINDS = {
 }
 
 MASK_OPERAND_ALIASES = {"RET_MASK", "IO_SLOT", "FANOUT_FLAGS"}
+IO_HANDSHAKE_EXTRA = {"op_13_00"}
+IO_FACADE_READS = {"op_13_00"}
+CALL_HELPER_ALIAS_MNEMONICS = {"op_10_E4", "op_10_E8", "op_10_32", "op_FD_4A", "op_05_F0"}
 
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
@@ -716,6 +726,7 @@ class IRNormalizer:
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
         self._pass_io_operations(items)
+        self._pass_io_facade(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_opcode_tables(items)
@@ -1811,6 +1822,63 @@ class IRNormalizer:
                 break
         return None
 
+    def _pass_io_facade(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if isinstance(node, IRIOFacade):
+                index += 1
+                continue
+            if not isinstance(node, (IRIORead, IRIOWrite)):
+                index += 1
+                continue
+
+            helper_steps: List[IRStackEffect] = []
+            removal_positions: List[int] = []
+
+            scan = index + 1
+            while scan < len(items):
+                candidate = items[scan]
+                if not isinstance(candidate, IRCallCleanup):
+                    break
+                if not all(step.mnemonic == "call_helpers" for step in candidate.steps):
+                    break
+                helper_steps.extend(candidate.steps)
+                removal_positions.append(scan)
+                scan += 1
+
+            if not helper_steps and index + 1 < len(items):
+                follower = items[index + 1]
+                if isinstance(follower, IRReturn):
+                    extracted = [step for step in follower.cleanup if step.mnemonic == "call_helpers"]
+                    if extracted:
+                        helper_steps.extend(extracted)
+                        remaining_cleanup = tuple(
+                            step for step in follower.cleanup if step.mnemonic != "call_helpers"
+                        )
+                        if len(remaining_cleanup) != len(follower.cleanup):
+                            updated_return = IRReturn(
+                                values=follower.values,
+                                varargs=follower.varargs,
+                                cleanup=remaining_cleanup,
+                            )
+                            self._transfer_ssa(follower, updated_return)
+                            items.replace_slice(index + 1, index + 2, [updated_return])
+
+            if not helper_steps:
+                index += 1
+                continue
+
+            facade = IRIOFacade(io=node, helpers=tuple(helper_steps))
+            self._transfer_ssa(node, facade)
+            for offset, position in enumerate(removal_positions):
+                cleanup = items.pop(position - offset)
+                assert isinstance(cleanup, IRCallCleanup)
+                self._transfer_ssa(cleanup, facade)
+
+            items.replace_slice(index, index + 1, [facade])
+            index += 1
+
     def _is_io_write_candidate(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
         if mnemonic in IO_WRITE_MNEMONICS:
@@ -1826,6 +1894,8 @@ class IRNormalizer:
         allow_prefix: bool = False,
     ) -> Optional[IRNode]:
         mnemonic = instruction.mnemonic
+        if mnemonic in IO_FACADE_READS:
+            return IRIORead(port=IO_PORT_NAME)
         if self._is_io_handshake_instruction(instruction):
             mask = self._io_mask_value(items, index)
             return IRIOWrite(mask=mask, port=IO_PORT_NAME)
@@ -3058,6 +3128,8 @@ class IRNormalizer:
 
     def _is_io_handshake_instruction(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
+        if mnemonic in IO_HANDSHAKE_EXTRA:
+            return self._operand_is_io_slot(instruction.operand)
         return (
             mnemonic.startswith("op_")
             and mnemonic.endswith("_30")
@@ -3976,6 +4048,8 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         pops = 0
+        if mnemonic in CALL_HELPER_ALIAS_MNEMONICS:
+            mnemonic = "call_helpers"
         if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:
             mnemonic = "page_register"
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:

@@ -13,7 +13,7 @@ from typing import Dict
 # which makes it hard to reason about them in isolation.
 RET_MASK = 0x2910
 IO_SLOT = 0x6910
-IO_SLOT_ALIASES = frozenset({IO_SLOT, 0x6901, 0x3069, 0x2961})
+IO_SLOT_ALIASES = frozenset({IO_SLOT, 0x6901, 0x6911, 0x3069, 0x2961})
 IO_PORT_NAME = "io.port_6910"
 PAGE_REGISTER = 0x6C01
 FANOUT_FLAGS_A = 0x2C02
@@ -26,6 +26,7 @@ OPERAND_ALIASES: Dict[int, str] = {
     IO_SLOT: "IO_SLOT",
     0x6901: "IO_SLOT",
     0x3069: "IO_SLOT",
+    0x6911: "IO_SLOT",
     0x2961: "IO_SLOT",
     PAGE_REGISTER: "PAGE_REG",
     FANOUT_FLAGS_A: "FANOUT_FLAGS",

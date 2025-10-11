@@ -97,6 +97,7 @@ class HeuristicEngine:
         features.extend(self._call_features(profiles, following))
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
+        features.extend(self._alias_features(profiles))
         features.extend(self._context_features(previous, following))
 
         confidence = sum(feature.score for feature in features)
@@ -252,6 +253,21 @@ class HeuristicEngine:
                     evidence=(base[0].label, lookup[-1].label),
                 )
             )
+        return features
+
+    def _alias_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        alias_map = {
+            "IO_SLOT": ("io_slot_operand", 0.05),
+            "RET_MASK": ("ret_mask_operand", 0.05),
+            "FANOUT_FLAGS": ("fanout_operand", 0.05),
+        }
+        features: List[LocalFeature] = []
+        for alias, (name, weight) in alias_map.items():
+            hits = [profile for profile in profiles if profile.operand_alias() == alias]
+            if not hits:
+                continue
+            evidence = tuple(profile.label for profile in hits[:3])
+            features.append(LocalFeature(name=name, score=weight * len(hits), evidence=evidence))
         return features
 
     def _context_features(

@@ -681,6 +681,73 @@ class MarkerRunSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, self.base_confidence, notes)
 
 
+class IOFacadeSlotSignature(SignatureRule):
+    """Highlight IO slot facades guarded by helper cleanup scaffolding."""
+
+    name = "io_facade_slot"
+    category = "call"
+    base_confidence = 0.6
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        for index, profile in enumerate(profiles):
+            if profile.label != "13:00":
+                continue
+            if profile.operand not in IO_SLOT_ALIASES:
+                continue
+
+            neighbour_indices = [index - 1, index + 1]
+            helper_nearby = any(
+                0 <= pos < len(profiles) and is_call_helper(profiles[pos])
+                for pos in neighbour_indices
+            )
+            if not helper_nearby:
+                continue
+
+            notes = (
+                f"operand=0x{profile.operand:04X}",
+                f"stackΔ={stack.change:+d}",
+            )
+            return SignatureMatch(self.name, self.category, self.base_confidence, notes)
+        return None
+
+
+class CallHelperScaffoldSignature(SignatureRule):
+    """Detect helper scaffolding sequences centred around ``10:E4`` opcodes."""
+
+    name = "call_helper_scaffold"
+    category = "call"
+    base_confidence = 0.58
+    _context_labels = {"F0:4B", "4A:10", "10:AC"}
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        for profile in profiles:
+            if profile.label != "10:E4":
+                continue
+
+            context_hits = 0
+            for neighbour in profiles:
+                if neighbour is profile:
+                    continue
+                if neighbour.label in self._context_labels or is_call_helper(neighbour):
+                    context_hits += 1
+
+            if context_hits == 0:
+                continue
+
+            notes = (
+                f"helper=0x{profile.operand:04X}",
+                f"context_hits={context_hits}",
+                f"stackΔ={stack.change:+d}",
+            )
+            confidence = min(0.85, self.base_confidence + 0.04 * context_hits)
+            return SignatureMatch(self.name, self.category, confidence, notes)
+        return None
+
+
 class ModeSweepSignature(SignatureRule):
     """Detect uniform mode sweeps used for register initialisation."""
 
@@ -1927,6 +1994,7 @@ class SignatureDetector:
             MarkerFenceReduceSignature(),
             LiteralZeroInitSignature(),
             LiteralRunWithMarkersSignature(),
+            IOFacadeSlotSignature(),
             LiteralMirrorReduceSignature(),
             LiteralReduceChainExSignature(),
             StackLiftPairSignature(),
@@ -1935,6 +2003,7 @@ class SignatureDetector:
             JumpAsciiTailcallSignature(),
             AsciiIndirectTailcallSignature(),
             TailcallPostJumpSignature(),
+            CallHelperScaffoldSignature(),
             TailcallReturnMarkerSignature(),
             TailcallReturnComboSignature(),
             TailcallReturnIndirectSignature(),

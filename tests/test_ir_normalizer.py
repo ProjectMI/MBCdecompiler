@@ -36,6 +36,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
+    IRIOFacade,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1021,6 +1022,33 @@ def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_builds_io_facade_with_call_helpers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x10, 0x00, 0x3E4B),
+        build_word(4, 0x13, 0x00, 0x3069),
+        build_word(8, 0x10, 0xE4, 0x0100),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    facade = next(node for node in block.nodes if isinstance(node, IRIOFacade))
+    assert isinstance(facade.io, (IRIORead, IRIOWrite))
+    helper_mnemonics = [step.mnemonic for step in facade.helpers]
+    helper_operands = [step.operand for step in facade.helpers]
+    assert helper_mnemonics == ["call_helpers"]
+    assert helper_operands == [0x0100]
+
+
 def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1039,6 +1067,59 @@ def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     assert isinstance(node, IRConditionMask)
     assert node.source == "op_29_10"
     assert node.mask == RET_MASK
+
+
+def test_normalizer_consumes_helper_variants(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    # op_10_32 attaches to cleanup as call_helpers
+    words = [
+        build_word(0, 0x10, 0x32, 0x2C03),
+        build_word(4, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+    block = IRNormalizer(knowledge).normalise_container(container).segments[0].blocks[0]
+    ret_node = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert any(step.mnemonic == "call_helpers" and step.operand == 0x2C03 for step in ret_node.cleanup)
+    assert not any(isinstance(node, IRRaw) and node.mnemonic == "op_10_32" for node in block.nodes)
+
+    # op_FD_4A folded into return cleanup
+    words = [
+        build_word(0, 0xFD, 0x4A, 0x9D01),
+        build_word(4, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    block = IRNormalizer(knowledge).normalise_container(MbcContainer(Path("dummy"), [segment])).segments[0].blocks[0]
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert any(step.mnemonic == "call_helpers" for step in ret.cleanup)
+    assert not any(isinstance(node, IRRaw) and node.mnemonic == "op_FD_4A" for node in block.nodes)
+
+    # op_05_F0 recognised as call preparation
+    words = [
+        build_word(0, 0x05, 0xF0, 0x4B76),
+        build_word(4, 0x28, 0x00, 0x1234),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    block = IRNormalizer(knowledge).normalise_container(MbcContainer(Path("dummy"), [segment])).segments[0].blocks[0]
+    assert not any(isinstance(node, IRRaw) and node.mnemonic == "op_05_F0" for node in block.nodes)
+
+    # op_3D_30 with extended IO slot aliases converts to IO write
+    words = [
+        build_word(0, 0x3D, 0x30, 0x6911),
+        build_word(4, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    segment = Segment(SegmentDescriptor(0, 0, len(data)), data)
+    block = IRNormalizer(knowledge).normalise_container(MbcContainer(Path("dummy"), [segment])).segments[0].blocks[0]
+    write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
+    assert write.port == IO_PORT_NAME
+    assert not any(isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes)
 
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:

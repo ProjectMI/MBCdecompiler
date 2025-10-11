@@ -576,6 +576,21 @@ class IRIOWrite(IRNode):
 
 
 @dataclass(frozen=True)
+class IRIOFacade(IRNode):
+    """Wrapper that combines an IO access with helper cleanup scaffolding."""
+
+    io: IRNode
+    helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        base = getattr(self.io, "describe", lambda: "io?")()
+        if not self.helpers:
+            return f"io.facade[{base}]"
+        rendered = ", ".join(step.describe() for step in self.helpers)
+        return f"io.facade[{base} helpers=[{rendered}]]"
+
+
+@dataclass(frozen=True)
 class IRStackDuplicate(IRNode):
     """Duplicate the value currently at the top of the VM stack."""
 
@@ -1033,6 +1048,7 @@ __all__ = [
     "IRIndirectStore",
     "IRIORead",
     "IRIOWrite",
+    "IRIOFacade",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRPageRegister",

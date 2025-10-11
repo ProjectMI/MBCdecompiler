@@ -43,6 +43,7 @@ from .model import (
     IRConditionMask,
     IRIORead,
     IRIOWrite,
+    IRIOFacade,
     MemSpace,
     NormalizerMetrics,
 )
@@ -78,6 +79,7 @@ __all__ = [
     "IRStore",
     "IRIORead",
     "IRIOWrite",
+    "IRIOFacade",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRPageRegister",
