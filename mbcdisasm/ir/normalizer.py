@@ -724,6 +724,7 @@ class IRNormalizer:
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
+        self._pass_tail_dispatch(items)
         self._pass_literals(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
@@ -1237,6 +1238,132 @@ class IRNormalizer:
             items.replace_slice(start, removal_end, [combined])
             metrics.reduce_replaced += len(reducers)
             index = start + 1
+
+    def _pass_tail_dispatch(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, RawInstruction) or node.mnemonic != "tailcall_dispatch":
+                index += 1
+                continue
+
+            helper = node.operand & 0xFFFF
+            if helper not in {0x1929, 0x1729}:
+                index += 1
+                continue
+
+            matched, end_index, cases = self._collect_tail_dispatch_cases(items, index)
+            if not matched or not cases:
+                index += 1
+                continue
+
+            helper_symbol = self.knowledge.lookup_address(helper)
+            dispatch = IRSwitchDispatch(
+                cases=tuple(cases),
+                helper=helper,
+                helper_symbol=helper_symbol,
+                default=None,
+            )
+            items.replace_slice(index, end_index, [dispatch])
+            index += 1
+
+    def _collect_tail_dispatch_cases(
+        self, items: _ItemList, start_index: int
+    ) -> Tuple[bool, int, List[IRDispatchCase]]:
+        index = start_index
+        helper_target = cast(RawInstruction, items[start_index]).operand & 0xFFFF
+        end_index = index
+        cases: List[IRDispatchCase] = []
+
+        while True:
+            match = self._match_tail_dispatch_case(items, index)
+            if match is None:
+                break
+
+            case_target, case_index = match
+            symbol = self.knowledge.lookup_address(case_target)
+            key = (case_target >> 8) & 0xFF
+            cases.append(IRDispatchCase(key=key, target=case_target, symbol=symbol))
+
+            end_index = case_index
+            index = case_index
+            if index >= len(items):
+                break
+            next_node = items[index]
+            if (
+                isinstance(next_node, RawInstruction)
+                and next_node.mnemonic == "tailcall_dispatch"
+                and next_node.operand & 0xFFFF in {0x1929, 0x1729}
+            ):
+                helper_target = next_node.operand & 0xFFFF
+                continue
+            break
+
+        return (helper_target in {0x1929, 0x1729}, end_index, cases)
+
+    def _match_tail_dispatch_case(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[int, int]]:
+        sequence = []
+        for offset in range(9):
+            position = index + offset
+            if position >= len(items):
+                return None
+            sequence.append(items[position])
+
+        helper_node = sequence[0]
+        if not (
+            isinstance(helper_node, RawInstruction)
+            and helper_node.mnemonic == "tailcall_dispatch"
+            and helper_node.operand & 0xFFFF in {0x1929, 0x1729}
+        ):
+            return None
+
+        def _is_mnemonic(node: object, expected: str, allowed: Optional[Set[str]] = None) -> bool:
+            if not isinstance(node, RawInstruction):
+                return False
+            mnemonic = node.mnemonic
+            if allowed is not None:
+                return mnemonic in allowed
+            return mnemonic == expected
+
+        if not _is_mnemonic(sequence[1], "op_10_18"):
+            return None
+        if not _is_mnemonic(sequence[2], "op_04_88", {"op_04_88", "op_20_96"}):
+            return None
+
+        case_node = sequence[3]
+        if not (
+            isinstance(case_node, RawInstruction)
+            and case_node.mnemonic == "tailcall_dispatch"
+        ):
+            return None
+        case_target = case_node.operand & 0xFFFF
+        if case_target & 0xFF != 0x2C:
+            return None
+        if case_target in {0x1929, 0x1729}:
+            return None
+
+        if not _is_mnemonic(sequence[4], "op_03_66"):
+            return None
+        if not _is_mnemonic(sequence[5], "op_10_70"):
+            return None
+
+        if not _is_mnemonic(sequence[6], "push_literal", {"push_literal", "op_01_29", "op_00_29"}):
+            return None
+
+        post_helper = sequence[7]
+        if not (
+            isinstance(post_helper, RawInstruction)
+            and post_helper.mnemonic == "tailcall_dispatch"
+            and post_helper.operand & 0xFFFF == 0x002C
+        ):
+            return None
+
+        if not _is_mnemonic(sequence[8], "op_06_66"):
+            return None
+
+        return case_target, index + 9
 
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int

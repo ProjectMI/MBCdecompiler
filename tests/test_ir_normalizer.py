@@ -161,7 +161,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": -1,
         },
         "tailcall_dispatch": {
-            "opcodes": ["0x2B:0x00"],
+            "opcodes": ["0x2B:0x00", "0x2B:0x10"],
             "name": "tailcall_dispatch",
             "category": "call_dispatch",
             "stack_delta": -1,
@@ -1511,6 +1511,48 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     return_node = block.nodes[2]
     assert isinstance(return_node, IRReturn)
     assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
+
+
+def test_normalizer_builds_tail_dispatch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2B, 0x10, 0x1929),
+        build_word(4, 0x10, 0x18, 0x6910),
+        build_word(8, 0x04, 0x88, 0x0000),
+        build_word(12, 0x2B, 0x10, 0x192C),
+        build_word(16, 0x03, 0x66, 0x0A29),
+        build_word(20, 0x10, 0x70, 0x2910),
+        build_word(24, 0x00, 0x29, 0x1000),
+        build_word(28, 0x2B, 0x00, 0x002C),
+        build_word(32, 0x06, 0x66, 0x0A30),
+        build_word(36, 0x2B, 0x10, 0x1929),
+        build_word(40, 0x10, 0x18, 0x6910),
+        build_word(44, 0x04, 0x88, 0x0000),
+        build_word(48, 0x2B, 0x10, 0x1A2C),
+        build_word(52, 0x03, 0x66, 0x0A29),
+        build_word(56, 0x10, 0x70, 0x2910),
+        build_word(60, 0x00, 0x29, 0x1000),
+        build_word(64, 0x2B, 0x00, 0x002C),
+        build_word(68, 0x06, 0x66, 0x0A30),
+        build_word(72, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    keys = {case.key for case in dispatch.cases}
+    targets = {case.target for case in dispatch.cases}
+
+    assert keys == {0x19, 0x1A}
+    assert targets == {0x192C, 0x1A2C}
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
