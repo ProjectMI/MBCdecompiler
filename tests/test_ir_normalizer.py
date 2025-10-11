@@ -15,6 +15,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -1511,6 +1512,83 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     return_node = block.nodes[2]
     assert isinstance(return_node, IRReturn)
     assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
+
+
+def test_normalizer_coalesces_tail_dispatch_literals() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    literal_a = IRLiteral(value=0x1001, mode=0, source="seed")
+    call_a = IRCall(target=0x0100, args=("lit(0x1001)",), tail=True)
+    literal_b = IRLiteral(value=0x1002, mode=0, source="seed")
+    call_b = IRCall(target=0x0200, args=("lit(0x1002)",), tail=True)
+
+    items = _ItemList([literal_a, call_a, literal_b, call_b])
+    normalizer._pass_tail_dispatchers(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    dispatch = nodes[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.selector == "lit(0x1001)"
+    assert {case.key for case in dispatch.cases} == {0x01, 0x02}
+    assert {case.target for case in dispatch.cases} == {0x0100, 0x0200}
+    assert dispatch.default is None
+
+
+def test_normalizer_coalesces_tail_dispatch_run() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    word = InstructionWord(offset=0, raw=(0x30 << 24) | (0x29 << 16) | 0x0001)
+    profile = InstructionProfile(
+        word=word,
+        info=None,
+        mnemonic="return_values",
+        summary=None,
+        category=None,
+        control_flow=None,
+        stack_hint=StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=1.0),
+        kind=InstructionKind.RETURN,
+        traits={},
+    )
+    event = StackEvent(
+        profile=profile,
+        delta=0,
+        minimum=0,
+        maximum=0,
+        confidence=1.0,
+        depth_before=0,
+        depth_after=0,
+        kind=InstructionKind.RETURN,
+    )
+    return_hint = RawInstruction(
+        profile=profile,
+        event=event,
+        annotations=tuple(),
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+    literal_a = IRLiteral(value=0x1000, mode=0, source="seed")
+    call_a = IRCall(target=0x0100, args=("lit(0x1000)",), tail=True)
+    literal_b = IRLiteral(value=0x1001, mode=0, source="seed")
+    call_b = IRCall(target=0x0200, args=("lit(0x1001)",), tail=True)
+    call_default = IRCall(target=0x0300, args=tuple(), tail=True)
+
+    items = _ItemList([return_hint, literal_a, call_a, literal_b, call_b, call_default])
+    raw_before = sum(isinstance(node, RawInstruction) for node in items)
+
+    normalizer._pass_tail_dispatchers(items)
+
+    nodes = items.to_tuple()
+    assert len(nodes) == 1
+    dispatch = nodes[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.selector == "lit(0x1000)"
+    assert {case.key for case in dispatch.cases} == {0x00, 0x01}
+    assert dispatch.default == 0x0300
+    raw_after = sum(isinstance(node, RawInstruction) for node in items)
+    assert raw_after < raw_before
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:

@@ -519,6 +519,7 @@ class IRNormalizer:
         "op_2C_46",
         "op_2B_47",
     }
+    _DISPATCH_HELPER_TARGETS = {0x6623, 0x6624}
     _TABLE_PATCH_EXTRA_MNEMONICS = {
         "fanout": None,
         "stack_teardown_4": None,
@@ -740,6 +741,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_io_facade(items)
         self._pass_call_conventions(items)
+        self._pass_tail_dispatchers(items)
         self._pass_tailcall_frames(items)
         self._pass_opcode_tables(items)
         self._pass_table_patches(items)
@@ -2354,6 +2356,20 @@ class IRNormalizer:
             items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
             index += 1
 
+    def _resolve_dispatch_helper(
+        self, items: _ItemList, start: int
+    ) -> Tuple[Optional[int], Optional[str]]:
+        follow = start
+        while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
+            follow += 1
+        if follow < len(items):
+            candidate = items[follow]
+            if isinstance(candidate, CallLike):
+                target = getattr(candidate, "target", None)
+                if isinstance(target, int) and target in self._DISPATCH_HELPER_TARGETS:
+                    return target, self.knowledge.lookup_address(target)
+        return None, None
+
     def _pass_table_dispatch(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -2362,18 +2378,7 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            helper_target: Optional[int] = None
-            helper_symbol: Optional[str] = None
-            follow = index + 1
-            while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
-                follow += 1
-            if follow < len(items):
-                candidate = items[follow]
-                if isinstance(candidate, CallLike):
-                    target = getattr(candidate, "target", None)
-                    if isinstance(target, int) and target in {0x6623, 0x6624}:
-                        helper_target = target
-                        helper_symbol = self.knowledge.lookup_address(target)
+            helper_target, helper_symbol = self._resolve_dispatch_helper(items, index + 1)
 
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
@@ -2382,12 +2387,187 @@ class IRNormalizer:
 
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
+                selector=None,
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
+
+    def _pass_tail_dispatchers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not self._is_tail_dispatch_node(node):
+                index += 1
+                continue
+
+            series_start = index
+            while series_start > 0:
+                prefix = items[series_start - 1]
+                if not self._is_tail_dispatch_prefix(prefix):
+                    break
+                series_start -= 1
+
+            scan = index
+            call_positions: List[int] = []
+            series_end = index
+            while scan < len(items):
+                candidate = items[scan]
+                if self._is_tail_dispatch_node(candidate):
+                    call_positions.append(scan)
+                    scan += 1
+                    series_end = scan
+                    continue
+                if self._is_tail_dispatch_safe(candidate):
+                    scan += 1
+                    series_end = scan
+                    continue
+                break
+
+            if len(call_positions) < 2:
+                index += 1
+                continue
+
+            used_sources: Set[int] = set()
+            cases: Dict[int, IRDispatchCase] = {}
+            default_target: Optional[int] = None
+            valid = True
+
+            for position in call_positions:
+                call_node = items[position]
+                target = getattr(call_node, "target", None)
+                symbol = getattr(call_node, "symbol", None)
+                if isinstance(call_node, IRTailCall):
+                    target = call_node.target
+                    symbol = call_node.symbol
+                if not isinstance(target, int):
+                    valid = False
+                    break
+
+                key, source_index = self._extract_tail_dispatch_key(
+                    items, position, series_start, used_sources
+                )
+                if key is None:
+                    if default_target is not None:
+                        valid = False
+                        break
+                    default_target = target
+                else:
+                    if key in cases:
+                        valid = False
+                        break
+                    cases[key] = IRDispatchCase(
+                        key=key,
+                        target=target,
+                        symbol=symbol,
+                    )
+                    if source_index is not None:
+                        used_sources.add(source_index)
+
+            if not valid:
+                index += 1
+                continue
+
+            total_options = len(cases) + (1 if default_target is not None else 0)
+            if total_options < 2:
+                index += 1
+                continue
+
+            helper_target, helper_symbol = self._resolve_dispatch_helper(items, series_end)
+            selector = self._tail_dispatch_selector(items[call_positions[0]])
+
+            for position in range(series_start, series_end):
+                self._ssa_bindings.pop(id(items[position]), None)
+
+            dispatch = IRSwitchDispatch(
+                cases=tuple(sorted(cases.values(), key=lambda entry: entry.key)),
+                selector=selector,
+                helper=helper_target,
+                helper_symbol=helper_symbol,
+                default=default_target,
+            )
+            items.replace_slice(series_start, series_end, [dispatch])
+            index = series_start + 1
+
+    def _is_tail_dispatch_node(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, IRTailCall):
+            return True
+        if isinstance(node, IRCall) and node.tail:
+            return True
+        return False
+
+    def _is_tail_dispatch_prefix(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, IRLiteral) and (node.value & 0xFF00) == 0x1000:
+            return True
+        if isinstance(node, RawInstruction):
+            return (
+                node.mnemonic == "return_values"
+                and node.profile.mode in RETURN_NIBBLE_MODES
+            )
+        if isinstance(node, (IRCallCleanup, IRCallPreparation, IRConditionMask, IRStackDuplicate)):
+            return True
+        if isinstance(node, IRLiteralChunk):
+            return True
+        return False
+
+    def _is_tail_dispatch_safe(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, IRLiteral) and (node.value & 0xFF00) == 0x1000:
+            return True
+        if isinstance(node, RawInstruction):
+            return (
+                node.mnemonic == "return_values"
+                and node.profile.mode in RETURN_NIBBLE_MODES
+            )
+        if isinstance(node, (IRCallCleanup, IRCallPreparation, IRConditionMask, IRStackDuplicate, IRLiteralChunk)):
+            return True
+        return False
+
+    def _extract_tail_dispatch_key(
+        self,
+        items: _ItemList,
+        call_index: int,
+        start: int,
+        used_sources: Set[int],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        scan = call_index - 1
+        while scan >= start:
+            if scan in used_sources:
+                scan -= 1
+                continue
+            candidate = items[scan]
+            if isinstance(candidate, IRLiteral):
+                if (candidate.value & 0xFF00) == 0x1000:
+                    return candidate.value & 0x00FF, scan
+                scan -= 1
+                continue
+            if isinstance(candidate, RawInstruction):
+                if (
+                    candidate.mnemonic == "return_values"
+                    and candidate.profile.mode in RETURN_NIBBLE_MODES
+                ):
+                    return candidate.operand & 0x0F, scan
+                break
+            if self._is_tail_dispatch_node(candidate):
+                break
+            if isinstance(
+                candidate,
+                (IRCallCleanup, IRCallPreparation, IRConditionMask, IRStackDuplicate, IRLiteralChunk),
+            ):
+                scan -= 1
+                continue
+            scan -= 1
+        return None, None
+
+    def _tail_dispatch_selector(self, node: Union[IRCall, IRTailCall]) -> Optional[str]:
+        if isinstance(node, IRTailCall):
+            call = node.call
+        else:
+            call = node
+        if isinstance(call, IRCall) and call.args:
+            return call.args[0]
+        return None
 
     def _pass_dispatch_wrappers(self, items: _ItemList) -> None:
         index = 0

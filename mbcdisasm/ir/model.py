@@ -707,6 +707,7 @@ class IRSwitchDispatch(IRNode):
     """High level representation of dispatch helper tables."""
 
     cases: Tuple[IRDispatchCase, ...]
+    selector: Optional[str] = None
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
@@ -719,7 +720,11 @@ class IRSwitchDispatch(IRNode):
                 helper_repr = f"{self.helper_symbol}({helper_repr})"
             helper_details = f"helper={helper_repr}"
         case_text = ", ".join(case.describe() for case in self.cases)
-        description = f"dispatch {helper_details} cases=[{case_text}]"
+        parts = []
+        if self.selector:
+            parts.append(f"selector={self.selector}")
+        parts.append(helper_details)
+        description = f"dispatch {' '.join(parts)} cases=[{case_text}]"
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"
