@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
@@ -1367,70 +1368,74 @@ class IRNormalizer:
 
     def _pass_aggregates(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
-        while index < len(items):
-            literal = self._literal_at(items, index)
-            if literal is None:
-                index += 1
-                continue
-
-            literal_nodes: List[IRLiteral] = [literal]
-            reducers: List[RawInstruction] = []
-            spacers: List[RawInstruction] = []
-            scan = index + 1
-            added_literal_since_reduce = True
-
-            while scan < len(items):
-                candidate_literal = self._literal_at(items, scan)
-                if candidate_literal is not None:
-                    literal_nodes.append(candidate_literal)
-                    scan += 1
-                    added_literal_since_reduce = True
+        with ThreadPoolExecutor() as executor:
+            while index < len(items):
+                literal = self._literal_at(items, index)
+                if literal is None:
+                    index += 1
                     continue
 
-                candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
-                    spacers.append(candidate)
-                    scan += 1
-                    continue
+                literal_nodes: List[IRLiteral] = [literal]
+                reducers: List[RawInstruction] = []
+                spacers: List[RawInstruction] = []
+                scan = index + 1
+                added_literal_since_reduce = True
 
-                if isinstance(candidate, RawInstruction) and candidate.mnemonic.startswith("reduce"):
-                    if not added_literal_since_reduce:
-                        self._annotation_offsets.add(candidate.offset)
+                while scan < len(items):
+                    candidate_literal = self._literal_at(items, scan)
+                    if candidate_literal is not None:
+                        literal_nodes.append(candidate_literal)
+                        scan += 1
+                        added_literal_since_reduce = True
+                        continue
+
+                    candidate = items[scan]
+                    if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
                         spacers.append(candidate)
                         scan += 1
                         continue
-                    reducers.append(candidate)
-                    scan += 1
-                    added_literal_since_reduce = False
+
+                    if isinstance(candidate, RawInstruction) and candidate.mnemonic.startswith("reduce"):
+                        if not added_literal_since_reduce:
+                            self._annotation_offsets.add(candidate.offset)
+                            spacers.append(candidate)
+                            scan += 1
+                            continue
+                        reducers.append(candidate)
+                        scan += 1
+                        added_literal_since_reduce = False
+                        continue
+
+                    break
+
+                if not reducers:
+                    index += 1
                     continue
 
-                break
+                if len(literal_nodes) == 1:
+                    literals = [self._literal_repr(literal_nodes[0])]
+                else:
+                    literals = list(executor.map(self._literal_repr, literal_nodes))
+                replacement: IRNode
+                if len(literals) >= 2 and len(literals) == 2 * len(reducers):
+                    entries = []
+                    for pos in range(0, len(literals), 2):
+                        entries.append((literals[pos], literals[pos + 1]))
+                    replacement = IRBuildMap(entries=tuple(entries))
+                elif len(literals) == len(reducers) + 1:
+                    replacement = IRBuildArray(elements=tuple(literals))
+                else:
+                    replacement = IRBuildTuple(elements=tuple(literals))
 
-            if not reducers:
+                metrics.aggregates += 1
+                metrics.reduce_replaced += len(reducers)
+                replacement_sequence: List[Union[RawInstruction, IRNode]] = [replacement]
+                if reducers:
+                    self._transfer_ssa(reducers[-1], replacement)
+                if spacers:
+                    replacement_sequence.extend(spacers)
+                items.replace_slice(index, scan, replacement_sequence)
                 index += 1
-                continue
-
-            literals = [self._literal_repr(node) for node in literal_nodes]
-            replacement: IRNode
-            if len(literals) >= 2 and len(literals) == 2 * len(reducers):
-                entries = []
-                for pos in range(0, len(literals), 2):
-                    entries.append((literals[pos], literals[pos + 1]))
-                replacement = IRBuildMap(entries=tuple(entries))
-            elif len(literals) == len(reducers) + 1:
-                replacement = IRBuildArray(elements=tuple(literals))
-            else:
-                replacement = IRBuildTuple(elements=tuple(literals))
-
-            metrics.aggregates += 1
-            metrics.reduce_replaced += len(reducers)
-            replacement_sequence: List[Union[RawInstruction, IRNode]] = [replacement]
-            if reducers:
-                self._transfer_ssa(reducers[-1], replacement)
-            if spacers:
-                replacement_sequence.extend(spacers)
-            items.replace_slice(index, scan, replacement_sequence)
-            index += 1
 
     def _pass_literal_blocks(self, items: _ItemList) -> None:
         index = 0
