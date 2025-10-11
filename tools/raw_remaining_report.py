@@ -13,7 +13,8 @@ from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 def iter_script_pairs(root: Path) -> list[tuple[Path, Path]]:
     adb_stems = {path.stem for path in root.glob("*.adb")}
     mbc_stems = {path.stem for path in root.glob("*.mbc")}
-    common = sorted(adb_stems & mbc_stems)
+    excluded_stems = {"_main"}
+    common = sorted(stem for stem in adb_stems & mbc_stems if stem not in excluded_stems)
     return [(root / f"{stem}.adb", root / f"{stem}.mbc") for stem in common]
 
 
