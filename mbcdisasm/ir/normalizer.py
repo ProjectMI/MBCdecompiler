@@ -162,9 +162,28 @@ TAILCALL_HELPERS = {
     0x01EC,
     0x01F1,
     0x032C,
+    0x002C,
+    0x003C,
+    0x022C,
+    0x022F,
+    0x0C2C,
+    0x102B,
+    0x1729,
+    0x1929,
+    0x1A2C,
+    0x402B,
     0x0BF0,
     0x0FF0,
     0x16F0,
+}
+
+TAIL_CLUSTER_CLEANUP_MNEMONICS = {
+    "call_helpers",
+    "op_01_29",
+    "op_01_2C",
+    "op_01_3D",
+    "op_01_66",
+    "op_06_66",
 }
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
@@ -747,6 +766,7 @@ class IRNormalizer:
         self._pass_dispatch_wrappers(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
+        self._pass_fold_tailcall_clusters(items)
         self._pass_tailcall_returns(items)
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
@@ -2745,6 +2765,102 @@ class IRNormalizer:
 
             index += 1
 
+    def _pass_fold_tailcall_clusters(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not self._is_tail_dispatch_call(node):
+                index += 1
+                continue
+
+            scan = index + 1
+            tail_nodes: List[CallLike] = [cast(CallLike, node)]
+            while scan < len(items):
+                candidate = items[scan]
+                if self._is_tail_dispatch_call(candidate):
+                    tail_nodes.append(cast(CallLike, candidate))
+                    scan += 1
+                    continue
+                if self._is_tail_cluster_bridge(candidate):
+                    scan += 1
+                    continue
+                break
+
+            if len(tail_nodes) <= 1:
+                index += 1
+                continue
+
+            cleanup_steps: List[IRStackEffect] = []
+
+            prefix = index - 1
+            while prefix >= 0:
+                candidate = items[prefix]
+                if isinstance(candidate, IRCallCleanup) and self._is_tail_cluster_cleanup(candidate.steps):
+                    cleanup_steps = list(candidate.steps) + cleanup_steps
+                    items.pop(prefix)
+                    index -= 1
+                    scan -= 1
+                    tail_nodes = self._refresh_tail_nodes(items, tail_nodes)
+                    prefix -= 1
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_tail_cluster_cleanup_instruction(candidate):
+                    cleanup_steps.insert(0, self._call_cleanup_effect(candidate))
+                    items.pop(prefix)
+                    index -= 1
+                    scan -= 1
+                    tail_nodes = self._refresh_tail_nodes(items, tail_nodes)
+                    prefix -= 1
+                    continue
+                break
+
+            position = index + 1
+            while position < scan:
+                candidate = items[position]
+                if isinstance(candidate, IRCallCleanup) and self._is_tail_cluster_cleanup(candidate.steps):
+                    cleanup_steps.extend(candidate.steps)
+                    items.pop(position)
+                    scan -= 1
+                    tail_nodes = self._refresh_tail_nodes(items, tail_nodes)
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_tail_cluster_cleanup_instruction(candidate):
+                    cleanup_steps.append(self._call_cleanup_effect(candidate))
+                    items.pop(position)
+                    scan -= 1
+                    tail_nodes = self._refresh_tail_nodes(items, tail_nodes)
+                    continue
+                position += 1
+
+            suffix = scan
+            while suffix < len(items):
+                candidate = items[suffix]
+                if isinstance(candidate, IRCallCleanup) and self._is_tail_cluster_cleanup(candidate.steps):
+                    cleanup_steps.extend(candidate.steps)
+                    items.pop(suffix)
+                    tail_nodes = self._refresh_tail_nodes(items, tail_nodes)
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_tail_cluster_cleanup_instruction(candidate):
+                    cleanup_steps.append(self._call_cleanup_effect(candidate))
+                    items.pop(suffix)
+                    tail_nodes = self._refresh_tail_nodes(items, tail_nodes)
+                    continue
+                break
+
+            cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+            cleanup_mask = self._extract_cleanup_mask(cleanup_steps) if cleanup_steps else None
+            extra_cleanup = tuple(cleanup_steps)
+
+            for tail_node in tail_nodes:
+                node_index = self._find_item_index(items, tail_node)
+                if node_index is None:
+                    continue
+                updated = self._call_with_extra_cleanup(tail_node, extra_cleanup, cleanup_mask)
+                if updated is tail_node:
+                    continue
+                self._transfer_ssa(tail_node, updated)
+                items.replace_slice(node_index, node_index + 1, [updated])
+
+            index = scan
+
     def _pass_tailcall_returns(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -3641,6 +3757,160 @@ class IRNormalizer:
             )
 
         return node
+
+    def _call_with_extra_cleanup(
+        self,
+        node: CallLike,
+        extra: Tuple[IRStackEffect, ...],
+        cleanup_mask: Optional[int],
+    ) -> CallLike:
+        if not extra and cleanup_mask is None:
+            return node
+
+        existing_cleanup = tuple(getattr(node, "cleanup", tuple()))
+        combined_cleanup = extra + existing_cleanup if extra else existing_cleanup
+        existing_mask = getattr(node, "cleanup_mask", None)
+        mask = existing_mask or cleanup_mask
+
+        if isinstance(node, IRCall):
+            return IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=mask,
+                cleanup=combined_cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+
+        if isinstance(node, IRCallReturn):
+            return IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=combined_cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=mask,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+
+        if isinstance(node, IRTailCall):
+            inner_cleanup = node.call.cleanup
+            updated_call = IRCall(
+                target=node.target,
+                args=node.args,
+                tail=True,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=node.call.cleanup_mask,
+                cleanup=inner_cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+            combined = extra + tuple(node.cleanup) if extra else tuple(node.cleanup)
+            return IRTailCall(
+                call=updated_call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=combined,
+                cleanup_mask=mask or node.cleanup_mask,
+            )
+
+        if isinstance(node, IRTailcallReturn):
+            combined = extra + node.cleanup if extra else node.cleanup
+            return IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=combined,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup_mask=mask or node.cleanup_mask,
+                symbol=node.symbol,
+                predicate=node.predicate,
+            )
+
+        return node
+
+    def _refresh_tail_nodes(
+        self, items: _ItemList, nodes: Sequence[CallLike]
+    ) -> List[CallLike]:
+        refreshed: List[CallLike] = []
+        seen: Set[int] = set()
+        for node in nodes:
+            index = self._find_item_index(items, node)
+            if index is None:
+                continue
+            identity = id(items[index])
+            if identity in seen:
+                continue
+            refreshed.append(cast(CallLike, items[index]))
+            seen.add(identity)
+        return refreshed
+
+    def _find_item_index(
+        self, items: _ItemList, target: Union[RawInstruction, IRNode]
+    ) -> Optional[int]:
+        for position in range(len(items)):
+            if items[position] is target:
+                return position
+        return None
+
+    def _is_tail_dispatch_call(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(node, CallLike):
+            return False
+        if not getattr(node, "tail", False):
+            return False
+        target = getattr(node, "target", None)
+        symbol = getattr(node, "symbol", None)
+        if isinstance(target, int) and target in TAILCALL_HELPERS:
+            return True
+        if symbol and str(symbol).startswith("tail_helper"):
+            return True
+        if symbol == "io.write":
+            return True
+        return False
+
+    def _is_tail_cluster_bridge(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(
+            node,
+            (
+                IRCallCleanup,
+                IRConditionMask,
+                IRReturn,
+                IRLiteral,
+                IRLiteralChunk,
+                IRAsciiFinalize,
+                IRAsciiPreamble,
+                IRIORead,
+                IRIOWrite,
+                IRLoad,
+                IRStore,
+                IRStackDrop,
+                IRStackDuplicate,
+            ),
+        ):
+            return True
+        if isinstance(node, RawInstruction) and self._is_tail_cluster_cleanup_instruction(node):
+            return True
+        return False
+
+    def _is_tail_cluster_cleanup(self, steps: Sequence[IRStackEffect]) -> bool:
+        if not steps:
+            return False
+        return all(step.mnemonic in TAIL_CLUSTER_CLEANUP_MNEMONICS for step in steps)
+
+    def _is_tail_cluster_cleanup_instruction(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        return mnemonic in TAIL_CLUSTER_CLEANUP_MNEMONICS
 
     def _pass_call_contracts(self, items: _ItemList) -> None:
         index = 0

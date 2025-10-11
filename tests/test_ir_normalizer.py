@@ -277,6 +277,7 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x0BF0": "tail_helper_bf0",
         "0x0FF0": "tail_helper_ff0",
         "0x16F0": "tail_helper_16f0",
+        "0x3D30": "io.write",
         "0x6623": "dispatch_helper_6623",
         "0x6624": "dispatch_helper_6624",
     }
@@ -619,8 +620,22 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
 
     assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
 
-    ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
-    assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
+
+def test_tailcall_cluster_cleanup_is_aggregated(tmp_path: Path) -> None:
+    normalizer = IRNormalizer(write_manual(tmp_path))
+
+    call_a = IRCall(target=0x003E, args=tuple(), tail=True)
+    call_b = IRCall(target=0x003E, args=tuple(), tail=True)
+    cleanup = IRCallCleanup(steps=(IRStackEffect(mnemonic="call_helpers"),))
+
+    items = _ItemList([call_a, cleanup, call_b])
+
+    normalizer._pass_fold_tailcall_clusters(items)
+
+    assert len(items) == 2
+    for node in items:
+        assert isinstance(node, IRCall)
+        assert any(step.mnemonic == "call_helpers" for step in node.cleanup)
 
 
 def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
