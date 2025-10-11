@@ -1407,7 +1407,9 @@ class IRNormalizer:
                 break
 
             if not reducers:
-                index += 1
+                # Skip past the scanned literal run to avoid rescanning it for
+                # each literal entry when no reducers were discovered.
+                index = scan
                 continue
 
             literals = [self._literal_repr(node) for node in literal_nodes]
