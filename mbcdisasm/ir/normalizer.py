@@ -739,6 +739,7 @@ class IRNormalizer:
         self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
         self._pass_table_builders(items)
+        self._compact_prologue_markers(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_headers(items)
@@ -748,6 +749,7 @@ class IRNormalizer:
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
+        self._compact_epilogue_markers(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
 
@@ -2577,6 +2579,107 @@ class IRNormalizer:
 
             state = None
             index += 1
+
+    _EPILOGUE_MARKERS = {"op_02_00", "op_06_00", "op_E4_06"}
+    _PROLOGUE_MARKERS = {"op_06_00"}
+    _EPILOGUE_PREFIX_TYPES = (
+        IRCallCleanup,
+        IRConditionMask,
+        IRLiteral,
+        IRLiteralChunk,
+        IRStringConstant,
+    )
+
+    def _compact_epilogue_markers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            terminator = items[index]
+            if not isinstance(terminator, (IRReturn, IRTailCall)):
+                index += 1
+                continue
+
+            collected: List[RawInstruction] = []
+            removal_indices: List[int] = []
+            scan = index - 1
+            while scan >= 0:
+                node = items[scan]
+                if isinstance(node, RawInstruction):
+                    if node.mnemonic not in self._EPILOGUE_MARKERS:
+                        break
+                    collected.append(node)
+                    removal_indices.append(scan)
+                    scan -= 1
+                    continue
+                if isinstance(node, self._EPILOGUE_PREFIX_TYPES):
+                    scan -= 1
+                    continue
+                break
+
+            if not collected:
+                index += 1
+                continue
+
+            effects: List[IRStackEffect] = []
+            for raw in reversed(collected):
+                # Preserve the stack semantics captured by the tracker when
+                # folding the raw instruction into the structured terminator.
+                effect = self._call_cleanup_effect(raw)
+                if effect is not None:
+                    effects.append(effect)
+                self._transfer_ssa(raw, terminator)
+
+            for position in reversed(removal_indices):
+                items.pop(position)
+                index -= 1
+
+            if isinstance(terminator, IRReturn):
+                cleanup = list(terminator.cleanup)
+                cleanup = effects + cleanup
+                updated = replace(terminator, cleanup=tuple(cleanup))
+            else:
+                assert isinstance(terminator, IRTailCall)
+                cleanup = list(terminator.cleanup)
+                cleanup = effects + cleanup
+                updated = replace(terminator, cleanup=tuple(cleanup))
+
+            self._transfer_ssa(terminator, updated)
+            items.replace_slice(index, index + 1, [updated])
+            terminator = updated
+            index += 1
+
+    def _compact_prologue_markers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, RawInstruction):
+                index += 1
+                continue
+
+            if node.mnemonic not in self._PROLOGUE_MARKERS:
+                index += 1
+                continue
+
+            if node.event.delta != 0:
+                index += 1
+                continue
+
+            if any(
+                isinstance(trailer, (IRReturn, IRTailCall))
+                for trailer in items[index + 1 :]
+            ):
+                index += 1
+                continue
+
+            if not all(
+                self._is_prologue_prefix(items[pos]) for pos in range(index)
+            ):
+                index += 1
+                continue
+
+            successor = items[index + 1] if index + 1 < len(items) else None
+            if successor is not None:
+                self._transfer_ssa(node, successor)
+            items.pop(index)
 
     def _match_table_builder_prologue(self, items: _ItemList, index: int) -> int:
         if index >= len(items):

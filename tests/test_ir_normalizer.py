@@ -38,6 +38,9 @@ from mbcdisasm.ir.model import (
     IRIORead,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
+
+
+KNOWLEDGE_FILE = Path(__file__).resolve().parents[1] / "knowledge" / "manual_annotations.json"
 from mbcdisasm.constants import (
     IO_SLOT,
     IO_SLOT_ALIASES,
@@ -1403,6 +1406,85 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
     assert tail_call.cleanup and tail_call.cleanup[-1].mnemonic == "stack_teardown"
     assert tail_call.cleanup[-1].pops == 4
+
+
+def test_epilogue_marker_absorbed_into_return() -> None:
+    knowledge = KnowledgeBase.load(KNOWLEDGE_FILE)
+
+    words = [
+        build_word(0, 0x02, 0x00, 0x0000),  # epilogue marker
+        build_word(4, 0x01, 0x00, 0x0028),  # stack teardown
+        build_word(8, 0x30, 0x00, 0x0000),  # return
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_02_00"
+        for node in block.nodes
+    )
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert any(step.mnemonic == "op_02_00" for step in ret.cleanup)
+
+
+def test_prologue_marker_suppressed_before_function_prologue(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x06, 0x00, 0x0000),  # prologue marker
+        build_word(4, 0x00, 0x00, 0x0001),  # literal consumed by testset
+        build_word(8, 0x27, 0x00, 0x0010),  # testset_branch
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_06_00"
+        for node in block.nodes
+    )
+    assert any(isinstance(node, IRFunctionPrologue) for node in block.nodes)
+
+
+def test_epilogue_marker_merges_into_tailcall(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x06, 0x00, 0x0000),  # epilogue marker
+        build_word(4, 0x2B, 0x00, 0x0040),  # tailcall_dispatch
+        build_word(8, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_06_00"
+        for node in block.nodes
+    )
+    tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert any(step.mnemonic == "op_06_00" for step in tail_call.cleanup)
 
 
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
