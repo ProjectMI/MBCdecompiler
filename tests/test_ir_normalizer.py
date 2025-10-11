@@ -161,7 +161,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": -1,
         },
         "tailcall_dispatch": {
-            "opcodes": ["0x2B:0x00"],
+            "opcodes": ["0x29:0x00", "0x29:0x10", "0x2B:0x00"],
             "name": "tailcall_dispatch",
             "category": "call_dispatch",
             "stack_delta": -1,
@@ -249,11 +249,6 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x66:0x15"],
             "name": "stack_shuffle",
             "category": "stack_shuffle",
-        },
-        "op_29_10": {
-            "opcodes": ["0x29:0x10"],
-            "name": "op_29_10",
-            "category": "call_mask",
         },
         "op_70_29": {
             "opcodes": ["0x70:0x29"],
@@ -1654,6 +1649,36 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.call.symbol == "test_helper_1234"
     assert tail_call.call.args == ()
     assert tail_call.returns == ("ret0",)
+
+
+def test_normalizer_collapses_tail_dispatch_clusters(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x29, 0x10, 0x1111),  # case A
+        build_word(4, 0x00, 0x00, 0x0001),  # key literal
+        build_word(8, 0x29, 0x10, 0x002C),  # helper tailcall
+        build_word(12, 0x29, 0x10, 0x2222),  # case B
+        build_word(16, 0x00, 0x00, 0x0002),  # key literal
+        build_word(20, 0x29, 0x10, 0x002C),  # helper tailcall
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    dispatch = block.nodes[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    keys = [case.key for case in dispatch.cases]
+    targets = [case.target for case in dispatch.cases]
+    assert keys == [1, 2]
+    assert targets == [0x1111, 0x2222]
 
 
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:

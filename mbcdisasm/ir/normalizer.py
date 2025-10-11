@@ -538,6 +538,43 @@ class IRNormalizer:
         InstructionKind.META,
     }
 
+    _TAIL_DISPATCH_HELPER_TARGETS = set(TAILCALL_HELPERS).union(
+        {
+            0x002C,
+            0x003D,
+            0x0100,
+            0x012D,
+            0x013D,
+            0x1929,
+            0x1969,
+            0x01F0,
+            RET_MASK,
+        }
+    )
+
+    _TAIL_DISPATCH_HELPER_MNEMONICS = {
+        "push_literal",
+        "op_03_66",
+        "op_06_66",
+        "op_10_18",
+        "op_10_40",
+        "op_10_60",
+        "op_10_70",
+        "op_15_29",
+        "op_28_10",
+        "op_29_10",
+        "op_48_00",
+        "op_60_88",
+        "op_63_9D",
+        "op_66_0A",
+        "op_67_00",
+        "op_78_88",
+        "op_7E_15",
+        "op_88_00",
+    }
+
+    _TAIL_DISPATCH_KEY_EXCLUDE = {0x0000, 0x1000, RET_MASK}
+
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
         SSAValueKind.BYTE: 1,
@@ -728,6 +765,7 @@ class IRNormalizer:
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
+        self._pass_tail_dispatch_clusters(items)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
         self._pass_literal_blocks(items)
@@ -1030,6 +1068,132 @@ class IRNormalizer:
 
             index += 1
 
+    def _pass_tail_dispatch_clusters(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, RawInstruction):
+                index += 1
+                continue
+
+            if node.mnemonic != "tailcall_dispatch":
+                index += 1
+                continue
+
+            operand = node.operand & 0xFFFF
+            if operand in self._TAIL_DISPATCH_HELPER_TARGETS:
+                index += 1
+                continue
+
+            cluster_start = index
+            cases: List[Tuple[RawInstruction, List[Union[RawInstruction, IRNode]]]] = []
+            scan = index
+
+            while scan < len(items):
+                entry = items[scan]
+                if not isinstance(entry, RawInstruction):
+                    break
+
+                if entry.mnemonic != "tailcall_dispatch":
+                    break
+
+                target = entry.operand & 0xFFFF
+                if target in self._TAIL_DISPATCH_HELPER_TARGETS:
+                    break
+
+                helpers: List[Union[RawInstruction, IRNode]] = []
+                helper_pos = scan + 1
+                while helper_pos < len(items):
+                    helper = items[helper_pos]
+                    if isinstance(helper, RawInstruction):
+                        if helper.mnemonic == "tailcall_dispatch":
+                            helper_target = helper.operand & 0xFFFF
+                            if helper_target in self._TAIL_DISPATCH_HELPER_TARGETS:
+                                helpers.append(helper)
+                                helper_pos += 1
+                                continue
+                            break
+
+                        if helper.mnemonic in self._TAIL_DISPATCH_HELPER_MNEMONICS:
+                            helpers.append(helper)
+                            helper_pos += 1
+                            continue
+
+                        break
+
+                    if isinstance(helper, (IRLiteral, IRLiteralChunk)):
+                        helpers.append(helper)
+                        helper_pos += 1
+                        continue
+
+                    break
+
+                cases.append((entry, helpers))
+                scan = helper_pos
+                if helper_pos >= len(items):
+                    break
+
+                follower = items[helper_pos]
+                if not (
+                    isinstance(follower, RawInstruction)
+                    and follower.mnemonic == "tailcall_dispatch"
+                    and follower.operand & 0xFFFF not in self._TAIL_DISPATCH_HELPER_TARGETS
+                ):
+                    break
+
+            if len(cases) <= 1:
+                index += 1
+                continue
+
+            slice_end = scan
+
+            dispatch_cases: List[IRDispatchCase] = []
+            used_keys: Set[int] = set()
+
+            for case_index, (instruction, helpers) in enumerate(cases):
+                key = self._infer_tail_dispatch_key(helpers, case_index)
+                if key in used_keys:
+                    probe = key
+                    while probe in used_keys:
+                        probe += 1
+                    key = probe
+                used_keys.add(key)
+                target = instruction.operand & 0xFFFF
+                symbol = self.knowledge.lookup_address(target)
+                dispatch_cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+
+            dispatch = IRSwitchDispatch(cases=tuple(dispatch_cases))
+            items.replace_slice(cluster_start, slice_end, [dispatch])
+            index = cluster_start + 1
+
+    def _infer_tail_dispatch_key(
+        self, helpers: Sequence[Union[RawInstruction, IRNode]], fallback: int
+    ) -> int:
+        for helper in helpers:
+            if isinstance(helper, RawInstruction):
+                if helper.mnemonic == "push_literal":
+                    value = helper.operand & 0xFFFF
+                    alias = helper.profile.operand_alias()
+                    if alias == "RET_MASK":
+                        continue
+                    if value in self._TAIL_DISPATCH_KEY_EXCLUDE:
+                        continue
+                    return value
+                operand_alias = helper.profile.operand_alias()
+                if operand_alias and isinstance(operand_alias, str):
+                    try:
+                        candidate = int(str(operand_alias), 0)
+                    except ValueError:
+                        continue
+                    if candidate not in self._TAIL_DISPATCH_KEY_EXCLUDE:
+                        return candidate
+            elif isinstance(helper, IRLiteral):
+                value = helper.value & 0xFFFF
+                if value in self._TAIL_DISPATCH_KEY_EXCLUDE:
+                    continue
+                return value
+        return fallback
+
     def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
         constant = self._string_pool.get(data)
         if constant is not None:
@@ -1097,11 +1261,59 @@ class IRNormalizer:
 
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
+                inline_target: Optional[int] = None
+                if mnemonic == "tailcall_dispatch":
+                    inline_target = self._extract_tail_dispatch_target(items, index)
+                    if inline_target is None and (item.operand & 0xFFFF) == RET_MASK:
+                        prev_call: Optional[CallLike] = None
+                        helper_trail = False
+                        scan = index - 1
+                        while scan >= 0:
+                            candidate = items[scan]
+                            if isinstance(candidate, CallLike):
+                                prev_call = candidate
+                                break
+                            if isinstance(candidate, (IRCallCleanup, IRConditionMask)):
+                                scan -= 1
+                                continue
+                            if isinstance(candidate, RawInstruction) and (
+                                self._is_call_cleanup_instruction(candidate)
+                                or self._is_neutral_cleanup_step(candidate)
+                            ):
+                                helper_trail = True
+                                scan -= 1
+                                continue
+                            if isinstance(candidate, RawInstruction) and candidate.mnemonic == "tailcall_dispatch":
+                                helper_target = candidate.operand & 0xFFFF
+                                if helper_target in self._TAIL_DISPATCH_HELPER_TARGETS:
+                                    helper_trail = True
+                                    scan -= 1
+                                    continue
+                            if isinstance(candidate, RawInstruction) and candidate.mnemonic in self._TAIL_DISPATCH_HELPER_MNEMONICS:
+                                helper_trail = True
+                                scan -= 1
+                                continue
+                            break
+                        if prev_call is None:
+                            if not helper_trail:
+                                index += 1
+                                continue
+                        elif not getattr(prev_call, "tail", False):
+                            index += 1
+                            continue
+                        elif getattr(prev_call, "target", None) == 0x0072:
+                            index += 1
+                            continue
+                is_mask_dispatch = (
+                    mnemonic == "tailcall_dispatch"
+                    and inline_target is None
+                    and (item.operand & 0xFFFF) == RET_MASK
+                )
                 args, start = self._collect_call_arguments(items, index)
                 target = item.operand
                 symbol = self.knowledge.lookup_address(target)
+                cleanup_mask: Optional[int] = None
                 if mnemonic == "tailcall_dispatch":
-                    inline_target = self._extract_tail_dispatch_target(items, index)
                     if inline_target is not None:
                         target = inline_target
                         symbol = self.knowledge.lookup_address(target)
@@ -1118,15 +1330,20 @@ class IRNormalizer:
                                 source = getattr(prior, "source", "")
                                 if source in {"op_00_52", "push_literal"} or prior.value == 0:
                                     start = literal_index
+                        cleanup_mask = None
+                    elif (item.operand & 0xFFFF) == RET_MASK:
+                        cleanup_mask = RET_MASK
                 call = IRCall(
                     target=target,
                     args=tuple(args),
                     tail=mnemonic == "tailcall_dispatch",
                     symbol=symbol,
+                    cleanup_mask=cleanup_mask,
                 )
-                metrics.calls += 1
-                if call.tail:
-                    metrics.tail_calls += 1
+                if not is_mask_dispatch:
+                    metrics.calls += 1
+                    if call.tail:
+                        metrics.tail_calls += 1
                 items.replace_slice(start, index + 1, [call])
                 index = start
                 if call.tail:
@@ -2754,6 +2971,25 @@ class IRNormalizer:
                 mask = item.cleanup_mask
 
                 pre = index - 1
+                if pre >= 0 and isinstance(items[pre], IRCall):
+                    prefix = items[pre]
+                    assert isinstance(prefix, IRCall)
+                    if prefix.target in TAILCALL_HELPERS and prefix.cleanup:
+                        cleanup_steps = list(prefix.cleanup) + cleanup_steps
+                        mask = mask or prefix.cleanup_mask
+                        updated_call = IRCall(
+                            target=prefix.target,
+                            args=prefix.args,
+                            tail=prefix.tail,
+                            arity=prefix.arity,
+                            convention=prefix.convention,
+                            cleanup_mask=prefix.cleanup_mask,
+                            cleanup=tuple(),
+                            symbol=prefix.symbol,
+                            predicate=prefix.predicate,
+                        )
+                        self._transfer_ssa(prefix, updated_call)
+                        items.replace_slice(pre, pre + 1, [updated_call])
                 while pre >= 0 and isinstance(items[pre], (IRCallCleanup, IRConditionMask)):
                     prefix = items[pre]
                     if isinstance(prefix, IRCallCleanup):
@@ -3352,6 +3588,27 @@ class IRNormalizer:
                 base_tail = call.tail
                 consumed = 0
 
+                prev_index = index - 1
+                if prev_index >= 0 and isinstance(items[prev_index], IRCall):
+                    helper_call = items[prev_index]
+                    assert isinstance(helper_call, IRCall)
+                    if helper_call.target in TAILCALL_HELPERS and helper_call.cleanup:
+                        cleanup_steps = list(helper_call.cleanup) + cleanup_steps
+                        cleanup_mask = cleanup_mask or helper_call.cleanup_mask
+                        stripped_helper = IRCall(
+                            target=helper_call.target,
+                            args=helper_call.args,
+                            tail=helper_call.tail,
+                            arity=helper_call.arity,
+                            convention=helper_call.convention,
+                            cleanup_mask=helper_call.cleanup_mask,
+                            cleanup=tuple(),
+                            symbol=helper_call.symbol,
+                            predicate=helper_call.predicate,
+                        )
+                        self._transfer_ssa(helper_call, stripped_helper)
+                        items.replace_slice(prev_index, prev_index + 1, [stripped_helper])
+
                 while offset < len(items):
                     candidate = items[offset]
                     if isinstance(candidate, IRCallCleanup):
@@ -3462,8 +3719,15 @@ class IRNormalizer:
                     items.replace_slice(index, index + 1, [node])
                     continue
             if isinstance(item, RawInstruction):
-                if item.operand == RET_MASK and item.mnemonic in {"terminator", "op_29_10"}:
-                    node = IRConditionMask(source=item.mnemonic, mask=item.operand)
+                if item.operand == RET_MASK and item.mnemonic in {
+                    "terminator",
+                    "op_29_10",
+                    "tailcall_dispatch",
+                }:
+                    source = item.mnemonic
+                    if source == "tailcall_dispatch" and item.profile.operand_alias() == "RET_MASK":
+                        source = "op_29_10"
+                    node = IRConditionMask(source=source, mask=item.operand)
                     items.replace_slice(index, index + 1, [node])
                     continue
             index += 1
@@ -5180,3 +5444,4 @@ class IRNormalizer:
 
 
 __all__ = ["IRNormalizer", "RawInstruction", "RawBlock"]
+
