@@ -426,6 +426,10 @@ CALL_CLEANUP_TEMPLATES: Tuple[InstructionTemplate, ...] = (
 CallLike = Union[IRCall, IRCallReturn, IRTailcallReturn, IRTailCall]
 
 
+_TAIL_DISPATCH_KEY_MNEMONICS = {"fanout", "stack_shuffle", "op_29_10"}
+_TAIL_DISPATCH_KEY_PREFIXES = ("op_10_",)
+
+
 class _ItemList:
     """Mutable wrapper around a block during normalisation passes."""
 
@@ -744,6 +748,7 @@ class IRNormalizer:
         self._pass_opcode_tables(items)
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
+        self._pass_tail_dispatch(items)
         self._pass_dispatch_wrappers(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
@@ -2389,6 +2394,78 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
 
+    def _pass_tail_dispatch(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            if index >= len(items):
+                break
+            node = items[index]
+            if not self._is_tail_dispatch_node(node):
+                index += 1
+                continue
+
+            cases: List[Tuple[int, int, int, int, Optional[str]]] = []
+            scan = index
+            last_end = index + 1
+
+            while scan < len(items) and self._is_tail_dispatch_node(items[scan]):
+                call = cast(CallLike, items[scan])
+                case_start = self._tail_case_start(items, scan)
+                key = self._extract_tail_dispatch_key(items, case_start, scan)
+                target = getattr(call, "target", None)
+                symbol = getattr(call, "symbol", None)
+
+                if key is None or not isinstance(target, int):
+                    break
+
+                cases.append((case_start, scan + 1, key & 0xFFFF, target, symbol))
+                last_end = max(last_end, scan + 1)
+
+                scan += 1
+                while scan < len(items) and self._is_tail_case_prefix(items[scan]):
+                    last_end = scan + 1
+                    scan += 1
+
+                if scan >= len(items) or not self._is_tail_dispatch_node(items[scan]):
+                    break
+
+            if len(cases) < 2:
+                index = last_end
+                continue
+
+            dispatch_cases: List[IRDispatchCase] = []
+            default: Optional[int] = None
+
+            for start, end, key, target, symbol in cases:
+                if key == RET_MASK and default is None:
+                    default = target
+                    continue
+                dispatch_cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+
+            total_options = len(dispatch_cases) + (1 if default is not None else 0)
+            if total_options < 2:
+                index = last_end
+                continue
+
+            replacement_start = cases[0][0]
+            replacement_end = cases[-1][1]
+
+            helper_target, helper_symbol = self._extract_tail_dispatch_helper(
+                items, replacement_start, replacement_end
+            )
+
+            for pos in range(replacement_start, replacement_end):
+                self._ssa_bindings.pop(id(items[pos]), None)
+
+            dispatch = IRSwitchDispatch(
+                cases=tuple(sorted(dispatch_cases, key=lambda entry: entry.key)),
+                helper=helper_target,
+                helper_symbol=helper_symbol,
+                default=default,
+            )
+            items.replace_slice(replacement_start, replacement_end, [dispatch])
+            index = replacement_start + 1
+
     def _pass_dispatch_wrappers(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -2514,6 +2591,109 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _is_tail_dispatch_node(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if not isinstance(node, CallLike):
+            return False
+        if not getattr(node, "tail", False):
+            return False
+        if getattr(node, "predicate", None) is not None:
+            return False
+        return True
+
+    def _tail_case_start(self, items: _ItemList, index: int) -> int:
+        start = index
+        while start > 0 and self._is_tail_case_prefix(items[start - 1]):
+            start -= 1
+        return start
+
+    def _is_tail_case_prefix(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, (IRConditionMask, IRLiteral)):
+            return True
+        if isinstance(node, RawInstruction):
+            return self._tail_dispatch_key_from_raw(node) is not None
+        return False
+
+    def _extract_tail_dispatch_key(
+        self, items: _ItemList, start: int, call_index: int
+    ) -> Optional[int]:
+        for pos in range(call_index - 1, start - 1, -1):
+            node = items[pos]
+            key = self._tail_dispatch_key_from_node(node)
+            if key is not None:
+                return key
+
+        scan = start - 1
+        while scan >= 0 and isinstance(items[scan], IRCallCleanup):
+            key = self._tail_dispatch_key_from_cleanup(cast(IRCallCleanup, items[scan]))
+            if key is not None:
+                return key
+            scan -= 1
+
+        follow = call_index + 1
+        while follow < len(items) and self._is_tail_case_prefix(items[follow]):
+            key = self._tail_dispatch_key_from_node(items[follow])
+            if key is not None:
+                return key
+            follow += 1
+
+        return None
+
+    def _tail_dispatch_key_from_node(self, node: Union[RawInstruction, IRNode]) -> Optional[int]:
+        if isinstance(node, IRConditionMask):
+            return node.mask
+        if isinstance(node, IRLiteral):
+            return node.value & 0xFFFF
+        if isinstance(node, IRCallCleanup):
+            return self._tail_dispatch_key_from_cleanup(node)
+        if isinstance(node, RawInstruction):
+            key = self._tail_dispatch_key_from_raw(node)
+            if key is not None:
+                return key
+        return None
+
+    def _tail_dispatch_key_from_cleanup(self, cleanup: IRCallCleanup) -> Optional[int]:
+        for step in reversed(cleanup.steps):
+            mnemonic = step.mnemonic
+            if mnemonic in _TAIL_DISPATCH_KEY_MNEMONICS:
+                return step.operand & 0xFFFF
+            if any(mnemonic.startswith(prefix) for prefix in _TAIL_DISPATCH_KEY_PREFIXES):
+                return step.operand & 0xFFFF
+        return None
+
+    def _tail_dispatch_key_from_raw(self, instruction: RawInstruction) -> Optional[int]:
+        mnemonic = instruction.mnemonic
+        if mnemonic in _TAIL_DISPATCH_KEY_MNEMONICS:
+            return instruction.operand & 0xFFFF
+        if any(mnemonic.startswith(prefix) for prefix in _TAIL_DISPATCH_KEY_PREFIXES):
+            return instruction.operand & 0xFFFF
+        if instruction.profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
+            return instruction.operand & 0xFFFF
+        return None
+
+    def _extract_tail_dispatch_helper(
+        self, items: _ItemList, start: int, end: int
+    ) -> Tuple[Optional[int], Optional[str]]:
+        helper_target: Optional[int] = None
+        helper_symbol: Optional[str] = None
+
+        search_start = max(0, start - 3)
+        search_end = min(len(items), end + 3)
+
+        for pos in range(search_start, search_end):
+            node = items[pos]
+            if isinstance(node, IRCallCleanup):
+                for step in node.steps:
+                    if step.mnemonic == "call_helpers":
+                        helper_target = step.operand & 0xFFFF
+                        helper_symbol = self.knowledge.lookup_address(helper_target)
+                        return helper_target, helper_symbol
+            elif isinstance(node, RawInstruction) and node.mnemonic == "call_helpers":
+                helper_target = node.operand & 0xFFFF
+                helper_symbol = self.knowledge.lookup_address(helper_target)
+                return helper_target, helper_symbol
+
+        return helper_target, helper_symbol
 
     def _pass_table_builders(self, items: _ItemList) -> None:
         state: Optional[_TableBuilderState] = None

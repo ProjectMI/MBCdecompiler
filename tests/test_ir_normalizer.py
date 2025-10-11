@@ -1513,6 +1513,79 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
 
 
+def test_tail_dispatch_collapses_cluster() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    call_one = IRCall(target=0x1111, args=tuple(), tail=True, symbol="case_one")
+    call_two = IRCall(target=0x2222, args=tuple(), tail=True, symbol="case_two")
+
+    items = _ItemList(
+        [
+            IRConditionMask(source="mask", mask=0x0001),
+            call_one,
+            IRConditionMask(source="mask", mask=0x0002),
+            call_two,
+        ]
+    )
+
+    normalizer._pass_tail_dispatch(items)
+
+    assert len(items) == 1
+    dispatch = items[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert [case.key for case in dispatch.cases] == [0x0001, 0x0002]
+    assert [case.target for case in dispatch.cases] == [0x1111, 0x2222]
+
+
+def test_tail_dispatch_extracts_default_case() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    items = _ItemList(
+        [
+            IRConditionMask(source="mask", mask=0x0005),
+            IRCall(target=0x4444, args=tuple(), tail=True),
+            IRConditionMask(source="mask", mask=RET_MASK),
+            IRCall(target=0x5555, args=tuple(), tail=True),
+        ]
+    )
+
+    normalizer._pass_tail_dispatch(items)
+
+    assert len(items) == 1
+    dispatch = items[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert [case.key for case in dispatch.cases] == [0x0005]
+    assert dispatch.default == 0x5555
+
+
+def test_tail_dispatch_detects_helper() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    helper_cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(mnemonic="call_helpers", operand=0x6622),
+        )
+    )
+
+    items = _ItemList(
+        [
+            helper_cleanup,
+            IRConditionMask(source="mask", mask=0x0003),
+            IRCall(target=0x1000, args=tuple(), tail=True),
+            IRConditionMask(source="mask", mask=0x0004),
+            IRCall(target=0x2000, args=tuple(), tail=True),
+        ]
+    )
+
+    normalizer._pass_tail_dispatch(items)
+
+    assert len(items) == 2
+    assert isinstance(items[0], IRCallCleanup)
+    dispatch = items[1]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == 0x6622
+
+
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
     normalizer = IRNormalizer(knowledge)
