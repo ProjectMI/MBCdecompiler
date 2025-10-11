@@ -65,6 +65,7 @@ from .model import (
     IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
+    IRPredicateMaterialization,
     IRIndirectLoad,
     IRIndirectStore,
     IRIORead,
@@ -3256,6 +3257,7 @@ class IRNormalizer:
                         flag=flag,
                         then_target=item.then_target,
                         else_target=item.else_target,
+                        predicate=item.predicate,
                     )
                     items.replace_slice(index, index + 1, [node])
                     index += 1
@@ -3276,6 +3278,7 @@ class IRNormalizer:
                             expr=item.expr,
                             then_target=item.then_target,
                             else_target=item.else_target,
+                            predicate=item.predicate,
                         )
                         self._transfer_ssa(item, node)
                         items.replace_slice(index, index + 1, [node])
@@ -3483,6 +3486,7 @@ class IRNormalizer:
                     expr=alias,
                     then_target=branch.then_target,
                     else_target=branch.else_target,
+                    predicate=branch.predicate,
                 )
                 items.replace_slice(branch_index, branch_index + 1, [updated_branch])
             elif isinstance(branch, IRIf) and branch.condition != alias:
@@ -3490,6 +3494,7 @@ class IRNormalizer:
                     condition=alias,
                     then_target=branch.then_target,
                     else_target=branch.else_target,
+                    predicate=branch.predicate,
                 )
                 items.replace_slice(branch_index, branch_index + 1, [updated_branch])
 
@@ -4290,6 +4295,12 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
+                predicate_info = self._consume_predicate_materialization(items, index)
+                predicate_node: Optional[IRPredicateMaterialization] = None
+                if predicate_info is not None:
+                    predicate_node, index = predicate_info
+                    item = cast(RawInstruction, items[index])
+
                 expr = self._describe_condition(items, index, skip_literals=True)
                 then_target = self._branch_target(item)
                 else_target = self._fallthrough_target(item)
@@ -4298,6 +4309,7 @@ class IRNormalizer:
                     expr=expr,
                     then_target=then_target,
                     else_target=else_target,
+                    predicate=predicate_node,
                 )
                 self._transfer_ssa(item, node)
                 replacement: List[Union[RawInstruction, IRNode]] = [node]
@@ -4306,6 +4318,7 @@ class IRNormalizer:
                         condition=node.var,
                         then_target=then_target,
                         else_target=else_target,
+                        predicate=predicate_node,
                     )
                     replacement.append(branch)
                     metrics.if_branches += 1
@@ -4324,10 +4337,17 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                predicate_info = self._consume_predicate_materialization(items, index)
+                predicate_node: Optional[IRPredicateMaterialization] = None
+                if predicate_info is not None:
+                    predicate_node, index = predicate_info
+                    item = cast(RawInstruction, items[index])
+
                 node = IRIf(
                     condition=self._describe_condition(items, index),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    predicate=predicate_node,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
@@ -4941,6 +4961,70 @@ class IRNormalizer:
             if value in {0x0166, 0x0266}:
                 return value
         return None
+
+    def _consume_predicate_materialization(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[IRPredicateMaterialization, int]]:
+        if index <= 0:
+            return None
+
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                scan -= 1
+                continue
+            break
+
+        if scan < 0:
+            return None
+
+        candidate = items[scan]
+        if not isinstance(candidate, RawInstruction):
+            return None
+        if not self._is_predicate_materializer(candidate):
+            return None
+
+        predicate = self._predicate_from_instruction(candidate)
+        items.pop(scan)
+        return predicate, index - 1
+
+    @staticmethod
+    def _predicate_from_instruction(instruction: RawInstruction) -> IRPredicateMaterialization:
+        return IRPredicateMaterialization(
+            mnemonic=instruction.mnemonic,
+            operand=instruction.operand,
+            operand_role=instruction.profile.operand_role(),
+            operand_alias=instruction.profile.operand_alias(),
+        )
+
+    def _is_predicate_materializer(self, instruction: RawInstruction) -> bool:
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+
+        mnemonic = instruction.mnemonic
+        if not mnemonic.startswith("op_"):
+            return False
+
+        parts = mnemonic.split("_")
+        if len(parts) < 3:
+            return False
+
+        try:
+            opcode = int(parts[1], 16)
+            mode = int(parts[2], 16)
+        except ValueError:
+            return False
+
+        operand = instruction.operand
+        if opcode in {0x02, 0x03, 0x04} and operand == 0:
+            return True
+        if opcode == 0x64 and operand == 0 and mode in {0x04, 0x30}:
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # annotation helpers

@@ -149,6 +149,7 @@ def default_patterns() -> PatternRegistry:
             return_pipeline(),
             indirect_load_pipeline(),
             table_builder_pipeline(),
+            predicate_materialization_pattern(),
         ]
     )
     return registry
@@ -198,6 +199,31 @@ def ascii_run_pattern() -> PipelinePattern:
         allow_extra=True,
         stack_change=0,
         description="Run of inline ASCII words",
+    )
+
+
+def predicate_materialization_pattern() -> PipelinePattern:
+    """Return a pattern that recognises flag materialisation before a branch."""
+
+    return PipelinePattern(
+        name="predicate_materialization",
+        category="predicate",
+        tokens=(
+            PatternToken(
+                kinds=tuple(),
+                min_delta=0,
+                max_delta=0,
+                allow_unknown=True,
+                description="predicate setup",
+            ),
+            PatternToken(
+                kinds=(InstructionKind.TEST, InstructionKind.BRANCH),
+                min_delta=-1,
+                max_delta=1,
+                description="predicate consumer",
+            ),
+        ),
+        description="Neutral instruction materialising a predicate consumed by a branch",
     )
 
 

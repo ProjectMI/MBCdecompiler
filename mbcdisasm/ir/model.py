@@ -404,18 +404,45 @@ class IRLiteralBlock(IRNode):
 
 
 @dataclass(frozen=True)
+class IRPredicateMaterialization(IRNode):
+    """Instruction that produced a branch predicate without touching the stack."""
+
+    mnemonic: str
+    operand: int
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+
+    def describe(self) -> str:
+        alias = self.operand_alias
+        rendered = f"0x{self.operand:04X}"
+        if alias:
+            text = str(alias)
+            if text.upper().startswith("0X"):
+                text = text.upper()
+            rendered = text if text == rendered else f"{text}({rendered})"
+        role = self.operand_role
+        if role:
+            return f"{self.mnemonic} {role}={rendered}"
+        return f"{self.mnemonic} operand={rendered}"
+
+
+@dataclass(frozen=True)
 class IRIf(IRNode):
     """Standard conditional branch."""
 
     condition: str
     then_target: int
     else_target: int
+    predicate: Optional[IRPredicateMaterialization] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"if cond={self.condition} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate is not None:
+            return f"{base} predicate={self.predicate.describe()}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -426,12 +453,16 @@ class IRTestSetBranch(IRNode):
     expr: str
     then_target: int
     else_target: int
+    predicate: Optional[IRPredicateMaterialization] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"testset {self.var}={self.expr} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate is not None:
+            return f"{base} predicate={self.predicate.describe()}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -441,12 +472,16 @@ class IRFlagCheck(IRNode):
     flag: int
     then_target: int
     else_target: int
+    predicate: Optional[IRPredicateMaterialization] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"check_flag flag=0x{self.flag:04X} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate is not None:
+            return f"{base} predicate={self.predicate.describe()}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -457,12 +492,16 @@ class IRFunctionPrologue(IRNode):
     expr: str
     then_target: int
     else_target: int
+    predicate: Optional[IRPredicateMaterialization] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"function_prologue {self.var}={self.expr} "
             f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
         )
+        if self.predicate is not None:
+            return f"{base} predicate={self.predicate.describe()}"
+        return base
 
 
 @dataclass(frozen=True)

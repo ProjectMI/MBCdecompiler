@@ -18,6 +18,7 @@ from mbcdisasm.ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRIf,
+    IRFlagCheck,
     IRReturn,
     IRFunctionPrologue,
     IRStackEffect,
@@ -183,6 +184,18 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x95:0xFE"],
             "name": "op_95_FE",
             "category": "call_wrapper",
+            "stack_delta": 0,
+        },
+        "op_02_00": {
+            "opcodes": ["0x02:0x00"],
+            "name": "op_02_00",
+            "category": "test_predicate",
+            "stack_delta": 0,
+        },
+        "op_64_30": {
+            "opcodes": ["0x64:0x30"],
+            "name": "op_64_30",
+            "category": "test_predicate",
             "stack_delta": 0,
         },
         "call_helpers": {
@@ -1326,6 +1339,69 @@ def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:
     assert branch.then_target == predicate.then_target
     assert branch.else_target == predicate.else_target
     assert branch.condition == predicate.var
+    assert branch.predicate == predicate.predicate
+
+
+def test_normalizer_materializes_testset_predicate(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x02, 0x00, 0x0000),  # raw predicate materialisation
+        build_word(4, 0x27, 0x00, 0x0010),  # testset_branch
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    branch = next(
+        node
+        for node in block.nodes
+        if isinstance(node, (IRTestSetBranch, IRFunctionPrologue))
+    )
+
+    assert branch.predicate is not None
+    assert branch.predicate.mnemonic == "op_02_00"
+    assert branch.predicate.operand == 0
+    assert not any(isinstance(node, IRRaw) and node.mnemonic == "op_02_00" for node in block.nodes)
+
+
+def test_normalizer_materializes_flag_check_predicate(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0166),  # push_literal flag value
+        build_word(4, 0x64, 0x30, 0x0000),  # raw predicate materialisation
+        build_word(8, 0x23, 0x00, 0x0010),  # branch_eq
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    flag_node = next(
+        (node for node in block.nodes if isinstance(node, IRFlagCheck)),
+        None,
+    )
+    if flag_node is None:
+        flag_node = next(node for node in block.nodes if isinstance(node, IRIf))
+    else:
+        assert flag_node.flag == 0x0166
+
+    assert flag_node.predicate is not None
+    assert flag_node.predicate.mnemonic == "op_64_30"
+    assert flag_node.predicate.operand == 0
+    assert not any(isinstance(node, IRRaw) and node.mnemonic == "op_64_30" for node in block.nodes)
 
 
 def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:
