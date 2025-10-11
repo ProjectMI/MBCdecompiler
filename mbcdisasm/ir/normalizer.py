@@ -57,6 +57,7 @@ from .model import (
     IRStackDrop,
     IRStringConstant,
     IRTablePatch,
+    IRTableBuilder,
     IRDispatchCase,
     IRSwitchDispatch,
     IRTailcallFrame,
@@ -498,6 +499,22 @@ class IRNormalizer:
         "op_2C_46": {0x0000},
         "op_2B_47": {0x0000},
     }
+    _TABLE_BUILDER_PAYLOAD_TYPES = (
+        IRStringConstant,
+        IRLiteral,
+        IRLiteralChunk,
+        IRTablePatch,
+        IRSwitchDispatch,
+        IRCall,
+        IRTailCall,
+        IRCallReturn,
+        IRCallCleanup,
+        IRIOWrite,
+    )
+    _TABLE_BUILDER_POST_TYPES = (
+        IRTestSetBranch,
+        IRIf,
+    )
     _ADAPTIVE_TABLE_MIN_RUN = 8
     _ADAPTIVE_TABLE_KINDS = {
         InstructionKind.UNKNOWN,
@@ -711,6 +728,8 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_dispatch_wrappers(items)
+        self._pass_table_builders(items)
+        self._pass_table_builder_glue(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
@@ -2400,6 +2419,169 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _pass_table_builders(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            match = self._match_table_builder(items, index)
+            if match is None:
+                index += 1
+                continue
+
+            start, end, builder = match
+            items.replace_slice(start, end, [builder])
+            index = start + 1
+
+    def _match_table_builder(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[int, int, IRTableBuilder]]:
+        if index >= len(items):
+            return None
+
+        entry = items[index]
+        start = index
+        prologue_entry: Optional[RawInstruction]
+        if isinstance(entry, RawInstruction):
+            prologue_entry = entry
+        elif isinstance(entry, (IRStringConstant, IRLiteral, IRLiteralChunk)):
+            if index == 0:
+                return None
+            previous = items[index - 1]
+            if not isinstance(previous, RawInstruction):
+                return None
+            prologue_entry = previous
+            start = index - 1
+        else:
+            return None
+
+        if not self._is_table_builder_candidate(prologue_entry):
+            return None
+
+        prologue_ops: List[Tuple[str, int]] = [(prologue_entry.mnemonic, prologue_entry.operand)]
+        scan = start + 1
+
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                prologue_ops.append((candidate.mnemonic, candidate.operand))
+                scan += 1
+                continue
+            break
+
+        if scan >= len(items):
+            return None
+
+        first_payload = items[scan]
+        if not isinstance(first_payload, (IRStringConstant, IRLiteral, IRLiteralChunk)):
+            return None
+
+        payload: List[IRNode] = []
+        postconditions: List[IRNode] = []
+        seen_table = False
+        end = scan
+        while end < len(items):
+            candidate = items[end]
+            if isinstance(candidate, RawInstruction):
+                if self._is_annotation_only(candidate):
+                    prologue_ops.append((candidate.mnemonic, candidate.operand))
+                    end += 1
+                    continue
+                break
+
+            if isinstance(candidate, self._TABLE_BUILDER_PAYLOAD_TYPES):
+                payload.append(candidate)
+                if isinstance(candidate, (IRTablePatch, IRSwitchDispatch)):
+                    seen_table = True
+                end += 1
+                continue
+
+            if isinstance(candidate, self._TABLE_BUILDER_POST_TYPES):
+                if not self._is_table_builder_postcondition(candidate):
+                    break
+                postconditions.append(candidate)
+                end += 1
+                continue
+
+            break
+
+        if not seen_table:
+            return None
+
+        builder = IRTableBuilder(
+            prologue=tuple(prologue_ops),
+            payload=tuple(payload),
+            postconditions=tuple(postconditions),
+        )
+        self._transfer_ssa(prologue_entry, builder)
+
+        for pos in range(start + 1, end):
+            removed = items[pos]
+            if isinstance(removed, RawInstruction):
+                self._ssa_bindings.pop(id(removed), None)
+
+        return start, end, builder
+
+    @staticmethod
+    def _is_table_builder_postcondition(node: IRNode) -> bool:
+        if isinstance(node, IRTestSetBranch):
+            return node.then_target == 0
+        if isinstance(node, IRIf):
+            if node.then_target != 0:
+                return False
+            condition = node.condition.lower()
+            return "bool" in condition or "table" in condition or "cleanup" in condition
+        return False
+
+    def _is_table_builder_candidate(self, instruction: RawInstruction) -> bool:
+        if not isinstance(instruction, RawInstruction):
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        if instruction.operand != 0:
+            return False
+        if self._is_annotation_only(instruction):
+            return False
+        event = instruction.event
+        if abs(event.delta) > 1:
+            return False
+        return True
+
+    def _pass_table_builder_glue(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, IRTableBuilder):
+                index += 1
+                continue
+
+            prefix = index
+            added_prologue: List[Tuple[str, int]] = []
+            leading_payload: List[IRNode] = []
+            while prefix > 0:
+                candidate = items[prefix - 1]
+                if isinstance(candidate, RawInstruction) and self._is_table_builder_candidate(candidate):
+                    added_prologue.insert(0, (candidate.mnemonic, candidate.operand))
+                    self._ssa_bindings.pop(id(candidate), None)
+                    prefix -= 1
+                    continue
+                if isinstance(candidate, (IRStringConstant, IRLiteral, IRLiteralChunk)):
+                    leading_payload.insert(0, candidate)
+                    prefix -= 1
+                    continue
+                break
+
+            if not added_prologue and not leading_payload:
+                index += 1
+                continue
+
+            new_builder = IRTableBuilder(
+                prologue=tuple(added_prologue) + node.prologue,
+                payload=tuple(leading_payload) + node.payload,
+                postconditions=node.postconditions,
+            )
+            self._transfer_ssa(node, new_builder)
+            items.replace_slice(prefix, index + 1, [new_builder])
+            index = prefix + 1
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]

@@ -148,6 +148,7 @@ def default_patterns() -> PatternRegistry:
             call_preparation_pipeline(),
             return_pipeline(),
             indirect_load_pipeline(),
+            table_builder_pipeline(),
         ]
     )
     return registry
@@ -456,4 +457,40 @@ def indirect_load_pipeline() -> PipelinePattern:
         category="indirect",
         tokens=tokens,
         description="Push base/key then resolve table entry",
+    )
+
+
+def table_builder_pipeline() -> PipelinePattern:
+    """Match the prologue/metadata/table triplet used by builder helpers."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=0,
+            allow_unknown=True,
+            description="table prologue",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.ASCII_CHUNK, InstructionKind.LITERAL, InstructionKind.PUSH),
+            min_delta=0,
+            max_delta=1,
+            allow_unknown=True,
+            description="table metadata",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            allow_unknown=True,
+            description="table body",
+        ),
+    )
+
+    return PipelinePattern(
+        name="table_builder",
+        category="table",
+        tokens=tokens,
+        allow_extra=True,
+        description="Prologue followed by inline metadata and table rows",
     )

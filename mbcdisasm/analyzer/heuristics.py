@@ -19,6 +19,7 @@ the project notes:
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -71,6 +72,7 @@ class HeuristicSettings:
     call_weight: float = 0.3
     return_weight: float = 0.25
     indirect_weight: float = 0.2
+    table_builder_weight: float = 0.3
     max_literal_gap: int = 2
     max_call_gap: int = 3
 
@@ -96,6 +98,7 @@ class HeuristicEngine:
         features.extend(self._call_features(profiles, following))
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
+        features.extend(self._table_builder_features(profiles))
         features.extend(self._context_features(previous, following))
 
         confidence = sum(feature.score for feature in features)
@@ -219,6 +222,47 @@ class HeuristicEngine:
             )
         if following and following.kind is InstructionKind.TERMINATOR:
             features.append(LocalFeature(name="terminator_followup", score=0.05))
+        return features
+
+    def _table_builder_features(
+        self, profiles: Sequence[InstructionProfile]
+    ) -> List[LocalFeature]:
+        features: List[LocalFeature] = []
+        if len(profiles) < 4:
+            return features
+
+        mode_counts: Counter[int] = Counter()
+        ascii_like = 0
+        unknown_kinds = 0
+        for profile in profiles:
+            mode_counts[profile.word.mode] += 1
+            if profile.kind is InstructionKind.UNKNOWN:
+                unknown_kinds += 1
+            if profile.kind in {
+                InstructionKind.ASCII_CHUNK,
+                InstructionKind.LITERAL,
+                InstructionKind.PUSH,
+            }:
+                ascii_like += 1
+
+        if not mode_counts:
+            return features
+
+        dominant_mode, dominant_count = mode_counts.most_common(1)[0]
+        if dominant_count < 3 or unknown_kinds < 2 or ascii_like == 0:
+            return features
+
+        if len(mode_counts) > 3:
+            return features
+
+        score = self.settings.table_builder_weight
+        score += min(ascii_like, 4) * 0.03
+        evidence = (
+            f"mode=0x{dominant_mode:02X}",
+            f"len={len(profiles)}",
+            f"ascii={ascii_like}",
+        )
+        features.append(LocalFeature(name="table_builder", score=score, evidence=evidence))
         return features
 
     def _indirect_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:

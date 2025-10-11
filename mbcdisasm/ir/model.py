@@ -657,6 +657,56 @@ class IRTablePatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTableBuilder(IRNode):
+    """High level representation for table construction pipelines."""
+
+    prologue: Tuple[Tuple[str, int], ...]
+    payload: Tuple[IRNode, ...]
+    postconditions: Tuple[IRNode, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        prefix = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        if not prefix:
+            prefix = "∅"
+
+        table_summaries = []
+        literal_count = 0
+        extra_notes: List[str] = []
+        for node in self.payload:
+            if isinstance(node, IRTablePatch):
+                kind = "table"
+                mode = "?"
+                for note in node.annotations:
+                    if note.endswith("_table"):
+                        kind = note.replace("_table", "")
+                    elif note.startswith("mode="):
+                        mode = note.split("=", 1)[1]
+                table_summaries.append(f"{kind}:{mode}")
+            elif isinstance(node, IRSwitchDispatch):
+                table_summaries.append(f"dispatch:{len(node.cases)}")
+            elif isinstance(node, (IRStringConstant, IRLiteral, IRLiteralChunk)):
+                literal_count += 1
+            else:
+                describe = getattr(node, "describe", None)
+                if callable(describe):
+                    extra_notes.append(describe())
+
+        parts = [f"table_builder prologue=[{prefix}]"]
+        if table_summaries:
+            parts.append("tables=[" + ", ".join(table_summaries) + "]")
+        if literal_count:
+            parts.append(f"strings={literal_count}")
+        if extra_notes:
+            parts.append("extras=[" + "; ".join(extra_notes) + "]")
+        if self.postconditions:
+            rendered = ", ".join(
+                getattr(node, "describe", lambda: repr(node))() for node in self.postconditions
+            )
+            parts.append(f"post=[{rendered}]")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
 class IRDispatchCase:
     """Single dispatch case extracted from a table patch."""
 
