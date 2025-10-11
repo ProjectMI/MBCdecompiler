@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
+from dataclasses import dataclass, field, replace
+from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
@@ -57,6 +57,9 @@ from .model import (
     IRStackDrop,
     IRStringConstant,
     IRTablePatch,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTableBuilderCommit,
     IRDispatchCase,
     IRSwitchDispatch,
     IRTailcallFrame,
@@ -431,6 +434,17 @@ class _ItemList:
         return tuple(self._items)
 
 
+@dataclass
+class _TableBuilderState:
+    """Book-keeping for an active table builder sequence."""
+
+    begin_index: int
+    parameters: List[str] = field(default_factory=list)
+    header: Optional[str] = None
+    mode_description: Optional[str] = None
+    setup_ops: List[Tuple[str, int]] = field(default_factory=list)
+
+
 class IRNormalizer:
     """Drive the multi-pass IR normalisation pipeline."""
 
@@ -486,6 +500,7 @@ class IRNormalizer:
         "op_2C_46",
         "op_2B_47",
     }
+    _TABLE_BUILDER_HEADER_PREFIXES = ("op_40_",)
     _TABLE_PATCH_EXTRA_MNEMONICS = {
         "fanout": None,
         "stack_teardown_4": None,
@@ -717,6 +732,7 @@ class IRNormalizer:
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
+        self._pass_table_builders(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
         self._pass_ascii_headers(items)
@@ -2400,6 +2416,370 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _pass_table_builders(self, items: _ItemList) -> None:
+        state: Optional[_TableBuilderState] = None
+        index = 0
+        while index < len(items):
+            if state is None:
+                prologue_span = self._match_table_builder_prologue(items, index)
+                if not prologue_span:
+                    index += 1
+                    continue
+
+                prologue_nodes = [items[index + offset] for offset in range(prologue_span)]
+                mode = cast(RawInstruction, prologue_nodes[0]).profile.mode
+                prologue_ops = [
+                    (cast(RawInstruction, node).mnemonic, cast(RawInstruction, node).operand)
+                    for node in prologue_nodes
+                ]
+                annotations: List[str] = []
+                seen: Set[str] = set()
+                for node in prologue_nodes:
+                    raw = cast(RawInstruction, node)
+                    self._ssa_bindings.pop(id(raw), None)
+                    for note in raw.annotations:
+                        if not note or note in seen:
+                            continue
+                        annotations.append(note)
+                        seen.add(note)
+
+                begin = IRTableBuilderBegin(
+                    mode=mode,
+                    prologue=tuple(prologue_ops),
+                    annotations=tuple(annotations),
+                )
+                items.replace_slice(index, index + prologue_span, [begin])
+                state = _TableBuilderState(begin_index=index)
+                index += 1
+                continue
+
+            node = items[index]
+            begin_node = cast(IRTableBuilderBegin, items[state.begin_index])
+            commit = self._build_table_builder_commit(node)
+            if commit is not None:
+                self._ssa_bindings.pop(id(node), None)
+                if isinstance(node, IRTestSetBranch) and index + 1 < len(items):
+                    follower = items[index + 1]
+                    if isinstance(follower, IRIf) and (
+                        follower.then_target == commit.commit_target
+                        and follower.else_target == commit.fallback_target
+                    ):
+                        self._ssa_bindings.pop(id(follower), None)
+                        items.pop(index + 1)
+                self._table_builder_refresh_begin(items, state)
+                items.replace_slice(index, index + 1, [commit])
+                state = None
+                index += 1
+                continue
+
+            if isinstance(node, IRTablePatch):
+                emit = self._table_builder_emit(node, state, begin_node)
+                self._ssa_bindings.pop(id(node), None)
+                items.replace_slice(index, index + 1, [emit])
+                state.parameters.clear()
+                index += 1
+                continue
+
+            follower = items[index + 1] if index + 1 < len(items) else None
+
+            if self._is_table_builder_parameter(node):
+                descriptor = self._describe_table_builder_parameter(cast(IRNode, node))
+                literal_associated = False
+                if isinstance(node, IRLiteralChunk) and node.symbol:
+                    if self._is_table_builder_header_instruction(follower, begin_node.mode):
+                        summary = self._table_builder_literal_summary(descriptor)
+                        if state.header is None:
+                            state.header = summary
+                            literal_associated = True
+                        elif state.mode_description is None:
+                            state.mode_description = summary
+                            literal_associated = True
+                        else:
+                            state.parameters.append(descriptor)
+                    else:
+                        state.parameters.append(descriptor)
+                else:
+                    state.parameters.append(descriptor)
+                self._ssa_bindings.pop(id(node), None)
+                items.pop(index)
+                if literal_associated:
+                    self._table_builder_refresh_begin(items, state)
+                continue
+
+            if self._is_table_builder_setup(node, begin_node):
+                raw = cast(RawInstruction, node)
+                state.setup_ops.append((raw.mnemonic, raw.operand))
+                self._ssa_bindings.pop(id(node), None)
+                items.pop(index)
+                self._table_builder_refresh_begin(items, state)
+                continue
+
+            if isinstance(node, IRTableBuilderBegin):
+                state = _TableBuilderState(begin_index=index)
+                index += 1
+                continue
+
+            state = None
+            index += 1
+
+    def _match_table_builder_prologue(self, items: _ItemList, index: int) -> int:
+        if index >= len(items):
+            return 0
+        node = items[index]
+        if not isinstance(node, RawInstruction):
+            return 0
+        if not self._is_table_builder_prologue(node):
+            return 0
+
+        lookahead = min(len(items), index + 12)
+        has_table = False
+        scan = index + 1
+        while scan < lookahead:
+            candidate = items[scan]
+            if isinstance(candidate, IRTablePatch):
+                has_table = True
+                break
+            if isinstance(candidate, IRTableBuilderBegin):
+                break
+            if isinstance(candidate, RawInstruction) and candidate.profile.kind is InstructionKind.BRANCH:
+                break
+            scan += 1
+
+        if not has_table:
+            return 0
+
+        span = index + 1
+        while span < len(items):
+            candidate = items[span]
+            if not isinstance(candidate, RawInstruction):
+                break
+            if not self._is_table_builder_prologue(candidate):
+                break
+            span += 1
+        return span - index
+
+    def _is_table_builder_prologue(self, item: RawInstruction) -> bool:
+        if not item.mnemonic.startswith("op_"):
+            return False
+        if item.profile.mode == 0:
+            return False
+        if item.profile.kind in {
+            InstructionKind.BRANCH,
+            InstructionKind.RETURN,
+            InstructionKind.CALL,
+            InstructionKind.TEST,
+        }:
+            return False
+        if self._is_annotation_only(item):
+            return False
+        return self._has_trivial_stack_effect(item)
+
+    def _is_table_builder_parameter(self, node: Union[RawInstruction, IRNode]) -> bool:
+        return isinstance(node, (IRLiteral, IRLiteralChunk, IRLoad))
+
+    def _describe_table_builder_parameter(self, node: IRNode) -> str:
+        if isinstance(node, IRLiteralChunk) and node.symbol:
+            return f"str({node.symbol})"
+        return node.describe()
+
+    def _table_builder_emit(
+        self,
+        table: IRTablePatch,
+        state: _TableBuilderState,
+        begin: IRTableBuilderBegin,
+    ) -> IRTableBuilderEmit:
+        annotations = tuple(table.annotations)
+        mode = self._table_builder_mode(table)
+        kind = self._table_builder_kind(annotations, begin)
+        return IRTableBuilderEmit(
+            mode=mode,
+            kind=kind,
+            operations=table.operations,
+            annotations=annotations,
+            parameters=tuple(state.parameters),
+        )
+
+    def _table_builder_refresh_begin(
+        self, items: _ItemList, state: _TableBuilderState
+    ) -> None:
+        if not (0 <= state.begin_index < len(items)):
+            return
+        begin = items[state.begin_index]
+        if not isinstance(begin, IRTableBuilderBegin):
+            return
+        header = state.header if state.header is not None else begin.header
+        mode_desc = (
+            state.mode_description
+            if state.mode_description is not None
+            else begin.mode_description
+        )
+        setup = tuple(state.setup_ops)
+        if (
+            header == begin.header
+            and mode_desc == begin.mode_description
+            and setup == begin.setup
+        ):
+            return
+        items.replace_slice(
+            state.begin_index,
+            state.begin_index + 1,
+            [
+                replace(
+                    begin,
+                    header=header,
+                    mode_description=mode_desc,
+                    setup=setup,
+                )
+            ],
+        )
+
+    def _table_builder_literal_summary(self, descriptor: str) -> str:
+        if descriptor.startswith("str(") and descriptor.endswith(")"):
+            return descriptor[4:-1]
+        if descriptor.startswith("lit(") and descriptor.endswith(")"):
+            return descriptor[4:-1]
+        return descriptor
+
+    def _is_table_builder_header_instruction(
+        self, node: Union[RawInstruction, IRNode], mode: int
+    ) -> bool:
+        if not isinstance(node, RawInstruction):
+            return False
+        if node.profile.mode not in {mode, 0}:
+            return False
+        if not any(node.mnemonic.startswith(prefix) for prefix in self._TABLE_BUILDER_HEADER_PREFIXES):
+            return False
+        if self._is_annotation_only(node):
+            return self._has_trivial_stack_effect(node)
+        return self._has_trivial_stack_effect(node)
+
+    def _is_table_builder_setup(
+        self, node: Union[RawInstruction, IRNode], begin: IRTableBuilderBegin
+    ) -> bool:
+        if not isinstance(node, RawInstruction):
+            return False
+        if node.profile.mode not in {begin.mode, 0}:
+            return False
+        if not node.mnemonic.startswith("op_"):
+            return False
+        if node.mnemonic.startswith("op_2C_"):
+            return False
+        if node.profile.kind in {
+            InstructionKind.BRANCH,
+            InstructionKind.RETURN,
+            InstructionKind.CALL,
+            InstructionKind.TEST,
+        }:
+            return False
+        if self._is_annotation_only(node) and not any(
+            node.mnemonic.startswith(prefix) for prefix in self._TABLE_BUILDER_HEADER_PREFIXES
+        ):
+            return False
+        return self._has_trivial_stack_effect(node)
+
+    def _table_builder_mode(self, table: IRTablePatch) -> int:
+        for note in table.annotations:
+            if note.startswith("mode=0x"):
+                try:
+                    return int(note[6:], 16)
+                except ValueError:
+                    continue
+        if table.operations:
+            mnemonic = table.operations[0][0]
+            if len(mnemonic) >= 8:
+                try:
+                    return int(mnemonic[6:8], 16)
+                except ValueError:
+                    pass
+        return 0
+
+    def _table_builder_kind(
+        self, annotations: Sequence[str], begin: IRTableBuilderBegin
+    ) -> str:
+        for note in annotations:
+            if note.startswith("kind="):
+                value = note[5:]
+                if value and value != "unknown":
+                    return value
+
+        if "opcode_table" in annotations:
+            base = "opcode_table"
+        elif "adaptive_table" in annotations:
+            base = "adaptive_table"
+        elif annotations:
+            base = annotations[0]
+        else:
+            base = "table_patch"
+
+        parts: List[str] = []
+        if begin.prologue:
+            parts.append(begin.prologue[0][0])
+        else:
+            parts.append(f"mode_0x{begin.mode:02X}")
+        if begin.header:
+            parts.append(self._table_builder_slug(begin.header))
+        if begin.mode_description:
+            parts.append(self._table_builder_slug(begin.mode_description))
+
+        signature = ".".join(part for part in parts if part)
+        if not signature:
+            return base
+        return f"{base}.{signature}"
+
+    @staticmethod
+    def _table_builder_slug(value: str) -> str:
+        slug_chars: List[str] = []
+        for char in value:
+            if char.isalnum() or char in {"_", "."}:
+                slug_chars.append(char.lower())
+            else:
+                slug_chars.append("_")
+        slug = "".join(slug_chars).strip("_")
+        return slug or "label"
+
+    def _build_table_builder_commit(
+        self, node: Union[RawInstruction, IRNode]
+    ) -> Optional[IRTableBuilderCommit]:
+        guard: Optional[str] = None
+        commit_target: Optional[int] = None
+        fallback_target: Optional[int] = None
+        kind = "testset"
+
+        if isinstance(node, IRTestSetBranch):
+            guard = f"{node.var}={node.expr}"
+            commit_target = node.then_target
+            fallback_target = node.else_target
+            kind = "testset"
+            if "table" not in node.expr:
+                return None
+        elif isinstance(node, IRIf):
+            guard = node.condition
+            commit_target = node.then_target
+            fallback_target = node.else_target
+            kind = "if"
+            if "table" not in node.condition:
+                return None
+        else:
+            return None
+
+        assert guard is not None and commit_target is not None and fallback_target is not None
+        if commit_target == fallback_target:
+            return None
+
+        orientation = kind
+        if commit_target == 0 and fallback_target != 0:
+            orientation = f"{kind}_commit_zero"
+        elif fallback_target == 0 and commit_target != 0:
+            commit_target, fallback_target = fallback_target, commit_target
+            orientation = f"{kind}_fallback_zero"
+
+        return IRTableBuilderCommit(
+            guard=guard,
+            commit_target=commit_target,
+            fallback_target=fallback_target,
+            kind=orientation,
+        )
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]

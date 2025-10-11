@@ -696,6 +696,78 @@ class IRSwitchDispatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTableBuilderBegin(IRNode):
+    """Marks the start of a table construction pipeline."""
+
+    mode: int
+    prologue: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+    setup: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+    header: Optional[str] = None
+    mode_description: Optional[str] = None
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        setup = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.setup)
+        details = [f"mode=0x{self.mode:02X}"]
+        if ops:
+            details.append(f"prologue=[{ops}]")
+        if setup:
+            details.append(f"setup=[{setup}]")
+        if self.header:
+            details.append(f"header={self.header}")
+        if self.mode_description:
+            details.append(f"mode_desc={self.mode_description}")
+        if self.annotations:
+            details.extend(self.annotations)
+        return "table_begin " + " ".join(details)
+
+
+@dataclass(frozen=True)
+class IRTableBuilderEmit(IRNode):
+    """Table body emitted by the table construction pipeline."""
+
+    mode: int
+    kind: str
+    operations: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+    parameters: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
+        if self.parameters:
+            params = ", ".join(self.parameters)
+            details.append(f"params=[{params}]")
+        extra = [
+            note
+            for note in self.annotations
+            if note not in {self.kind, f"mode=0x{self.mode:02X}", f"kind={self.kind}"}
+        ]
+        if extra:
+            details.extend(extra)
+        return "table_emit " + " ".join(details)
+
+
+@dataclass(frozen=True)
+class IRTableBuilderCommit(IRNode):
+    """Represents the control-flow guard terminating a table builder."""
+
+    guard: str
+    commit_target: int
+    fallback_target: int
+    kind: str = "testset"
+
+    def describe(self) -> str:
+        return (
+            f"table_commit guard={self.guard} "
+            f"commit=0x{self.commit_target:04X} "
+            f"fallback=0x{self.fallback_target:04X} "
+            f"kind={self.kind}"
+        )
+
+
+@dataclass(frozen=True)
 class IRAsciiFinalize(IRNode):
     """Normalises helper invocations that terminate ASCII aggregation blocks."""
 
