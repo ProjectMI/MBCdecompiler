@@ -48,6 +48,7 @@ from .model import (
     IRProgram,
     IRRaw,
     IRReturn,
+    IRTerminator,
     IRSegment,
     IRSlot,
     MemRef,
@@ -764,12 +765,22 @@ class IRNormalizer:
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
+        self._pass_promote_push_literals(items, metrics)
 
         final_items = list(items)
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
         for index, item in enumerate(final_items):
             if isinstance(item, RawInstruction):
+                if item.mnemonic == "terminator":
+                    node = IRTerminator(
+                        operand=item.operand,
+                        operand_alias=item.profile.operand_alias(),
+                        operand_role=item.profile.operand_role(),
+                    )
+                    self._transfer_ssa(item, node)
+                    nodes.append(node)
+                    continue
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_items, index
                 ):
@@ -778,17 +789,34 @@ class IRNormalizer:
                         block_annotations.append(annotation)
                     continue
                 metrics.raw_remaining += 1
-                nodes.append(
-                    IRRaw(
-                        mnemonic=item.mnemonic,
-                        operand=item.operand,
-                        operand_role=item.profile.operand_role(),
-                        operand_alias=item.profile.operand_alias(),
-                        annotations=item.annotations,
-                    )
+                raw_node = IRRaw(
+                    mnemonic=item.mnemonic,
+                    operand=item.operand,
+                    operand_role=item.profile.operand_role(),
+                    operand_alias=item.profile.operand_alias(),
+                    annotations=item.annotations,
                 )
+                self._transfer_ssa(item, raw_node)
+                nodes.append(raw_node)
             else:
                 nodes.append(item)
+
+        if nodes:
+            converted: List[IRNode] = []
+            for node in nodes:
+                if isinstance(node, IRRaw) and node.mnemonic == "terminator":
+                    if metrics.raw_remaining > 0:
+                        metrics.raw_remaining -= 1
+                    updated = IRTerminator(
+                        operand=node.operand,
+                        operand_alias=node.operand_alias,
+                        operand_role=node.operand_role,
+                    )
+                    self._transfer_ssa(node, updated)
+                    converted.append(updated)
+                else:
+                    converted.append(node)
+            nodes = converted
 
         ir_block = IRBlock(
             label=f"block_{block.index}",
@@ -4500,6 +4528,52 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=instruction.profile.operand_alias(),
         )
+
+    def _pass_promote_push_literals(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+            if not self._can_promote_push_literal(item, items, index):
+                index += 1
+                continue
+
+            literal = IRLiteral(
+                value=item.operand,
+                mode=item.profile.mode,
+                source=item.mnemonic,
+                annotations=item.annotations,
+            )
+            self._transfer_ssa(item, literal)
+            items.replace_slice(index, index + 1, [literal])
+            metrics.literals += 1
+            continue
+
+    def _can_promote_push_literal(
+        self, instruction: RawInstruction, items: _ItemList, index: int
+    ) -> bool:
+        profile = instruction.profile
+        if profile.kind is not InstructionKind.PUSH:
+            return False
+        event = instruction.event
+        if event.delta <= 0 or event.popped_types:
+            return False
+        mnemonic = instruction.mnemonic
+        if mnemonic in CALL_PREPARATION_MNEMONICS or mnemonic in CALL_CLEANUP_MNEMONICS:
+            return False
+        if mnemonic == "op_02_66":
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+
+        following = items[index + 1] if index + 1 < len(items) else None
+        if isinstance(following, IRCallCleanup):
+            return False
+        if isinstance(following, RawInstruction) and self._is_call_cleanup_instruction(following):
+            return False
+        return True
 
     def _append_epilogue_effects(
         self,
