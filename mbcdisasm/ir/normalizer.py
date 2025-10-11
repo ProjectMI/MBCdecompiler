@@ -748,6 +748,7 @@ class IRNormalizer:
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
+        self._pass_epilogue_prologue_compaction(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
 
@@ -4408,6 +4409,150 @@ class IRNormalizer:
             index += 1
 
         self._sweep_indirect_configuration(items)
+
+    def _pass_epilogue_prologue_compaction(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not self._is_epilogue_marker(item):
+                index += 1
+                continue
+
+            replacement = self._compact_epilogue_marker(items, index)
+            if replacement:
+                continue
+
+            index += 1
+
+    def _compact_epilogue_marker(self, items: _ItemList, index: int) -> bool:
+        marker = cast(RawInstruction, items[index])
+        scan = index + 1
+        cleanup_nodes: List[IRCallCleanup] = []
+
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, IRCallCleanup):
+                cleanup_nodes.append(candidate)
+                scan += 1
+                continue
+            if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                scan += 1
+                continue
+            break
+
+        if scan >= len(items):
+            return False
+
+        target = items[scan]
+
+        if isinstance(target, IRFunctionPrologue):
+            if self._dominates_function_prologue(items, index):
+                items.pop(index)
+                return True
+            return False
+
+        terminator = self._resolve_epilogue_target(target)
+        if terminator is None:
+            return False
+
+        residual_depth = self._residual_stack_depth(marker, cleanup_nodes, terminator)
+        if residual_depth > 0:
+            return False
+
+        items.pop(index)
+        return True
+
+    def _dominates_function_prologue(self, items: _ItemList, index: int) -> bool:
+        for position in range(index):
+            if not self._is_prologue_prefix(items[position]):
+                return False
+        return True
+
+    def _resolve_epilogue_target(
+        self, node: Union[RawInstruction, IRNode]
+    ) -> Optional[Union[IRReturn, IRTailCall, IRTailcallReturn, IRCallReturn]]:
+        if isinstance(node, IRReturn):
+            return node
+        if isinstance(node, IRTailCall):
+            return node
+        if isinstance(node, IRTailcallReturn):
+            return node
+        if isinstance(node, IRCallReturn) and node.tail:
+            return node
+        return None
+
+    def _residual_stack_depth(
+        self,
+        marker: RawInstruction,
+        cleanup_nodes: Sequence[IRCallCleanup],
+        terminator: Union[IRReturn, IRTailCall, IRTailcallReturn, IRCallReturn],
+    ) -> int:
+        depth = marker.event.depth_after
+        for cleanup in cleanup_nodes:
+            depth = self._apply_cleanup(depth, cleanup.steps)
+
+        if isinstance(terminator, IRReturn):
+            depth = self._apply_cleanup(depth, terminator.cleanup)
+            if not terminator.varargs:
+                depth = self._consume_returns(depth, len(terminator.values))
+            else:
+                depth = 0
+            return depth
+
+        if isinstance(terminator, IRTailCall):
+            depth = self._apply_cleanup(depth, terminator.cleanup)
+            if not terminator.varargs:
+                depth = self._consume_returns(depth, len(terminator.returns))
+            else:
+                depth = 0
+            return depth
+
+        if isinstance(terminator, IRTailcallReturn):
+            depth = self._apply_cleanup(depth, terminator.cleanup)
+            if not terminator.varargs:
+                depth = self._consume_returns(depth, terminator.returns)
+            else:
+                depth = 0
+            return depth
+
+        # IRCallReturn tail variant
+        depth = self._apply_cleanup(depth, terminator.cleanup)
+        if not terminator.varargs:
+            depth = self._consume_returns(depth, len(terminator.returns))
+        else:
+            depth = 0
+        return depth
+
+    @staticmethod
+    def _apply_cleanup(depth: int, steps: Sequence[IRStackEffect]) -> int:
+        for step in steps:
+            depth = max(depth - step.pops, 0)
+        return depth
+
+    @staticmethod
+    def _consume_returns(depth: int, count: int) -> int:
+        if count <= 0:
+            return depth
+        return max(depth - count, 0)
+
+    def _is_epilogue_marker(self, instruction: RawInstruction) -> bool:
+        if instruction.event.uncertain:
+            return False
+        if instruction.event.delta != 0:
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+
+        mnemonic = instruction.mnemonic
+        if mnemonic in {"op_06_00", "op_E4_06"}:
+            return True
+        if mnemonic.startswith("op_02_") and instruction.profile.is_control():
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # description helpers

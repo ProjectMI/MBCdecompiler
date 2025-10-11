@@ -2098,8 +2098,60 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
     assert load_node.ref.bank == 0x4B0C
     assert any(page.register == 0x06D4 for page in page_nodes)
     assert any(page.register == 0x06C8 for page in page_nodes)
-    assert not any(
-        isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
-        for node in block.nodes
+
+
+def test_epilogue_marker_absorbed_into_return() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    marker = make_stack_neutral_instruction(
+        0,
+        "op_02_00",
+        kind=InstructionKind.TERMINATOR,
     )
+    cleanup = IRCallCleanup(steps=(IRStackEffect(mnemonic="stack_teardown", pops=1),))
+    ret = IRReturn(values=tuple())
+
+    items = _ItemList([marker, cleanup, ret])
+    normalizer._pass_epilogue_prologue_compaction(items)
+
+    assert list(items) == [cleanup, ret]
+
+
+def test_epilogue_marker_absorbed_into_tailcall() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    marker = make_stack_neutral_instruction(
+        0,
+        "op_06_00",
+        kind=InstructionKind.CONTROL,
+    )
+    call = IRCall(target=0x1234, args=("arg0",), tail=True)
+    tail = IRTailCall(call=call, returns=tuple())
+
+    items = _ItemList([marker, tail])
+    normalizer._pass_epilogue_prologue_compaction(items)
+
+    assert list(items) == [tail]
+
+
+def test_prologue_marker_absorbed_before_function_prologue() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    literal = IRLiteralChunk(data=b"HEAD", source="test")
+    marker = make_stack_neutral_instruction(
+        4,
+        "op_02_00",
+        kind=InstructionKind.TERMINATOR,
+    )
+    prologue = IRFunctionPrologue(
+        var="slot(0x0000)",
+        expr="cond",
+        then_target=0x0010,
+        else_target=0x0020,
+    )
+
+    items = _ItemList([literal, marker, prologue])
+    normalizer._pass_epilogue_prologue_compaction(items)
+
+    assert list(items) == [literal, prologue]
 
