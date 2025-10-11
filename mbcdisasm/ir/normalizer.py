@@ -441,6 +441,9 @@ class _ItemList:
     def __getitem__(self, index: int) -> Union[RawInstruction, IRNode]:
         return self._items[index]
 
+    def __setitem__(self, index: int, value: Union[RawInstruction, IRNode]) -> None:
+        self._items[index] = value
+
     def replace_slice(
         self, start: int, end: int, replacement: Sequence[Union[RawInstruction, IRNode]]
     ) -> None:
@@ -1388,21 +1391,27 @@ class IRNormalizer:
                     continue
 
                 candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
-                    spacers.append(candidate)
-                    scan += 1
-                    continue
-
-                if isinstance(candidate, RawInstruction) and candidate.mnemonic.startswith("reduce"):
-                    if not added_literal_since_reduce:
-                        self._annotation_offsets.add(candidate.offset)
+                if isinstance(candidate, RawInstruction):
+                    if self._is_annotation_only(candidate):
                         spacers.append(candidate)
                         scan += 1
                         continue
-                    reducers.append(candidate)
-                    scan += 1
-                    added_literal_since_reduce = False
-                    continue
+
+                    kind = candidate.profile.kind
+                    is_reduce = kind is InstructionKind.REDUCE
+                    if not is_reduce and candidate.mnemonic.startswith("reduce"):
+                        is_reduce = True
+
+                    if is_reduce:
+                        if not added_literal_since_reduce:
+                            self._annotation_offsets.add(candidate.offset)
+                            spacers.append(candidate)
+                            scan += 1
+                            continue
+                        reducers.append(candidate)
+                        scan += 1
+                        added_literal_since_reduce = False
+                        continue
 
                 break
 
@@ -4191,7 +4200,7 @@ class IRNormalizer:
                     source=item.profile.mnemonic,
                     annotations=item.annotations,
                 )
-                items.replace_slice(index, index + 1, [literal])
+                items[index] = literal
                 return literal
         return None
 
