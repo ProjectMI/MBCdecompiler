@@ -299,6 +299,10 @@ SIDE_EFFECT_KIND_HINTS = {
 SIDE_EFFECT_KEYWORDS = ("io", "port", "memory", "store", "write", "page", "mode", "status", "flag")
 
 
+PREDICATE_MATERIALIZER_PREFIXES = ("op_02_", "op_03_", "op_04_")
+PREDICATE_MATERIALIZER_MNEMONICS = {"op_64_04", "op_64_30"}
+
+
 INDIRECT_PAGE_REGISTER_MNEMONICS = {
     "op_D4_06": 0x06D4,
     "op_C8_06": 0x06C8,
@@ -3160,8 +3164,6 @@ class IRNormalizer:
         event = instruction.event
         if event.delta != 0:
             return False
-        if event.popped_types or event.pushed_types:
-            return False
         kind = instruction.profile.kind
         if kind in {
             InstructionKind.BRANCH,
@@ -3256,6 +3258,7 @@ class IRNormalizer:
                         flag=flag,
                         then_target=item.then_target,
                         else_target=item.else_target,
+                        materialized=item.materialized,
                     )
                     items.replace_slice(index, index + 1, [node])
                     index += 1
@@ -4290,6 +4293,10 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
+                materialized, new_index = self._collect_predicate_materialization(items, index)
+                if new_index != index:
+                    index = new_index
+                    item = cast(RawInstruction, items[index])
                 expr = self._describe_condition(items, index, skip_literals=True)
                 then_target = self._branch_target(item)
                 else_target = self._fallthrough_target(item)
@@ -4298,6 +4305,7 @@ class IRNormalizer:
                     expr=expr,
                     then_target=then_target,
                     else_target=else_target,
+                    materialized=materialized,
                 )
                 self._transfer_ssa(item, node)
                 replacement: List[Union[RawInstruction, IRNode]] = [node]
@@ -4306,6 +4314,7 @@ class IRNormalizer:
                         condition=node.var,
                         then_target=then_target,
                         else_target=else_target,
+                        materialized=materialized,
                     )
                     replacement.append(branch)
                     metrics.if_branches += 1
@@ -4324,10 +4333,16 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                materialized, new_index = self._collect_predicate_materialization(items, index)
+                if new_index != index:
+                    index = new_index
+                    item = cast(RawInstruction, items[index])
+                condition = self._describe_condition(items, index)
                 node = IRIf(
-                    condition=self._describe_condition(items, index),
+                    condition=condition,
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    materialized=materialized,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
@@ -4516,6 +4531,49 @@ class IRNormalizer:
                 return getattr(candidate, "describe", lambda: "expr()")()
             scan -= 1
         return "stack_top"
+
+    def _collect_predicate_materialization(
+        self, items: _ItemList, index: int
+    ) -> Tuple[Tuple[str, ...], int]:
+        materialized: List[RawInstruction] = []
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if not isinstance(candidate, RawInstruction):
+                break
+            if not self._is_predicate_materializer(candidate):
+                break
+            materialized.append(candidate)
+            scan -= 1
+        if not materialized:
+            return tuple(), index
+        start = scan + 1
+        labels = [
+            self._describe_predicate_materializer(instruction)
+            for instruction in reversed(materialized)
+        ]
+        items.replace_slice(start, start + len(materialized), [])
+        return tuple(labels), start
+
+    def _is_predicate_materializer(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if not (
+            mnemonic.startswith(PREDICATE_MATERIALIZER_PREFIXES)
+            or mnemonic in PREDICATE_MATERIALIZER_MNEMONICS
+        ):
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.popped_types or event.pushed_types:
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        return True
+
+    @staticmethod
+    def _describe_predicate_materializer(instruction: RawInstruction) -> str:
+        return f"{instruction.mnemonic}(operand=0x{instruction.operand:04X})"
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:

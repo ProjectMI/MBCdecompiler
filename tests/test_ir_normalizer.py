@@ -18,6 +18,7 @@ from mbcdisasm.ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRIf,
+    IRFlagCheck,
     IRReturn,
     IRFunctionPrologue,
     IRStackEffect,
@@ -1326,6 +1327,80 @@ def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:
     assert branch.then_target == predicate.then_target
     assert branch.else_target == predicate.else_target
     assert branch.condition == predicate.var
+
+
+def test_normalizer_materializes_predicate_before_testset(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x64, 0x04, 0x0000),
+        build_word(4, 0x27, 0x00, 0x0010),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    normalizer = IRNormalizer(knowledge)
+    block = normalizer._parse_segment(segment)[0]
+    items = _ItemList(block.instructions)
+    metrics = NormalizerMetrics()
+
+    normalizer._pass_testset_branches(items, metrics)
+
+    assert any(isinstance(node, IRTestSetBranch) for node in items)
+    branch = next(node for node in items if isinstance(node, IRTestSetBranch))
+    assert branch.materialized == ("op_64_04(operand=0x0000)",)
+    assert not any(
+        isinstance(node, RawInstruction) and node.mnemonic == "op_64_04" for node in items
+    )
+
+
+def test_normalizer_materializes_predicate_before_branch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x64, 0x04, 0x0000),
+        build_word(4, 0x23, 0x00, 0x0010),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    normalizer = IRNormalizer(knowledge)
+    block = normalizer._parse_segment(segment)[0]
+    items = _ItemList(block.instructions)
+    metrics = NormalizerMetrics()
+
+    normalizer._pass_branches(items, metrics)
+
+    assert any(isinstance(node, IRIf) for node in items)
+    branch = next(node for node in items if isinstance(node, IRIf))
+    assert branch.materialized == ("op_64_04(operand=0x0000)",)
+    assert not any(
+        isinstance(node, RawInstruction) and node.mnemonic == "op_64_04" for node in items
+    )
+
+
+def test_flag_check_inherits_materialized_predicate(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    items = _ItemList(
+        [
+            IRIf(
+                condition="lit(0x0166)",
+                then_target=0x1000,
+                else_target=0x2000,
+                materialized=("op_02_10(operand=0x0000)",),
+            )
+        ]
+    )
+
+    normalizer._pass_flag_checks(items)
+
+    assert len(items) == 1
+    node = items[0]
+    assert isinstance(node, IRFlagCheck)
+    assert node.materialized == ("op_02_10(operand=0x0000)",)
 
 
 def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:

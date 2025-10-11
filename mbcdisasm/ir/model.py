@@ -410,11 +410,17 @@ class IRIf(IRNode):
     condition: str
     then_target: int
     else_target: int
+    materialized: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
+        details = []
+        if self.materialized:
+            rendered = ", ".join(self.materialized)
+            details.append(f"materialized=[{rendered}]")
+        suffix = f" {' '.join(details)}" if details else ""
         return (
             f"if cond={self.condition} then=0x{self.then_target:04X} "
-            f"else=0x{self.else_target:04X}"
+            f"else=0x{self.else_target:04X}{suffix}"
         )
 
 
@@ -426,11 +432,17 @@ class IRTestSetBranch(IRNode):
     expr: str
     then_target: int
     else_target: int
+    materialized: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
+        details = []
+        if self.materialized:
+            rendered = ", ".join(self.materialized)
+            details.append(f"materialized=[{rendered}]")
+        suffix = f" {' '.join(details)}" if details else ""
         return (
             f"testset {self.var}={self.expr} then=0x{self.then_target:04X} "
-            f"else=0x{self.else_target:04X}"
+            f"else=0x{self.else_target:04X}{suffix}"
         )
 
 
@@ -441,11 +453,17 @@ class IRFlagCheck(IRNode):
     flag: int
     then_target: int
     else_target: int
+    materialized: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
+        details = []
+        if self.materialized:
+            rendered = ", ".join(self.materialized)
+            details.append(f"materialized=[{rendered}]")
+        suffix = f" {' '.join(details)}" if details else ""
         return (
             f"check_flag flag=0x{self.flag:04X} then=0x{self.then_target:04X} "
-            f"else=0x{self.else_target:04X}"
+            f"else=0x{self.else_target:04X}{suffix}"
         )
 
 
