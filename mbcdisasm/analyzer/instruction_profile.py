@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
@@ -137,6 +137,23 @@ class StackEffectHint:
         )
 
 
+@dataclass(frozen=True)
+class _ProfileTemplate:
+    """Cached profile metadata shared between identical instruction words."""
+
+    info: Optional[OpcodeInfo]
+    mnemonic: str
+    summary: Optional[str]
+    category: Optional[str]
+    control_flow: Optional[str]
+    stack_hint: StackEffectHint
+    kind: InstructionKind
+    traits: Mapping[str, object]
+
+
+_PROFILE_CACHE: Dict[tuple[int, int], _ProfileTemplate] = {}
+
+
 @dataclass
 class InstructionProfile:
     """Bundle low level instruction details with analysis helpers."""
@@ -150,40 +167,70 @@ class InstructionProfile:
     stack_hint: StackEffectHint
     kind: InstructionKind
     traits: Mapping[str, object] = field(default_factory=dict)
+    _label: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._label = self.word.label()
 
     @classmethod
     def from_word(cls, word: InstructionWord, knowledge: KnowledgeBase) -> "InstructionProfile":
         """Create a profile for ``word`` using ``knowledge`` annotations."""
 
-        info, heuristic = resolve_opcode_info(word, knowledge)
-        mnemonic = info.mnemonic if info else f"op_{word.opcode:02X}_{word.mode:02X}"
-        summary = info.summary if info else None
-        category = info.category if info else None
-        control_flow = info.control_flow if info else None
-        stack_hint = StackEffectHint.from_info(info)
-        kind = classify_kind(word, info)
-        if info and info.attributes:
-            traits: Mapping[str, object] = dict(info.attributes)
-        else:
-            traits = {}
-        if heuristic:
-            traits = dict(traits)
-            traits.setdefault("heuristic", True)
+        cache_key = (id(knowledge), word.raw)
+        template = _PROFILE_CACHE.get(cache_key)
+        if template is None:
+            info, heuristic = resolve_opcode_info(word, knowledge)
+            mnemonic = info.mnemonic if info else f"op_{word.opcode:02X}_{word.mode:02X}"
+            summary = info.summary if info else None
+            category = info.category if info else None
+            control_flow = info.control_flow if info else None
+            stack_hint = StackEffectHint.from_info(info)
+            kind = classify_kind(word, info)
+            if info and info.attributes:
+                traits: Mapping[str, object] = dict(info.attributes)
+            else:
+                traits = {}
+            if heuristic:
+                traits = dict(traits)
+                traits.setdefault("heuristic", True)
+            profile = cls(
+                word=word,
+                info=info,
+                mnemonic=mnemonic,
+                summary=summary,
+                category=category,
+                control_flow=control_flow,
+                stack_hint=stack_hint,
+                kind=kind,
+                traits=traits,
+            )
+            _PROFILE_CACHE[cache_key] = _ProfileTemplate(
+                info=info,
+                mnemonic=mnemonic,
+                summary=summary,
+                category=category,
+                control_flow=control_flow,
+                stack_hint=stack_hint,
+                kind=kind,
+                traits=traits,
+            )
+            return profile
+
         return cls(
             word=word,
-            info=info,
-            mnemonic=mnemonic,
-            summary=summary,
-            category=category,
-            control_flow=control_flow,
-            stack_hint=stack_hint,
-            kind=kind,
-            traits=traits,
+            info=template.info,
+            mnemonic=template.mnemonic,
+            summary=template.summary,
+            category=template.category,
+            control_flow=template.control_flow,
+            stack_hint=template.stack_hint,
+            kind=template.kind,
+            traits=template.traits,
         )
 
     @property
     def label(self) -> str:
-        return self.word.label()
+        return self._label
 
     @property
     def opcode(self) -> int:
