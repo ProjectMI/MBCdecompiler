@@ -154,6 +154,13 @@ CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_70_29",
 }
 
+PREDICATE_MATERIALIZER_OPCODES: Dict[int, Optional[Set[int]]] = {
+    0x02: None,
+    0x03: None,
+    0x04: None,
+    0x64: {0x04, 0x30},
+}
+
 TAILCALL_HELPERS = {
     0x003E,
     0x00ED,
@@ -3250,12 +3257,25 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             if isinstance(item, IRIf):
+                predicate_expr: Optional[str] = None
+                extracted = self._collect_predicate_materialization(items, index)
+                if extracted is not None:
+                    predicate_expr, start, count = extracted
+                    items.replace_slice(start, start + count, [])
+                    index -= count
+                    if index < 0:
+                        index = 0
+                    item = items[index]
+                    if not isinstance(item, IRIf):
+                        index += 1
+                        continue
                 flag = self._flag_literal_value(item.condition)
                 if flag is not None:
                     node = IRFlagCheck(
                         flag=flag,
                         then_target=item.then_target,
                         else_target=item.else_target,
+                        predicate=predicate_expr,
                     )
                     items.replace_slice(index, index + 1, [node])
                     index += 1
@@ -3276,6 +3296,7 @@ class IRNormalizer:
                             expr=item.expr,
                             then_target=item.then_target,
                             else_target=item.else_target,
+                            predicate=item.predicate,
                         )
                         self._transfer_ssa(item, node)
                         items.replace_slice(index, index + 1, [node])
@@ -3483,6 +3504,7 @@ class IRNormalizer:
                     expr=alias,
                     then_target=branch.then_target,
                     else_target=branch.else_target,
+                    predicate=branch.predicate,
                 )
                 items.replace_slice(branch_index, branch_index + 1, [updated_branch])
             elif isinstance(branch, IRIf) and branch.condition != alias:
@@ -3553,6 +3575,7 @@ class IRNormalizer:
                 expr=alias,
                 then_target=branch.then_target,
                 else_target=branch.else_target,
+                predicate=branch.predicate,
             )
             return predicate, scan, alias
 
@@ -3796,6 +3819,7 @@ class IRNormalizer:
                 expr=candidate.expr,
                 then_target=candidate.then_target,
                 else_target=candidate.else_target,
+                predicate=candidate.predicate,
             )
             cleanup_mask = pattern.cleanup_mask
             tail = pattern.tail
@@ -3808,6 +3832,7 @@ class IRNormalizer:
                 flag=candidate.flag,
                 then_target=candidate.then_target,
                 else_target=candidate.else_target,
+                predicate=candidate.predicate,
             )
             cleanup_mask = pattern.cleanup_mask
             tail = pattern.tail
@@ -4037,6 +4062,73 @@ class IRNormalizer:
         if self._is_stack_teardown_step(instruction):
             return True
         return False
+
+    def _is_predicate_materializer(self, instruction: RawInstruction) -> bool:
+        opcode = instruction.profile.opcode
+        if opcode not in PREDICATE_MATERIALIZER_OPCODES:
+            return False
+        allowed_modes = PREDICATE_MATERIALIZER_OPCODES[opcode]
+        mode = instruction.profile.mode
+        if allowed_modes is not None and mode not in allowed_modes:
+            return False
+        if opcode in {0x02, 0x03, 0x04} and instruction.operand != 0:
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.pushed_types or event.popped_types:
+            return False
+        if instruction.ssa_values:
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        kind = instruction.profile.kind
+        if kind in {
+            InstructionKind.BRANCH,
+            InstructionKind.CALL,
+            InstructionKind.RETURN,
+            InstructionKind.TAILCALL,
+            InstructionKind.TERMINATOR,
+        }:
+            return False
+        return True
+
+    def _collect_predicate_materialization(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[str, int, int]]:
+        start = index
+        collected: List[RawInstruction] = []
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction) and self._is_predicate_materializer(candidate):
+                collected.append(candidate)
+                start = scan
+                scan -= 1
+                continue
+            break
+        if not collected:
+            return None
+        collected.reverse()
+        expr = self._format_predicate_expression(collected)
+        return expr, start, len(collected)
+
+    def _format_predicate_expression(
+        self, instructions: Sequence[RawInstruction]
+    ) -> str:
+        tokens = [self._format_predicate_token(instruction) for instruction in instructions]
+        if not tokens:
+            return "bool(predicate)"
+        rendered = tokens[0] if len(tokens) == 1 else " & ".join(tokens)
+        return f"bool({rendered})"
+
+    @staticmethod
+    def _format_predicate_token(instruction: RawInstruction) -> str:
+        mnemonic = instruction.mnemonic
+        operand = instruction.operand
+        if operand:
+            return f"{mnemonic}(0x{operand:04X})"
+        return mnemonic
 
     @staticmethod
     def _call_preparation_step(instruction: RawInstruction) -> Tuple[str, int]:
@@ -4290,7 +4382,19 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
-                expr = self._describe_condition(items, index, skip_literals=True)
+                predicate_expr: Optional[str] = None
+                extracted = self._collect_predicate_materialization(items, index)
+                if extracted is not None:
+                    predicate_expr, start, count = extracted
+                    items.replace_slice(start, start + count, [])
+                    index -= count
+                    if index < 0:
+                        index = 0
+                    item = items[index]
+                if predicate_expr is not None:
+                    expr = predicate_expr
+                else:
+                    expr = self._describe_condition(items, index, skip_literals=True)
                 then_target = self._branch_target(item)
                 else_target = self._fallthrough_target(item)
                 node = IRTestSetBranch(
@@ -4298,6 +4402,7 @@ class IRNormalizer:
                     expr=expr,
                     then_target=then_target,
                     else_target=else_target,
+                    predicate=predicate_expr,
                 )
                 self._transfer_ssa(item, node)
                 replacement: List[Union[RawInstruction, IRNode]] = [node]

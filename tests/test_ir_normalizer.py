@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from mbcdisasm.ir.model import (
     IRTailcallReturn,
     IRIf,
     IRReturn,
+    IRFlagCheck,
     IRFunctionPrologue,
     IRStackEffect,
     IRTestSetBranch,
@@ -206,6 +208,30 @@ def write_manual(path: Path) -> KnowledgeBase:
             "opcodes": ["0x27:0x00", "0x27:0x33"],
             "name": "testset_branch",
             "category": "testset_branch",
+        },
+        "predicate_op_02_00": {
+            "opcodes": ["0x02:0x00"],
+            "name": "op_02_00",
+            "category": "predicate_helper",
+            "stack_delta": 0,
+        },
+        "predicate_op_03_00": {
+            "opcodes": ["0x03:0x00"],
+            "name": "op_03_00",
+            "category": "predicate_helper",
+            "stack_delta": 0,
+        },
+        "predicate_op_64_04": {
+            "opcodes": ["0x64:0x04"],
+            "name": "op_64_04",
+            "category": "predicate_helper",
+            "stack_delta": 0,
+        },
+        "predicate_op_64_30": {
+            "opcodes": ["0x64:0x30"],
+            "name": "op_64_30",
+            "category": "predicate_helper",
+            "stack_delta": 0,
         },
         "indirect_access": {
             "opcodes": ["0x69:0x01"],
@@ -1326,6 +1352,80 @@ def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:
     assert branch.then_target == predicate.then_target
     assert branch.else_target == predicate.else_target
     assert branch.condition == predicate.var
+
+
+def test_normalizer_absorbs_predicate_materializer_before_testset(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x02, 0x00, 0x0000),  # predicate materializer
+        build_word(4, 0x27, 0x00, 0x0010),  # testset_branch
+        build_word(8, 0x30, 0x00, 0x0000),  # return
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    normalizer = IRNormalizer(knowledge)
+    block = normalizer._parse_segment(segment)[0]
+
+    predicate_instruction = block.instructions[0]
+    event = predicate_instruction.event
+    neutral_event = replace(
+        event,
+        delta=0,
+        minimum=event.depth_before,
+        maximum=event.depth_before,
+        depth_after=event.depth_before,
+        popped_types=tuple(),
+        pushed_types=tuple(),
+        kind=InstructionKind.UNKNOWN,
+        uncertain=False,
+    )
+    updated_predicate = replace(
+        predicate_instruction,
+        event=neutral_event,
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+    instructions = list(block.instructions)
+    instructions[0] = updated_predicate
+    updated_block = RawBlock(
+        index=block.index,
+        start_offset=block.start_offset,
+        instructions=tuple(instructions),
+    )
+
+    ir_block, _ = normalizer._normalise_block(updated_block)
+
+    predicate_node = next(
+        node
+        for node in ir_block.nodes
+        if isinstance(node, (IRTestSetBranch, IRFunctionPrologue))
+    )
+
+    assert getattr(predicate_node, "predicate", None) == "bool(op_02_00)"
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_02_00"
+        for node in ir_block.nodes
+    )
+
+
+def test_normalizer_absorbs_flag_predicate_materializer(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    normalizer = IRNormalizer(knowledge)
+    predicate = make_stack_neutral_instruction(0, "op_64_30")
+    branch = IRIf(condition="lit(0x0166)", then_target=0x0010, else_target=0x000C)
+    items = _ItemList([predicate, branch])
+
+    normalizer._pass_flag_checks(items)
+
+    assert len(items) == 1
+    flag_check = items[0]
+    assert isinstance(flag_check, IRFlagCheck)
+    assert flag_check.flag == 0x0166
+    assert flag_check.predicate == "bool(op_64_30)"
 
 
 def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:

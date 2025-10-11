@@ -117,6 +117,7 @@ class CallPredicate:
     then_target: Optional[int] = None
     else_target: Optional[int] = None
     flag: Optional[int] = None
+    predicate: Optional[str] = None
 
     def describe(self) -> str:
         if self.kind == "testset":
@@ -124,12 +125,18 @@ class CallPredicate:
             expr = self.expr or "expr"
             then_target = f"0x{self.then_target:04X}" if self.then_target is not None else "?"
             else_target = f"0x{self.else_target:04X}" if self.else_target is not None else "?"
-            return f"testset {var}={expr} then={then_target} else={else_target}"
+            details = f"testset {var}={expr} then={then_target} else={else_target}"
+            if self.predicate:
+                details += f" predicate={self.predicate}"
+            return details
         if self.kind == "flag":
             flag = f"0x{self.flag:04X}" if self.flag is not None else "?"
             then_target = f"0x{self.then_target:04X}" if self.then_target is not None else "?"
             else_target = f"0x{self.else_target:04X}" if self.else_target is not None else "?"
-            return f"flag {flag} then={then_target} else={else_target}"
+            details = f"flag {flag} then={then_target} else={else_target}"
+            if self.predicate:
+                details += f" predicate={self.predicate}"
+            return details
         then_target = f"0x{self.then_target:04X}" if self.then_target is not None else "?"
         else_target = f"0x{self.else_target:04X}" if self.else_target is not None else "?"
         return f"{self.kind} then={then_target} else={else_target}"
@@ -426,12 +433,16 @@ class IRTestSetBranch(IRNode):
     expr: str
     then_target: int
     else_target: int
+    predicate: Optional[str] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"testset {self.var}={self.expr} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate:
+            base += f" predicate={self.predicate}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -441,12 +452,16 @@ class IRFlagCheck(IRNode):
     flag: int
     then_target: int
     else_target: int
+    predicate: Optional[str] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"check_flag flag=0x{self.flag:04X} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate:
+            base += f" predicate={self.predicate}"
+        return base
 
 
 @dataclass(frozen=True)
@@ -457,12 +472,16 @@ class IRFunctionPrologue(IRNode):
     expr: str
     then_target: int
     else_target: int
+    predicate: Optional[str] = None
 
     def describe(self) -> str:
-        return (
+        base = (
             f"function_prologue {self.var}={self.expr} "
             f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
         )
+        if self.predicate:
+            base += f" predicate={self.predicate}"
+        return base
 
 
 @dataclass(frozen=True)
