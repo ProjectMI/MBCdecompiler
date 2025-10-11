@@ -993,6 +993,36 @@ def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
     assert "op_F0_E8" not in raw_mnemonics
 
 
+def test_normalizer_merges_io_facade_with_call_helper(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x13, 0x00, IO_SLOT),
+        build_word(4, 0x10, 0xE4, 0x0100),
+        build_word(8, 0xF0, 0x4B, 0x0000),
+        build_word(12, 0x4A, 0x10, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert len(io_writes) == 1
+    facade = io_writes[0]
+    helper_names = [step.mnemonic for step in facade.helper]
+    assert helper_names == ["call_helpers", "op_F0_4B", "op_4A_10"]
+    assert facade.helper[0].operand == 0x0100
+    assert "helper=[" in facade.describe()
+
+    assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
+
+
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

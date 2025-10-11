@@ -9,9 +9,14 @@ from mbcdisasm.analyzer.instruction_profile import (
     InstructionProfile,
     looks_like_ascii_chunk,
 )
-from mbcdisasm.analyzer.signatures import SignatureDetector
+from mbcdisasm.analyzer.signatures import (
+    SignatureDetector,
+    CallHelperFacadeSignature,
+    IOFacadeSignature,
+)
 from mbcdisasm.analyzer.stack import StackTracker
 from mbcdisasm.instruction import InstructionWord
+from mbcdisasm.constants import FANOUT_FLAGS_A, IO_SLOT, RET_MASK
 
 
 def make_word(opcode: int, mode: int, operand: int = 0, offset: int = 0) -> InstructionWord:
@@ -206,6 +211,39 @@ def test_signature_detector_matches_indirect_call_ex():
     match = detector.detect(profiles, summary)
     assert match is not None
     assert match.name == "indirect_call_ex"
+
+
+def test_signature_detector_matches_io_facade_sequence():
+    knowledge = KnowledgeBase({})
+    words = [
+        make_word(0x13, 0x00, IO_SLOT, 0),
+        make_word(0x10, 0xE4, 0x0100, 4),
+        make_word(0xF0, 0x4B, 0x0000, 8),
+        make_word(0x4A, 0x10, 0x0000, 12),
+        make_word(0x10, 0x08, RET_MASK, 16),
+        make_word(0x10, 0x32, FANOUT_FLAGS_A, 20),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector((IOFacadeSignature(),))
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "io_facade"
+
+
+def test_signature_detector_matches_call_helper_facade():
+    knowledge = KnowledgeBase({})
+    words = [
+        make_word(0x13, 0x00, IO_SLOT, 0),
+        make_word(0x10, 0xE4, 0x0100, 4),
+        make_word(0xF0, 0x4B, 0x0000, 8),
+        make_word(0x4A, 0x10, 0x0000, 12),
+        make_word(0x10, 0x08, RET_MASK, 16),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector((CallHelperFacadeSignature(),))
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "call_helper_facade"
 
 
 def test_signature_detector_matches_indirect_call_mini():

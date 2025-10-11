@@ -37,6 +37,10 @@ LiteralLike = {
 
 INDIRECT_RETURN_TERMINALS = {"2C:01", "66:3E", "F1:3D", "10:48"}
 
+IO_FACADE_LABELS = {"13:00", "3D:30"}
+CALL_HELPER_FACADE_LABELS = {"10:E4", "FD:4A", "05:F0"}
+CALL_HELPER_TRAIL_LABELS = {"F0:4B", "4A:10", "4A:05", "4A:00"}
+
 
 def is_literal_marker(profile: InstructionProfile) -> bool:
     """Return ``True`` when ``profile`` represents a literal marker opcode."""
@@ -1723,6 +1727,128 @@ class IndirectCallDualLiteralSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class IOFacadeSignature(SignatureRule):
+    """Recognise IO slot facades guarded by helper scaffolding."""
+
+    name = "io_facade"
+    category = "io"
+    base_confidence = 0.62
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 2:
+            return None
+
+        facade_idx = next(
+            (idx for idx, profile in enumerate(profiles) if profile.label in IO_FACADE_LABELS),
+            None,
+        )
+        if facade_idx is None:
+            return None
+
+        facade = profiles[facade_idx]
+        alias = facade.operand_alias()
+        operand = facade.operand
+        if alias != "IO_SLOT" and operand not in IO_SLOT_ALIASES:
+            return None
+
+        helper_idx = next(
+            (idx for idx in range(facade_idx + 1, len(profiles)) if is_call_helper(profiles[idx])),
+            None,
+        )
+        if helper_idx is None:
+            return None
+
+        suffix = profiles[helper_idx + 1 :]
+        ret_hits = sum(
+            1
+            for profile in suffix
+            if profile.operand == RET_MASK or profile.operand_alias() == "RET_MASK"
+        )
+        flag_hits = sum(1 for profile in suffix if profile.operand_alias() == "FANOUT_FLAGS")
+
+        notes = (
+            f"facade_idx={facade_idx}",
+            f"helper_idx={helper_idx}",
+            f"ret_hits={ret_hits}",
+            f"flag_hits={flag_hits}",
+            f"stackΔ={stack.change:+d}",
+        )
+
+        confidence = self.base_confidence
+        if alias == "IO_SLOT":
+            confidence += 0.05
+        confidence += 0.03 * min(ret_hits, 2)
+        confidence += 0.03 * min(flag_hits, 1)
+        confidence = min(0.9, confidence)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
+class CallHelperFacadeSignature(SignatureRule):
+    """Detect call-helper scaffolding that fronts IO facade blocks."""
+
+    name = "call_helper_facade"
+    category = "call"
+    base_confidence = 0.58
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        if len(profiles) < 2:
+            return None
+
+        helper_idx = next(
+            (idx for idx, profile in enumerate(profiles) if profile.label in CALL_HELPER_FACADE_LABELS),
+            None,
+        )
+        if helper_idx is None:
+            return None
+
+        prefix = profiles[:helper_idx]
+        has_io_neighbor = any(
+            candidate.label in IO_FACADE_LABELS
+            or candidate.operand in IO_SLOT_ALIASES
+            or candidate.operand_alias() == "IO_SLOT"
+            for candidate in prefix
+        )
+        if not has_io_neighbor:
+            return None
+
+        suffix = profiles[helper_idx + 1 :]
+        if not suffix:
+            return None
+
+        cleanup_hits = sum(1 for candidate in suffix if candidate.label in CALL_HELPER_TRAIL_LABELS)
+        helper_tail = any(is_call_helper(candidate) for candidate in suffix)
+        if cleanup_hits == 0 and not helper_tail:
+            return None
+
+        ret_hits = sum(
+            1
+            for candidate in suffix
+            if candidate.operand == RET_MASK or candidate.operand_alias() == "RET_MASK"
+        )
+        flag_hit = any(candidate.operand_alias() == "FANOUT_FLAGS" for candidate in suffix)
+
+        notes = (
+            f"helper_idx={helper_idx}",
+            f"cleanup_hits={cleanup_hits}",
+            f"ret_hits={ret_hits}",
+            f"stackΔ={stack.change:+d}",
+        )
+
+        confidence = self.base_confidence
+        confidence += 0.03 * min(cleanup_hits, 2)
+        if helper_tail:
+            confidence += 0.03
+        confidence += 0.02 * min(ret_hits, 2)
+        if flag_hit:
+            confidence += 0.02
+        confidence = min(0.88, confidence)
+        return SignatureMatch(self.name, self.category, confidence, notes)
+
+
 class IndirectCallExSignature(SignatureRule):
     """Recognise extended indirect call setup blocks."""
 
@@ -1949,6 +2075,8 @@ class SignatureDetector:
             FanoutTeardownExtendedSignature(),
             FanoutTeardownSignature(),
             DoubleTailcallBranchSignature(),
+            IOFacadeSignature(),
+            CallHelperFacadeSignature(),
             IndirectCallDualLiteralSignature(),
             IndirectCallMiniSignature(),
             IndirectCallExSignature(),

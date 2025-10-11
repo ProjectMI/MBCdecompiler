@@ -1,12 +1,14 @@
 from mbcdisasm import Disassembler, Segment, SegmentDescriptor
 from mbcdisasm.analyzer import PipelineAnalyzer
 from mbcdisasm.analyzer.context import SegmentContext
+from mbcdisasm.analyzer.heuristics import HeuristicEngine
 from mbcdisasm.analyzer.instruction_profile import InstructionKind, InstructionProfile
 from mbcdisasm.analyzer.report import PipelineBlock, PipelineReport
-from mbcdisasm.analyzer.stack import StackSummary
+from mbcdisasm.analyzer.stack import StackSummary, StackTracker
 from mbcdisasm.analyzer.stats import CategoryStats, KindStats, PipelineStatistics
 from mbcdisasm.instruction import InstructionWord
 from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
+from mbcdisasm.constants import FANOUT_FLAGS_A, IO_SLOT, RET_MASK
 
 
 def make_word(offset: int, opcode: int, mode: int = 0, operand: int = 0) -> InstructionWord:
@@ -212,3 +214,26 @@ def test_listing_summary_counts_unknowns():
     assert summary.unknown_patterns == 1
     assert summary.unknown_dominant == 1
     assert summary.warning_count == 1
+
+
+def test_heuristics_recognises_io_operands():
+    knowledge = KnowledgeBase({})
+    words = [
+        make_word(0, 0x13, 0x00, IO_SLOT),
+        make_word(4, 0x10, 0x08, RET_MASK),
+        make_word(8, 0x10, 0x32, FANOUT_FLAGS_A),
+    ]
+
+    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    summary = StackTracker().run(profiles)
+
+    engine = HeuristicEngine()
+    report = engine.analyse(profiles, summary)
+    feature_map = report.feature_map()
+
+    assert "io_slot_operand" in feature_map
+    assert "ret_mask_operand" in feature_map
+    assert "fanout_flags_operand" in feature_map
+    assert feature_map["io_slot_operand"].score > 0
+    assert feature_map["ret_mask_operand"].score > 0
+    assert feature_map["fanout_flags_operand"].score > 0

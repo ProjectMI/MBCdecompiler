@@ -118,6 +118,7 @@ CALL_CLEANUP_MNEMONICS = {
     "op_10_8C",
     "op_10_DC",
     "op_10_E8",
+    "op_10_E4",
     "op_14_07",
     "op_0C_00",
     "op_0F_00",
@@ -137,9 +138,11 @@ CALL_CLEANUP_MNEMONICS = {
     "op_D0_06",
     "op_D8_04",
     "op_F0_4B",
+    "op_FD_4A",
     "stack_shuffle",
     "op_4B_91",
     "op_E4_01",
+    "op_05_F0",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
@@ -149,6 +152,12 @@ CALL_PREDICATE_SKIP_MNEMONICS = {
     "op_64_20",
     "op_65_30",
     "op_70_29",
+}
+
+CALL_HELPER_NORMALIZED = {
+    "op_10_E4": "call_helpers",
+    "op_FD_4A": "call_helpers",
+    "op_05_F0": "call_helpers",
 }
 
 TAILCALL_HELPERS = {
@@ -230,7 +239,9 @@ _IO_READ_MASK_PREFIXES = {prefix for prefix in _io_prefixes() if prefix in {0x20
 _IO_READ_MASKS = {prefix | 0x08 for prefix in _IO_READ_MASK_PREFIXES}
 
 IO_READ_MNEMONICS = _mnemonics_for_pairs(_IO_READ_PORT_CODES, _IO_READ_MASKS)
+IO_FACADE_WRITE_MNEMONICS = {"op_13_00"}
 IO_WRITE_MNEMONICS = _mnemonics_for_pairs(_IO_PORT_CODES, _IO_MASK_VALUES, mirror=True)
+IO_WRITE_MNEMONICS.update(IO_FACADE_WRITE_MNEMONICS)
 IO_ACCEPTED_OPERANDS = {0} | set(IO_SLOT_ALIASES)
 
 _IO_BRIDGE_FAMILIES = {
@@ -716,6 +727,7 @@ class IRNormalizer:
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
         self._pass_io_operations(items)
+        self._pass_io_facade(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_opcode_tables(items)
@@ -1777,6 +1789,58 @@ class IRNormalizer:
             self._transfer_ssa(item, node)
             items.replace_slice(index, index + 1, [node])
             continue
+
+    def _pass_io_facade(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, (IRIORead, IRIOWrite)):
+                index += 1
+                continue
+
+            prefix_steps: List[IRStackEffect] = []
+            suffix_steps: List[IRStackEffect] = []
+
+            while index > 0:
+                candidate = items[index - 1]
+                if isinstance(candidate, IRCallCleanup) and self._cleanup_has_call_helper(candidate):
+                    prefix_steps[:0] = list(candidate.steps)
+                    self._transfer_ssa(candidate, node)
+                    items.replace_slice(index - 1, index, [])
+                    index -= 1
+                    continue
+                break
+
+            while index + 1 < len(items):
+                candidate = items[index + 1]
+                if isinstance(candidate, IRCallCleanup) and self._cleanup_has_call_helper(candidate):
+                    suffix_steps.extend(candidate.steps)
+                    self._transfer_ssa(candidate, node)
+                    items.replace_slice(index + 1, index + 2, [])
+                    continue
+                break
+
+            if prefix_steps or suffix_steps:
+                existing = getattr(node, "helper", tuple())
+                combined = tuple(prefix_steps) + tuple(existing) + tuple(suffix_steps)
+                updated = self._io_with_helper(node, combined)
+                self._transfer_ssa(node, updated)
+                items.replace_slice(index, index + 1, [updated])
+                node = updated
+
+            index += 1
+
+    @staticmethod
+    def _cleanup_has_call_helper(cleanup: IRCallCleanup) -> bool:
+        return any(step.mnemonic == "call_helpers" for step in cleanup.steps)
+
+    @staticmethod
+    def _io_with_helper(node: IRNode, helper: Tuple[IRStackEffect, ...]) -> IRNode:
+        if isinstance(node, IRIOWrite):
+            return IRIOWrite(mask=node.mask, port=node.port, helper=helper)
+        if isinstance(node, IRIORead):
+            return IRIORead(port=node.port, helper=helper)
+        return node
 
     def _find_io_candidate(self, items: _ItemList, handshake_index: int) -> Optional[int]:
         for direction in (-1, 1):
@@ -3974,6 +4038,7 @@ class IRNormalizer:
 
     def _call_cleanup_effect(self, instruction: RawInstruction) -> IRStackEffect:
         mnemonic = instruction.mnemonic
+        mnemonic = CALL_HELPER_NORMALIZED.get(mnemonic, mnemonic)
         operand = instruction.operand
         pops = 0
         if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:

@@ -98,6 +98,7 @@ class HeuristicEngine:
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
         features.extend(self._context_features(previous, following))
+        features.extend(self._io_operand_features(profiles))
 
         confidence = sum(feature.score for feature in features)
         confidence = max(0.0, min(1.0, confidence))
@@ -166,6 +167,35 @@ class HeuristicEngine:
         if run and run <= self.settings.max_literal_gap:
             gaps.append(run)
         return gaps
+
+    def _io_operand_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        io_hits: List[str] = []
+        ret_hits: List[str] = []
+        flag_hits: List[str] = []
+
+        for profile in profiles:
+            alias = profile.operand_alias()
+            if alias == "IO_SLOT":
+                io_hits.append(profile.label)
+            elif alias == "RET_MASK":
+                ret_hits.append(profile.label)
+            elif alias == "FANOUT_FLAGS":
+                flag_hits.append(profile.label)
+
+        features: List[LocalFeature] = []
+        if io_hits:
+            evidence = tuple(io_hits[:2])
+            score = 0.12 + 0.02 * min(len(io_hits) - 1, 3)
+            features.append(LocalFeature(name="io_slot_operand", score=score, evidence=evidence))
+        if ret_hits:
+            evidence = tuple(ret_hits[:2])
+            score = 0.1 + 0.02 * min(len(ret_hits) - 1, 3)
+            features.append(LocalFeature(name="ret_mask_operand", score=score, evidence=evidence))
+        if flag_hits:
+            evidence = tuple(flag_hits[:2])
+            score = 0.1 + 0.02 * min(len(flag_hits) - 1, 3)
+            features.append(LocalFeature(name="fanout_flags_operand", score=score, evidence=evidence))
+        return features
 
     def _table_builder_features(
         self, profiles: Sequence[InstructionProfile]

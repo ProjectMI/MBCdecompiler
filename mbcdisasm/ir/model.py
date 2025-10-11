@@ -552,11 +552,19 @@ class IRIORead(IRNode):
     """Read a value from the shared IO port."""
 
     port: str = IO_PORT_NAME
+    helper: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         if self.port != IO_PORT_NAME:
-            return f"io.read(port={self.port})"
-        return "io.read()"
+            base = f"io.read(port={self.port})"
+        else:
+            base = "io.read()"
+
+        if not self.helper:
+            return base
+
+        rendered = ", ".join(step.describe() for step in self.helper)
+        return f"{base} helper=[{rendered}]"
 
 
 @dataclass(frozen=True)
@@ -565,14 +573,19 @@ class IRIOWrite(IRNode):
 
     mask: Optional[int] = None
     port: str = IO_PORT_NAME
+    helper: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         details = [f"port={self.port}"]
         if self.mask is not None:
             details.append(f"mask=0x{self.mask:04X}")
-        if details:
-            return f"io.write({', '.join(details)})"
-        return "io.write()"
+        base = "io.write()" if not details else f"io.write({', '.join(details)})"
+
+        if not self.helper:
+            return base
+
+        rendered = ", ".join(step.describe() for step in self.helper)
+        return f"{base} helper=[{rendered}]"
 
 
 @dataclass(frozen=True)
