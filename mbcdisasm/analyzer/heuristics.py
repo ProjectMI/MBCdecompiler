@@ -20,7 +20,7 @@ the project notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind, InstructionProfile, filter_profiles
 from .stack import StackSummary
@@ -93,6 +93,7 @@ class HeuristicEngine:
 
         features.extend(self._stack_features(stack))
         features.extend(self._literal_features(profiles))
+        features.extend(self._table_builder_features(profiles))
         features.extend(self._call_features(profiles, following))
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
@@ -165,6 +166,24 @@ class HeuristicEngine:
         if run and run <= self.settings.max_literal_gap:
             gaps.append(run)
         return gaps
+
+    def _table_builder_features(
+        self, profiles: Sequence[InstructionProfile]
+    ) -> List[LocalFeature]:
+        mode_counts: Dict[int, int] = {}
+        for profile in profiles:
+            if profile.kind is InstructionKind.UNKNOWN and profile.mode:
+                mode_counts[profile.mode] = mode_counts.get(profile.mode, 0) + 1
+
+        if not mode_counts:
+            return []
+
+        dominant_mode, count = max(mode_counts.items(), key=lambda item: item[1])
+        has_ascii = any(profile.kind is InstructionKind.ASCII_CHUNK for profile in profiles)
+        if has_ascii and count >= 6:
+            evidence = (f"mode=0x{dominant_mode:02X}", f"span={count}")
+            return [LocalFeature(name="table_builder", score=0.15, evidence=evidence)]
+        return []
 
     def _call_features(
         self,
