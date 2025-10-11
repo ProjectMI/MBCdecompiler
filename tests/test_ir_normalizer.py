@@ -186,7 +186,7 @@ def write_manual(path: Path) -> KnowledgeBase:
             "stack_delta": 0,
         },
         "call_helpers": {
-            "opcodes": ["0x10:0xE8"],
+            "opcodes": ["0x10:0xE8", "0x10:0x00", "0x10:0xAC"],
             "name": "call_helpers",
             "category": "call_helpers",
         },
@@ -655,6 +655,122 @@ def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
         node.mnemonic for node in nodes if isinstance(node, IRRaw)
     }
     assert {"op_10_64", "op_10_F4", "op_3D_30", "op_11_28"}.isdisjoint(raw_mnemonics)
+
+
+def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x01, 0x00, 0x0029),  # stack_teardown
+        build_word(4, 0x10, 0x00, 0x3E4B),  # call_helpers
+        build_word(8, 0x13, 0x00, 0x3069),  # io write façade
+        build_word(12, 0x10, 0xAC, 0x0100),  # call_helpers
+        build_word(16, 0x00, 0x00, 0x109C),  # literal
+        build_word(20, 0x10, 0xE4, 0x0100),  # io write façade (variant)
+        build_word(24, 0x00, 0x29, 0x1003),  # literal mask
+        build_word(28, 0xF0, 0x4B, 0x0500),  # helper scaffold
+        build_word(32, 0x4A, 0x10, 0x0030),  # helper scaffold
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
+    assert len(io_writes) == 2
+
+    first, second = io_writes
+    assert [step.mnemonic for step in first.pre_helpers] == ["call_helpers"]
+    assert [step.operand for step in first.pre_helpers] == [0x3E4B]
+    assert [step.mnemonic for step in first.post_helpers] == ["call_helpers"]
+    assert [step.operand for step in first.post_helpers] == [0x0100]
+
+    assert [step.mnemonic for step in second.pre_helpers] == []
+    assert [step.mnemonic for step in second.post_helpers] == ["op_F0_4B", "op_4A_10"]
+
+    raw_mnemonics = {node.mnemonic for node in block.nodes if isinstance(node, IRRaw)}
+    assert "op_13_00" not in raw_mnemonics
+    assert "op_10_E4" not in raw_mnemonics
+
+
+def test_normalizer_converts_call_helper_variants(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0xFD, 0x4A, 0x9D01),  # helper scaffold before return
+        build_word(4, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRReturn)
+    assert [step.mnemonic for step in node.cleanup] == ["call_helpers"]
+    assert [step.operand for step in node.cleanup] == [0x9D01]
+
+
+def test_normalizer_attaches_f0_helper_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x05, 0xF0, 0x4B76),  # helper scaffold before IO literal
+        build_word(4, 0x00, 0x00, 0x6901),  # literal
+        build_word(8, 0x6C, 0x01, 0xEC01),  # page register cleanup
+        build_word(12, 0x30, 0x00, 0x0000),  # return
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert any(isinstance(node, IRCallCleanup) for node in block.nodes)
+    return_node = next(node for node in block.nodes if isinstance(node, IRReturn))
+    cleanup_mnemonics = [step.mnemonic for step in return_node.cleanup]
+    assert cleanup_mnemonics and cleanup_mnemonics[0] in {"page_register", "op_6C_01"}
+    helper_cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
+    assert [step.mnemonic for step in helper_cleanup.steps] == ["call_helpers"]
+
+
+def test_normalizer_labels_fanout_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x10, 0x32, 0x2C03),
+        build_word(4, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRReturn)
+    assert [step.mnemonic for step in node.cleanup] == ["fanout"]
+    assert [step.operand for step in node.cleanup] == [0x2C03]
 
 
 def test_normalizer_structural_templates(tmp_path: Path) -> None:

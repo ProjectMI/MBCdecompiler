@@ -552,10 +552,19 @@ class IRIORead(IRNode):
     """Read a value from the shared IO port."""
 
     port: str = IO_PORT_NAME
+    pre_helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    post_helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
+        details = []
         if self.port != IO_PORT_NAME:
-            return f"io.read(port={self.port})"
+            details.append(f"port={self.port}")
+        helper_note = _render_io_helpers(self.pre_helpers, self.post_helpers)
+        if helper_note:
+            details.append(helper_note)
+        if details:
+            joined = ", ".join(details)
+            return f"io.read({joined})"
         return "io.read()"
 
 
@@ -565,14 +574,36 @@ class IRIOWrite(IRNode):
 
     mask: Optional[int] = None
     port: str = IO_PORT_NAME
+    pre_helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
+    post_helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         details = [f"port={self.port}"]
         if self.mask is not None:
             details.append(f"mask=0x{self.mask:04X}")
+        helper_note = _render_io_helpers(self.pre_helpers, self.post_helpers)
+        if helper_note:
+            details.append(helper_note)
         if details:
             return f"io.write({', '.join(details)})"
         return "io.write()"
+
+
+def _render_io_helpers(
+    pre_helpers: Tuple[IRStackEffect, ...], post_helpers: Tuple[IRStackEffect, ...]
+) -> str:
+    """Render helper scaffolding attached to IO nodes."""
+
+    parts = []
+    if pre_helpers:
+        rendered = ", ".join(step.describe() for step in pre_helpers)
+        parts.append(f"before=[{rendered}]")
+    if post_helpers:
+        rendered = ", ".join(step.describe() for step in post_helpers)
+        parts.append(f"after=[{rendered}]")
+    if not parts:
+        return ""
+    return "helpers=" + " ".join(parts)
 
 
 @dataclass(frozen=True)
