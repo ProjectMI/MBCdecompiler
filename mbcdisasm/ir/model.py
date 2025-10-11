@@ -696,6 +696,61 @@ class IRSwitchDispatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTableBuilderBegin(IRNode):
+    """Marks the start of a table construction pipeline."""
+
+    mode: int
+    prologue: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        details = f"mode=0x{self.mode:02X}"
+        if ops:
+            details += f" prologue=[{ops}]"
+        if self.annotations:
+            details += " " + ", ".join(self.annotations)
+        return f"table_begin {details}"
+
+
+@dataclass(frozen=True)
+class IRTableBuilderEmit(IRNode):
+    """Table body emitted by the table construction pipeline."""
+
+    mode: int
+    kind: str
+    operations: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+    parameters: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
+        if self.parameters:
+            params = ", ".join(self.parameters)
+            details.append(f"params=[{params}]")
+        extra = [note for note in self.annotations if note not in {self.kind, f"mode=0x{self.mode:02X}"}]
+        if extra:
+            details.extend(extra)
+        return "table_emit " + " ".join(details)
+
+
+@dataclass(frozen=True)
+class IRTableBuilderCommit(IRNode):
+    """Represents the control-flow guard terminating a table builder."""
+
+    predicate: str
+    then_target: int
+    else_target: int
+
+    def describe(self) -> str:
+        return (
+            f"table_commit predicate={self.predicate} "
+            f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
+        )
+
+
+@dataclass(frozen=True)
 class IRAsciiFinalize(IRNode):
     """Normalises helper invocations that terminate ASCII aggregation blocks."""
 
