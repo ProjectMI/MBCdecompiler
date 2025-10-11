@@ -910,6 +910,29 @@ class IRRaw(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTerminator(IRNode):
+    """Explicit representation for VM terminator instructions."""
+
+    operand: int
+    operand_alias: Optional[str] = None
+    operand_role: Optional[str] = None
+
+    def describe(self) -> str:
+        rendered = _format_operand(self.operand)
+        alias = self.operand_alias
+        if alias:
+            alias_text = str(alias)
+            if alias_text.upper().startswith("0X"):
+                alias_text = alias_text.upper()
+            rendered = alias_text if alias_text == rendered else f"{alias_text}({rendered})"
+        if self.operand_role:
+            detail = f"{self.operand_role}={rendered}"
+        else:
+            detail = f"operand={rendered}"
+        return f"terminator {detail}"
+
+
+@dataclass(frozen=True)
 class IRTailcallReturn(IRNode):
     """Bundle that represents a tail call immediately followed by a return."""
 
@@ -1070,6 +1093,7 @@ __all__ = [
     "IRAsciiHeader",
     "IRCallReturn",
     "IRTailcallReturn",
+    "IRTerminator",
     "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
