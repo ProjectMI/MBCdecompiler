@@ -143,6 +143,36 @@ def test_literal_reduce_chain_is_tracked_with_high_confidence():
     assert reducer.pushed_types == (StackValueType.NUMBER,)
 
 
+def test_mixed_literal_chain_is_tracked_with_high_confidence():
+    words = [
+        make_word(0x67, 0x04, 0x0000, 0),
+        make_word(0x00, 0x67, 0x0400, 4),
+        make_word(0x00, 0x00, 0x6704, 8),
+        make_word(0x00, 0x00, 0x0067, 12),
+        make_word(0x04, 0x00, 0x0000, 16),
+        make_word(0x67, 0x04, 0x0000, 20),
+    ]
+
+    profiles = load_profiles(words)
+    tracker = StackTracker()
+    summary = tracker.run(profiles)
+
+    assert summary.change == 2
+    assert not summary.uncertain
+
+    deltas = [0, 1, 1, 1, -1, 0]
+    for event, expected in zip(summary.events, deltas):
+        assert event.delta == expected
+        assert not event.uncertain
+
+    reduce_event = summary.events[4]
+    assert reduce_event.popped_types == (
+        StackValueType.NUMBER,
+        StackValueType.NUMBER,
+    )
+    assert reduce_event.pushed_types == (StackValueType.NUMBER,)
+
+
 def test_tail_mask_is_stack_neutral():
     words = [make_word(0x29, 0x10, RET_MASK, 0)]
 

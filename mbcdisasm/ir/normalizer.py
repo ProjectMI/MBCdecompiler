@@ -11,6 +11,7 @@ from ..constants import (
     IO_PORT_NAME,
     IO_SLOT,
     IO_SLOT_ALIASES,
+    LITERAL_MARKER_HINTS,
     PAGE_REGISTER,
     MEMORY_BANK_ALIASES,
     MEMORY_PAGE_ALIASES,
@@ -168,14 +169,6 @@ TAILCALL_HELPERS = {
 }
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
-
-
-LITERAL_MARKER_HINTS: Dict[int, str] = {
-    0x0067: "literal_hint",
-    0x6704: "literal_hint",
-    0x0400: "literal_hint",
-    0x0110: "literal_hint",
-}
 
 
 def _io_slot_bytes() -> Set[int]:

@@ -16,8 +16,11 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Iterable, List, Sequence, Tuple
 
-from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
+from ..constants import CALL_SHUFFLE_STANDARD, LITERAL_MARKER_HINTS, RET_MASK
 from .instruction_profile import InstructionKind, InstructionProfile, StackEffectHint
+
+
+_LITERAL_MARKER_VALUES = frozenset(LITERAL_MARKER_HINTS)
 
 
 class StackValueType(Enum):
@@ -504,9 +507,8 @@ def _apply_literal_chain_overrides(
     noise from pipeline reports.
     """
 
+    opcode = profile.opcode
     role = _literal_chain_role(profiles, index)
-    if role is None:
-        return hint, list(popped), list(pushed), kind_override
 
     if role in {"literal_head", "literal_tail"}:
         stable_hint = StackEffectHint(nominal=1, minimum=1, maximum=1, confidence=0.9)
@@ -517,6 +519,13 @@ def _apply_literal_chain_overrides(
         pops = [StackValueType.NUMBER, StackValueType.NUMBER]
         pushes = [StackValueType.NUMBER]
         return stable_hint, pops, pushes, InstructionKind.REDUCE
+
+    if opcode == 0x00 and profile.operand in _LITERAL_MARKER_VALUES:
+        stable_hint = StackEffectHint(nominal=1, minimum=1, maximum=1, confidence=0.9)
+        pushes = [StackValueType.NUMBER]
+        if kind_override is None:
+            kind_override = InstructionKind.LITERAL
+        return stable_hint, list(popped), pushes, kind_override
 
     return hint, list(popped), list(pushed), kind_override
 
@@ -616,3 +625,4 @@ def contains_literal_push(profiles: Iterable[InstructionProfile]) -> bool:
         InstructionKind.TABLE_LOOKUP,
     }
     return any(profile.kind in literal_like for profile in profiles)
+

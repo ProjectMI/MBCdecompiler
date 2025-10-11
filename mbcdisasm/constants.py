@@ -21,6 +21,14 @@ FANOUT_FLAGS_B = 0x2C03
 CALL_SHUFFLE_STANDARD = 0x4B08
 
 
+LITERAL_MARKER_HINTS: Dict[int, str] = {
+    0x0067: "literal_hint",
+    0x6704: "literal_hint",
+    0x0400: "literal_hint",
+    0x0110: "literal_hint",
+}
+
+
 OPERAND_ALIASES: Dict[int, str] = {
     RET_MASK: "RET_MASK",
     IO_SLOT: "IO_SLOT",
@@ -62,6 +70,7 @@ __all__ = [
     "FANOUT_FLAGS_A",
     "FANOUT_FLAGS_B",
     "CALL_SHUFFLE_STANDARD",
+    "LITERAL_MARKER_HINTS",
     "OPERAND_ALIASES",
     "MEMORY_BANK_ALIASES",
     "MEMORY_PAGE_ALIASES",
