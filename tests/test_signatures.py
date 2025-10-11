@@ -162,6 +162,35 @@ def test_signature_detector_matches_stack_lift_pair():
     assert match.name == "stack_lift_pair"
 
 
+def test_signature_detector_matches_io_facade():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x01, 0x00, 0x0029, 0),
+        make_word(0x10, 0x00, 0x3E4B, 4),
+        make_word(0x13, 0x00, 0x3069, 8),
+        make_word(0x10, 0xAC, 0x0100, 12),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "io_call_facade"
+
+
+def test_signature_detector_matches_call_helper_scaffold():
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    words = [
+        make_word(0x10, 0xE4, 0x0100, 0),
+        make_word(0xF0, 0x4B, 0x0500, 4),
+        make_word(0x4A, 0x10, 0x0030, 8),
+    ]
+    profiles, summary = profiles_from_words(words, knowledge)
+    detector = SignatureDetector()
+    match = detector.detect(profiles, summary)
+    assert match is not None
+    assert match.name == "call_helper_scaffold"
+
+
 def test_signature_detector_matches_tailcall_return_combo():
     knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
     words = [

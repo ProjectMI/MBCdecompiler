@@ -1630,6 +1630,67 @@ class FanoutTeardownSignature(SignatureRule):
         return SignatureMatch(self.name, self.category, confidence, notes)
 
 
+class IOFacadeSignature(SignatureRule):
+    """Detect IO slot façade sequences wrapped by helper scaffolding."""
+
+    name = "io_call_facade"
+    category = "call"
+    base_confidence = 0.62
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        slot_hits = [
+            idx
+            for idx, profile in enumerate(profiles)
+            if profile.label == "13:00" and profile.operand in IO_SLOT_ALIASES
+        ]
+        if not slot_hits:
+            return None
+
+        helper_nearby = any(
+            is_call_helper(profiles[idx])
+            or (idx > 0 and is_call_helper(profiles[idx - 1]))
+            or (idx + 1 < len(profiles) and is_call_helper(profiles[idx + 1]))
+            for idx in slot_hits
+        )
+        if not helper_nearby:
+            return None
+
+        notes = (
+            f"io_slots={len(slot_hits)}",
+            f"stackΔ={stack.change:+d}",
+        )
+        return SignatureMatch(self.name, self.category, self.base_confidence, notes)
+
+
+class CallHelperScaffoldSignature(SignatureRule):
+    """Identify helper scaffolding headed by the 10:E4 family."""
+
+    name = "call_helper_scaffold"
+    category = "call"
+    base_confidence = 0.6
+    _after_mnemonics = {"F0:4B", "4A:10"}
+
+    def match(
+        self, profiles: Sequence[InstructionProfile], stack: StackSummary
+    ) -> Optional[SignatureMatch]:
+        targets = [idx for idx, profile in enumerate(profiles) if profile.label == "10:E4"]
+        if not targets:
+            return None
+
+        for idx in targets:
+            neighbours = profiles[idx + 1 : idx + 3]
+            if any(profile.label in self._after_mnemonics for profile in neighbours):
+                notes = (
+                    f"scaffold_pos={idx}",
+                    f"stackΔ={stack.change:+d}",
+                )
+                confidence = min(0.85, self.base_confidence + 0.04)
+                return SignatureMatch(self.name, self.category, confidence, notes)
+        return None
+
+
 class DoubleTailcallBranchSignature(SignatureRule):
     """Spot double tailcall blocks followed by branch validation."""
 
@@ -1948,6 +2009,8 @@ class SignatureDetector:
             CallprepAsciiDispatchSignature(),
             FanoutTeardownExtendedSignature(),
             FanoutTeardownSignature(),
+            IOFacadeSignature(),
+            CallHelperScaffoldSignature(),
             DoubleTailcallBranchSignature(),
             IndirectCallDualLiteralSignature(),
             IndirectCallMiniSignature(),

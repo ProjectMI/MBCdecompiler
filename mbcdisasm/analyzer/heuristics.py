@@ -22,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, IO_SLOT_ALIASES, RET_MASK
 from .instruction_profile import InstructionKind, InstructionProfile, filter_profiles
 from .stack import StackSummary
 
@@ -210,6 +211,22 @@ class HeuristicEngine:
             )
             if following and following.kind is InstructionKind.BRANCH:
                 features.append(LocalFeature(name="call_followed_by_branch", score=0.05))
+
+        alias_evidence: List[str] = []
+        for profile in profiles:
+            operand = profile.operand
+            alias = profile.operand_alias()
+            if operand in IO_SLOT_ALIASES or alias == "IO_SLOT":
+                alias_evidence.append(f"{profile.label}->IO_SLOT")
+            elif operand == RET_MASK or alias == "RET_MASK":
+                alias_evidence.append(f"{profile.label}->RET_MASK")
+            elif operand in {FANOUT_FLAGS_A, FANOUT_FLAGS_B} or alias == "FANOUT_FLAGS":
+                alias_evidence.append(f"{profile.label}->FANOUT_FLAGS")
+
+        if alias_evidence:
+            evidence = tuple(alias_evidence[:3])
+            score = 0.04 * len(alias_evidence)
+            features.append(LocalFeature(name="call_operand_alias", score=score, evidence=evidence))
         return features
 
     def _return_features(

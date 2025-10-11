@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
@@ -118,6 +118,7 @@ CALL_CLEANUP_MNEMONICS = {
     "op_10_8C",
     "op_10_DC",
     "op_10_E8",
+    "op_10_32",
     "op_14_07",
     "op_0C_00",
     "op_0F_00",
@@ -137,6 +138,8 @@ CALL_CLEANUP_MNEMONICS = {
     "op_D0_06",
     "op_D8_04",
     "op_F0_4B",
+    "op_FD_4A",
+    "op_05_F0",
     "stack_shuffle",
     "op_4B_91",
     "op_E4_01",
@@ -230,7 +233,9 @@ _IO_READ_MASK_PREFIXES = {prefix for prefix in _io_prefixes() if prefix in {0x20
 _IO_READ_MASKS = {prefix | 0x08 for prefix in _IO_READ_MASK_PREFIXES}
 
 IO_READ_MNEMONICS = _mnemonics_for_pairs(_IO_READ_PORT_CODES, _IO_READ_MASKS)
+IO_FACADE_WRITE_MNEMONICS = {"op_13_00", "op_10_E4"}
 IO_WRITE_MNEMONICS = _mnemonics_for_pairs(_IO_PORT_CODES, _IO_MASK_VALUES, mirror=True)
+IO_WRITE_MNEMONICS.update(IO_FACADE_WRITE_MNEMONICS)
 IO_ACCEPTED_OPERANDS = {0} | set(IO_SLOT_ALIASES)
 
 _IO_BRIDGE_FAMILIES = {
@@ -261,6 +266,10 @@ IO_BRIDGE_NODE_TYPES = (
     IRSwitchDispatch,
     IRTailcallFrame,
 )
+
+IO_HELPER_MNEMONICS = {"call_helpers", "op_F0_4B", "op_4A_10"}
+CALL_HELPER_FACADE_MNEMONICS = {"op_05_F0", "op_FD_4A"}
+FANOUT_FACADE_MNEMONICS = {"op_10_32"}
 
 ASCII_NEIGHBOR_NODE_TYPES = (
     IRLiteralChunk,
@@ -716,6 +725,7 @@ class IRNormalizer:
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
         self._pass_io_operations(items)
+        self._pass_io_facade(items)
         self._pass_call_conventions(items)
         self._pass_tailcall_frames(items)
         self._pass_opcode_tables(items)
@@ -1777,6 +1787,84 @@ class IRNormalizer:
             self._transfer_ssa(item, node)
             items.replace_slice(index, index + 1, [node])
             continue
+
+    def _pass_io_facade(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, (IRIORead, IRIOWrite)):
+                index += 1
+                continue
+
+            pre_helpers = list(getattr(node, "pre_helpers", tuple()))
+            post_helpers = list(getattr(node, "post_helpers", tuple()))
+            changed = False
+
+            prev_index = self._io_facade_neighbor_index(items, index, direction=-1)
+            if prev_index is not None:
+                helpers, remaining = self._extract_io_helper_steps(items[prev_index], trailing=True)
+                if helpers:
+                    pre_helpers = list(helpers) + pre_helpers
+                    changed = True
+                    if remaining:
+                        items.replace_slice(prev_index, prev_index + 1, [IRCallCleanup(steps=remaining)])
+                    else:
+                        items.pop(prev_index)
+                        index -= 1
+
+            next_index = self._io_facade_neighbor_index(items, index, direction=1)
+            if next_index is not None:
+                helpers, remaining = self._extract_io_helper_steps(items[next_index], trailing=False)
+                if helpers:
+                    post_helpers.extend(helpers)
+                    changed = True
+                    if remaining:
+                        items.replace_slice(next_index, next_index + 1, [IRCallCleanup(steps=remaining)])
+                    else:
+                        items.pop(next_index)
+
+            if changed:
+                updated = replace(
+                    node,
+                    pre_helpers=tuple(pre_helpers),
+                    post_helpers=tuple(post_helpers),
+                )
+                self._transfer_ssa(node, updated)
+                items.replace_slice(index, index + 1, [updated])
+            index += 1
+
+    def _extract_io_helper_steps(
+        self, cleanup: IRCallCleanup, *, trailing: bool
+    ) -> Tuple[Tuple[IRStackEffect, ...], Tuple[IRStackEffect, ...]]:
+        steps = list(cleanup.steps)
+        extracted: List[IRStackEffect] = []
+        if trailing:
+            while steps and self._is_io_helper_step(steps[-1]):
+                extracted.insert(0, steps.pop())
+        else:
+            while steps and self._is_io_helper_step(steps[0]):
+                extracted.append(steps.pop(0))
+        if not extracted:
+            return tuple(), tuple(cleanup.steps)
+        return tuple(extracted), tuple(steps)
+
+    @staticmethod
+    def _is_io_helper_step(step: IRStackEffect) -> bool:
+        return step.mnemonic in IO_HELPER_MNEMONICS
+
+    def _io_facade_neighbor_index(
+        self, items: _ItemList, index: int, *, direction: int
+    ) -> Optional[int]:
+        scan = index + direction
+        while 0 <= scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, IRCallCleanup):
+                return scan
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                scan += direction
+                continue
+            break
+        return None
 
     def _find_io_candidate(self, items: _ItemList, handshake_index: int) -> Optional[int]:
         for direction in (-1, 1):
@@ -3976,6 +4064,10 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         pops = 0
+        if mnemonic in CALL_HELPER_FACADE_MNEMONICS:
+            mnemonic = "call_helpers"
+        elif mnemonic in FANOUT_FACADE_MNEMONICS:
+            mnemonic = "fanout"
         if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:
             mnemonic = "page_register"
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
