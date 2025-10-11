@@ -290,13 +290,8 @@ STACK_NEUTRAL_CONTROL_KINDS = {
 
 MASK_OPERAND_ALIASES = {"RET_MASK", "IO_SLOT", "FANOUT_FLAGS"}
 
-SIDE_EFFECT_KIND_HINTS = {
-    InstructionKind.INDIRECT,
-    InstructionKind.INDIRECT_STORE,
-    InstructionKind.TABLE_LOOKUP,
-}
-
-SIDE_EFFECT_KEYWORDS = ("io", "port", "memory", "store", "write", "page", "mode", "status", "flag")
+PREDICATE_MATERIALIZER_PREFIXES = ("op_02_", "op_03_", "op_04_")
+PREDICATE_MATERIALIZER_MNEMONICS = {"op_64_04", "op_64_30"}
 
 
 INDIRECT_PAGE_REGISTER_MNEMONICS = {
@@ -2304,6 +2299,49 @@ class IRNormalizer:
             return False
         return True
 
+    def _is_predicate_materializer(self, instruction: RawInstruction) -> bool:
+        mnemonic = instruction.mnemonic
+        if mnemonic in PREDICATE_MATERIALIZER_MNEMONICS:
+            pass
+        elif any(mnemonic.startswith(prefix) for prefix in PREDICATE_MATERIALIZER_PREFIXES):
+            if instruction.operand != 0:
+                return False
+        else:
+            return False
+        if not self._has_trivial_stack_effect(instruction):
+            return False
+        if instruction.profile.has_side_effects():
+            return False
+        return True
+
+    def _describe_predicate_materializer(self, instruction: RawInstruction) -> str:
+        operand = instruction.operand
+        if operand:
+            return f"{instruction.mnemonic}(0x{operand:04X})"
+        return instruction.mnemonic
+
+    def _consume_predicate_materializers(
+        self, items: _ItemList, index: int
+    ) -> Tuple[Tuple[str, ...], int]:
+        positions: List[int] = []
+        descriptors: List[str] = []
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if not isinstance(candidate, RawInstruction):
+                break
+            if not self._is_predicate_materializer(candidate):
+                break
+            positions.append(scan)
+            descriptors.append(self._describe_predicate_materializer(candidate))
+            scan -= 1
+        if not positions:
+            return tuple(), index
+        for pos in reversed(positions):
+            items.pop(pos)
+        descriptors.reverse()
+        return tuple(descriptors), index - len(positions)
+
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -3256,6 +3294,7 @@ class IRNormalizer:
                         flag=flag,
                         then_target=item.then_target,
                         else_target=item.else_target,
+                        predicate_ops=getattr(item, "predicate_ops", tuple()),
                     )
                     items.replace_slice(index, index + 1, [node])
                     index += 1
@@ -4290,6 +4329,10 @@ class IRNormalizer:
                 continue
 
             if item.mnemonic == "testset_branch":
+                predicate_ops, new_index = self._consume_predicate_materializers(items, index)
+                if new_index != index:
+                    index = new_index
+                    item = cast(RawInstruction, items[index])
                 expr = self._describe_condition(items, index, skip_literals=True)
                 then_target = self._branch_target(item)
                 else_target = self._fallthrough_target(item)
@@ -4298,6 +4341,7 @@ class IRNormalizer:
                     expr=expr,
                     then_target=then_target,
                     else_target=else_target,
+                    predicate_ops=predicate_ops,
                 )
                 self._transfer_ssa(item, node)
                 replacement: List[Union[RawInstruction, IRNode]] = [node]
@@ -4306,6 +4350,7 @@ class IRNormalizer:
                         condition=node.var,
                         then_target=then_target,
                         else_target=else_target,
+                        predicate_ops=predicate_ops,
                     )
                     replacement.append(branch)
                     metrics.if_branches += 1
@@ -4324,10 +4369,15 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                predicate_ops, new_index = self._consume_predicate_materializers(items, index)
+                if new_index != index:
+                    index = new_index
+                    item = cast(RawInstruction, items[index])
                 node = IRIf(
                     condition=self._describe_condition(items, index),
                     then_target=self._branch_target(item),
                     else_target=self._fallthrough_target(item),
+                    predicate_ops=predicate_ops,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
@@ -4974,37 +5024,13 @@ class IRNormalizer:
             return False
         if instruction.profile.is_control():
             return False
-        if self._has_profile_side_effects(instruction):
+        if instruction.profile.has_side_effects():
             return False
         if self._is_bridge_edge_position(items, index):
             return False
         if self._is_io_bridge_instruction(instruction):
             return True
         return self._has_ascii_neighbor(items, index)
-
-    def _has_profile_side_effects(self, instruction: RawInstruction) -> bool:
-        profile = instruction.profile
-        if profile.kind in SIDE_EFFECT_KIND_HINTS:
-            return True
-        operand = instruction.operand
-        if operand in IO_SLOT_ALIASES or operand == PAGE_REGISTER:
-            return True
-        alias = profile.operand_alias()
-        if alias and any(keyword in alias.lower() for keyword in SIDE_EFFECT_KEYWORDS):
-            return True
-        role = profile.operand_role()
-        if role and any(keyword in role.lower() for keyword in SIDE_EFFECT_KEYWORDS):
-            return True
-        category = profile.category
-        if category and any(keyword in category.lower() for keyword in SIDE_EFFECT_KEYWORDS):
-            return True
-        summary = profile.summary
-        if summary and any(keyword in summary.lower() for keyword in SIDE_EFFECT_KEYWORDS):
-            return True
-        mnemonic = profile.mnemonic.lower()
-        if any(keyword in mnemonic for keyword in SIDE_EFFECT_KEYWORDS):
-            return True
-        return False
 
     def _is_bridge_edge_position(
         self,

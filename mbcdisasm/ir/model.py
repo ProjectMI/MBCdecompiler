@@ -410,12 +410,17 @@ class IRIf(IRNode):
     condition: str
     then_target: int
     else_target: int
+    predicate_ops: Tuple[str, ...] = tuple()
 
     def describe(self) -> str:
-        return (
+        base = (
             f"if cond={self.condition} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate_ops:
+            ops = ",".join(self.predicate_ops)
+            base += f" predicate=[{ops}]"
+        return base
 
 
 @dataclass(frozen=True)
@@ -426,12 +431,17 @@ class IRTestSetBranch(IRNode):
     expr: str
     then_target: int
     else_target: int
+    predicate_ops: Tuple[str, ...] = tuple()
 
     def describe(self) -> str:
-        return (
+        base = (
             f"testset {self.var}={self.expr} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate_ops:
+            ops = ",".join(self.predicate_ops)
+            base += f" predicate=[{ops}]"
+        return base
 
 
 @dataclass(frozen=True)
@@ -441,12 +451,17 @@ class IRFlagCheck(IRNode):
     flag: int
     then_target: int
     else_target: int
+    predicate_ops: Tuple[str, ...] = tuple()
 
     def describe(self) -> str:
-        return (
+        base = (
             f"check_flag flag=0x{self.flag:04X} then=0x{self.then_target:04X} "
             f"else=0x{self.else_target:04X}"
         )
+        if self.predicate_ops:
+            ops = ",".join(self.predicate_ops)
+            base += f" predicate=[{ops}]"
+        return base
 
 
 @dataclass(frozen=True)

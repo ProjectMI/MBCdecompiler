@@ -12,7 +12,7 @@ large chunks of code.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .instruction_profile import InstructionKind
 from .stack import StackEvent
@@ -27,15 +27,33 @@ class PatternToken:
     max_delta: int = 999
     allow_unknown: bool = False
     description: str = ""
+    mnemonics: Tuple[str, ...] = tuple()
+    mnemonic_prefixes: Tuple[str, ...] = tuple()
+    require_stack_neutral: bool = False
+    forbid_side_effects: bool = False
+    predicate: Optional[Callable[[StackEvent], bool]] = None
 
     def matches(self, event: StackEvent) -> bool:
         """Return ``True`` if ``event`` satisfies this token."""
 
+        profile = event.profile
         if not self.allow_unknown and event.kind is InstructionKind.UNKNOWN:
             return False
         if self.kinds and event.kind not in self.kinds:
             return False
+        if self.mnemonics and profile.mnemonic not in self.mnemonics:
+            return False
+        if self.mnemonic_prefixes and not any(
+            profile.mnemonic.startswith(prefix) for prefix in self.mnemonic_prefixes
+        ):
+            return False
         if event.delta < self.min_delta or event.delta > self.max_delta:
+            return False
+        if self.require_stack_neutral and not _is_stack_neutral(event):
+            return False
+        if self.forbid_side_effects and profile.has_side_effects():
+            return False
+        if self.predicate is not None and not self.predicate(event):
             return False
         return True
 
@@ -132,6 +150,38 @@ class PatternRegistry:
         return best
 
 
+def _is_stack_neutral(event: StackEvent) -> bool:
+    if event.delta != 0:
+        return False
+    if event.depth_before != event.depth_after:
+        return False
+    if event.minimum != event.depth_before:
+        return False
+    if event.maximum != event.depth_before:
+        return False
+    if event.popped_types or event.pushed_types:
+        return False
+    return True
+
+
+def _is_predicate_materialiser_event(event: StackEvent) -> bool:
+    profile = event.profile
+    mnemonic = profile.mnemonic
+    if mnemonic in {"op_64_04", "op_64_30"}:
+        allowed = True
+    elif any(mnemonic.startswith(prefix) for prefix in ("op_02_", "op_03_", "op_04_")):
+        if profile.operand != 0:
+            return False
+        allowed = True
+    else:
+        allowed = False
+    if not allowed:
+        return False
+    if profile.has_side_effects():
+        return False
+    return True
+
+
 def default_patterns() -> PatternRegistry:
     """Return a :class:`PatternRegistry` populated with built-in patterns."""
 
@@ -145,6 +195,7 @@ def default_patterns() -> PatternRegistry:
             ascii_pipeline(),
             *guarded_return_patterns(),
             reduce_pipeline(),
+            predicate_materialization_pattern(),
             call_preparation_pipeline(),
             return_pipeline(),
             indirect_load_pipeline(),
@@ -198,6 +249,29 @@ def ascii_run_pattern() -> PipelinePattern:
         allow_extra=True,
         stack_change=0,
         description="Run of inline ASCII words",
+    )
+
+
+def predicate_materialization_pattern() -> PipelinePattern:
+    """Return a pattern that matches predicate materialisers."""
+
+    token = PatternToken(
+        kinds=tuple(),
+        allow_unknown=True,
+        min_delta=0,
+        max_delta=0,
+        description="predicate materialiser",
+        require_stack_neutral=True,
+        forbid_side_effects=True,
+        predicate=_is_predicate_materialiser_event,
+    )
+    return PipelinePattern(
+        name="predicate_materialiser",
+        category="predicate",
+        tokens=(token,),
+        allow_extra=False,
+        stack_change=0,
+        description="Instructions that materialise predicates without touching the stack",
     )
 
 

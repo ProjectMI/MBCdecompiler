@@ -24,7 +24,7 @@ from typing import Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
-from ..constants import OPERAND_ALIASES
+from ..constants import OPERAND_ALIASES, IO_SLOT_ALIASES, PAGE_REGISTER
 
 # ---------------------------------------------------------------------------
 # Heuristic opcode helpers
@@ -36,7 +36,6 @@ ASCII_ALLOWED.update({0x09, 0x0A, 0x0D})  # tab/newline characters often occur
 ASCII_HEURISTIC_SUMMARY = (
     "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
 )
-
 
 class InstructionKind(Enum):
     """High level classification of an opcode.
@@ -70,6 +69,15 @@ class InstructionKind(Enum):
     BITWISE = auto()
     META = auto()
     UNKNOWN = auto()
+
+
+SIDE_EFFECT_KIND_HINTS = {
+    InstructionKind.INDIRECT,
+    InstructionKind.INDIRECT_STORE,
+    InstructionKind.TABLE_LOOKUP,
+}
+
+SIDE_EFFECT_KEYWORDS = ("io", "port", "memory", "store", "write", "page", "mode", "status", "flag")
 
 
 @dataclass(frozen=True)
@@ -238,6 +246,38 @@ class InstructionProfile:
         if alias is not None:
             return alias
         return None
+
+    def has_side_effects(self) -> bool:
+        """Return ``True`` when the instruction likely mutates external state."""
+
+        if self.kind in SIDE_EFFECT_KIND_HINTS:
+            return True
+
+        operand = self.operand
+        if operand in IO_SLOT_ALIASES or operand == PAGE_REGISTER:
+            return True
+
+        alias = self.operand_alias()
+        if alias and any(keyword in alias.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+
+        role = self.operand_role()
+        if role and any(keyword in role.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+
+        category = self.category
+        if category and any(keyword in category.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+
+        summary = self.summary
+        if summary and any(keyword in summary.lower() for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+
+        mnemonic = self.mnemonic.lower()
+        if any(keyword in mnemonic for keyword in SIDE_EFFECT_KEYWORDS):
+            return True
+
+        return False
 
     def estimated_stack_delta(self) -> StackEffectHint:
         """Return the stack hint adjusted by heuristics."""
