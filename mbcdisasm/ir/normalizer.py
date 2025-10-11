@@ -268,6 +268,24 @@ IO_BRIDGE_NODE_TYPES = (
     IRTailcallFrame,
 )
 
+IO_HANDSHAKE_BRIDGE_NODE_TYPES = IO_BRIDGE_NODE_TYPES + (
+    IRLiteral,
+    IRLiteralChunk,
+    IRStringConstant,
+    IRStackEffect,
+    IRStackDrop,
+    IRStackDuplicate,
+    IRAsciiPreamble,
+    IRAsciiFinalize,
+    IRAsciiHeader,
+    IRBuildArray,
+    IRBuildMap,
+    IRBuildTuple,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTableBuilderCommit,
+)
+
 EPILOGUE_ALLOWED_NODE_TYPES = (
     IRCallCleanup,
     IRCallReturn,
@@ -1752,7 +1770,7 @@ class IRNormalizer:
             item = items[index]
             if not (
                 isinstance(item, RawInstruction)
-                and self._is_io_handshake_instruction(item)
+                and self._is_io_handshake_instruction(item, items, index)
             ):
                 index += 1
                 continue
@@ -1891,6 +1909,40 @@ class IRNormalizer:
             break
         return None
 
+    def _find_io_candidate_forward(
+        self, items: _ItemList, index: int, *, limit: int = 12
+    ) -> Optional[int]:
+        scan = index + 1
+        steps = 0
+        while scan < len(items) and steps < limit:
+            node = items[scan]
+            if isinstance(node, RawInstruction):
+                if self._is_io_write_candidate(node):
+                    return scan
+                if self._is_io_bridge_instruction(node):
+                    scan += 1
+                    steps += 1
+                    continue
+                event = node.event
+                if (
+                    event.delta != 0
+                    or event.popped_types
+                    or event.pushed_types
+                    or event.kind in STACK_NEUTRAL_CONTROL_KINDS
+                ):
+                    return None
+                scan += 1
+                steps += 1
+                continue
+            if isinstance(node, IO_HANDSHAKE_BRIDGE_NODE_TYPES):
+                scan += 1
+                steps += 1
+                continue
+            if isinstance(node, IRIOWrite):
+                return scan
+            break
+        return None
+
     def _find_io_candidate(self, items: _ItemList, handshake_index: int) -> Optional[int]:
         for direction in (-1, 1):
             scan = handshake_index + direction
@@ -1939,7 +1991,7 @@ class IRNormalizer:
         allow_prefix: bool = False,
     ) -> Optional[IRNode]:
         mnemonic = instruction.mnemonic
-        if self._is_io_handshake_instruction(instruction):
+        if self._is_io_handshake_instruction(instruction, items, index):
             mask = self._io_mask_value(items, index)
             return IRIOWrite(mask=mask, port=IO_PORT_NAME)
         if mnemonic in IO_READ_MNEMONICS:
@@ -1969,7 +2021,7 @@ class IRNormalizer:
             if isinstance(node, IRLiteral):
                 return node.value
             if isinstance(node, RawInstruction):
-                if self._is_io_bridge_instruction(node) or self._is_io_handshake_instruction(node):
+                if self._is_io_bridge_instruction(node) or self._is_io_handshake_instruction(node, items, scan):
                     scan -= 1
                     steps += 1
                     continue
@@ -3151,7 +3203,7 @@ class IRNormalizer:
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, RawInstruction):
-                if self._is_io_handshake_instruction(candidate):
+                if self._is_io_handshake_instruction(candidate, items, scan):
                     return scan
                 if candidate.mnemonic.startswith("op_10_"):
                     break
@@ -3169,13 +3221,36 @@ class IRNormalizer:
             scan -= 1
         return None
 
-    def _is_io_handshake_instruction(self, instruction: RawInstruction) -> bool:
+    def _is_io_handshake_instruction(
+        self,
+        instruction: RawInstruction,
+        items: Optional[_ItemList] = None,
+        index: Optional[int] = None,
+    ) -> bool:
         mnemonic = instruction.mnemonic
-        return (
+        if mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS:
+            return False
+        if (
             mnemonic.startswith("op_")
             and mnemonic.endswith("_30")
             and self._operand_is_io_slot(instruction.operand)
-        )
+        ):
+            return True
+        if items is None or index is None:
+            return False
+        if instruction.profile.word.opcode < 0x80:
+            return False
+        event = instruction.event
+        if event.delta != 0 or event.popped_types or event.pushed_types:
+            return False
+        candidate_index = self._find_io_candidate_forward(items, index)
+        if candidate_index is None or candidate_index <= index:
+            return False
+        candidate = items[candidate_index]
+        if not isinstance(candidate, RawInstruction):
+            return False
+        node = self._build_io_node(items, candidate_index, candidate, allow_prefix=True)
+        return isinstance(node, IRIOWrite)
 
     def _is_io_bridge_instruction(self, instruction: RawInstruction) -> bool:
         if instruction.mnemonic in IO_WRITE_MNEMONICS or self._is_io_handshake_instruction(instruction):
