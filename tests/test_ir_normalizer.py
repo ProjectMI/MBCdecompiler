@@ -13,6 +13,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -31,6 +32,9 @@ from mbcdisasm.ir.model import (
     IRBuildArray,
     IRSwitchDispatch,
     IRTablePatch,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
 )
@@ -1855,6 +1859,65 @@ def test_normalizer_collapses_adaptive_unknown_tables() -> None:
     assert f"mode=0x{words[0].mode:02X}" in node.annotations
     assert any(note == "kind=unknown" for note in node.annotations)
 
+
+def test_normalizer_builds_table_pipeline_nodes() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    prologue = make_stack_neutral_instruction(0, "op_39_4D")
+    header = IRLiteralChunk(data=b"MODE", source="test", symbol="str_0000")
+    descriptor = make_stack_neutral_instruction(2, "op_40_4D")
+    body_param = IRLiteral(value=0x1234, mode=0, source="test")
+    table = IRTablePatch(
+        operations=(("op_82_4D", 0x0000), ("op_88_4D", 0x0000)),
+        annotations=("adaptive_table", "mode=0x4D"),
+    )
+    guard_literal = IRLiteral(value=0x0000, mode=0, source="test")
+    guard = IRTestSetBranch(
+        var="slot0",
+        expr="table_patch adaptive_table, mode=0x4D",
+        then_target=0x0000,
+        else_target=0x1000,
+    )
+    follower = IRIf(
+        condition="table_patch adaptive_table, mode=0x4D",
+        then_target=0x0000,
+        else_target=0x1000,
+    )
+
+    items = _ItemList(
+        [
+            prologue,
+            header,
+            descriptor,
+            body_param,
+            table,
+            guard_literal,
+            guard,
+            follower,
+        ]
+    )
+    normalizer._pass_table_builders(items)
+
+    assert len(items) == 3
+    begin, emit, commit = items[0], items[1], items[2]
+    assert isinstance(begin, IRTableBuilderBegin)
+    assert begin.mode == 0x4D
+    assert begin.prologue == (("op_39_4D", 0x0000),)
+    assert begin.headers == ("str(str_0000)",)
+    assert begin.descriptors == ("op_40_4D(0x0000)",)
+
+    assert isinstance(emit, IRTableBuilderEmit)
+    assert emit.kind == "adaptive_table"
+    assert emit.mode == 0x4D
+    assert emit.parameters == ("lit(0x1234)",)
+    assert emit.operations[0][0] == "op_82_4D"
+
+    assert isinstance(commit, IRTableBuilderCommit)
+    assert commit.commit_target == 0x0000
+    assert commit.fallback_target == 0x1000
+    assert commit.fallback_literal == 0x0000
+    assert commit.parameters == ("lit(0x0000)",)
 
 def test_normalizer_emits_page_register_for_single_write(tmp_path: Path) -> None:
     knowledge = KnowledgeBase({"31:30": OpcodeInfo(mnemonic="op_31_30")})

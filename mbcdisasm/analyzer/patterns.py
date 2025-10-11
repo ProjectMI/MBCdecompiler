@@ -148,6 +148,7 @@ def default_patterns() -> PatternRegistry:
             call_preparation_pipeline(),
             return_pipeline(),
             indirect_load_pipeline(),
+            table_builder_pipeline(),
         ]
     )
     return registry
@@ -456,4 +457,36 @@ def indirect_load_pipeline() -> PipelinePattern:
         category="indirect",
         tokens=tokens,
         description="Push base/key then resolve table entry",
+    )
+
+
+def table_builder_pipeline() -> PipelinePattern:
+    """Return the pattern for table builder prologues."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN,),
+            min_delta=-1,
+            max_delta=1,
+            description="table prologue",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.ASCII_CHUNK, InstructionKind.LITERAL),
+            min_delta=0,
+            max_delta=1,
+            description="table label",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN, InstructionKind.TABLE_LOOKUP, InstructionKind.META),
+            min_delta=-1,
+            max_delta=1,
+            description="table emit",
+        ),
+    )
+    return PipelinePattern(
+        name="table_builder",
+        category="table",
+        tokens=tokens,
+        allow_extra=True,
+        description="Prologue with inline labels and table emission",
     )
