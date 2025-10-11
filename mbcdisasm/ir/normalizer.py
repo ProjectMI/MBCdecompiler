@@ -57,6 +57,9 @@ from .model import (
     IRStackDrop,
     IRStringConstant,
     IRTablePatch,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTableBuilderCommit,
     IRDispatchCase,
     IRSwitchDispatch,
     IRTailcallFrame,
@@ -711,6 +714,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_dispatch_wrappers(items)
+        self._pass_table_builders(items, metrics)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
@@ -2400,6 +2404,258 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _pass_table_builders(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
+        index = 0
+        while index < len(items):
+            match = self._match_table_builder(items, index)
+            if match is None:
+                index += 1
+                continue
+
+            (
+                start,
+                end,
+                begin_node,
+                emit_nodes,
+                commit_node,
+                testset_count,
+                branch_count,
+                commit_source,
+            ) = match
+
+            removed_items = [items[pos] for pos in range(start, end)]
+            for removed in removed_items:
+                self._ssa_bindings.pop(id(removed), None)
+
+            replacement: List[Union[RawInstruction, IRNode]] = [begin_node]
+            replacement.extend(emit_nodes)
+            if commit_node is not None:
+                replacement.append(commit_node)
+
+            items.replace_slice(start, end, replacement)
+
+            if commit_node is not None and commit_source is not None:
+                self._transfer_ssa(commit_source, commit_node)
+
+            if testset_count:
+                metrics.testset_branches += testset_count
+            if branch_count:
+                metrics.if_branches += branch_count
+
+            index = start + len(replacement)
+
+    def _match_table_builder(
+        self, items: _ItemList, index: int
+    ) -> Optional[
+        Tuple[
+            int,
+            int,
+            IRTableBuilderBegin,
+            Tuple[IRTableBuilderEmit, ...],
+            Optional[IRTableBuilderCommit],
+            int,
+            int,
+            Optional[RawInstruction],
+        ]
+    ]:
+        start = index
+        seed = items[index]
+        if not isinstance(seed, RawInstruction):
+            return None
+        if not self._is_table_builder_prolog(seed):
+            return None
+
+        mode = seed.profile.mode
+        prolog_steps: List[RawInstruction] = []
+        annotations: List[str] = []
+
+        while index < len(items):
+            candidate = items[index]
+            if isinstance(candidate, RawInstruction) and self._is_table_builder_prolog(candidate, mode=mode):
+                prolog_steps.append(candidate)
+                annotations.extend(candidate.annotations)
+                index += 1
+                continue
+            break
+
+        if not prolog_steps:
+            return None
+
+        emit_nodes: List[IRTableBuilderEmit] = []
+        current_literals: List[IRLiteralChunk] = []
+        while index < len(items):
+            candidate = items[index]
+            if isinstance(candidate, RawInstruction) and self._is_table_builder_prolog(candidate, mode=mode):
+                prolog_steps.append(candidate)
+                annotations.extend(candidate.annotations)
+                index += 1
+                continue
+            if isinstance(candidate, IRLiteralChunk):
+                current_literals.append(candidate)
+                index += 1
+                continue
+            if isinstance(candidate, IRTablePatch):
+                if not current_literals:
+                    return None
+                emit_nodes.append(self._build_table_emit(candidate, current_literals))
+                current_literals = []
+                index += 1
+                break
+            break
+
+        if not emit_nodes:
+            return None
+
+        commit_start = index
+        commit_steps: List[RawInstruction] = []
+        while index < len(items):
+            candidate = items[index]
+            if isinstance(candidate, RawInstruction) and self._is_table_builder_commit_step(candidate):
+                commit_steps.append(candidate)
+                index += 1
+                continue
+            break
+
+        commit_node: Optional[IRTableBuilderCommit] = None
+        testset_count = 0
+        branch_count = 0
+        commit_source: Optional[RawInstruction] = None
+
+        if index < len(items):
+            branch_candidate = items[index]
+            if isinstance(branch_candidate, RawInstruction) and branch_candidate.mnemonic == "testset_branch":
+                expr = self._describe_condition(items, index, skip_literals=True)
+                then_target = self._branch_target(branch_candidate)
+                else_target = self._fallthrough_target(branch_candidate)
+                commit_node = IRTableBuilderCommit(
+                    steps=tuple((step.mnemonic, step.operand) for step in commit_steps),
+                    branch_type="testset",
+                    var=self._format_testset_var(branch_candidate),
+                    expr=expr,
+                    then_target=then_target,
+                    else_target=else_target,
+                )
+                index += 1
+                testset_count = 1
+                commit_source = branch_candidate
+            elif isinstance(branch_candidate, RawInstruction) and branch_candidate.profile.kind is InstructionKind.BRANCH:
+                condition = self._describe_condition(items, index, skip_literals=True)
+                then_target = self._branch_target(branch_candidate)
+                else_target = self._fallthrough_target(branch_candidate)
+                commit_node = IRTableBuilderCommit(
+                    steps=tuple((step.mnemonic, step.operand) for step in commit_steps),
+                    branch_type="branch",
+                    condition=condition,
+                    then_target=then_target,
+                    else_target=else_target,
+                )
+                index += 1
+                branch_count = 1
+                commit_source = branch_candidate
+            else:
+                index = commit_start
+                commit_steps = []
+
+        if commit_node is None:
+            index = commit_start
+
+        begin_node = IRTableBuilderBegin(
+            steps=tuple((step.mnemonic, step.operand) for step in prolog_steps),
+            mode=mode,
+            annotations=tuple(annotation for annotation in dict.fromkeys(annotations) if annotation),
+        )
+
+        return (
+            start,
+            index,
+            begin_node,
+            tuple(emit_nodes),
+            commit_node,
+            testset_count,
+            branch_count,
+            commit_source,
+        )
+
+    def _is_table_builder_prolog(self, instruction: RawInstruction, mode: Optional[int] = None) -> bool:
+        if not isinstance(instruction, RawInstruction):
+            return False
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        if instruction.operand != 0:
+            return False
+        if mode is not None and instruction.profile.mode != mode:
+            return False
+        return self._has_trivial_stack_effect(instruction)
+
+    def _is_table_builder_commit_step(self, instruction: RawInstruction) -> bool:
+        if not instruction.mnemonic.startswith("op_"):
+            return False
+        if instruction.operand != 0:
+            return False
+        return self._has_trivial_stack_effect(instruction)
+
+    def _build_table_emit(
+        self, patch: IRTablePatch, chunks: Sequence[IRLiteralChunk]
+    ) -> IRTableBuilderEmit:
+        mode = self._table_patch_mode(patch)
+        kind = self._table_patch_kind(patch)
+        labels = tuple(self._table_literal_label(chunk) for chunk in chunks)
+        return IRTableBuilderEmit(
+            mode=mode,
+            kind=kind,
+            labels=labels,
+            operations=patch.operations,
+            annotations=patch.annotations,
+        )
+
+    @staticmethod
+    def _table_patch_mode(patch: IRTablePatch) -> int:
+        for note in patch.annotations:
+            if note.startswith("mode=0x"):
+                try:
+                    return int(note[6:], 16)
+                except ValueError:
+                    continue
+        for mnemonic, _ in patch.operations:
+            parts = mnemonic.split("_")
+            if len(parts) >= 3:
+                try:
+                    return int(parts[2], 16)
+                except ValueError:
+                    continue
+        return 0
+
+    @staticmethod
+    def _table_patch_kind(patch: IRTablePatch) -> str:
+        if any(note == "adaptive_table" for note in patch.annotations):
+            return "adaptive"
+        if any(note == "opcode_table" for note in patch.annotations):
+            return "opcode"
+        if any(note == "table_patch" for note in patch.annotations):
+            return "patch"
+        return "table"
+
+    def _table_literal_label(self, chunk: IRLiteralChunk) -> str:
+        if chunk.symbol:
+            label = f"str({chunk.symbol})"
+        else:
+            label = f"ascii({self._ascii_repr(chunk.data)})"
+        if chunk.annotations:
+            label += " " + ", ".join(chunk.annotations)
+        return label
+
+    @staticmethod
+    def _ascii_repr(data: bytes) -> str:
+        parts: List[str] = []
+        for byte in data:
+            if 0x20 <= byte <= 0x7E:
+                parts.append(chr(byte))
+            elif byte in {0x09, 0x0A, 0x0D}:
+                parts.append({0x09: "\\t", 0x0A: "\\n", 0x0D: "\\r"}[byte])
+            else:
+                parts.append(f"\\x{byte:02x}")
+        return "".join(parts)
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]

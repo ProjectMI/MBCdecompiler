@@ -19,6 +19,7 @@ the project notes:
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -97,6 +98,7 @@ class HeuristicEngine:
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
         features.extend(self._context_features(previous, following))
+        features.extend(self._table_builder_features(profiles))
 
         confidence = sum(feature.score for feature in features)
         confidence = max(0.0, min(1.0, confidence))
@@ -233,6 +235,40 @@ class HeuristicEngine:
                     evidence=(base[0].label, lookup[-1].label),
                 )
             )
+        return features
+
+    def _table_builder_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        features: List[LocalFeature] = []
+        ascii_chunks = [profile for profile in profiles if profile.kind is InstructionKind.ASCII_CHUNK]
+        if len(ascii_chunks) < 2:
+            return features
+
+        opcode_modes = [
+            profile.word.mode
+            for profile in profiles
+            if profile.mnemonic.startswith("op_") and profile.kind is InstructionKind.UNKNOWN
+        ]
+        if not opcode_modes:
+            return features
+
+        mode_counts = Counter(opcode_modes)
+        dominant_mode, dominant_count = mode_counts.most_common(1)[0]
+        if dominant_count < max(4, len(opcode_modes) // 2):
+            return features
+
+        ascii_modes = {chunk.word.mode for chunk in ascii_chunks}
+        if dominant_mode not in ascii_modes:
+            return features
+
+        labels = [chunk.label for chunk in ascii_chunks[:2] if chunk.label]
+        evidence: Tuple[str, ...] = tuple(labels)
+        features.append(
+            LocalFeature(
+                name="table_builder",
+                score=0.35,
+                evidence=evidence,
+            )
+        )
         return features
 
     def _context_features(

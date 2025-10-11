@@ -143,6 +143,7 @@ def default_patterns() -> PatternRegistry:
             marker_run_pattern(),
             literal_pipeline(),
             ascii_pipeline(),
+            table_builder_pipeline(),
             *guarded_return_patterns(),
             reduce_pipeline(),
             call_preparation_pipeline(),
@@ -197,6 +198,46 @@ def ascii_run_pattern() -> PipelinePattern:
         allow_extra=True,
         stack_change=0,
         description="Run of inline ASCII words",
+    )
+
+
+def table_builder_pipeline() -> PipelinePattern:
+    """Return the pattern that marks table builder prologues."""
+
+    tokens = (
+        PatternToken(
+            kinds=(InstructionKind.ASCII_CHUNK,),
+            min_delta=1,
+            max_delta=1,
+            description="table label chunk",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN, InstructionKind.ASCII_CHUNK),
+            min_delta=0,
+            max_delta=1,
+            allow_unknown=True,
+            description="table label glue",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.ASCII_CHUNK,),
+            min_delta=1,
+            max_delta=1,
+            description="table label chunk",
+        ),
+        PatternToken(
+            kinds=(InstructionKind.UNKNOWN, InstructionKind.TABLE_LOOKUP),
+            min_delta=0,
+            max_delta=0,
+            allow_unknown=True,
+            description="table opcode seed",
+        ),
+    )
+    return PipelinePattern(
+        name="table_builder",
+        category="table_builder",
+        tokens=tokens,
+        allow_extra=True,
+        description="Inline ASCII label followed by opcode run",
     )
 
 

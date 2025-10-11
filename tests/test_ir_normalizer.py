@@ -31,6 +31,9 @@ from mbcdisasm.ir.model import (
     IRBuildArray,
     IRSwitchDispatch,
     IRTablePatch,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
 )
@@ -1714,6 +1717,68 @@ def test_normalizer_absorbs_zero_mode_affixes_for_opcode_tables() -> None:
     assert node.operations[0][0] == "op_08_00"
     assert node.operations[-1][0] == "op_08_00"
     assert len(node.operations) == len(raw_instructions)
+
+
+def test_table_builder_collapses_prolog_and_patch() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    prolog_a = make_stack_neutral_instruction(0, "op_39_4D")
+    prolog_b = make_stack_neutral_instruction(4, "op_3F_4D")
+    literal = IRLiteralChunk(data=b"FM\x00\x00", source="inline", annotations=tuple())
+    patch = IRTablePatch(
+        operations=(("op_82_4D", 0), ("op_88_4D", 0)),
+        annotations=("adaptive_table", "mode=0x4D"),
+    )
+
+    items = _ItemList([prolog_a, prolog_b, literal, patch])
+    metrics = NormalizerMetrics()
+
+    normalizer._pass_table_builders(items, metrics)
+
+    assert len(items) == 2
+    begin, emit = items[0], items[1]
+    assert isinstance(begin, IRTableBuilderBegin)
+    assert begin.mode == 0x4D
+    assert begin.steps and begin.steps[0][0] == "op_39_4D"
+    assert isinstance(emit, IRTableBuilderEmit)
+    assert emit.mode == 0x4D
+    assert emit.kind == "adaptive"
+    assert emit.labels and emit.labels[0].startswith("ascii(")
+    assert metrics.testset_branches == 0
+
+
+def test_table_builder_captures_testset_branch() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    prolog = make_stack_neutral_instruction(0, "op_32_59")
+    literal = IRLiteralChunk(data=b"AA\x00\x00", source="inline", annotations=tuple())
+    patch = IRTablePatch(
+        operations=(("op_80_59", 0),),
+        annotations=("adaptive_table", "mode=0x59"),
+    )
+    branch = make_stack_neutral_instruction(
+        12,
+        "testset_branch",
+        operand=0x9000,
+        kind=InstructionKind.BRANCH,
+    )
+
+    items = _ItemList([prolog, literal, patch, branch])
+    metrics = NormalizerMetrics()
+
+    normalizer._pass_table_builders(items, metrics)
+
+    assert len(items) == 3
+    begin, emit, commit = items
+    assert isinstance(begin, IRTableBuilderBegin)
+    assert isinstance(emit, IRTableBuilderEmit)
+    assert isinstance(commit, IRTableBuilderCommit)
+    assert commit.branch_type == "testset"
+    assert commit.then_target == 0x9000
+    assert commit.var == "slot(0x9000)"
+    assert metrics.testset_branches == 1
 
 
 def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:

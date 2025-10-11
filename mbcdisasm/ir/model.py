@@ -657,6 +657,71 @@ class IRTablePatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTableBuilderBegin(IRNode):
+    """Prologue that initialises an adaptive/opcode table builder."""
+
+    steps: Tuple[Tuple[str, int], ...]
+    mode: int
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        note = f"table_builder.begin mode=0x{self.mode:02X}"
+        if ops:
+            note += f" [{ops}]"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
+class IRTableBuilderEmit(IRNode):
+    """Single emission step within a table builder run."""
+
+    mode: int
+    kind: str
+    labels: Tuple[str, ...]
+    operations: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        label = ", ".join(self.labels) if self.labels else "?"
+        count = len(self.operations)
+        note = f"table_builder.emit mode=0x{self.mode:02X} kind={self.kind} label=[{label}] entries={count}"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
+class IRTableBuilderCommit(IRNode):
+    """Terminal step that finalises a table builder and encodes control flow."""
+
+    steps: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+    branch_type: Optional[str] = None
+    condition: Optional[str] = None
+    then_target: Optional[int] = None
+    else_target: Optional[int] = None
+    var: Optional[str] = None
+    expr: Optional[str] = None
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        suffix = f" steps=[{ops}]" if ops else ""
+        if self.branch_type == "testset":
+            return (
+                f"table_builder.commit{suffix} testset {self.var}={self.expr} "
+                f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
+            )
+        if self.branch_type == "branch":
+            return (
+                f"table_builder.commit{suffix} if cond={self.condition} "
+                f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
+            )
+        return f"table_builder.commit{suffix}" if suffix else "table_builder.commit"
+
+
+@dataclass(frozen=True)
 class IRDispatchCase:
     """Single dispatch case extracted from a table patch."""
 
