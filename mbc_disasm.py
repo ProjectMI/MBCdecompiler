@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -90,6 +91,7 @@ def resolve_input_paths(args: argparse.Namespace) -> tuple[Path, Path]:
 
 
 def main() -> None:
+    start_time = time.perf_counter()
     args = parse_args()
     adb_path, mbc_path = resolve_input_paths(args)
     validate_inputs(adb_path, mbc_path)
@@ -122,6 +124,9 @@ def main() -> None:
     ir_output_path = args.ir_out or mbc_path.with_suffix(".ir.txt")
     IRTextRenderer().write(program, ir_output_path)
     print(f"ir written to {ir_output_path}")
+
+    total_time = time.perf_counter() - start_time
+    print(f"total execution time: {total_time:.2f}s")
 
 
 if __name__ == "__main__":
