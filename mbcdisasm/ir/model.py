@@ -457,12 +457,17 @@ class IRFunctionPrologue(IRNode):
     expr: str
     then_target: int
     else_target: int
+    prefix: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        return (
+        base = (
             f"function_prologue {self.var}={self.expr} "
             f"then=0x{self.then_target:04X} else=0x{self.else_target:04X}"
         )
+        if self.prefix:
+            rendered = ", ".join(step.describe() for step in self.prefix)
+            return f"{base} prefix=[{rendered}]"
+        return base
 
 
 @dataclass(frozen=True)

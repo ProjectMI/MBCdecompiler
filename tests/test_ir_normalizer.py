@@ -144,6 +144,24 @@ def write_manual(path: Path) -> KnowledgeBase:
             "category": "call_dispatch",
             "stack_delta": -1,
         },
+        "op_02_00": {
+            "opcodes": ["0x02:0x00"],
+            "name": "op_02_00",
+            "category": "terminator_marker",
+            "stack_delta": 0,
+        },
+        "op_06_00": {
+            "opcodes": ["0x06:0x00"],
+            "name": "op_06_00",
+            "category": "terminator_marker",
+            "stack_delta": 0,
+        },
+        "op_E4_06": {
+            "opcodes": ["0xE4:0x06"],
+            "name": "op_E4_06",
+            "category": "terminator_marker",
+            "stack_delta": 0,
+        },
         "return_values": {
             "opcodes": ["0x30:0x00"],
             "name": "return_values",
@@ -1299,6 +1317,31 @@ def test_normalizer_lifts_branch_predicate_from_call(tmp_path: Path) -> None:
     assert call.predicate.else_target == branch.else_target
 
 
+def test_marker_compaction_attaches_to_prologue(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x06, 0x00, 0x0000),  # marker
+        build_word(4, 0x00, 0x00, 0x0001),  # push_literal
+        build_word(8, 0x27, 0x00, 0x0010),  # testset_branch
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    prologue = next(node for node in block.nodes if isinstance(node, IRFunctionPrologue))
+    assert prologue.prefix and prologue.prefix[0].mnemonic == "op_06_00"
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_06_00" for node in block.nodes
+    )
+
+
 def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1382,6 +1425,31 @@ def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
     )
 
 
+def test_marker_compaction_attaches_to_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x02, 0x00, 0x0000),  # marker
+        build_word(4, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(8, 0x30, 0x00, 0x0001),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert [step.mnemonic for step in ret.cleanup][:2] == ["op_02_00", "stack_teardown"]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_02_00" for node in block.nodes
+    )
+
+
 def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1403,6 +1471,32 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
     assert tail_call.cleanup and tail_call.cleanup[-1].mnemonic == "stack_teardown"
     assert tail_call.cleanup[-1].pops == 4
+
+
+def test_marker_compaction_attaches_to_tailcall(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x02, 0x00, 0x0000),  # marker
+        build_word(4, 0x2B, 0x00, 0x0040),  # tailcall_dispatch
+        build_word(8, 0x01, 0xF0, 0x0000),  # stack_teardown_4
+        build_word(12, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
+    assert [step.mnemonic for step in tail_call.cleanup][:2] == ["op_02_00", "stack_teardown"]
+    assert not any(
+        isinstance(node, IRRaw) and node.mnemonic == "op_02_00" for node in block.nodes
+    )
 
 
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:

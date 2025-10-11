@@ -78,6 +78,8 @@ from .model import (
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
+STRUCTURAL_MARKER_MNEMONICS = {"op_02_00", "op_06_00", "op_E4_06"}
+
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
 CALL_PREPARATION_MNEMONICS = {
@@ -688,6 +690,8 @@ class IRNormalizer:
 
     @staticmethod
     def _is_block_terminator(instruction: RawInstruction) -> bool:
+        if instruction.mnemonic in STRUCTURAL_MARKER_MNEMONICS:
+            return False
         profile = instruction.profile
         if profile.kind in {
             InstructionKind.BRANCH,
@@ -741,6 +745,7 @@ class IRNormalizer:
         self._pass_table_builders(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
+        self._pass_epilogue_compaction(items)
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_condition_masks(items)
@@ -2578,6 +2583,182 @@ class IRNormalizer:
             state = None
             index += 1
 
+    def _pass_epilogue_compaction(self, items: _ItemList) -> None:
+        if not items:
+            return
+
+        while True:
+            exit_index = len(items)
+            successors = self._block_successors(items)
+            if not successors:
+                return
+            post_dominators = self._compute_post_dominators(successors, exit_index)
+            changed = False
+
+            for index, item in enumerate(items):
+                if not isinstance(item, RawInstruction):
+                    continue
+                if not self._is_structural_marker(item):
+                    continue
+
+                dominators = post_dominators.get(index)
+                if not dominators:
+                    continue
+
+                target_index = self._select_marker_target(items, index, dominators)
+                if target_index is None:
+                    continue
+
+                target = items[target_index]
+                effect = self._marker_stack_effect(item)
+
+                if isinstance(target, IRReturn):
+                    cleanup = (effect,) + tuple(target.cleanup)
+                    updated = replace(target, cleanup=cleanup)
+                elif isinstance(target, IRTailCall):
+                    cleanup = (effect,) + tuple(target.cleanup)
+                    updated = replace(target, cleanup=cleanup)
+                elif isinstance(target, IRCallReturn):
+                    cleanup = (effect,) + tuple(target.cleanup)
+                    updated = replace(target, cleanup=cleanup)
+                elif isinstance(target, IRFunctionPrologue):
+                    prefix = tuple(target.prefix) + (effect,)
+                    updated = replace(target, prefix=prefix)
+                else:
+                    continue
+
+                items.replace_slice(target_index, target_index + 1, [updated])
+                removed = items.pop(index)
+                self._ssa_bindings.pop(id(removed), None)
+                changed = True
+                break
+
+            if not changed:
+                break
+
+    def _block_successors(self, items: _ItemList) -> Dict[int, Set[int]]:
+        total = len(items)
+        exit_index = total
+        successors: Dict[int, Set[int]] = {index: set() for index in range(total)}
+
+        for index, item in enumerate(items):
+            if self._node_exits_block(item):
+                successors[index].add(exit_index)
+                continue
+            if index + 1 <= total:
+                successors[index].add(index + 1)
+
+        return successors
+
+    def _node_exits_block(self, item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, RawInstruction):
+            if item.mnemonic in STRUCTURAL_MARKER_MNEMONICS:
+                return False
+            kind = item.profile.kind
+            if kind in {
+                InstructionKind.BRANCH,
+                InstructionKind.RETURN,
+                InstructionKind.TAILCALL,
+                InstructionKind.TERMINATOR,
+            }:
+                return True
+            return False
+
+        return isinstance(
+            item,
+            (
+                IRReturn,
+                IRTailCall,
+                IRTailcallReturn,
+                IRCallReturn,
+                IRSwitchDispatch,
+                IRIf,
+                IRTestSetBranch,
+                IRFlagCheck,
+            ),
+        )
+
+    def _compute_post_dominators(
+        self, successors: Dict[int, Set[int]], exit_index: int
+    ) -> Dict[int, Set[int]]:
+        nodes = set(successors.keys()) | {exit_index}
+        post_dominators: Dict[int, Set[int]] = {node: set(nodes) for node in nodes}
+        post_dominators[exit_index] = {exit_index}
+
+        changed = True
+        ordered_nodes = list(successors.keys())
+        ordered_nodes.sort(reverse=True)
+
+        while changed:
+            changed = False
+            for node in ordered_nodes:
+                successors_for_node = successors.get(node)
+                if not successors_for_node:
+                    new_set = {node} | post_dominators[exit_index]
+                else:
+                    intersection = set(nodes)
+                    for successor in successors_for_node:
+                        intersection &= post_dominators.get(successor, {successor})
+                    new_set = {node} | intersection
+                if new_set != post_dominators[node]:
+                    post_dominators[node] = new_set
+                    changed = True
+
+        return post_dominators
+
+    def _select_marker_target(
+        self,
+        items: _ItemList,
+        index: int,
+        dominators: Set[int],
+    ) -> Optional[int]:
+        exit_index = len(items)
+        candidates = sorted(pos for pos in dominators if pos not in {index, exit_index})
+
+        for position in candidates:
+            if position <= index:
+                continue
+            node = items[position]
+            if isinstance(node, (IRReturn, IRTailCall, IRCallReturn, IRTailcallReturn)):
+                return position
+
+        for position in candidates:
+            if position <= index:
+                continue
+            node = items[position]
+            if isinstance(node, IRFunctionPrologue):
+                return position
+
+        return None
+
+    def _is_structural_marker(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic not in STRUCTURAL_MARKER_MNEMONICS:
+            return False
+        event = instruction.event
+        if event.uncertain:
+            return False
+        if event.pushed_types:
+            return False
+        return event.delta <= 0
+
+    def _marker_stack_effect(self, instruction: RawInstruction) -> IRStackEffect:
+        event = instruction.event
+        delta = event.delta
+        pops = 0
+        if delta < 0:
+            pops = -delta
+        elif event.popped_types:
+            pops = sum(1 for value in event.popped_types if value is not StackValueType.MARKER)
+        operand_role = instruction.profile.operand_role()
+        operand_alias = instruction.profile.operand_alias()
+        return IRStackEffect(
+            mnemonic=instruction.mnemonic,
+            operand=instruction.operand,
+            pops=pops,
+            operand_role=operand_role,
+            operand_alias=operand_alias,
+        )
+
     def _match_table_builder_prologue(self, items: _ItemList, index: int) -> int:
         if index >= len(items):
             return 0
@@ -3285,6 +3466,8 @@ class IRNormalizer:
 
     @staticmethod
     def _is_prologue_prefix(item: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(item, RawInstruction):
+            return item.mnemonic in STRUCTURAL_MARKER_MNEMONICS
         return isinstance(
             item,
             (
