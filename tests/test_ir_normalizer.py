@@ -1656,6 +1656,49 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.returns == ("ret0",)
 
 
+def test_normalizer_lifts_tail_dispatch_switch(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x29, 0x1000),
+        build_word(4, 0x29, 0x10, 0x002C),
+        build_word(8, 0x06, 0x66, 0x0A30),
+        build_word(12, 0x29, 0x10, 0x1929),
+        build_word(16, 0x10, 0x18, 0x6910),
+        build_word(20, 0x04, 0x88, 0x0000),
+        build_word(24, 0x29, 0x10, 0x252C),
+        build_word(28, 0x03, 0x66, 0x0A29),
+        build_word(32, 0x10, 0x70, 0x2910),
+        build_word(36, 0x00, 0x29, 0x1000),
+        build_word(40, 0x29, 0x10, 0x002C),
+        build_word(44, 0x06, 0x66, 0x0A30),
+        build_word(48, 0x29, 0x10, 0x1929),
+        build_word(52, 0x10, 0x18, 0x6910),
+        build_word(56, 0x04, 0x88, 0x0000),
+        build_word(60, 0x29, 0x10, 0x262C),
+        build_word(64, 0x03, 0x66, 0x0A29),
+        build_word(68, 0x10, 0x70, 0x2910),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert isinstance(block.nodes[0], IRCallCleanup)
+    dispatch = block.nodes[1]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == 0x1929
+    keys = [case.key for case in dispatch.cases]
+    targets = [case.target for case in dispatch.cases]
+    assert keys == [0x25, 0x26]
+    assert targets == [0x252C, 0x262C]
+
+
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

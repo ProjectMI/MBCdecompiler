@@ -727,6 +727,7 @@ class IRNormalizer:
         self._pass_literals(items, metrics)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
+        self._pass_tail_dispatch_switches(items)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -1029,6 +1030,127 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_tail_dispatch_switches(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            match = self._match_tail_dispatch_case(items, index)
+            if match is None:
+                index += 1
+                continue
+
+            start = index
+            helper_target: Optional[int] = None
+            helper_symbol: Optional[str] = None
+            cases: List[IRDispatchCase] = []
+            cleanup_nodes: List[RawInstruction] = []
+
+            while match is not None:
+                index, helper_dispatch, prep_nodes, case_instruction = match
+
+                helper_value = helper_dispatch.operand & 0xFFFF
+                if helper_target is None:
+                    helper_target = helper_value
+                    if helper_target:
+                        helper_symbol = self.knowledge.lookup_address(helper_target)
+                elif helper_target != helper_value:
+                    helper_target = None
+                    helper_symbol = None
+
+                case_target = case_instruction.operand & 0xFFFF
+                case_key = (case_target >> 8) & 0xFF
+                case_symbol = self.knowledge.lookup_address(case_target)
+                cases.append(IRDispatchCase(key=case_key, target=case_target, symbol=case_symbol))
+
+                cleanup_nodes.extend(prep_nodes)
+
+                match = self._match_tail_dispatch_case(items, index)
+
+            end = index
+            if len(cases) <= 1:
+                index = start + 1
+                continue
+
+            cleanup_steps = [self._call_cleanup_effect(node) for node in cleanup_nodes]
+
+            for position in range(start, end):
+                removed = items[position]
+                self._ssa_bindings.pop(id(removed), None)
+
+            replacement: List[IRNode] = []
+            if cleanup_steps:
+                replacement.append(IRCallCleanup(steps=tuple(cleanup_steps)))
+            replacement.append(
+                IRSwitchDispatch(
+                    cases=tuple(sorted(cases, key=lambda entry: entry.key)),
+                    helper=helper_target,
+                    helper_symbol=helper_symbol,
+                )
+            )
+
+            items.replace_slice(start, end, replacement)
+            index = start + len(replacement)
+
+    def _match_tail_dispatch_case(
+        self, items: _ItemList, index: int
+    ) -> Optional[Tuple[int, RawInstruction, Tuple[RawInstruction, ...], RawInstruction]]:
+        if index >= len(items):
+            return None
+
+        start = index
+        if isinstance(items[index], IRLiteral):
+            index += 1
+            if index >= len(items):
+                return None
+
+        node = items[index]
+        if not isinstance(node, RawInstruction) or not self._is_tail_dispatch(node):
+            return None
+        index += 1
+
+        sequence = [
+            "op_06_66",
+            "tailcall_dispatch",
+            "op_10_18",
+            "op_04_88",
+            "tailcall_dispatch",
+            "op_03_66",
+            "op_10_70",
+        ]
+        collected: List[RawInstruction] = []
+        for mnemonic in sequence:
+            if index >= len(items):
+                return None
+            candidate = items[index]
+            if not isinstance(candidate, RawInstruction):
+                return None
+            if mnemonic == "tailcall_dispatch":
+                if not self._is_tail_dispatch(candidate):
+                    return None
+            elif candidate.mnemonic != mnemonic:
+                return None
+            collected.append(candidate)
+            index += 1
+
+        helper_dispatch = collected[1]
+        case_instruction = collected[4]
+        case_operand = case_instruction.operand & 0xFFFF
+        if case_operand & 0x00FF != 0x2C:
+            return None
+
+        prep_nodes = (
+            collected[0],
+            collected[2],
+            collected[3],
+            collected[5],
+            collected[6],
+        )
+
+        return (index, helper_dispatch, prep_nodes, case_instruction)
+
+    @staticmethod
+    def _is_tail_dispatch(instruction: RawInstruction) -> bool:
+        return instruction.mnemonic in {"tailcall_dispatch", "op_29_10"}
 
     def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
         constant = self._string_pool.get(data)
