@@ -273,10 +273,20 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x013D": "tail_helper_13d",
         "0x01EC": "tail_helper_1ec",
         "0x01F1": "tail_helper_1f1",
+        "0x002C": "tail_helper_2c",
+        "0x003C": "tail_helper_3c",
+        "0x022C": "tail_helper_22c",
+        "0x022F": "tail_helper_22f",
         "0x032C": "tail_helper_32c",
+        "0x0C2C": "tail_helper_0c2c",
         "0x0BF0": "tail_helper_bf0",
         "0x0FF0": "tail_helper_ff0",
+        "0x102B": "tail_helper_102b",
         "0x16F0": "tail_helper_16f0",
+        "0x1729": "tail_helper_1729",
+        "0x1929": "tail_helper_1929",
+        "0x1A2C": "tail_helper_1a2c",
+        "0x402B": "tail_helper_402b",
         "0x6623": "dispatch_helper_6623",
         "0x6624": "dispatch_helper_6624",
     }
@@ -524,12 +534,9 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     cleanup_nodes = [
         node for node in call_block.nodes if isinstance(node, IRCallCleanup)
     ]
-    assert any(
-        [step.mnemonic for step in node.steps]
-        == ["page_register", "op_5E_29", "op_F0_4B"]
-        for node in cleanup_nodes
-    )
-    assert [step.mnemonic for step in contract_call.cleanup] == ["stack_teardown"]
+    assert not cleanup_nodes
+    expected_cleanup = ["stack_teardown", "page_register", "op_5E_29", "op_F0_4B"]
+    assert [step.mnemonic for step in contract_call.cleanup] == expected_cleanup
     assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
@@ -1425,6 +1432,56 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     tail_call = next(node for node in block.nodes if isinstance(node, IRTailCall))
     assert tail_call.cleanup and tail_call.cleanup[-1].mnemonic == "stack_teardown"
     assert tail_call.cleanup[-1].pops == 4
+
+
+def test_normalizer_folds_tailcall_cluster_cleanup(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x10, 0x00, 0x0020),  # call_helpers
+        build_word(4, 0x01, 0x29, 0x0001),  # op_01_29
+        build_word(8, 0x2B, 0x00, 0x032C),  # tailcall_dispatch helper 0x032C
+        build_word(12, 0x06, 0x66, 0x0000),  # op_06_66
+        build_word(16, 0x2B, 0x00, 0x002C),  # tailcall_dispatch helper 0x002C
+        build_word(20, 0x10, 0x00, 0x0020),  # call_helpers
+        build_word(24, 0x30, 0x00, 0x0000),  # return_values
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_nodes = [
+        node
+        for node in block.nodes
+        if isinstance(node, (IRCall, IRCallReturn, IRTailCall, IRTailcallReturn))
+        and getattr(node, "tail", False)
+    ]
+
+    assert len(call_nodes) == 2
+    cleanups = []
+    for node in call_nodes:
+        if isinstance(node, IRCall):
+            cleanup = node.cleanup
+        elif isinstance(node, IRTailCall):
+            cleanup = node.cleanup
+        elif isinstance(node, IRCallReturn):
+            cleanup = node.cleanup
+        else:
+            cleanup = node.cleanup
+        cleanups.append([step.mnemonic for step in cleanup])
+
+    assert cleanups == [
+        ["call_helpers", "op_06_66"],
+        ["call_helpers", "call_helpers", "op_06_66"],
+    ]
+
+    assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
 
 
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:

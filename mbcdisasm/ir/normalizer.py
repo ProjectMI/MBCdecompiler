@@ -155,17 +155,29 @@ CALL_PREDICATE_SKIP_MNEMONICS = {
 }
 
 TAILCALL_HELPERS = {
+    0x002C,
+    0x003C,
     0x003E,
     0x00ED,
     0x00F0,
     0x013D,
     0x01EC,
     0x01F1,
+    0x022C,
+    0x022F,
     0x032C,
     0x0BF0,
+    0x0C2C,
     0x0FF0,
+    0x102B,
     0x16F0,
+    0x1729,
+    0x1929,
+    0x1A2C,
+    0x402B,
 }
+
+TAIL_CLUSTER_RAW_CLEANUP = {"op_01_29", "op_06_66"}
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
@@ -747,6 +759,7 @@ class IRNormalizer:
         self._pass_dispatch_wrappers(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
+        self._pass_fold_tailcall_clusters(items)
         self._pass_tailcall_returns(items)
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
@@ -3107,6 +3120,112 @@ class IRNormalizer:
         if slice_end < len(items) and isinstance(items[slice_end], IRReturn):
             slice_end += 1
         items.replace_slice(handshake_index, slice_end, [io_node])
+
+    @staticmethod
+    def _is_tail_cluster_node(node: Union[RawInstruction, IRNode]) -> bool:
+        return isinstance(node, CallLike) and getattr(node, "tail", False)
+
+    def _tail_cluster_cleanup_steps(
+        self, node: Union[RawInstruction, IRNode]
+    ) -> List[IRStackEffect]:
+        if isinstance(node, IRCallCleanup):
+            return list(node.steps)
+        if isinstance(node, IRConditionMask):
+            return [
+                IRStackEffect(
+                    mnemonic=node.source,
+                    operand=node.mask,
+                    operand_role="mask",
+                )
+            ]
+        if isinstance(node, RawInstruction):
+            mnemonic = node.mnemonic
+            if mnemonic in TAIL_CLUSTER_RAW_CLEANUP or any(
+                mnemonic.startswith(prefix) for prefix in TAIL_CLUSTER_RAW_CLEANUP
+            ):
+                return [self._call_cleanup_effect(node)]
+        return []
+
+    def _append_tail_cluster_cleanup(
+        self, node: CallLike, extra: Sequence[IRStackEffect]
+    ) -> CallLike:
+        if not extra:
+            return node
+
+        existing = list(getattr(node, "cleanup", tuple()))
+        combined = tuple(self._coalesce_epilogue_steps(existing + list(extra)))
+
+        if isinstance(node, IRCall):
+            updated: CallLike = replace(node, cleanup=combined)
+        elif isinstance(node, IRCallReturn):
+            updated = replace(node, cleanup=combined)
+        elif isinstance(node, IRTailCall):
+            updated = replace(node, cleanup=combined)
+        elif isinstance(node, IRTailcallReturn):
+            updated = replace(node, cleanup=combined)
+        else:
+            return node
+
+        self._transfer_ssa(node, updated)
+        return updated
+
+    def _pass_fold_tailcall_clusters(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not self._is_tail_cluster_node(node):
+                index += 1
+                continue
+
+            start = index
+            while start > 0 and self._tail_cluster_cleanup_steps(items[start - 1]):
+                start -= 1
+
+            end = index + 1
+            while end < len(items):
+                candidate = items[end]
+                if self._is_tail_cluster_node(candidate):
+                    end += 1
+                    continue
+                if isinstance(candidate, IRReturn):
+                    end += 1
+                    continue
+                if self._tail_cluster_cleanup_steps(candidate):
+                    end += 1
+                    continue
+                break
+
+            cluster_slice = list(items[start:end])
+            cleanup_steps: List[IRStackEffect] = []
+            remove_indices: Set[int] = set()
+
+            for offset, entry in enumerate(cluster_slice):
+                if self._is_tail_cluster_node(entry) or isinstance(entry, IRReturn):
+                    continue
+                steps = self._tail_cluster_cleanup_steps(entry)
+                if steps:
+                    cleanup_steps.extend(steps)
+                    remove_indices.add(offset)
+
+            if not cleanup_steps:
+                index = end
+                continue
+
+            aggregated = tuple(self._coalesce_epilogue_steps(cleanup_steps))
+            new_slice: List[Union[RawInstruction, IRNode]] = []
+
+            for offset, entry in enumerate(cluster_slice):
+                if offset in remove_indices:
+                    self._ssa_bindings.pop(id(entry), None)
+                    continue
+                if self._is_tail_cluster_node(entry):
+                    updated = self._append_tail_cluster_cleanup(entry, aggregated)
+                    new_slice.append(updated)
+                    continue
+                new_slice.append(entry)
+
+            items.replace_slice(start, end, new_slice)
+            index = start + len(new_slice)
 
     @staticmethod
     def _apply_call_shuffle(args: Sequence[str], operand: int) -> List[str]:
