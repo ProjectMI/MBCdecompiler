@@ -770,6 +770,7 @@ class IRNormalizer:
         final_items = list(items)
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
+        raw_terminators = 0
         for index, item in enumerate(final_items):
             if isinstance(item, RawInstruction):
                 if item.mnemonic == "terminator":
@@ -789,17 +790,29 @@ class IRNormalizer:
                         block_annotations.append(annotation)
                     continue
                 metrics.raw_remaining += 1
-                nodes.append(
-                    IRRaw(
-                        mnemonic=item.mnemonic,
-                        operand=item.operand,
-                        operand_role=item.profile.operand_role(),
-                        operand_alias=item.profile.operand_alias(),
-                        annotations=item.annotations,
-                    )
+                raw_node = IRRaw(
+                    mnemonic=item.mnemonic,
+                    operand=item.operand,
+                    operand_role=item.profile.operand_role(),
+                    operand_alias=item.profile.operand_alias(),
+                    annotations=item.annotations,
                 )
+                if raw_node.mnemonic == "terminator":
+                    nodes.append(
+                        IRTerminator(
+                            operand=raw_node.operand,
+                            operand_alias=raw_node.operand_alias,
+                            operand_role=raw_node.operand_role,
+                        )
+                    )
+                    raw_terminators += 1
+                    continue
+                nodes.append(raw_node)
             else:
                 nodes.append(item)
+
+        if raw_terminators:
+            metrics.raw_remaining -= raw_terminators
 
         ir_block = IRBlock(
             label=f"block_{block.index}",
