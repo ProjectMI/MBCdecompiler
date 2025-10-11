@@ -6,6 +6,8 @@ import pytest
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
+from dataclasses import replace
+
 from mbcdisasm.ir.model import (
     IRCall,
     IRCallCleanup,
@@ -117,6 +119,26 @@ def make_stack_neutral_instruction(
         ssa_values=tuple(),
         ssa_kinds=tuple(),
     )
+
+
+def test_epilogue_compaction_merges_raw_markers() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    marker = make_stack_neutral_instruction(0, "op_02_00")
+    marker = replace(marker, event=replace(marker.event, delta=1, depth_after=1))
+    trailer = make_stack_neutral_instruction(4, "op_15_4A")
+
+    return_node = IRReturn(values=tuple(), varargs=False)
+    items = _ItemList([marker, trailer, return_node])
+
+    normalizer._pass_epilogue_prologue_compaction(items)
+
+    assert all(not isinstance(node, RawInstruction) for node in items)
+    assert len(items) == 1
+    updated_return = items[0]
+    assert isinstance(updated_return, IRReturn)
+    assert [step.mnemonic for step in updated_return.cleanup] == ["op_02_00", "op_15_4A"]
 
 
 def write_manual(path: Path) -> KnowledgeBase:

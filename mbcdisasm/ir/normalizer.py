@@ -267,6 +267,19 @@ IO_BRIDGE_NODE_TYPES = (
     IRTailcallFrame,
 )
 
+EPILOGUE_ALLOWED_NODE_TYPES = (
+    IRCallCleanup,
+    IRCallReturn,
+    IRCallPreparation,
+    IRConditionMask,
+    IRLiteral,
+    IRLiteralChunk,
+    IRStringConstant,
+    IRAsciiPreamble,
+    IRAsciiFinalize,
+    IRAsciiHeader,
+)
+
 IO_HELPER_MNEMONICS = {"call_helpers", "op_F0_4B", "op_4A_10"}
 CALL_HELPER_FACADE_MNEMONICS = {"op_05_F0", "op_FD_4A"}
 FANOUT_FACADE_MNEMONICS = {"op_10_32"}
@@ -750,6 +763,7 @@ class IRNormalizer:
         self._pass_tailcall_returns(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
+        self._pass_epilogue_prologue_compaction(items)
 
         final_items = list(items)
         nodes: List[IRNode] = []
@@ -4408,6 +4422,112 @@ class IRNormalizer:
             index += 1
 
         self._sweep_indirect_configuration(items)
+
+    def _pass_epilogue_prologue_compaction(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            target_index = self._locate_epilogue_target(items, index)
+            if target_index is None:
+                index += 1
+                continue
+
+            target = items[target_index]
+            raw_positions: List[int] = []
+            safe = True
+            for scan in range(index, target_index):
+                candidate = items[scan]
+                if isinstance(candidate, RawInstruction):
+                    if isinstance(target, IRFunctionPrologue) and candidate.event.delta != 0:
+                        safe = False
+                        break
+                    raw_positions.append(scan)
+                    continue
+                if isinstance(candidate, EPILOGUE_ALLOWED_NODE_TYPES):
+                    continue
+                safe = False
+                break
+
+            if not safe or not raw_positions:
+                index += 1
+                continue
+
+            effects = [self._stack_effect_from_instruction(items[pos]) for pos in raw_positions]
+            updated = self._append_epilogue_effects(target, effects)
+            if updated is None:
+                index += 1
+                continue
+
+            self._transfer_ssa(target, updated)
+            for pos in reversed(raw_positions):
+                raw = items[pos]
+                assert isinstance(raw, RawInstruction)
+                self._ssa_bindings.pop(id(raw), None)
+                items.pop(pos)
+                if pos < target_index:
+                    target_index -= 1
+            items.replace_slice(target_index, target_index + 1, [updated])
+            continue
+
+    def _locate_epilogue_target(self, items: _ItemList, index: int) -> Optional[int]:
+        scan = index + 1
+        while scan < len(items):
+            node = items[scan]
+            if isinstance(node, (IRReturn, IRTailCall, IRTailcallReturn, IRFunctionPrologue)):
+                return scan
+            if isinstance(node, RawInstruction):
+                scan += 1
+                continue
+            if isinstance(node, EPILOGUE_ALLOWED_NODE_TYPES):
+                scan += 1
+                continue
+            return None
+        return None
+
+    def _stack_effect_from_instruction(self, instruction: RawInstruction) -> IRStackEffect:
+        pops = 0
+        delta = instruction.event.delta
+        if delta < 0:
+            pops = -delta
+        return IRStackEffect(
+            mnemonic=instruction.mnemonic,
+            operand=instruction.operand,
+            pops=pops,
+            operand_role=instruction.profile.operand_role(),
+            operand_alias=instruction.profile.operand_alias(),
+        )
+
+    def _append_epilogue_effects(
+        self,
+        target: IRNode,
+        effects: Sequence[IRStackEffect],
+    ) -> Optional[IRNode]:
+        if not effects:
+            return target
+        if isinstance(target, IRReturn):
+            cleanup = list(effects) + list(target.cleanup)
+            combined = tuple(self._coalesce_epilogue_steps(cleanup))
+            return IRReturn(
+                values=target.values,
+                varargs=target.varargs,
+                cleanup=combined,
+                mask=target.mask,
+            )
+        if isinstance(target, IRTailCall):
+            cleanup = list(effects) + list(target.cleanup)
+            combined = tuple(self._coalesce_epilogue_steps(cleanup))
+            return replace(target, cleanup=combined)
+        if isinstance(target, IRTailcallReturn):
+            cleanup = list(effects) + list(target.cleanup)
+            combined = tuple(self._coalesce_epilogue_steps(cleanup))
+            return replace(target, cleanup=combined)
+        if isinstance(target, IRFunctionPrologue):
+            return target
+        return None
 
     # ------------------------------------------------------------------
     # description helpers
