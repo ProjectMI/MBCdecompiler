@@ -57,6 +57,9 @@ from .model import (
     IRStackDrop,
     IRStringConstant,
     IRTablePatch,
+    IRBeginTable,
+    IREmitEntries,
+    IRCommitTable,
     IRDispatchCase,
     IRSwitchDispatch,
     IRTailcallFrame,
@@ -712,6 +715,7 @@ class IRNormalizer:
         self._pass_table_dispatch(items)
         self._pass_dispatch_wrappers(items)
         self._pass_ascii_finalize(items)
+        self._pass_table_builders(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
         self._pass_assign_ssa_names(items)
@@ -2204,6 +2208,57 @@ class IRNormalizer:
             return False
         return True
 
+    def _table_builder_mode(self, item: Union[RawInstruction, IRNode]) -> Optional[int]:
+        if not isinstance(item, RawInstruction):
+            return None
+        mnemonic = item.mnemonic
+        if not mnemonic.startswith("op_"):
+            return None
+        parts = mnemonic.split("_")
+        if len(parts) != 3:
+            return None
+        if item.operand != 0:
+            return None
+        try:
+            return int(parts[2], 16)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _extract_table_mode(patch: IRTablePatch) -> Optional[int]:
+        for note in patch.annotations:
+            if note.startswith("mode=0x"):
+                try:
+                    return int(note[7:], 16)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _extract_table_kind(patch: IRTablePatch) -> str:
+        for note in patch.annotations:
+            if note.endswith("_table"):
+                return note
+        return "table"
+
+    @staticmethod
+    def _format_table_parameter(chunk: IRLiteralChunk) -> str:
+        if chunk.symbol:
+            return chunk.symbol
+        return chunk.describe()
+
+    @staticmethod
+    def _mode_from_mnemonic(mnemonic: str) -> Optional[int]:
+        if not mnemonic.startswith("op_"):
+            return None
+        parts = mnemonic.split("_")
+        if len(parts) != 3:
+            return None
+        try:
+            return int(parts[2], 16)
+        except ValueError:
+            return None
+
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -2400,6 +2455,107 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _pass_table_builders(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            seed = items[index]
+            prologue_mode = self._table_builder_mode(seed)
+            if prologue_mode is None:
+                index += 1
+                continue
+
+            start = index
+            prologue_ops: List[Tuple[str, int]] = []
+            while index < len(items):
+                candidate = items[index]
+                mode = self._table_builder_mode(candidate)
+                if mode is None:
+                    break
+                prologue_ops.append((candidate.mnemonic, candidate.operand))
+                index += 1
+
+            cursor = index
+            stages: List[Tuple[IRTablePatch, Tuple[IRLiteralChunk, ...]]] = []
+            params: List[IRLiteralChunk] = []
+
+            while cursor < len(items):
+                node = items[cursor]
+                if isinstance(node, IRLiteralChunk):
+                    params.append(node)
+                    cursor += 1
+                    continue
+                if isinstance(node, IRTablePatch):
+                    stages.append((node, tuple(params)))
+                    params = []
+                    cursor += 1
+                    continue
+                break
+
+            if not stages:
+                index = start + 1
+                continue
+
+            if params:
+                index = start + 1
+                continue
+
+            commit_ops: List[Tuple[str, int]] = []
+            commit_cursor = cursor
+            while commit_cursor < len(items):
+                candidate = items[commit_cursor]
+                mode = self._table_builder_mode(candidate)
+                if mode is None:
+                    break
+                commit_ops.append((candidate.mnemonic, candidate.operand))
+                commit_cursor += 1
+
+            first_stage_mode = self._extract_table_mode(stages[0][0]) or prologue_mode
+            first_params = tuple(self._format_table_parameter(chunk) for chunk in stages[0][1])
+
+            nodes: List[IRNode] = [
+                IRBeginTable(
+                    mode=first_stage_mode,
+                    prologue=tuple(prologue_ops),
+                    parameters=first_params,
+                )
+            ]
+
+            for offset, (patch, param_nodes) in enumerate(stages):
+                stage_mode = self._extract_table_mode(patch) or prologue_mode
+                kind = self._extract_table_kind(patch)
+                if offset == 0:
+                    parameters: Tuple[str, ...] = tuple()
+                else:
+                    parameters = tuple(
+                        self._format_table_parameter(chunk) for chunk in param_nodes
+                    )
+                nodes.append(
+                    IREmitEntries(
+                        mode=stage_mode,
+                        kind=kind,
+                        operations=patch.operations,
+                        annotations=patch.annotations,
+                        parameters=parameters,
+                    )
+                )
+
+            if commit_ops:
+                commit_mode = self._mode_from_mnemonic(commit_ops[0][0]) or prologue_mode
+                nodes.append(
+                    IRCommitTable(
+                        mode=commit_mode,
+                        operations=tuple(commit_ops),
+                    )
+                )
+
+            end = commit_cursor if commit_ops else cursor
+            for position in range(start, end):
+                removed = items[position]
+                self._ssa_bindings.pop(id(removed), None)
+
+            items.replace_slice(start, end, nodes)
+            index = start + len(nodes)
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]

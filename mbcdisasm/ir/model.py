@@ -657,6 +657,56 @@ class IRTablePatch(IRNode):
 
 
 @dataclass(frozen=True)
+class IRBeginTable(IRNode):
+    """High level node that captures table builder prologues."""
+
+    mode: int
+    prologue: Tuple[Tuple[str, int], ...]
+    parameters: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        params = ""
+        if self.parameters:
+            params = " params=[" + ", ".join(self.parameters) + "]"
+        return f"table_begin mode=0x{self.mode:02X} prologue=[{ops}]{params}"
+
+
+@dataclass(frozen=True)
+class IREmitEntries(IRNode):
+    """Emit a batch of table entries for the current builder."""
+
+    mode: int
+    kind: str
+    operations: Tuple[Tuple[str, int], ...]
+    annotations: Tuple[str, ...]
+    parameters: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        params = ""
+        if self.parameters:
+            params = " params=[" + ", ".join(self.parameters) + "]"
+        annotation_text = ", ".join(note for note in self.annotations if note not in {"mode=0x%02X" % self.mode, self.kind})
+        extra = f" {annotation_text}" if annotation_text else ""
+        return f"table_emit kind={self.kind} mode=0x{self.mode:02X} entries=[{ops}]{params}{extra}"
+
+
+@dataclass(frozen=True)
+class IRCommitTable(IRNode):
+    """Marks table builder completion and captures trailing opcodes."""
+
+    mode: int
+    operations: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        if not self.operations:
+            return f"table_commit mode=0x{self.mode:02X}"
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        return f"table_commit mode=0x{self.mode:02X} ops=[{ops}]"
+
+
+@dataclass(frozen=True)
 class IRDispatchCase:
     """Single dispatch case extracted from a table patch."""
 
@@ -992,6 +1042,9 @@ __all__ = [
     "IRCallPreparation",
     "IRTailcallFrame",
     "IRTablePatch",
+    "IRBeginTable",
+    "IREmitEntries",
+    "IRCommitTable",
     "IRDispatchCase",
     "IRSwitchDispatch",
     "IRAsciiFinalize",

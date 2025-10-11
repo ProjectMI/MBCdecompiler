@@ -97,6 +97,7 @@ class HeuristicEngine:
         features.extend(self._return_features(profiles, following))
         features.extend(self._indirect_features(profiles))
         features.extend(self._context_features(previous, following))
+        features.extend(self._table_builder_features(profiles))
 
         confidence = sum(feature.score for feature in features)
         confidence = max(0.0, min(1.0, confidence))
@@ -191,6 +192,40 @@ class HeuristicEngine:
             )
             if following and following.kind is InstructionKind.BRANCH:
                 features.append(LocalFeature(name="call_followed_by_branch", score=0.05))
+        return features
+
+    def _table_builder_features(self, profiles: Sequence[InstructionProfile]) -> List[LocalFeature]:
+        features: List[LocalFeature] = []
+        if len(profiles) < 3:
+            return features
+
+        prologue = profiles[0]
+        if prologue.kind is not InstructionKind.UNKNOWN:
+            return features
+
+        if not prologue.mnemonic.startswith("op_"):
+            return features
+
+        mode = prologue.mode
+        dense_unknown = 0
+        literal_neighbors = 0
+        for profile in profiles[1:]:
+            if profile.kind in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK, InstructionKind.PUSH}:
+                literal_neighbors += 1
+                continue
+            if profile.kind is InstructionKind.UNKNOWN and profile.mode == mode:
+                dense_unknown += 1
+                continue
+            break
+
+        if dense_unknown >= 4 and literal_neighbors:
+            features.append(
+                LocalFeature(
+                    name="table_builder",
+                    score=0.35,
+                    evidence=(f"mode=0x{mode:02X}", f"entries={dense_unknown}"),
+                )
+            )
         return features
 
     def _return_features(
