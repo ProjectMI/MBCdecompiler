@@ -88,23 +88,30 @@ CALL_PREPARATION_MNEMONICS = {
     "op_02_F1",
     "op_09_29",
     "op_0A_F1",
-    "op_0F_00",
     "op_0C_2C",
+    "op_0F_00",
     "op_10_DC",
     "op_11_B4",
+    "op_1C_5C",
     "op_28_10",
     "op_3C_02",
     "op_3D_30",
+    "op_4B_91",
+    "op_4D_30",
     "op_4F_01",
     "op_4F_02",
-    "op_4D_30",
+    "op_50_00",
     "op_5C_08",
     "op_60_04",
     "op_60_08",
-    "op_74_08",
-    "op_AC_01",
-    "op_4B_91",
+    "op_61_10",
+    "op_6C_29",
+    "op_6D_10",
     "op_72_23",
+    "op_74_08",
+    "op_94_00",
+    "op_AC_01",
+    "op_EC_FF",
 }
 CALL_CLEANUP_MNEMONICS = {
     "call_helpers",
@@ -138,6 +145,7 @@ CALL_CLEANUP_MNEMONICS = {
     "op_D0_04",
     "op_D0_06",
     "op_D8_04",
+    "op_44_37",
     "op_F0_4B",
     "op_FD_4A",
     "op_05_F0",
@@ -801,9 +809,14 @@ class IRNormalizer:
         final_wrapper = _ItemList(final_items)
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
+        pending_annotations: List[str] = []
         for index, item in enumerate(final_items):
             if isinstance(item, RawInstruction):
                 if item.mnemonic == "terminator" or item.profile.kind is InstructionKind.TERMINATOR:
+                    if pending_annotations:
+                        block_annotations.append(self._coalesce_annotation_run(pending_annotations))
+                        metrics.meta_remaining += 1
+                        pending_annotations.clear()
                     node = IRTerminator(
                         operand=item.operand,
                         operand_alias=item.profile.operand_alias(),
@@ -814,10 +827,18 @@ class IRNormalizer:
                     continue
                 drop_node = self._stack_drop_node(final_wrapper, index)
                 if drop_node is not None:
+                    if pending_annotations:
+                        block_annotations.append(self._coalesce_annotation_run(pending_annotations))
+                        metrics.meta_remaining += 1
+                        pending_annotations.clear()
                     self._transfer_ssa(item, drop_node)
                     nodes.append(drop_node)
                     continue
                 if self._is_singleton_cleanup_instruction(final_wrapper, index):
+                    if pending_annotations:
+                        block_annotations.append(self._coalesce_annotation_run(pending_annotations))
+                        metrics.meta_remaining += 1
+                        pending_annotations.clear()
                     effect = self._call_cleanup_effect(item)
                     cleanup = IRCallCleanup(steps=(effect,))
                     self._transfer_ssa(item, cleanup)
@@ -828,9 +849,12 @@ class IRNormalizer:
                 ):
                     annotation = self._format_annotation(item)
                     if annotation:
-                        metrics.meta_remaining += 1
-                        block_annotations.append(annotation)
+                        pending_annotations.append(annotation)
                     continue
+                if pending_annotations:
+                    block_annotations.append(self._coalesce_annotation_run(pending_annotations))
+                    metrics.meta_remaining += 1
+                    pending_annotations.clear()
                 metrics.raw_remaining += 1
                 nodes.append(
                     IRRaw(
@@ -842,7 +866,16 @@ class IRNormalizer:
                     )
                 )
             else:
+                if pending_annotations:
+                    block_annotations.append(self._coalesce_annotation_run(pending_annotations))
+                    metrics.meta_remaining += 1
+                    pending_annotations.clear()
                 nodes.append(item)
+
+        if pending_annotations:
+            block_annotations.append(self._coalesce_annotation_run(pending_annotations))
+            metrics.meta_remaining += 1
+            pending_annotations.clear()
 
         ir_block = IRBlock(
             label=f"block_{block.index}",
@@ -5634,6 +5667,26 @@ class IRNormalizer:
         else:
             parts.append(instruction.mnemonic)
         return " ".join(parts)
+
+    @staticmethod
+    def _coalesce_annotation_run(entries: Sequence[str]) -> str:
+        if not entries:
+            return ""
+        if len(entries) == 1:
+            return entries[0]
+        offsets: List[str] = []
+        descriptors: List[str] = []
+        for entry in entries:
+            prefix, *rest = entry.split(" ", 1)
+            offsets.append(prefix)
+            descriptors.append(rest[0] if rest else "")
+        start = offsets[0]
+        end = offsets[-1]
+        prefix = start if start == end else f"{start}-{end}"
+        body = ", ".join(filter(None, descriptors))
+        if not body:
+            return prefix
+        return f"{prefix} [{body}]"
 
     @staticmethod
     def _format_testset_var(instruction: RawInstruction) -> str:
