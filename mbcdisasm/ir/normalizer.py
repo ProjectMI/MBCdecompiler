@@ -46,6 +46,7 @@ from .model import (
     IRLoad,
     IRNode,
     IRProgram,
+    IRReduce,
     IRRaw,
     IRReturn,
     IRTerminator,
@@ -799,6 +800,20 @@ class IRNormalizer:
                     self._transfer_ssa(item, node)
                     nodes.append(node)
                     continue
+                if item.profile.kind is InstructionKind.REDUCE:
+                    pops, pushes = self._estimate_reduce_stack_counts(item)
+                    node = IRReduce(
+                        mnemonic=item.mnemonic,
+                        operand=item.operand,
+                        operand_role=item.profile.operand_role(),
+                        operand_alias=item.profile.operand_alias(),
+                        pops=pops,
+                        pushes=pushes,
+                        annotations=item.annotations,
+                    )
+                    self._transfer_ssa(item, node)
+                    nodes.append(node)
+                    continue
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_items, index
                 ):
@@ -863,6 +878,24 @@ class IRNormalizer:
         if values:
             self._record_ssa(target, values, kinds=kinds)
         self._ssa_bindings.pop(id(source), None)
+
+    def _estimate_reduce_stack_counts(
+        self, instruction: RawInstruction
+    ) -> Tuple[Optional[int], Optional[int]]:
+        event = instruction.event
+        pushes = len(instruction.ssa_values)
+        if pushes == 0 and event.pushed_types:
+            pushes = len(event.pushed_types)
+        pops = len(event.popped_types)
+        if pushes:
+            inferred = pushes - event.delta
+            if inferred > 0:
+                pops = max(pops, inferred)
+        if pops == 0 and event.delta < 0:
+            pops = -event.delta
+        pop_count = pops if pops > 0 else None
+        push_count = pushes if pushes > 0 else None
+        return pop_count, push_count
 
     def _ssa_value(
         self,
@@ -4625,12 +4658,6 @@ class IRNormalizer:
             return False
         if self._has_profile_side_effects(instruction):
             return False
-
-        following = items[index + 1] if index + 1 < len(items) else None
-        if isinstance(following, IRCallCleanup):
-            return False
-        if isinstance(following, RawInstruction) and self._is_call_cleanup_instruction(following):
-            return False
         return True
 
     def _append_epilogue_effects(
@@ -5229,10 +5256,35 @@ class IRNormalizer:
         if self._has_profile_side_effects(instruction):
             return False
         if self._is_bridge_edge_position(items, index):
-            return False
+            return self._is_block_prologue_marker(instruction, items, index)
         if self._is_io_bridge_instruction(instruction):
             return True
         return self._has_ascii_neighbor(items, index)
+
+    def _is_block_prologue_marker(
+        self,
+        instruction: RawInstruction,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        if index != 0:
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if instruction.profile.kind is not InstructionKind.UNKNOWN:
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        if len(items) <= 1:
+            return False
+        next_item = items[1]
+        if isinstance(next_item, RawInstruction):
+            next_kind = next_item.profile.kind
+            return next_kind in {InstructionKind.LITERAL, InstructionKind.ASCII_CHUNK}
+        if isinstance(next_item, (IRLiteral, IRIf)):
+            return True
+        return False
 
     def _has_profile_side_effects(self, instruction: RawInstruction) -> bool:
         profile = instruction.profile

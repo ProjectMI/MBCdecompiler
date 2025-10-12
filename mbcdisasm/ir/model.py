@@ -874,6 +874,50 @@ class IRCallReturn(IRNode):
 
 
 @dataclass(frozen=True)
+class IRReduce(IRNode):
+    """Structured representation of reducer opcodes."""
+
+    mnemonic: str
+    operand: int = 0
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+    pops: Optional[int] = None
+    pushes: Optional[int] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        parts = [f"reduce {self.mnemonic}"]
+        note = ""
+        if self.annotations:
+            note = " " + ", ".join(self.annotations)
+
+        hex_value = f"0x{self.operand:04X}"
+        alias = self.operand_alias
+        if alias:
+            alias_text = str(alias)
+            if alias_text.upper().startswith("0X"):
+                alias_text = alias_text.upper()
+            value = alias_text if alias_text == hex_value else f"{alias_text}({hex_value})"
+        else:
+            value = hex_value
+
+        if self.operand_role:
+            parts.append(f"{self.operand_role}={value}")
+        elif self.operand or self.operand_alias:
+            parts.append(f"operand={value}")
+
+        stack_bits: List[str] = []
+        if self.pushes:
+            stack_bits.append(f"push={self.pushes}")
+        if self.pops:
+            stack_bits.append(f"pop={self.pops}")
+        if stack_bits:
+            parts.append("stack[" + " ".join(stack_bits) + "]")
+
+        return " ".join(parts) + note
+
+
+@dataclass(frozen=True)
 class IRRaw(IRNode):
     """Fallback wrapper for instructions that have not been normalised."""
 
@@ -1107,6 +1151,7 @@ __all__ = [
     "IRAsciiFinalize",
     "IRSlot",
     "MemRef",
+    "IRReduce",
     "IRRaw",
     "MemSpace",
     "SSAValueKind",
