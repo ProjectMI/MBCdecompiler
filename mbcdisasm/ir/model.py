@@ -803,6 +803,102 @@ class IRStackDrop(IRNode):
 
 
 @dataclass(frozen=True)
+class IRSlotPointer(IRNode):
+    """Push a pointer to a VM slot onto the stack."""
+
+    slot: IRSlot
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        suffix = ""
+        if self.annotations:
+            suffix = " " + ", ".join(self.annotations)
+        return f"slot_ptr {self.slot.space.name.lower()}[{self.slot.index}]" + suffix
+
+
+@dataclass(frozen=True)
+class IRControlMarker(IRNode):
+    """Stack-neutral opcode preserved for control-flow documentation."""
+
+    mnemonic: str
+    operand: int
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        details: List[str] = []
+
+        include_operand = bool(self.operand_role or self.operand_alias)
+        include_operand = include_operand or bool(self.operand)
+
+        if include_operand:
+            rendered = f"0x{self.operand:04X}"
+            alias = self.operand_alias
+            if alias:
+                alias_text = str(alias)
+                if alias_text.upper().startswith("0X"):
+                    alias_text = alias_text.upper()
+                rendered = alias_text if alias_text == rendered else f"{alias_text}({rendered})"
+            if self.operand_role:
+                details.append(f"{self.operand_role}={rendered}")
+            else:
+                details.append(f"operand={rendered}")
+
+        suffix = ""
+        if self.annotations:
+            suffix = " " + ", ".join(self.annotations)
+
+        if details:
+            return f"{self.mnemonic}({', '.join(details)}){suffix}"
+        return f"{self.mnemonic}{suffix}"
+
+
+@dataclass(frozen=True)
+class IRReduceOperation(IRNode):
+    """Generic representation for leftover reduce opcodes."""
+
+    kind: str
+    operand: int
+    pops: int = 0
+    pushes: int = 0
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        details: List[str] = []
+        if self.pushes:
+            details.append(f"push={self.pushes}")
+        if self.pops:
+            details.append(f"pop={self.pops}")
+
+        include_operand = bool(self.operand_role or self.operand_alias)
+        include_operand = include_operand or bool(self.operand)
+
+        if include_operand:
+            rendered = f"0x{self.operand:04X}"
+            alias = self.operand_alias
+            if alias:
+                alias_text = str(alias)
+                if alias_text.upper().startswith("0X"):
+                    alias_text = alias_text.upper()
+                rendered = alias_text if alias_text == rendered else f"{alias_text}({rendered})"
+            if self.operand_role:
+                details.append(f"{self.operand_role}={rendered}")
+            else:
+                details.append(f"operand={rendered}")
+
+        suffix = ""
+        if self.annotations:
+            suffix = " " + ", ".join(self.annotations)
+
+        if details:
+            return f"{self.kind}({', '.join(details)}){suffix}"
+        return f"{self.kind}{suffix}"
+
+
+@dataclass(frozen=True)
 class IRPageRegister(IRNode):
     """Interaction with the VM page register latch."""
 

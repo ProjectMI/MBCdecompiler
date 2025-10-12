@@ -56,6 +56,9 @@ from .model import (
     IRStore,
     IRStackDuplicate,
     IRStackDrop,
+    IRSlotPointer,
+    IRControlMarker,
+    IRReduceOperation,
     IRStringConstant,
     IRTablePatch,
     IRTableBuilderBegin,
@@ -764,6 +767,7 @@ class IRNormalizer:
         self._pass_literal_blocks(items)
         self._pass_literal_block_reducers(items, metrics)
         self._pass_reduce_pair_constants(items, metrics)
+        self._pass_reduce_operations(items)
         self._pass_ascii_preamble(items)
         self._collapse_call_wrapper_sequences(items)
         self._pass_call_preparation(items)
@@ -796,6 +800,7 @@ class IRNormalizer:
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
+        self._pass_control_markers(items)
 
         final_items = list(items)
         nodes: List[IRNode] = []
@@ -1051,6 +1056,13 @@ class IRNormalizer:
                 value = self._describe_stack_top(items, index)
                 copies = max(1, item.event.depth_after - item.event.depth_before)
                 node = IRStackDuplicate(value=value, copies=copies + 1)
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
+                continue
+
+            if mnemonic == "op_02_00":
+                slot = self._classify_slot(item.operand)
+                node = IRSlotPointer(slot=slot, annotations=item.annotations)
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 continue
@@ -1596,6 +1608,33 @@ class IRNormalizer:
             metrics.aggregates += 1
             metrics.reduce_replaced += 1
             index = removal_start + 1
+
+    def _pass_reduce_operations(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            if not item.mnemonic.startswith("reduce_"):
+                index += 1
+                continue
+
+            pops = max(0, -item.event.delta)
+            pushes = max(0, item.event.delta)
+            node = IRReduceOperation(
+                kind=item.mnemonic,
+                operand=item.operand,
+                pops=pops,
+                pushes=pushes,
+                operand_role=item.profile.operand_role(),
+                operand_alias=item.profile.operand_alias(),
+                annotations=item.annotations,
+            )
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            index += 1
 
     def _constant_aggregate_repr(
         self, item: Union[RawInstruction, IRNode]
@@ -4720,8 +4759,57 @@ class IRNormalizer:
         following = items[index + 1] if index + 1 < len(items) else None
         if isinstance(following, IRCallCleanup):
             return False
-        if self._is_call_cleanup_candidate(items, index + 1):
+            if self._is_call_cleanup_candidate(items, index + 1):
+                return False
+        return True
+
+    def _pass_control_markers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+            if not self._is_control_marker_candidate(item, items, index):
+                index += 1
+                continue
+
+            node = IRControlMarker(
+                mnemonic=item.mnemonic,
+                operand=item.operand,
+                operand_role=item.profile.operand_role(),
+                operand_alias=item.profile.operand_alias(),
+                annotations=item.annotations,
+            )
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            index += 1
+
+    def _is_control_marker_candidate(
+        self, instruction: RawInstruction, items: _ItemList, index: int
+    ) -> bool:
+        if not instruction.mnemonic.startswith("op_"):
             return False
+        profile = instruction.profile
+        if profile.kind in STACK_NEUTRAL_CONTROL_KINDS or profile.is_control():
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        if self._has_ascii_neighbor(items, index):
+            return False
+
+        event = instruction.event
+        if event.delta != 0 or event.popped_types or event.pushed_types:
+            return False
+        if event.kind in STACK_NEUTRAL_CONTROL_KINDS:
+            return False
+        if event.kind not in {
+            InstructionKind.UNKNOWN,
+            InstructionKind.META,
+            InstructionKind.REDUCE,
+        }:
+            return False
+
         return True
 
     def _append_epilogue_effects(

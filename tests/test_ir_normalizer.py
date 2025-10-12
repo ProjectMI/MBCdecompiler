@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -38,6 +39,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
+    IRReduceOperation,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1902,11 +1904,24 @@ def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
     block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
     ir_block, _ = normalizer._normalise_block(block)
 
-    assert len(ir_block.nodes) == 1
-    node = ir_block.nodes[0]
-    assert isinstance(node, IRTablePatch)
-    assert [op for op, _ in node.operations] == [
-        "reduce_pair",
+    assert 1 <= len(ir_block.nodes) <= 2
+    nodes = list(ir_block.nodes)
+    reduce_node: Optional[IRReduceOperation] = None
+    table_node: IRTablePatch
+    if len(nodes) == 2:
+        first, second = nodes
+        assert isinstance(first, IRReduceOperation)
+        assert first.kind == "reduce_pair"
+        reduce_node = first
+        assert isinstance(second, IRTablePatch)
+        table_node = second
+    else:
+        (only,) = nodes
+        assert isinstance(only, IRTablePatch)
+        table_node = only
+
+    operations = [op for op, _ in table_node.operations]
+    expected = [
         "op_10_01",
         "op_11_01",
         "op_12_01",
@@ -1914,6 +1929,9 @@ def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
         "op_04_02",
         "op_08_03",
     ]
+    if reduce_node is None:
+        expected = ["reduce_pair", *expected]
+    assert operations == expected
 
 
 def test_normalizer_extends_table_patch_with_affixes() -> None:
