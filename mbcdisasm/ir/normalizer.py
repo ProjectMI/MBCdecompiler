@@ -817,6 +817,12 @@ class IRNormalizer:
                     self._transfer_ssa(item, drop_node)
                     nodes.append(drop_node)
                     continue
+                if self._is_singleton_cleanup_instruction(final_wrapper, index):
+                    effect = self._call_cleanup_effect(item)
+                    cleanup = IRCallCleanup(steps=(effect,))
+                    self._transfer_ssa(item, cleanup)
+                    nodes.append(cleanup)
+                    continue
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_wrapper, index
                 ):
@@ -4230,6 +4236,30 @@ class IRNormalizer:
         if self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES):
             return True
         return self._is_slot_configuration_step(instruction)
+
+    def _is_singleton_cleanup_instruction(
+        self, items: _ItemList, index: int
+    ) -> bool:
+        if len(items) != 1:
+            return False
+        entry = items[index]
+        if not isinstance(entry, RawInstruction):
+            return False
+        event = entry.event
+        if event.delta != 0:
+            return False
+        if event.pushed_types or event.popped_types:
+            return False
+        profile = entry.profile
+        if profile.is_control():
+            return False
+        if profile.kind in STACK_NEUTRAL_CONTROL_KINDS:
+            return False
+        if profile.kind is InstructionKind.LITERAL:
+            return False
+        if self._has_profile_side_effects(entry):
+            return False
+        return True
 
     def _stack_drop_node(self, items: _ItemList, index: int) -> Optional[IRStackDrop]:
         entry = items[index]
