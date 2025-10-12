@@ -286,6 +286,18 @@ IO_HANDSHAKE_BRIDGE_NODE_TYPES = IO_BRIDGE_NODE_TYPES + (
     IRTableBuilderCommit,
 )
 
+STRUCTURAL_SKIP_NODE_TYPES = (
+    IRLiteral,
+    IRLiteralChunk,
+    IRStringConstant,
+    IRAsciiPreamble,
+    IRAsciiFinalize,
+    IRAsciiHeader,
+    IRBuildArray,
+    IRBuildMap,
+    IRBuildTuple,
+)
+
 EPILOGUE_ALLOWED_NODE_TYPES = (
     IRCallCleanup,
     IRCallReturn,
@@ -1705,7 +1717,7 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             item = items[index]
-            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
+            if not self._is_call_cleanup_candidate(items, index):
                 index += 1
                 continue
 
@@ -1715,7 +1727,7 @@ class IRNormalizer:
             scan = index
             while scan < len(items):
                 candidate = items[scan]
-                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_instruction(candidate):
+                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_candidate(items, scan):
                     steps.append(self._call_cleanup_effect(candidate))
                     end = scan + 1
                     scan += 1
@@ -4114,6 +4126,85 @@ class IRNormalizer:
             return False
         return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
 
+    def _nearest_structural_neighbor(
+        self, items: _ItemList, index: int, direction: int
+    ) -> Optional[Tuple[int, Union[RawInstruction, IRNode]]]:
+        pos = index + direction
+        while 0 <= pos < len(items):
+            candidate = items[pos]
+            if isinstance(candidate, STRUCTURAL_SKIP_NODE_TYPES):
+                pos += direction
+                continue
+            return pos, cast(Union[RawInstruction, IRNode], candidate)
+        return None
+
+    def _is_call_cleanup_candidate(self, items: _ItemList, index: int) -> bool:
+        if not (0 <= index < len(items)):
+            return False
+        entry = items[index]
+        if not isinstance(entry, RawInstruction):
+            return False
+        if self._is_call_cleanup_instruction(entry):
+            return True
+        mnemonic = entry.mnemonic
+        if mnemonic.startswith("reduce"):
+            return False
+        if mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS:
+            return False
+        kind = entry.profile.kind
+        if kind in STACK_NEUTRAL_CONTROL_KINDS or kind is InstructionKind.LITERAL:
+            return False
+        if not self._is_neutral_cleanup_step(entry):
+            return False
+        if self._is_io_handshake_instruction(entry, items, index):
+            return False
+
+        neighbor_types = (
+            CallLike,
+            IRCallCleanup,
+            IRReturn,
+            IRTailCall,
+            IRTailcallReturn,
+            IRIORead,
+            IRIOWrite,
+        )
+        previous = self._nearest_structural_neighbor(items, index, -1)
+        following = self._nearest_structural_neighbor(items, index, 1)
+        def _matches_neighbor(neighbor: Optional[Tuple[int, Union[RawInstruction, IRNode]]]) -> bool:
+            if neighbor is None:
+                return False
+            pos, node = neighbor
+            if isinstance(node, neighbor_types):
+                return True
+            if isinstance(node, RawInstruction):
+                if node.mnemonic in IO_WRITE_MNEMONICS or node.mnemonic in IO_READ_MNEMONICS:
+                    return True
+                if self._is_io_handshake_instruction(node, items, pos):
+                    return True
+            return False
+
+        if _matches_neighbor(previous) or _matches_neighbor(following):
+            return True
+
+        for direction in (-1, 1):
+            pos = index + direction
+            while 0 <= pos < len(items):
+                candidate = items[pos]
+                if isinstance(candidate, RawInstruction):
+                    if self._is_call_cleanup_instruction(candidate):
+                        return True
+                    if candidate.mnemonic.startswith("reduce"):
+                        break
+                    if not self._is_neutral_cleanup_step(candidate):
+                        break
+                    pos += direction
+                    continue
+                if isinstance(candidate, STRUCTURAL_SKIP_NODE_TYPES):
+                    pos += direction
+                    continue
+                break
+        return False
+
     def _is_dispatch_wrapper_instruction(self, instruction: RawInstruction) -> bool:
         if self._is_annotation_only(instruction):
             return False
@@ -4629,7 +4720,7 @@ class IRNormalizer:
         following = items[index + 1] if index + 1 < len(items) else None
         if isinstance(following, IRCallCleanup):
             return False
-        if isinstance(following, RawInstruction) and self._is_call_cleanup_instruction(following):
+        if self._is_call_cleanup_candidate(items, index + 1):
             return False
         return True
 
