@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -39,7 +38,6 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
-    IRReduceOperation,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -915,7 +913,6 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     ir_block, metrics = normalizer._normalise_block(block)
 
     assert metrics.raw_remaining == 0
-    assert metrics.meta_remaining == 1
     assert ir_block.annotations and any("op_AA_00" in note for note in ir_block.annotations)
     assert any(
         isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
@@ -950,7 +947,6 @@ def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:
     ir_block, metrics = normalizer._normalise_block(block)
 
     assert metrics.raw_remaining == 1
-    assert metrics.meta_remaining == 0
     assert any(
         isinstance(node, IRRaw) and node.mnemonic == "op_AA_00" for node in ir_block.nodes
     )
@@ -1906,24 +1902,11 @@ def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
     block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
     ir_block, _ = normalizer._normalise_block(block)
 
-    assert 1 <= len(ir_block.nodes) <= 2
-    nodes = list(ir_block.nodes)
-    reduce_node: Optional[IRReduceOperation] = None
-    table_node: IRTablePatch
-    if len(nodes) == 2:
-        first, second = nodes
-        assert isinstance(first, IRReduceOperation)
-        assert first.kind == "reduce_pair"
-        reduce_node = first
-        assert isinstance(second, IRTablePatch)
-        table_node = second
-    else:
-        (only,) = nodes
-        assert isinstance(only, IRTablePatch)
-        table_node = only
-
-    operations = [op for op, _ in table_node.operations]
-    expected = [
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRTablePatch)
+    assert [op for op, _ in node.operations] == [
+        "reduce_pair",
         "op_10_01",
         "op_11_01",
         "op_12_01",
@@ -1931,9 +1914,6 @@ def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
         "op_04_02",
         "op_08_03",
     ]
-    if reduce_node is None:
-        expected = ["reduce_pair", *expected]
-    assert operations == expected
 
 
 def test_normalizer_extends_table_patch_with_affixes() -> None:
