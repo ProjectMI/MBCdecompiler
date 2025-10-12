@@ -822,6 +822,7 @@ class IRNormalizer:
                 ):
                     annotation = self._format_annotation(item)
                     if annotation:
+                        metrics.meta_remaining += 1
                         block_annotations.append(annotation)
                     continue
                 metrics.raw_remaining += 1
