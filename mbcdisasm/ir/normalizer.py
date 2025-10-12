@@ -798,6 +798,7 @@ class IRNormalizer:
         self._pass_promote_push_literals(items, metrics)
 
         final_items = list(items)
+        final_wrapper = _ItemList(final_items)
         nodes: List[IRNode] = []
         block_annotations: List[str] = []
         for index, item in enumerate(final_items):
@@ -810,6 +811,11 @@ class IRNormalizer:
                     )
                     self._transfer_ssa(item, node)
                     nodes.append(node)
+                    continue
+                drop_node = self._stack_drop_node(final_wrapper, index)
+                if drop_node is not None:
+                    self._transfer_ssa(item, drop_node)
+                    nodes.append(drop_node)
                     continue
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_items, index
@@ -1699,11 +1705,12 @@ class IRNormalizer:
                     steps = list(candidate.steps) + steps
                     start = scan
                     break
-                if isinstance(candidate, RawInstruction) and self._is_call_preparation_instruction(candidate):
-                    steps.insert(0, self._call_preparation_step(candidate))
-                    start = scan
-                    scan -= 1
-                    continue
+                if isinstance(candidate, RawInstruction):
+                    if self._is_call_preparation_instruction(candidate):
+                        steps.insert(0, self._call_preparation_step(candidate))
+                        start = scan
+                        scan -= 1
+                        continue
                 break
 
             if steps:
@@ -1723,6 +1730,17 @@ class IRNormalizer:
 
             steps: List[IRStackEffect] = []
             start = index
+
+            prefix = index - 1
+            while prefix >= 0:
+                candidate = items[prefix]
+                if isinstance(candidate, RawInstruction) and self._is_call_cleanup_prefix(candidate):
+                    steps.insert(0, self._call_cleanup_effect(candidate))
+                    start = prefix
+                    prefix -= 1
+                    continue
+                break
+
             end = index
             scan = index
             while scan < len(items):
@@ -3560,6 +3578,16 @@ class IRNormalizer:
                     items.replace_slice(index, index + 1, [node])
                     continue
             if isinstance(item, RawInstruction):
+                if (
+                    self._is_condition_mask_instruction(item)
+                    and index + 1 < len(items)
+                    and isinstance(items[index + 1], IRIf)
+                ):
+                    branch = cast(IRIf, items[index + 1])
+                    if getattr(branch, "condition", None) == "stack_top":
+                        node = IRConditionMask(source=item.mnemonic, mask=item.operand)
+                        items.replace_slice(index, index + 1, [node])
+                        continue
                 if item.operand == RET_MASK and item.mnemonic in {"terminator", "op_29_10"}:
                     node = IRConditionMask(source=item.mnemonic, mask=item.operand)
                     items.replace_slice(index, index + 1, [node])
@@ -4118,6 +4146,47 @@ class IRNormalizer:
             return True
         return self._has_mask_operand(instruction)
 
+    def _cleanup_accepts_literal(
+        self, instruction: RawInstruction, cleanup: IRCallCleanup
+    ) -> bool:
+        if not cleanup.steps:
+            return False
+
+        profile = instruction.profile
+        if profile.kind is not InstructionKind.PUSH:
+            return False
+
+        event = instruction.event
+        if event.delta <= 0:
+            return False
+        if event.popped_types:
+            return False
+
+        if self._has_profile_side_effects(instruction):
+            return False
+        return True
+
+    def _is_call_cleanup_prefix(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic.startswith("op_2C_") and 0x6600 <= instruction.operand <= 0x66FF:
+            return False
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.pushed_types or event.popped_types:
+            return False
+
+        profile = instruction.profile
+        if profile.is_control():
+            return False
+        if profile.kind in STACK_NEUTRAL_CONTROL_KINDS:
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
+        return True
+
+    def _is_condition_mask_instruction(self, instruction: RawInstruction) -> bool:
+        return self._is_call_cleanup_prefix(instruction)
+
     def _is_call_cleanup_instruction(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
         if mnemonic.startswith("op_10_") and (
@@ -4125,6 +4194,24 @@ class IRNormalizer:
         ):
             return False
         return self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES)
+
+    def _stack_drop_node(self, items: _ItemList, index: int) -> Optional[IRStackDrop]:
+        entry = items[index]
+        if not isinstance(entry, RawInstruction):
+            return None
+        if self._is_call_cleanup_candidate(items, index):
+            return None
+        event = entry.event
+        if event.delta >= 0:
+            return None
+        if event.pushed_types:
+            return None
+        if entry.profile.is_control():
+            return None
+        if self._has_profile_side_effects(entry):
+            return None
+        value = self._describe_stack_top(items, index)
+        return IRStackDrop(value=value)
 
     def _nearest_structural_neighbor(
         self, items: _ItemList, index: int, direction: int
@@ -4146,6 +4233,8 @@ class IRNormalizer:
             return False
         if self._is_call_cleanup_instruction(entry):
             return True
+        if entry.mnemonic.startswith("op_2C_") and 0x6600 <= entry.operand <= 0x66FF:
+            return False
         mnemonic = entry.mnemonic
         if mnemonic.startswith("reduce"):
             return False
@@ -4240,6 +4329,11 @@ class IRNormalizer:
 
     def _is_call_preparation_instruction(self, instruction: RawInstruction) -> bool:
         if instruction.mnemonic == "op_4A_05":
+            return True
+        if (
+            instruction.mnemonic in CALL_PREDICATE_SKIP_MNEMONICS
+            and self._is_call_cleanup_prefix(instruction)
+        ):
             return True
         return self._matches_templates(instruction, CALL_PREPARATION_TEMPLATES)
 
@@ -4719,8 +4813,9 @@ class IRNormalizer:
 
         following = items[index + 1] if index + 1 < len(items) else None
         if isinstance(following, IRCallCleanup):
-            return False
-        if self._is_call_cleanup_candidate(items, index + 1):
+            if not self._cleanup_accepts_literal(instruction, following):
+                return False
+        elif self._is_call_cleanup_candidate(items, index + 1):
             return False
         return True
 
@@ -5319,10 +5414,21 @@ class IRNormalizer:
             return False
         if self._has_profile_side_effects(instruction):
             return False
+        if instruction.mnemonic in CALL_CLEANUP_MNEMONICS:
+            return False
         if self._is_bridge_edge_position(items, index):
             return False
         if self._is_io_bridge_instruction(instruction):
             return True
+        if self._is_call_cleanup_prefix(instruction):
+            prev_item = items[index - 1] if index > 0 else None
+            next_item = items[index + 1] if index + 1 < len(items) else None
+            literal_types = (IRLiteral, IRLiteralChunk, IRStringConstant, IRCallPreparation)
+            if isinstance(prev_item, literal_types) or isinstance(next_item, literal_types):
+                return True
+            io_types = (IRIOWrite, IRIORead, IRIndirectLoad, IRIndirectStore)
+            if isinstance(prev_item, io_types) or isinstance(next_item, io_types):
+                return True
         return self._has_ascii_neighbor(items, index)
 
     def _has_profile_side_effects(self, instruction: RawInstruction) -> bool:
