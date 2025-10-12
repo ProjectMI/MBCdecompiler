@@ -38,6 +38,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
+    IRContextMarker,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -56,7 +57,7 @@ from mbcdisasm.analyzer.instruction_profile import (
     InstructionProfile,
     StackEffectHint,
 )
-from mbcdisasm.analyzer.stack import StackEvent, StackTracker
+from mbcdisasm.analyzer.stack import StackEvent, StackTracker, StackValueType
 
 
 def build_word(offset: int, opcode: int, mode: int, operand: int) -> InstructionWord:
@@ -139,6 +140,47 @@ def test_epilogue_compaction_merges_raw_markers() -> None:
     updated_return = items[0]
     assert isinstance(updated_return, IRReturn)
     assert [step.mnemonic for step in updated_return.cleanup] == ["op_02_00", "op_15_4A"]
+
+
+def test_context_marker_promotes_stack_neutral_unknown() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    marker = make_stack_neutral_instruction(0, "op_AB_CD")
+    block = RawBlock(index=0, start_offset=0, instructions=(marker,))
+
+    ir_block, _ = normalizer._normalise_block(block)
+
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRContextMarker)
+    assert node.mnemonic == "op_AB_CD"
+
+
+def test_context_marker_ignores_stack_activity() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    marker = make_stack_neutral_instruction(0, "op_AB_CD")
+    marker = replace(
+        marker,
+        event=replace(
+            marker.event,
+            delta=1,
+            maximum=1,
+            depth_after=1,
+            pushed_types=(StackValueType.NUMBER,),
+        ),
+    )
+    block = RawBlock(index=0, start_offset=0, instructions=(marker,))
+
+    ir_block, metrics = normalizer._normalise_block(block)
+
+    assert len(ir_block.nodes) == 1
+    node = ir_block.nodes[0]
+    assert isinstance(node, IRRaw)
+    assert node.mnemonic == "op_AB_CD"
+    assert metrics.raw_remaining == 1
 
 
 def write_manual(path: Path) -> KnowledgeBase:
@@ -458,12 +500,12 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.calls == 1
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
-    assert program.metrics.literals == 5
+    assert program.metrics.literals == 7
     assert program.metrics.literal_chunks == 0
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches >= 1
     assert program.metrics.if_branches == 1
-    assert program.metrics.loads >= 2
+    assert program.metrics.loads >= 1
     assert program.metrics.stores >= 1
     assert program.metrics.reduce_replaced == 1
 

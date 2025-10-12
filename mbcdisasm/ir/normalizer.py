@@ -68,8 +68,10 @@ from .model import (
     IRIf,
     IRIndirectLoad,
     IRIndirectStore,
+    IRIOBridge,
     IRIORead,
     IRIOWrite,
+    IRContextMarker,
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
@@ -261,6 +263,7 @@ IO_BRIDGE_NODE_TYPES = (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRIOBridge,
     IRReturn,
     IRTailCall,
     IRTailcallReturn,
@@ -285,6 +288,43 @@ IO_HANDSHAKE_BRIDGE_NODE_TYPES = IO_BRIDGE_NODE_TYPES + (
     IRTableBuilderEmit,
     IRTableBuilderCommit,
 )
+
+CONTEXT_MARKER_MODES = {
+    0x85: {0x00},
+    0x88: {0x00},
+    0x8C: {0x00},
+    0x8E: {0x00},
+    0x94: {0x00},
+    0x28: {0x6C},
+    0x61: {0x00, 0x01},
+    0x0A: {0x21},
+    0x10: {0x03, 0x34, 0x0D, 0x0C, 0xA0, 0xD4, 0x5F, 0x94},
+    0x11: {0x00},
+    0x37: {0x00},
+    0x06: {0x00},
+    0x0D: {0x00},
+    0x44: {0x37, 0x87},
+    0xBD: {0x00},
+    0x3D: {0x30},
+    0x87: {0x00},
+    0x6D: {0x10},
+    0xE0: {0x15},
+    0x2D: {0x29},
+    0x2B: {0x2C},
+    0x2C: {0x01},
+    0x39: {0x20},
+    0xA4: {0x8F},
+    0x92: {0x00},
+    0x0E: {0x41},
+    0x5B: {0x04},
+}
+
+CONTEXT_MARKER_ALLOWED_KINDS = {
+    InstructionKind.UNKNOWN,
+    InstructionKind.ARITHMETIC,
+    InstructionKind.REDUCE,
+    InstructionKind.ASCII_CHUNK,
+}
 
 STRUCTURAL_SKIP_NODE_TYPES = (
     IRLiteral,
@@ -825,6 +865,17 @@ class IRNormalizer:
                         metrics.meta_remaining += 1
                         block_annotations.append(annotation)
                     continue
+                if self._should_promote_to_context_marker(item):
+                    profile = item.profile
+                    node = IRContextMarker(
+                        mnemonic=profile.mnemonic,
+                        operand=item.operand,
+                        operand_role=profile.operand_role(),
+                        operand_alias=profile.operand_alias(),
+                    )
+                    self._transfer_ssa(item, node)
+                    nodes.append(node)
+                    continue
                 metrics.raw_remaining += 1
                 nodes.append(
                     IRRaw(
@@ -1125,7 +1176,7 @@ class IRNormalizer:
             data = instruction.profile.word.raw.to_bytes(4, "big")
             return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
 
-        if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
+        if profile.kind in {InstructionKind.LITERAL, InstructionKind.PUSH} and instruction.pushes_value():
             return IRLiteral(
                 value=instruction.operand,
                 mode=profile.mode,
@@ -1862,6 +1913,23 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [node])
             continue
 
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not (isinstance(item, RawInstruction) and item.mnemonic in IO_BRIDGE_MNEMONICS):
+                index += 1
+                continue
+
+            node = IRIOBridge(
+                mnemonic=item.mnemonic,
+                operand=item.operand,
+                operand_role=item.profile.operand_role(),
+                operand_alias=item.profile.operand_alias(),
+            )
+            self._transfer_ssa(item, node)
+            items.replace_slice(index, index + 1, [node])
+            continue
+
     def _pass_io_facade(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -1906,6 +1974,32 @@ class IRNormalizer:
                 self._transfer_ssa(node, updated)
                 items.replace_slice(index, index + 1, [updated])
             index += 1
+
+    def _should_promote_to_context_marker(self, instruction: RawInstruction) -> bool:
+        profile = instruction.profile
+        word = profile.word
+        allowed_modes = CONTEXT_MARKER_MODES.get(word.opcode)
+        if allowed_modes and word.mode in allowed_modes:
+            return True
+
+        event = instruction.event
+        if event.delta != 0:
+            return False
+        if event.pushed_types or event.popped_types:
+            return False
+        if profile.is_control():
+            return False
+        alias = profile.operand_alias()
+        if alias:
+            if alias == "IO_SLOT":
+                return False
+            if alias == "PAGE_REG":
+                return False
+        if instruction.operand == PAGE_REGISTER:
+            return False
+        if profile.kind not in CONTEXT_MARKER_ALLOWED_KINDS:
+            return False
+        return True
 
     def _extract_io_helper_steps(
         self, cleanup: IRCallCleanup, *, trailing: bool

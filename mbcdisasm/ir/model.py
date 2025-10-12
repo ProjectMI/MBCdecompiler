@@ -589,6 +589,36 @@ class IRIOWrite(IRNode):
         return "io.write()"
 
 
+@dataclass(frozen=True)
+class IRIOBridge(IRNode):
+    """Stack-neutral instruction that prepares or bridges IO operations."""
+
+    mnemonic: str
+    operand: int
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+
+    def describe(self) -> str:
+        alias = self.operand_alias or self.operand_role
+        operand = alias or f"0x{self.operand:04X}"
+        return f"io.bridge({self.mnemonic}, operand={operand})"
+
+
+@dataclass(frozen=True)
+class IRContextMarker(IRNode):
+    """Metadata opcode that adjusts implicit execution context."""
+
+    mnemonic: str
+    operand: int
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+
+    def describe(self) -> str:
+        alias = self.operand_alias or self.operand_role
+        operand = alias or f"0x{self.operand:04X}"
+        return f"context.{self.mnemonic}(operand={operand})"
+
+
 def _render_io_helpers(
     pre_helpers: Tuple[IRStackEffect, ...], post_helpers: Tuple[IRStackEffect, ...]
 ) -> str:
@@ -1090,6 +1120,8 @@ __all__ = [
     "IRIndirectStore",
     "IRIORead",
     "IRIOWrite",
+    "IRIOBridge",
+    "IRContextMarker",
     "IRStackDuplicate",
     "IRStackDrop",
     "IRPageRegister",
