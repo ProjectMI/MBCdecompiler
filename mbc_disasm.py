@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Sequence
 
 from mbcdisasm import (
+    ASTBuilder,
+    ASTPrinter,
     Disassembler,
     IRNormalizer,
     IRTextRenderer,
@@ -45,16 +47,16 @@ def parse_args() -> argparse.Namespace:
         help="Truncate each segment after the specified instruction count",
     )
     parser.add_argument(
-        "--disasm-out",
-        type=Path,
-        default=None,
-        help="Override the default <mbc>.disasm.txt output path",
-    )
-    parser.add_argument(
         "--ir-out",
         type=Path,
         default=None,
         help="Override the default <mbc>.ir.txt output path",
+    )
+    parser.add_argument(
+        "--ast-out",
+        type=Path,
+        default=None,
+        help="Override the default <mbc>.ast.txt output path",
     )
     parser.add_argument(
         "--knowledge-base",
@@ -99,16 +101,15 @@ def main() -> None:
     knowledge = KnowledgeBase.load(args.knowledge_base)
     container = MbcContainer.load(mbc_path, adb_path)
 
-    output_path = args.disasm_out or mbc_path.with_suffix(".disasm.txt")
     disassembler = Disassembler(knowledge)
     selection = resolve_segments(args)
-    summary = disassembler.write_listing(
+    disassembler.generate_listing(
         container,
-        output_path,
         segment_indices=selection,
         max_instructions=args.max_instr,
     )
-    print(f"disassembly written to {output_path}")
+    summary = disassembler.summary
+    print("disassembly generation completed (no file written)")
     if summary:
         print(
             "analysis summary: "
@@ -124,6 +125,12 @@ def main() -> None:
     ir_output_path = args.ir_out or mbc_path.with_suffix(".ir.txt")
     IRTextRenderer().write(program, ir_output_path)
     print(f"ir written to {ir_output_path}")
+
+    ast_builder = ASTBuilder()
+    ast_program = ast_builder.build(program)
+    ast_output_path = args.ast_out or mbc_path.with_suffix(".ast.txt")
+    ASTPrinter().write(ast_program, ast_output_path)
+    print(f"ast written to {ast_output_path}")
 
     total_time = time.perf_counter() - start_time
     print(f"total execution time: {total_time:.2f}s")
