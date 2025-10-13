@@ -334,6 +334,10 @@ STACK_NEUTRAL_CONTROL_KINDS = {
 
 MASK_OPERAND_ALIASES = {"RET_MASK", "IO_SLOT", "FANOUT_FLAGS"}
 
+LITERAL_SKIP_MNEMONICS: Set[str] = set()
+
+CLEANUP_SIDE_EFFECT_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
+
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
     InstructionKind.INDIRECT_STORE,
@@ -844,6 +848,14 @@ class IRNormalizer:
             else:
                 nodes.append(item)
 
+        metrics.literals = sum(1 for node in nodes if isinstance(node, IRLiteral))
+        metrics.literal_chunks = sum(1 for node in nodes if isinstance(node, IRLiteralChunk))
+        literal_loads = sum(
+            1 for node in nodes if isinstance(node, IRLiteral) and node.source == "op_03_66"
+        )
+        indirect_loads = sum(1 for node in nodes if isinstance(node, IRIndirectLoad))
+        metrics.loads = max(metrics.loads, literal_loads + indirect_loads)
+
         ir_block = IRBlock(
             label=f"block_{block.index}",
             start_offset=block.start_offset,
@@ -1112,6 +1124,12 @@ class IRNormalizer:
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
+        mnemonic = profile.mnemonic
+
+        if mnemonic == "op_29_10" and instruction.operand == RET_MASK:
+            return None
+        if mnemonic in LITERAL_SKIP_MNEMONICS:
+            return None
 
         if profile.is_literal_marker():
             self._annotation_offsets.add(instruction.offset)
@@ -4200,7 +4218,12 @@ class IRNormalizer:
         if profile.kind in STACK_NEUTRAL_CONTROL_KINDS:
             return False
         if self._has_profile_side_effects(instruction):
-            return False
+            alias = instruction.profile.operand_alias()
+            if not (
+                (instruction.mnemonic == "op_6C_01" and instruction.operand == PAGE_REGISTER)
+                or (alias and alias in CLEANUP_SIDE_EFFECT_ALIASES)
+            ):
+                return False
         return True
 
     def _is_slot_configuration_step(self, instruction: RawInstruction) -> bool:
@@ -4229,9 +4252,22 @@ class IRNormalizer:
 
     def _is_call_cleanup_instruction(self, instruction: RawInstruction) -> bool:
         mnemonic = instruction.mnemonic
+        if self._is_io_handshake_instruction(instruction):
+            return False
+        if self._has_profile_side_effects(instruction):
+            alias = instruction.profile.operand_alias()
+            if not (
+                (mnemonic == "op_6C_01" and instruction.operand == PAGE_REGISTER)
+                or (alias and alias in CLEANUP_SIDE_EFFECT_ALIASES)
+            ):
+                return False
+        if mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS:
+            return False
         if mnemonic.startswith("op_10_") and (
             mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS
         ):
+            return False
+        if mnemonic == "op_29_10" and instruction.operand == RET_MASK:
             return False
         if self._matches_templates(instruction, CALL_CLEANUP_TEMPLATES):
             return True
