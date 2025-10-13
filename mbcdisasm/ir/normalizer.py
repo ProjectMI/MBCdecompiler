@@ -1140,6 +1140,8 @@ class IRNormalizer:
             )
 
         if profile.kind is InstructionKind.PUSH and instruction.pushes_value():
+            if instruction.mnemonic == "op_03_66":
+                return None
             if self._has_profile_side_effects(instruction) and not profile.operand_alias():
                 return None
             return IRLiteral(
@@ -4204,6 +4206,10 @@ class IRNormalizer:
         return True
 
     def _is_slot_configuration_step(self, instruction: RawInstruction) -> bool:
+        if self._is_io_handshake_instruction(instruction):
+            return False
+        if self._has_profile_side_effects(instruction):
+            return False
         event = instruction.event
         if event.delta > 0:
             return False
@@ -4216,12 +4222,18 @@ class IRNormalizer:
         role = profile.operand_role()
         tokens = []
         if alias:
-            tokens.append(alias.lower())
+            alias_text = alias.lower()
+            if "mask" in alias_text:
+                return False
+            tokens.append(alias_text)
         if role:
-            tokens.append(role.lower())
+            role_text = role.lower()
+            if "mask" in role_text:
+                return False
+            tokens.append(role_text)
         if not tokens:
             return False
-        keywords = ("io_slot", "fanout", "ret_mask", "mask", "flag")
+        keywords = ("io_slot", "fanout", "flag")
         return any(any(keyword in text for keyword in keywords) for text in tokens)
 
     def _is_condition_mask_instruction(self, instruction: RawInstruction) -> bool:
