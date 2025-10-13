@@ -45,7 +45,7 @@ def test_cli_generates_ir_only(tmp_path: Path) -> None:
             str(mbc_path),
             "--knowledge-base",
             str(manual_path),
-            "--disasm-out",
+            "--ir-out",
             str(output_path),
         ],
         check=True,
@@ -55,8 +55,9 @@ def test_cli_generates_ir_only(tmp_path: Path) -> None:
 
     disasm_output = mbc_path.with_suffix(".disasm.txt")
     assert not disasm_output.exists()
-    assert "analysis summary" in result.stdout
-    ir_output = mbc_path.with_suffix(".ir.txt")
+    assert f"ir written to {output_path}" in result.stdout
+    assert "total execution time" in result.stdout
+    ir_output = output_path
     assert ir_output.exists()
     ir_text = ir_output.read_text("utf-8")
     assert "normalizer metrics" in ir_text

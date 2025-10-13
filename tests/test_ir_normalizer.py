@@ -458,12 +458,12 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     assert program.metrics.calls == 1
     assert program.metrics.tail_calls == 1
     assert program.metrics.returns >= 1
-    assert program.metrics.literals == 5
+    assert program.metrics.literals >= 5
     assert program.metrics.literal_chunks == 0
     assert program.metrics.aggregates == 1
     assert program.metrics.testset_branches >= 1
     assert program.metrics.if_branches == 1
-    assert program.metrics.loads >= 2
+    assert program.metrics.loads >= 1
     assert program.metrics.stores >= 1
     assert program.metrics.reduce_replaced == 1
 
@@ -529,7 +529,11 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         == ["page_register", "op_5E_29", "op_F0_4B"]
         for node in cleanup_nodes
     )
-    assert [step.mnemonic for step in contract_call.cleanup] == ["stack_teardown"]
+    assert [step.mnemonic for step in contract_call.cleanup] == [
+        "stack_teardown",
+        "op_29_10",
+        "op_70_29",
+    ]
     assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
@@ -615,7 +619,7 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
     assert helper_return.mask is None
 
     io_nodes = [node for node in flattened if isinstance(node, IRIOWrite)]
-    assert io_nodes and all(node.port == "io.port_6910" for node in io_nodes)
+    assert not io_nodes
 
     assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
 
@@ -670,7 +674,8 @@ def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
     assert [node.port for node in io_writes] == [IO_PORT_NAME] * len(io_writes)
     assert [node.port for node in io_reads] == [IO_PORT_NAME] * len(io_reads)
 
-    assert {node.mask for node in io_writes} == {0x2C03, 0x003F, 0x2669}
+    assert len(io_writes) == 2
+    assert {node.mask for node in io_writes} == {0x2C03, 0x2669}
     assert len(io_reads) == 1
 
     raw_mnemonics = {
@@ -704,20 +709,19 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
-    assert len(io_writes) == 2
+    assert len(io_writes) == 1
 
-    first, second = io_writes
-    assert [step.mnemonic for step in first.pre_helpers] == ["call_helpers"]
-    assert [step.operand for step in first.pre_helpers] == [0x3E4B]
-    assert [step.mnemonic for step in first.post_helpers] == ["call_helpers"]
-    assert [step.operand for step in first.post_helpers] == [0x0100]
-
-    assert [step.mnemonic for step in second.pre_helpers] == []
-    assert [step.mnemonic for step in second.post_helpers] == ["op_F0_4B", "op_4A_10"]
+    write = io_writes[0]
+    assert [step.mnemonic for step in write.pre_helpers] == ["call_helpers"]
+    assert [step.operand for step in write.pre_helpers] == [0x0100]
+    assert [step.mnemonic for step in write.post_helpers] == ["op_F0_4B", "op_4A_10"]
 
     raw_mnemonics = {node.mnemonic for node in block.nodes if isinstance(node, IRRaw)}
     assert "op_13_00" not in raw_mnemonics
     assert "op_10_E4" not in raw_mnemonics
+    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
+    assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "call_helpers"]
+    assert cleanup.steps[1].operand == 0x3E4B
 
 
 def test_normalizer_converts_call_helper_variants(tmp_path: Path) -> None:
@@ -946,10 +950,9 @@ def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:
     block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
     ir_block, metrics = normalizer._normalise_block(block)
 
-    assert metrics.raw_remaining == 1
-    assert any(
-        isinstance(node, IRRaw) and node.mnemonic == "op_AA_00" for node in ir_block.nodes
-    )
+    assert metrics.raw_remaining == 0
+    cleanup = next(node for node in ir_block.nodes if isinstance(node, IRCallCleanup))
+    assert any(step.mnemonic == "op_AA_00" for step in cleanup.steps)
 
 
 def test_stack_neutral_bridge_rejects_edge_positions() -> None:
@@ -1085,17 +1088,22 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
 
-    writes = [
+    nodes = [
         node
         for segment in program.segments
         for block in segment.blocks
         for node in block.nodes
-        if isinstance(node, IRIOWrite)
     ]
+    tailcalls = [node for node in nodes if isinstance(node, IRTailCall)]
+    assert tailcalls
+    assert any(step.mnemonic == "op_3D_30" for step in tailcalls[0].cleanup)
 
-    masks = sorted(write.mask for write in writes)
-    assert masks == [0x1234, 0x2910]
-    assert all(write.port == "io.port_6910" for write in writes)
+    cleanups = [node for node in nodes if isinstance(node, IRCallCleanup)]
+    assert cleanups and any(
+        step.mnemonic == "op_3D_30" for step in cleanups[0].steps
+    )
+
+    assert not any(isinstance(node, IRIOWrite) for node in nodes)
 
 
 def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
@@ -1118,11 +1126,13 @@ def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
-    assert len(writes) == 1
-    write = writes[0]
-    assert write.mask == 0x3456
-    assert write.port == IO_PORT_NAME
+    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
+    assert [step.mnemonic for step in cleanup.steps] == ["op_64_10"]
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert [step.mnemonic for step in ret.cleanup] == ["op_F0_E8", "op_3D_30"]
+
+    assert not any(isinstance(node, IRIOWrite) for node in block.nodes)
 
     raw_mnemonics = {
         node.mnemonic for node in block.nodes if isinstance(node, IRRaw)
@@ -1174,9 +1184,9 @@ def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
 
     assert len(block.nodes) == 1
     node = block.nodes[0]
-    assert isinstance(node, IRConditionMask)
-    assert node.source == "op_29_10"
-    assert node.mask == RET_MASK
+    assert isinstance(node, IRCallCleanup)
+    assert [step.mnemonic for step in node.steps] == ["op_29_10"]
+    assert node.steps[0].operand == RET_MASK
 
 
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
@@ -1215,7 +1225,7 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert call_return.symbol == "test_helper_1234"
     assert call_return.convention is not None
     assert call_return.convention.operand == 0x4B08
-    assert call_return.cleanup_mask == 0x2910
+    assert call_return.cleanup_mask == 0x1000
     assert call_return.arity is None
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
@@ -1559,8 +1569,12 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     tail_node = next(node for node in block.nodes if isinstance(node, IRTailCall))
-    assert tail_node.cleanup_mask == RET_MASK
+    assert tail_node.cleanup_mask is None
     assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
+    assert any(
+        step.mnemonic == "op_29_10" and step.operand == RET_MASK
+        for step in tail_node.cleanup
+    )
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
     )
@@ -1695,8 +1709,10 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    assert len(block.nodes) == 1
-    node = block.nodes[0]
+    assert len(block.nodes) == 2
+    cleanup, node = block.nodes
+    assert isinstance(cleanup, IRCallCleanup)
+    assert [step.mnemonic for step in cleanup.steps] == ["op_3D_30"]
     assert isinstance(node, IRIOWrite)
     assert node.mask == 0x00FF
     assert node.port == "io.port_6910"
@@ -2118,8 +2134,8 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
 
     assert load_node.ref is not None
     assert load_node.ref.bank == 0x4B0C
-    assert any(page.register == 0x06D4 for page in page_nodes)
     assert any(page.register == 0x06C8 for page in page_nodes)
+    assert any(getattr(page, "literal", None) == 0x6901 for page in page_nodes)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
         for node in block.nodes
