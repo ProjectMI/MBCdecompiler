@@ -850,6 +850,12 @@ class IRNormalizer:
             nodes=tuple(nodes),
             annotations=tuple(block_annotations),
         )
+        metrics.literals = sum(1 for node in nodes if isinstance(node, IRLiteral))
+        metrics.literal_chunks = sum(1 for node in nodes if isinstance(node, IRLiteralChunk))
+        load_nodes = (IRLoad, IRIndirectLoad, IRIndirectStore)
+        store_nodes = (IRStore, IRIndirectStore)
+        metrics.loads = max(metrics.loads, sum(1 for node in nodes if isinstance(node, load_nodes)))
+        metrics.stores = max(metrics.stores, sum(1 for node in nodes if isinstance(node, store_nodes)))
         return ir_block, metrics
 
     # ------------------------------------------------------------------
@@ -1940,7 +1946,13 @@ class IRNormalizer:
 
     @staticmethod
     def _is_io_helper_step(step: IRStackEffect) -> bool:
-        return step.mnemonic in IO_HELPER_MNEMONICS
+        if step.mnemonic in IO_HELPER_MNEMONICS:
+            return True
+        if step.mnemonic.startswith("op_") and step.mnemonic.endswith("_30"):
+            operand = step.operand
+            if operand in IO_SLOT_ALIASES:
+                return True
+        return False
 
     def _io_facade_neighbor_index(
         self, items: _ItemList, index: int, *, direction: int
@@ -2167,7 +2179,21 @@ class IRNormalizer:
 
             tail = call.tail
             if not tail and cleanup_mask == RET_MASK:
-                tail = True
+                next_item = items[index + 1] if index + 1 < len(items) else None
+                if not (isinstance(next_item, IRReturn) and next_item.values):
+                    tail = True
+            if tail and cleanup_mask == RET_MASK:
+                skip_present = any(
+                    effect.mnemonic in CALL_PREDICATE_SKIP_MNEMONICS
+                    for effect in cleanup_steps
+                )
+                if skip_present:
+                    cleanup_steps = tuple(
+                        effect
+                        for effect in cleanup_steps
+                        if effect.mnemonic not in CALL_PREDICATE_SKIP_MNEMONICS
+                        and effect.mnemonic != "op_29_10"
+                    )
 
             updated = IRCall(
                 target=call.target,
@@ -2888,6 +2914,7 @@ class IRNormalizer:
                     items.pop(follow)
 
                 cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+                mask = mask or self._extract_cleanup_mask(cleanup_steps)
                 mask = mask or item.cleanup_mask
 
                 updated_call = IRCall(
@@ -2943,6 +2970,7 @@ class IRNormalizer:
                 items.pop(follow)
 
             cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+            mask = mask or self._extract_cleanup_mask(cleanup_steps)
             mask = mask or item.cleanup_mask
 
             returns = item.returns
@@ -3065,6 +3093,16 @@ class IRNormalizer:
                 )
                 continue
             retained_cleanup.append(effect)
+
+        retained_cleanup = [
+            effect
+            for effect in retained_cleanup
+            if effect.mnemonic not in CALL_PREDICATE_SKIP_MNEMONICS
+        ]
+        if cleanup_mask == RET_MASK:
+            retained_cleanup = [
+                effect for effect in retained_cleanup if effect.mnemonic != "op_29_10"
+            ]
 
         next_node: Optional[IRNode] = items[index + 1] if index + 1 < len(items) else None
         returns_node: Optional[IRReturn] = None
@@ -3596,6 +3634,10 @@ class IRNormalizer:
                     node = IRConditionMask(source="fanout", mask=step.operand)
                     items.replace_slice(index, index + 1, [node])
                     continue
+                if step.mnemonic == "op_29_10" and step.operand == RET_MASK:
+                    node = IRConditionMask(source=step.mnemonic, mask=step.operand)
+                    items.replace_slice(index, index + 1, [node])
+                    continue
             if isinstance(item, RawInstruction):
                 if (
                     self._is_condition_mask_instruction(item)
@@ -3880,6 +3922,13 @@ class IRNormalizer:
 
         signature_cleanup = self._convert_signature_effects(signature.cleanup)
         combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
+        if tail and cleanup_mask == RET_MASK:
+            combined_cleanup = tuple(
+                effect
+                for effect in combined_cleanup
+                if effect.mnemonic not in CALL_PREDICATE_SKIP_MNEMONICS
+                and effect.mnemonic != "op_29_10"
+            )
 
         updated = self._rebuild_call_node(
             node,
@@ -4161,6 +4210,8 @@ class IRNormalizer:
             return False
         if event.pushed_types:
             return False
+        if self._has_profile_side_effects(instruction):
+            return False
         if self._is_stack_teardown_step(instruction):
             return True
         return self._has_mask_operand(instruction)
@@ -4210,6 +4261,8 @@ class IRNormalizer:
         if event.pushed_types:
             return False
         if event.delta < 0 and event.popped_types:
+            return False
+        if self._has_profile_side_effects(instruction):
             return False
         profile = instruction.profile
         alias = profile.operand_alias()
@@ -4297,6 +4350,14 @@ class IRNormalizer:
             return False
         entry = items[index]
         if not isinstance(entry, RawInstruction):
+            return False
+        if (
+            entry.mnemonic.startswith("op_")
+            and entry.mnemonic.endswith("_30")
+            and self._operand_is_io_slot(entry.operand)
+        ):
+            return False
+        if entry.mnemonic in IO_FACADE_WRITE_MNEMONICS:
             return False
         if self._is_call_cleanup_instruction(entry):
             return True
@@ -4511,11 +4572,15 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
+        mask: Optional[int] = None
+        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout", "op_29_10"):
             for step in steps:
                 if step.mnemonic == mnemonic:
-                    return step.operand
-        return None
+                    if step.operand == RET_MASK:
+                        return step.operand
+                    if mask is None:
+                        mask = step.operand
+        return mask
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
