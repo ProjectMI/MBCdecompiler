@@ -92,25 +92,24 @@ def main() -> None:
 
     knowledge = KnowledgeBase.load(args.knowledge_base)
     container = MbcContainer.load(mbc_path, adb_path)
-
-    disassembler = Disassembler(knowledge)
     selection = resolve_segments(args)
-    disassembler.generate_listing(
-        container,
-        output_path,
-        segment_indices=selection,
-        max_instructions=args.max_instr,
-    )
-    summary = disassembler.summary
-    if summary:
-        print(
-            "analysis summary: "
-            f"unknown kind={summary.unknown_kinds} "
-            f"category={summary.unknown_categories} "
-            f"pattern={summary.unknown_patterns} "
-            f"dominant={summary.unknown_dominant} "
-            f"warnings={summary.warning_count}"
-        )
+    #disassembler = Disassembler(knowledge)
+    # disassembler.generate_listing(
+        # container,
+        # output_path,
+        # segment_indices=selection,
+        # max_instructions=args.max_instr,
+    # )
+    # summary = disassembler.summary
+    # if summary:
+        # print(
+            # "analysis summary: "
+            # f"unknown kind={summary.unknown_kinds} "
+            # f"category={summary.unknown_categories} "
+            # f"pattern={summary.unknown_patterns} "
+            # f"dominant={summary.unknown_dominant} "
+            # f"warnings={summary.warning_count}"
+        # )
 
     ir_normalizer = IRNormalizer(knowledge)
     program = ir_normalizer.normalise_container(container, segment_indices=selection)
