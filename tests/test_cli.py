@@ -35,7 +35,8 @@ def _write_knowledge(base: Path) -> Path:
 def test_cli_generates_listing(tmp_path: Path) -> None:
     adb_path, mbc_path = _write_container(tmp_path)
     manual_path = _write_knowledge(tmp_path)
-    output_path = tmp_path / "out.txt"
+    ir_output = tmp_path / "out.ir"
+    ast_output = tmp_path / "out.ast"
 
     result = subprocess.run(
         [
@@ -45,21 +46,23 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
             str(mbc_path),
             "--knowledge-base",
             str(manual_path),
-            "--disasm-out",
-            str(output_path),
+            "--ir-out",
+            str(ir_output),
+            "--ast-out",
+            str(ast_output),
         ],
         check=True,
         capture_output=True,
         text=True,
     )
 
-    assert output_path.exists()
-    listing = output_path.read_text("utf-8")
-    assert "manual_push" in listing
-    assert "Manual override for CLI test." in listing
-    assert "disassembly written" in result.stdout
-    ir_output = mbc_path.with_suffix(".ir.txt")
     assert ir_output.exists()
     ir_text = ir_output.read_text("utf-8")
     assert "normalizer metrics" in ir_text
     assert "segment" in ir_text
+
+    assert ast_output.exists()
+    ast_text = ast_output.read_text("utf-8")
+    assert "function segment" in ast_text
+    assert "ir written" in result.stdout
+    assert "ast written" in result.stdout
