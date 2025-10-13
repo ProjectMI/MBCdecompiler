@@ -32,7 +32,7 @@ def _write_knowledge(base: Path) -> Path:
     return manual_path
 
 
-def test_cli_generates_listing(tmp_path: Path) -> None:
+def test_cli_generates_ir_only(tmp_path: Path) -> None:
     adb_path, mbc_path = _write_container(tmp_path)
     manual_path = _write_knowledge(tmp_path)
     output_path = tmp_path / "out.txt"
@@ -53,11 +53,9 @@ def test_cli_generates_listing(tmp_path: Path) -> None:
         text=True,
     )
 
-    assert output_path.exists()
-    listing = output_path.read_text("utf-8")
-    assert "manual_push" in listing
-    assert "Manual override for CLI test." in listing
-    assert "disassembly written" in result.stdout
+    disasm_output = mbc_path.with_suffix(".disasm.txt")
+    assert not disasm_output.exists()
+    assert "analysis summary" in result.stdout
     ir_output = mbc_path.with_suffix(".ir.txt")
     assert ir_output.exists()
     ir_text = ir_output.read_text("utf-8")

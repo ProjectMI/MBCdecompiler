@@ -45,12 +45,6 @@ def parse_args() -> argparse.Namespace:
         help="Truncate each segment after the specified instruction count",
     )
     parser.add_argument(
-        "--disasm-out",
-        type=Path,
-        default=None,
-        help="Override the default <mbc>.disasm.txt output path",
-    )
-    parser.add_argument(
         "--ir-out",
         type=Path,
         default=None,
@@ -99,16 +93,15 @@ def main() -> None:
     knowledge = KnowledgeBase.load(args.knowledge_base)
     container = MbcContainer.load(mbc_path, adb_path)
 
-    output_path = args.disasm_out or mbc_path.with_suffix(".disasm.txt")
     disassembler = Disassembler(knowledge)
     selection = resolve_segments(args)
-    summary = disassembler.write_listing(
+    disassembler.generate_listing(
         container,
         output_path,
         segment_indices=selection,
         max_instructions=args.max_instr,
     )
-    print(f"disassembly written to {output_path}")
+    summary = disassembler.summary
     if summary:
         print(
             "analysis summary: "

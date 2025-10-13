@@ -14,7 +14,7 @@ described below.
 ## Usage
 
 ```
-python mbc_disasm.py <adb> <mbc> [--segment INDEX ...] [--max-instr COUNT] [--disasm-out PATH]
+python mbc_disasm.py <adb> <mbc> [--segment INDEX ...] [--max-instr COUNT]
 ```
 
 The tool loads opcode metadata from `knowledge/opcode_profiles.json`.  Manual overrides are merged automatically from `knowledge/manual_annotations.json` and drive the mnemonic and stack effect substitutions in the generated listing.
@@ -24,7 +24,7 @@ The tool loads opcode metadata from `knowledge/opcode_profiles.json`.  Manual ov
 - `--disasm-out` overrides the default `<mbc>.disasm.txt` output path.
 - `--knowledge-base` points to an alternate knowledge database location.
 
-The CLI prints the final output path and writes the listing to disk.
+The CLI prints an analysis summary (when available) and writes the IR listing to disk.
 
 ## Pipeline analyser
 
