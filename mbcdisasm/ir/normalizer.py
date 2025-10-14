@@ -44,6 +44,9 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRLiteralMarker,
+    IRStructuralMarker,
+    IRChatControl,
     IRPageRegister,
     IRLoad,
     IRNode,
@@ -148,6 +151,15 @@ CALL_CLEANUP_MNEMONICS = {
     "stack_shuffle",
     "op_4B_91",
     "op_E4_01",
+}
+
+CHAT_CONTROL_ACTIONS = {
+    "op_10_FE": "flush_stage",
+    "op_10_0A": "write_mask",
+    "op_10_EA": "commit_stage",
+    "op_2B_69": "sync_stage",
+    "op_10_06": "begin_stage",
+    "op_10_05": "end_stage",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
@@ -703,6 +715,11 @@ class IRNormalizer:
         pending: List[str] = []
 
         for profile in profiles:
+            if profile.mnemonic == "literal_marker":
+                index = len(executable)
+                annotations.setdefault(index, []).append(profile.mnemonic)
+                executable.append(profile)
+                continue
             if profile.mnemonic in ANNOTATION_MNEMONICS or (
                 profile.is_literal_marker() and profile.mnemonic.startswith("op_")
             ):
@@ -850,6 +867,11 @@ class IRNormalizer:
         block_annotations: List[str] = []
         for index, item in enumerate(final_items):
             if isinstance(item, RawInstruction):
+                chat_node = self._chat_control_node(final_wrapper, index)
+                if chat_node is not None:
+                    self._transfer_ssa(item, chat_node)
+                    nodes.append(chat_node)
+                    continue
                 if item.mnemonic == "terminator" or item.profile.kind is InstructionKind.TERMINATOR:
                     node = IRTerminator(
                         operand=item.operand,
@@ -870,9 +892,23 @@ class IRNormalizer:
                     self._transfer_ssa(item, cleanup)
                     nodes.append(cleanup)
                     continue
-                if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
-                    item, final_wrapper, index
-                ):
+                if self._is_annotation_only(item):
+                    marker_node = self._structural_marker_node(item)
+                    if marker_node is not None:
+                        self._transfer_ssa(item, marker_node)
+                        nodes.append(marker_node)
+                        continue
+                    annotation = self._format_annotation(item)
+                    if annotation:
+                        metrics.meta_remaining += 1
+                        block_annotations.append(annotation)
+                    continue
+                if self._is_stack_neutral_bridge(item, final_wrapper, index):
+                    marker_node = self._structural_marker_node(item)
+                    if marker_node is not None:
+                        self._transfer_ssa(item, marker_node)
+                        nodes.append(marker_node)
+                        continue
                     annotation = self._format_annotation(item)
                     if annotation:
                         metrics.meta_remaining += 1
@@ -1161,6 +1197,12 @@ class IRNormalizer:
         profile = instruction.profile
 
         if profile.is_literal_marker():
+            if profile.mnemonic == "literal_marker":
+                return IRLiteralMarker(
+                    value=instruction.operand,
+                    mode=profile.mode,
+                    annotations=instruction.annotations,
+                )
             self._annotation_offsets.add(instruction.offset)
             hint = LITERAL_MARKER_HINTS.get(instruction.operand)
             if hint is not None:
@@ -5727,6 +5769,71 @@ class IRNormalizer:
                 return True
             return any("ascii" in note for note in item.annotations)
         return False
+
+    def _chat_control_node(self, items: _ItemList, index: int) -> Optional[IRChatControl]:
+        item = items[index]
+        if not isinstance(item, RawInstruction):
+            return None
+        action = CHAT_CONTROL_ACTIONS.get(item.mnemonic)
+        if action is None:
+            return None
+
+        command_value: Optional[int] = None
+        command_source: Optional[str] = None
+        for offset in (-1, -2, 1, 2):
+            neighbor_index = index + offset
+            if not (0 <= neighbor_index < len(items)):
+                continue
+            neighbor = items[neighbor_index]
+            if isinstance(neighbor, IRLiteral):
+                command_value = neighbor.value
+                command_source = neighbor.source
+                break
+            if isinstance(neighbor, RawInstruction):
+                profile = neighbor.profile
+                if profile.kind in {InstructionKind.LITERAL, InstructionKind.PUSH} and neighbor.pushes_value():
+                    command_value = neighbor.operand
+                    command_source = profile.mnemonic
+                    break
+
+        port_hint: Optional[int] = None
+        for offset in (-1, 1, -2, 2):
+            neighbor_index = index + offset
+            if not (0 <= neighbor_index < len(items)):
+                continue
+            neighbor = items[neighbor_index]
+            if isinstance(neighbor, IRLiteralMarker):
+                port_hint = neighbor.value
+                break
+            if isinstance(neighbor, RawInstruction) and neighbor.profile.mnemonic == "literal_marker":
+                port_hint = neighbor.operand
+                break
+
+        return IRChatControl(
+            action=action,
+            operand=item.operand,
+            mode=item.profile.mode,
+            command=command_value,
+            command_source=command_source,
+            port_hint=port_hint,
+            annotations=item.annotations,
+        )
+
+    def _structural_marker_node(self, instruction: RawInstruction) -> Optional[IRStructuralMarker]:
+        mnemonic = instruction.mnemonic
+        if mnemonic == "literal_marker":
+            return None
+        profile = instruction.profile
+        if profile.kind in STACK_NEUTRAL_CONTROL_KINDS or profile.is_control():
+            return None
+        if profile.kind is not InstructionKind.ASCII_CHUNK and self._has_profile_side_effects(instruction):
+            return None
+        return IRStructuralMarker(
+            mnemonic=mnemonic,
+            operand=instruction.operand,
+            mode=profile.mode,
+            annotations=instruction.annotations,
+        )
 
     def _format_annotation(self, instruction: RawInstruction) -> str:
         parts = [f"0x{instruction.offset:06X}"]

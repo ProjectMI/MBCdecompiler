@@ -347,6 +347,64 @@ class IRLiteral(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteralMarker(IRNode):
+    """Marker instruction carrying literal metadata without side effects."""
+
+    value: int
+    mode: int
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        note = f"marker(mode=0x{self.mode:02X}, value=0x{self.value:04X})"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
+class IRStructuralMarker(IRNode):
+    """Generic metadata instruction preserved in the IR."""
+
+    mnemonic: str
+    operand: int
+    mode: int
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        note = f"meta({self.mnemonic}, operand=0x{self.operand:04X})"
+        if self.mode:
+            note += f" mode=0x{self.mode:02X}"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
+class IRChatControl(IRNode):
+    """Side-band control sequence emitted around chat I/O helpers."""
+
+    action: str
+    operand: int
+    mode: int
+    command: Optional[int] = None
+    command_source: Optional[str] = None
+    port_hint: Optional[int] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        note = f"chat.{self.action}(operand=0x{self.operand:04X})"
+        if self.mode:
+            note += f" mode=0x{self.mode:02X}"
+        if self.command is not None:
+            note += f" command=0x{self.command:04X}"
+        if self.port_hint is not None:
+            note += f" port=0x{self.port_hint:04X}"
+        if self.annotations:
+            note += " " + ", ".join(self.annotations)
+        return note
+
+
+@dataclass(frozen=True)
 class IRLiteralChunk(IRNode):
     """Inline ASCII chunk embedded directly in the code stream."""
 
@@ -1208,6 +1266,8 @@ __all__ = [
     "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRLiteralMarker",
+    "IRStructuralMarker",
     "IRStringConstant",
     "IRAsciiPreamble",
     "IRCallPreparation",
