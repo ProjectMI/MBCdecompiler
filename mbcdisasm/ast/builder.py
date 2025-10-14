@@ -16,13 +16,14 @@ from ..ir.model import (
     IRIOWrite,
     IRIf,
     IRFlagCheck,
+    IRBankedLoad,
+    IRBankedStore,
     IRIndirectLoad,
     IRIndirectStore,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
-    IRStackEffect,
     IRStore,
     IRTestSetBranch,
     IRTailCall,
@@ -39,12 +40,13 @@ from .model import (
     ASTComment,
     ASTExpression,
     ASTFlagCheck,
-    ASTFrameFinalize,
     ASTFunctionPrologue,
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
     ASTIndirectLoadExpr,
+    ASTBankedLoadExpr,
+    ASTBankedRefExpr,
     ASTLiteral,
     ASTMetrics,
     ASTProcedure,
@@ -351,6 +353,55 @@ class ASTBuilder:
             return [ASTIORead(port=node.port)], []
         if isinstance(node, IRIOWrite):
             return [ASTIOWrite(port=node.port, mask=node.mask)], []
+        if isinstance(node, IRBankedLoad):
+            pointer_expr = (
+                self._resolve_expr(node.pointer, value_state) if node.pointer else None
+            )
+            offset_expr = (
+                self._resolve_expr(node.offset_source, value_state)
+                if node.offset_source
+                else None
+            )
+            expr = ASTBankedLoadExpr(
+                ref=node.ref,
+                register=node.register,
+                register_value=node.register_value,
+                pointer=pointer_expr,
+                offset=offset_expr,
+            )
+            value_state[node.target] = expr
+            metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
+            pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
+            offset_known = offset_expr is None or not isinstance(offset_expr, ASTUnknown)
+            metrics.observe_load(pointer_known and offset_known)
+            return [
+                ASTAssign(
+                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    value=expr,
+                )
+            ], []
+        if isinstance(node, IRBankedStore):
+            pointer_expr = (
+                self._resolve_expr(node.pointer, value_state) if node.pointer else None
+            )
+            offset_expr = (
+                self._resolve_expr(node.offset_source, value_state)
+                if node.offset_source
+                else None
+            )
+            value_expr = self._resolve_expr(node.value, value_state)
+            pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
+            offset_known = offset_expr is None or not isinstance(offset_expr, ASTUnknown)
+            value_known = not isinstance(value_expr, ASTUnknown)
+            metrics.observe_store(pointer_known and offset_known and value_known)
+            target = ASTBankedRefExpr(
+                ref=node.ref,
+                register=node.register,
+                register_value=node.register_value,
+                pointer=pointer_expr,
+                offset=offset_expr,
+            )
+            return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRIndirectLoad):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
@@ -436,13 +487,10 @@ class ASTBuilder:
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
             return [ASTTailCall(call=call_expr, returns=resolved_returns)], []
         if isinstance(node, IRReturn):
-            statements: List[ASTStatement] = []
-            statements.extend(self._frame_finalize(node.cleanup))
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            statements.append(ASTReturn(values=values, varargs=node.varargs, mask=node.mask))
-            return statements, []
+            return [ASTReturn(values=values, varargs=node.varargs)], []
         if isinstance(node, IRCallCleanup):
-            return self._frame_finalize(node.steps), []
+            return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             branch = ASTBranch(condition=condition)
@@ -541,42 +589,6 @@ class ASTBuilder:
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
 
-    def _frame_finalize(self, steps: Sequence[IRStackEffect]) -> List[ASTFrameFinalize]:
-        pops = sum(step.pops for step in steps)
-        notes: List[str] = []
-        seen_notes: Set[str] = set()
-        for step in steps:
-            if step.mnemonic in {"stack_teardown", "call_helpers", "cleanup_call"}:
-                continue
-            alias = step.operand_alias
-            if alias:
-                note = self._format_finalize_note(str(alias))
-                if note and note not in seen_notes:
-                    seen_notes.add(note)
-                    notes.append(note)
-                continue
-            if step.operand_role and step.operand:
-                note = self._format_finalize_note(
-                    f"{step.operand_role}=0x{step.operand:04X}"
-                )
-                if note and note not in seen_notes:
-                    seen_notes.add(note)
-                    notes.append(note)
-                continue
-            if step.operand:
-                note = self._format_finalize_note(f"0x{step.operand:04X}")
-                if note and note not in seen_notes:
-                    seen_notes.add(note)
-                    notes.append(note)
-                continue
-            note = self._format_finalize_note(step.mnemonic)
-            if note and note not in seen_notes:
-                seen_notes.add(note)
-                notes.append(note)
-        if pops == 0 and not notes:
-            return []
-        return [ASTFrameFinalize(pops=pops, notes=tuple(notes))]
-
     def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:
         if target_offset in self._current_block_labels:
             return self._current_block_labels[target_offset]
@@ -597,28 +609,6 @@ class ASTBuilder:
             return ""
         mapping = {"return": "return", "tail_call": "tail_call"}
         return "|".join(mapping.get(reason, reason) for reason in exit_reasons)
-
-    def _format_finalize_note(self, note: str | None) -> str | None:
-        if not note:
-            return None
-        text = note.strip()
-        if not text:
-            return None
-        lowered = text.lower()
-        if lowered.startswith("op_"):
-            return None
-        if self._is_hex_literal(text):
-            return None
-        if "=" in text:
-            key, value = text.split("=", 1)
-            key = key.strip()
-            value = value.strip()
-            if self._is_hex_literal(value):
-                return key
-            return f"{key}={value}" if value else key
-        if lowered.startswith("page_register"):
-            return "page_register"
-        return text
 
     @staticmethod
     def _is_hex_literal(value: str) -> bool:

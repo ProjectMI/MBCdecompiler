@@ -144,10 +144,10 @@ class IRCall(IRNode):
     tail: bool = False
     arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
-    cleanup_mask: Optional[int] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
@@ -160,15 +160,23 @@ class IRCall(IRNode):
             details.append(f"arity={self.arity}")
         if self.convention is not None:
             details.append(f"convention={self.convention.describe()}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.abi_effects:
+            rendered = ", ".join(effect.describe() for effect in self.abi_effects)
+            details.append(f"abi=[{rendered}]")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
         return f"call{suffix} target={target_repr} args=[{args}]{extra}"
+
+    @property
+    def cleanup_mask(self) -> Optional[int]:
+        for effect in self.abi_effects:
+            if effect.kind == "return_mask":
+                return effect.operand
+        return None
 
 
 @dataclass(frozen=True)
@@ -179,7 +187,7 @@ class IRTailCall(IRNode):
     returns: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    cleanup_mask: Optional[int] = None
+    abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
     @property
     def target(self) -> int:
@@ -220,10 +228,18 @@ class IRTailCall(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
+        if self.abi_effects:
+            rendered = ", ".join(effect.describe() for effect in self.abi_effects)
+            details.append(f"abi=[{rendered}]")
         suffix = "" if not details else " " + " ".join(details)
         return f"tailcall {call_repr}{suffix}"
+
+    @property
+    def cleanup_mask(self) -> Optional[int]:
+        for effect in self.abi_effects:
+            if effect.kind == "return_mask":
+                return effect.operand
+        return None
 
 
 @dataclass(frozen=True)
@@ -264,28 +280,57 @@ class IRStackEffect:
 
 
 @dataclass(frozen=True)
+class IRAbiEffect(IRNode):
+    """Side effect produced by the ABI helpers."""
+
+    kind: str
+    operand: Optional[int] = None
+    alias: Optional[str] = None
+
+    def describe(self) -> str:
+        parts: List[str] = []
+        if self.operand is not None:
+            value = _format_operand(self.operand)
+            if self.alias and self.alias != value:
+                parts.append(f"value={self.alias}({value})")
+            else:
+                parts.append(f"value={value}")
+        elif self.alias is not None:
+            parts.append(f"value={self.alias}")
+        suffix = "" if not parts else " " + " ".join(parts)
+        return f"abi.{self.kind}{suffix}"
+
+
+@dataclass(frozen=True)
 class IRReturn(IRNode):
     """Return from the current routine."""
 
     values: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    mask: Optional[int] = None
+    abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         cleanup = ""
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             cleanup = f" cleanup=[{rendered}]"
-        if self.mask is not None:
-            mask_repr = _format_operand(self.mask)
-            cleanup = f" mask={mask_repr}{cleanup}"
+        if self.abi_effects:
+            rendered = ", ".join(effect.describe() for effect in self.abi_effects)
+            cleanup = f" abi=[{rendered}]{cleanup}"
         if self.varargs:
             if self.values:
                 return f"return varargs({', '.join(self.values)}){cleanup}"
             return f"return varargs{cleanup}"
         values = ", ".join(self.values)
         return f"return [{values}]{cleanup}"
+
+    @property
+    def mask(self) -> Optional[int]:
+        for effect in self.abi_effects:
+            if effect.kind == "return_mask":
+                return effect.operand
+        return None
 
 
 @dataclass(frozen=True)
@@ -518,6 +563,28 @@ class IRIndirectLoad(IRNode):
 
 
 @dataclass(frozen=True)
+class IRBankedLoad(IRNode):
+    """Read a value from a banked memory region."""
+
+    ref: MemRef
+    target: str
+    register: int
+    register_value: Optional[int] = None
+    pointer: Optional[str] = None
+    offset_source: Optional[str] = None
+
+    def describe(self) -> str:
+        details = [self.ref.describe(), f"-> {self.target}"]
+        if self.pointer:
+            details.append(f"ptr={self.pointer}")
+        if self.offset_source:
+            details.append(f"offset={self.offset_source}")
+        if self.register_value is not None:
+            details.append(f"page=0x{self.register_value:04X}")
+        return "banked_load " + " ".join(details)
+
+
+@dataclass(frozen=True)
 class IRIndirectStore(IRNode):
     """Write a value through an indirect slot pointer."""
 
@@ -545,6 +612,28 @@ class IRIndirectStore(IRNode):
         ptr = self.pointer or prefix
         offset = self.offset_source or f"0x{self.offset:04X}"
         return f"indirect_store {self.value} -> ptr={ptr} offset={offset}"
+
+
+@dataclass(frozen=True)
+class IRBankedStore(IRNode):
+    """Write a value into a banked memory region."""
+
+    ref: MemRef
+    value: str
+    register: int
+    register_value: Optional[int] = None
+    pointer: Optional[str] = None
+    offset_source: Optional[str] = None
+
+    def describe(self) -> str:
+        details = [self.ref.describe(), f"<- {self.value}"]
+        if self.pointer:
+            details.append(f"ptr={self.pointer}")
+        if self.offset_source:
+            details.append(f"offset={self.offset_source}")
+        if self.register_value is not None:
+            details.append(f"page=0x{self.register_value:04X}")
+        return "banked_store " + " ".join(details)
 
 
 @dataclass(frozen=True)
@@ -840,9 +929,9 @@ class IRCallReturn(IRNode):
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
-    cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -854,6 +943,9 @@ class IRCallReturn(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             cleanup = f" cleanup=[{rendered}]"
+        if self.abi_effects:
+            rendered = ", ".join(effect.describe() for effect in self.abi_effects)
+            cleanup += f" abi=[{rendered}]"
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
@@ -862,8 +954,6 @@ class IRCallReturn(IRNode):
             details.append(f"arity={self.arity}")
         if self.convention is not None:
             details.append(f"convention={self.convention.describe()}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
         extra = f" {' '.join(details)}" if details else ""
@@ -871,6 +961,13 @@ class IRCallReturn(IRNode):
             f"{prefix} target={target_repr} args=[{args}] returns=[{ret}]"
             f"{cleanup}{extra}"
         )
+
+    @property
+    def cleanup_mask(self) -> Optional[int]:
+        for effect in self.abi_effects:
+            if effect.kind == "return_mask":
+                return effect.operand
+        return None
 
 
 @dataclass(frozen=True)
@@ -944,9 +1041,9 @@ class IRTailcallReturn(IRNode):
     tail: bool = True
     arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
-    cleanup_mask: Optional[int] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
+    abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"
@@ -958,17 +1055,25 @@ class IRTailcallReturn(IRNode):
             details.append("varargs")
         if self.convention is not None:
             details.append(f"convention={self.convention.describe()}")
-        if self.cleanup_mask is not None:
-            details.append(f"mask={_format_operand(self.cleanup_mask)}")
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
+        if self.abi_effects:
+            rendered = ", ".join(effect.describe() for effect in self.abi_effects)
+            details.append(f"abi=[{rendered}]")
         if self.arity is not None:
             details.append(f"arity={self.arity}")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
         suffix = " ".join(details)
         return f"tailcall_return target={target_repr} args=[{args}] {suffix}".rstrip()
+
+    @property
+    def cleanup_mask(self) -> Optional[int]:
+        for effect in self.abi_effects:
+            if effect.kind == "return_mask":
+                return effect.operand
+        return None
 
 
 @dataclass(frozen=True)
@@ -1076,6 +1181,7 @@ __all__ = [
     "IRCall",
     "IRTailCall",
     "IRReturn",
+    "IRAbiEffect",
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
@@ -1087,7 +1193,9 @@ __all__ = [
     "IRLoad",
     "IRStore",
     "IRIndirectLoad",
+    "IRBankedLoad",
     "IRIndirectStore",
+    "IRBankedStore",
     "IRIORead",
     "IRIOWrite",
     "IRStackDuplicate",
