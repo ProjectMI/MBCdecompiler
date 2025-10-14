@@ -173,6 +173,7 @@ TAILCALL_HELPERS = {
 }
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
+ASCII_HELPER_MNEMONICS = {"call_helpers", "formatting"}
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -315,7 +316,7 @@ EPILOGUE_ALLOWED_NODE_TYPES = (
     IRAsciiHeader,
 )
 
-IO_HELPER_MNEMONICS = {"call_helpers", "op_F0_4B", "op_4A_10"}
+IO_HELPER_MNEMONICS = {"call_helpers", "io_service", "op_F0_4B", "op_4A_10"}
 CALL_HELPER_FACADE_MNEMONICS = {"op_05_F0", "op_FD_4A"}
 FANOUT_FACADE_MNEMONICS = {"op_10_32"}
 
@@ -2856,7 +2857,7 @@ class IRNormalizer:
                 continue
 
             if helper_target == 0x0072:
-                self._rewrite_tail_helper_72(items, index, item, new_target)
+                self._rewrite_tail_helper_72(items, index, item, new_target, helper_target)
                 continue
 
             if helper_target in {0x003D, 0x00F0}:
@@ -3018,13 +3019,16 @@ class IRNormalizer:
                 candidate = items[scan]
                 if isinstance(candidate, IRCallCleanup):
                     for step in candidate.steps:
-                        if step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS:
+                        if step.mnemonic in ASCII_HELPER_MNEMONICS and step.operand in ASCII_HELPER_IDS:
                             return step.operand & 0xFFFF
                     break
                 if isinstance(candidate, IRAsciiFinalize):
                     return candidate.helper & 0xFFFF
                 if isinstance(candidate, RawInstruction):
-                    if candidate.mnemonic == "call_helpers" and candidate.operand in ASCII_HELPER_IDS:
+                    if (
+                        candidate.mnemonic in ASCII_HELPER_MNEMONICS
+                        and candidate.operand in ASCII_HELPER_IDS
+                    ):
                         return candidate.operand & 0xFFFF
                     break
                 if isinstance(candidate, IRLiteral):
@@ -3044,6 +3048,7 @@ class IRNormalizer:
         index: int,
         node: CallLike,
         target: int,
+        helper: int,
     ) -> None:
         args = list(getattr(node, "args", tuple()))
         convention = getattr(node, "convention", None)
@@ -3082,16 +3087,21 @@ class IRNormalizer:
 
         symbol = self.knowledge.lookup_address(target)
 
+        tail_effect = self._tail_helper_effect(helper)
+
         if cleanup_mask == RET_MASK and returns_node is not None:
             cleanup_chain = list(returns_node.cleanup)
             if teardown is not None:
                 cleanup_chain.append(teardown)
                 teardown = None
+            abi_effects = returns_node.abi_effects
+            if tail_effect is not None:
+                abi_effects = abi_effects + (tail_effect,)
             new_return = IRReturn(
                 values=returns_node.values,
                 varargs=returns_node.varargs,
                 cleanup=tuple(cleanup_chain),
-                abi_effects=returns_node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
@@ -3102,6 +3112,12 @@ class IRNormalizer:
         if returns_node is not None:
             returns = len(returns_node.values)
             varargs = returns_node.varargs
+
+        abi_effects = self._merge_return_mask_effects(
+            getattr(node, "abi_effects", tuple()), cleanup_mask
+        )
+        if tail_effect is not None:
+            abi_effects = abi_effects + (tail_effect,)
 
         tailcall = IRTailcallReturn(
             target=target,
@@ -3114,7 +3130,7 @@ class IRNormalizer:
             convention=None,
             symbol=symbol,
             predicate=predicate,
-            abi_effects=self._merge_return_mask_effects(getattr(node, "abi_effects", tuple()), cleanup_mask),
+            abi_effects=abi_effects,
         )
         self._transfer_ssa(node, tailcall)
         items.replace_slice(index, index + 1, [tailcall])
@@ -3138,6 +3154,8 @@ class IRNormalizer:
             args = getattr(node, "args", tuple())
             predicate = getattr(node, "predicate", None)
             arity = getattr(node, "arity", None)
+            helper_effect = self._tail_helper_effect(helper)
+            abi_effects = (helper_effect,) if helper_effect is not None else tuple()
             if isinstance(node, IRCall):
                 replacement = IRCall(
                     target=target,
@@ -3148,7 +3166,7 @@ class IRNormalizer:
                     cleanup=cleanup,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=abi_effects,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3162,7 +3180,7 @@ class IRNormalizer:
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=abi_effects,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3176,7 +3194,7 @@ class IRNormalizer:
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=abi_effects,
                 )
             elif isinstance(node, IRTailCall):
                 updated_call = IRCall(
@@ -3188,14 +3206,14 @@ class IRNormalizer:
                     cleanup=tuple(),
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=abi_effects,
                 )
                 replacement = IRTailCall(
                     call=updated_call,
                     returns=getattr(node, "returns", tuple()),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
-                    abi_effects=tuple(),
+                    abi_effects=abi_effects,
                 )
             else:
                 replacement = IRTailcallReturn(
@@ -3209,7 +3227,7 @@ class IRNormalizer:
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=abi_effects,
                 )
             self._transfer_ssa(node, replacement)
             items.replace_slice(index, index + 1, [replacement])
@@ -3344,7 +3362,10 @@ class IRNormalizer:
             if instruction.mnemonic == "op_08_00":
                 self._pending_tail_targets[0x0072].append(instruction.operand & 0xFFFF)
                 break
-            if instruction.mnemonic == "call_helpers" and instruction.operand in ASCII_HELPER_IDS:
+            if (
+                instruction.mnemonic in ASCII_HELPER_MNEMONICS
+                and instruction.operand in ASCII_HELPER_IDS
+            ):
                 self._pending_tail_targets[0x003D].append(instruction.operand & 0xFFFF)
                 break
 
@@ -3354,13 +3375,19 @@ class IRNormalizer:
             item = items[index]
             helper_operand: Optional[int] = None
             if isinstance(item, RawInstruction):
-                if item.mnemonic == "call_helpers" and item.operand in ASCII_HELPER_IDS:
+                if (
+                    item.mnemonic in ASCII_HELPER_MNEMONICS
+                    and item.operand in ASCII_HELPER_IDS
+                ):
                     helper_operand = item.operand
             elif isinstance(item, IRCallCleanup):
                 ascii_steps = [
                     step
                     for step in item.steps
-                    if step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS
+                    if (
+                        step.mnemonic in ASCII_HELPER_MNEMONICS
+                        and step.operand in ASCII_HELPER_IDS
+                    )
                 ]
                 if ascii_steps:
                     helper_operand = ascii_steps[0].operand
@@ -3389,7 +3416,10 @@ class IRNormalizer:
                 remaining_steps = tuple(
                     step
                     for step in item.steps
-                    if not (step.mnemonic == "call_helpers" and step.operand in ASCII_HELPER_IDS)
+                    if not (
+                        step.mnemonic in ASCII_HELPER_MNEMONICS
+                        and step.operand in ASCII_HELPER_IDS
+                    )
                 )
                 if remaining_steps:
                     updated_cleanup = IRCallCleanup(steps=remaining_steps)
@@ -4029,6 +4059,11 @@ class IRNormalizer:
                 if delta > 0:
                     pops = delta
 
+        if spec.mnemonic == "call_helpers":
+            helper = self._helper_stack_effect(operand, pops, instruction)
+            if helper is not None:
+                return helper
+
         return IRStackEffect(
             mnemonic=spec.mnemonic,
             operand=operand,
@@ -4437,6 +4472,10 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
+        if mnemonic == "call_helpers":
+            helper = self._helper_stack_effect(operand, pops, instruction)
+            if helper is not None:
+                return helper
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
@@ -4868,11 +4907,71 @@ class IRNormalizer:
             return None
         return None
 
+    @staticmethod
+    def _default_helper_role(kind: str) -> Optional[str]:
+        if kind == "io_service":
+            return "slot"
+        if kind == "return_scheduler":
+            return "flag"
+        if kind == "page_config":
+            return "page"
+        return None
+
+    def _helper_stack_effect(
+        self,
+        operand: Optional[int],
+        pops: int,
+        instruction: Optional[RawInstruction] = None,
+    ) -> Optional[IRStackEffect]:
+        if operand is None:
+            return None
+        info = self.knowledge.helper_call_effect(operand)
+        if info is None:
+            return None
+
+        alias = info.alias
+        role = info.role
+
+        if instruction is not None:
+            if alias is None:
+                alias = instruction.profile.operand_alias()
+            if role is None:
+                role = instruction.profile.operand_role()
+
+        if alias is None:
+            alias = self.knowledge.lookup_address(operand)
+        if alias is None:
+            alias = OPERAND_ALIASES.get(operand)
+
+        if role is None:
+            role = self._default_helper_role(info.kind)
+
+        return IRStackEffect(
+            mnemonic=info.kind,
+            operand=operand,
+            pops=pops,
+            operand_role=role,
+            operand_alias=alias,
+        )
+
+    def _tail_helper_effect(self, helper: int) -> Optional[IRAbiEffect]:
+        info = self.knowledge.helper_tail_effect(helper)
+        if info is None:
+            return None
+        alias = info.alias
+        if alias is None:
+            alias = self.knowledge.lookup_address(helper)
+        return IRAbiEffect(kind=info.kind, operand=helper, alias=alias)
+
     def _stack_effect_from_instruction(self, instruction: RawInstruction) -> IRStackEffect:
         pops = 0
         delta = instruction.event.delta
         if delta < 0:
             pops = -delta
+        if instruction.mnemonic == "call_helpers":
+            helper = self._helper_stack_effect(instruction.operand, pops, instruction)
+            if helper is not None:
+                return helper
         return IRStackEffect(
             mnemonic=instruction.mnemonic,
             operand=instruction.operand,

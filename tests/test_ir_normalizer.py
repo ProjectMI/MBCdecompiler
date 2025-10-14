@@ -333,6 +333,22 @@ def write_manual(path: Path) -> KnowledgeBase:
         },
     }
     (path / "call_signatures.json").write_text(json.dumps(call_signatures, indent=2), "utf-8")
+    helper_effects = {
+        "call_helpers": {
+            "0x0100": {"kind": "io_service", "alias": "ChatOut", "role": "slot"},
+            "0x3E4B": {"kind": "io_service", "alias": "io.handshake"},
+            "0x0001": {"kind": "return_scheduler", "role": "flag"},
+            "0x9D01": {"kind": "formatting"},
+            "0x3D30": {"kind": "formatting"},
+            "0x4B76": {"kind": "formatting"},
+        },
+        "tail_helpers": {
+            "0x0072": {"kind": "return_scheduler"},
+            "0x003D": {"kind": "formatting"},
+            "0x00F0": {"kind": "io_service"},
+        },
+    }
+    (path / "helper_effects.json").write_text(json.dumps(helper_effects, indent=2), "utf-8")
     return KnowledgeBase.load(manual_path)
 
 
@@ -710,7 +726,7 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "call_helpers"]
+    assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "io_service"]
     assert cleanup.steps[1].operand == 0x3E4B
 
     io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
@@ -718,7 +734,7 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
 
     io_write = io_writes[0]
     assert io_write.mask == 0x109C
-    assert [step.mnemonic for step in io_write.pre_helpers] == ["call_helpers"]
+    assert [step.mnemonic for step in io_write.pre_helpers] == ["io_service"]
     assert [step.operand for step in io_write.pre_helpers] == [0x0100]
     assert [step.mnemonic for step in io_write.post_helpers] == ["op_F0_4B", "op_4A_10"]
 
@@ -747,7 +763,7 @@ def test_normalizer_converts_call_helper_variants(tmp_path: Path) -> None:
     assert len(block.nodes) == 1
     node = block.nodes[0]
     assert isinstance(node, IRReturn)
-    assert [step.mnemonic for step in node.cleanup] == ["call_helpers"]
+    assert [step.mnemonic for step in node.cleanup] == ["formatting"]
     assert [step.operand for step in node.cleanup] == [0x9D01]
 
 
@@ -775,7 +791,7 @@ def test_normalizer_attaches_f0_helper_cleanup(tmp_path: Path) -> None:
     cleanup_mnemonics = [step.mnemonic for step in return_node.cleanup]
     assert cleanup_mnemonics and cleanup_mnemonics[0] in {"page_register", "op_6C_01"}
     helper_cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in helper_cleanup.steps] == ["call_helpers"]
+    assert [step.mnemonic for step in helper_cleanup.steps] == ["formatting"]
 
 
 def test_normalizer_labels_fanout_cleanup(tmp_path: Path) -> None:
@@ -1175,7 +1191,7 @@ def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
 
     ret = next(node for node in block.nodes if isinstance(node, IRReturn))
     cleanup_mnemonics = [step.mnemonic for step in ret.cleanup]
-    assert cleanup_mnemonics == ["op_D0_04", "call_helpers", "op_D0_06"]
+    assert cleanup_mnemonics == ["op_D0_04", "formatting", "op_D0_06"]
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D0_04", "op_D0_06"}
         for node in block.nodes
@@ -1227,7 +1243,7 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
 
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
     assert [step.mnemonic for step in call_return.cleanup] == [
-        "call_helpers",
+        "return_scheduler",
         "op_32_29",
         "op_29_10",
         "stack_teardown",

@@ -1,0 +1,18 @@
+{
+  "call_helpers": {
+    "0x0100": {"kind": "io_service", "alias": "ChatOut", "role": "slot"},
+    "0x3E4B": {"kind": "io_service", "alias": "io.handshake"},
+    "0x0001": {"kind": "return_scheduler", "role": "flag"},
+    "0x9D01": {"kind": "formatting"},
+    "0x3D30": {"kind": "formatting"},
+    "0x4B76": {"kind": "formatting"},
+    "0x7223": {"kind": "formatting"},
+    "0xF172": {"kind": "formatting"}
+  },
+  "tail_helpers": {
+    "0x0072": {"kind": "return_scheduler"},
+    "0x003D": {"kind": "formatting"},
+    "0x003E": {"kind": "formatting"},
+    "0x00F0": {"kind": "io_service"}
+  }
+}

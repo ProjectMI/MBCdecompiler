@@ -135,6 +135,16 @@ class CallSignature:
     tail: Optional[bool] = None
 
 
+@dataclass(frozen=True)
+class HelperEffectInfo:
+    """Metadata that classifies helper entrypoints."""
+
+    kind: str
+    alias: Optional[str] = None
+    role: Optional[str] = None
+    ssa_kind: Optional[str] = None
+
+
 class KnowledgeBase:
     """Resolve opcode/mode pairs to :class:`OpcodeInfo` entries.
 
@@ -165,12 +175,20 @@ class KnowledgeBase:
         by_name: Optional[Mapping[str, OpcodeInfo]] = None,
         addresses: Optional[Mapping[int, str]] = None,
         call_signatures: Optional[Mapping[int, CallSignature]] = None,
+        helper_call_effects: Optional[Mapping[int, HelperEffectInfo]] = None,
+        helper_tail_effects: Optional[Mapping[int, HelperEffectInfo]] = None,
     ) -> None:
         self._annotations: Dict[str, OpcodeInfo] = dict(annotations)
         self._wildcards: Dict[int, OpcodeInfo] = dict(wildcards or {})
         self._by_name: Dict[str, OpcodeInfo] = dict(by_name or {})
         self._addresses: Dict[int, str] = dict(addresses or {})
         self._call_signatures: Dict[int, CallSignature] = dict(call_signatures or {})
+        self._helper_call_effects: Dict[int, HelperEffectInfo] = dict(
+            helper_call_effects or {}
+        )
+        self._helper_tail_effects: Dict[int, HelperEffectInfo] = dict(
+            helper_tail_effects or {}
+        )
 
     @classmethod
     def load(cls, manual_path: Path) -> "KnowledgeBase":
@@ -190,6 +208,8 @@ class KnowledgeBase:
         wildcard_specs: Dict[int, Mapping[str, Any]] = {}
         address_table: Dict[int, str] = {}
         call_signatures: Dict[int, CallSignature] = {}
+        helper_call_effects: Dict[int, HelperEffectInfo] = {}
+        helper_tail_effects: Dict[int, HelperEffectInfo] = {}
 
         if isinstance(data, dict):
             for key, entry in data.items():
@@ -227,12 +247,18 @@ class KnowledgeBase:
         if signatures_path.exists():
             call_signatures = _load_call_signatures(signatures_path)
 
+        helper_path = resolved.with_name("helper_effects.json")
+        if helper_path.exists():
+            helper_call_effects, helper_tail_effects = _load_helper_effects(helper_path)
+
         return cls(
             annotations,
             wildcards=wildcard_annotations,
             by_name=by_name,
             addresses=address_table,
             call_signatures=call_signatures,
+            helper_call_effects=helper_call_effects,
+            helper_tail_effects=helper_tail_effects,
         )
 
     def lookup(self, label: str) -> Optional[OpcodeInfo]:
@@ -262,6 +288,16 @@ class KnowledgeBase:
         """Return the call contract for ``target`` when available."""
 
         return self._call_signatures.get(int(target) & 0xFFFF)
+
+    def helper_call_effect(self, operand: int) -> Optional[HelperEffectInfo]:
+        """Return helper classification for ``call_helpers`` operands."""
+
+        return self._helper_call_effects.get(int(operand) & 0xFFFF)
+
+    def helper_tail_effect(self, target: int) -> Optional[HelperEffectInfo]:
+        """Return helper classification for dedicated tail helpers."""
+
+        return self._helper_tail_effects.get(int(target) & 0xFFFF)
 
 
 def _parse_component(component: str) -> int:
@@ -452,6 +488,69 @@ def _load_call_signatures(table_path: Path) -> Dict[int, CallSignature]:
         if signature is not None:
             signatures[target] = signature
     return signatures
+
+
+def _load_helper_effects(
+    table_path: Path,
+) -> Tuple[Dict[int, HelperEffectInfo], Dict[int, HelperEffectInfo]]:
+    """Load helper classification metadata from ``table_path``."""
+
+    try:
+        raw = json.loads(table_path.read_text("utf-8"))
+    except json.JSONDecodeError:
+        return {}, {}
+
+    if not isinstance(raw, Mapping):
+        return {}, {}
+
+    call_effects: Dict[int, HelperEffectInfo] = {}
+    tail_effects: Dict[int, HelperEffectInfo] = {}
+
+    for key, target in (
+        ("call_helpers", call_effects),
+        ("tail_helpers", tail_effects),
+    ):
+        section = raw.get(key)
+        if not isinstance(section, Mapping):
+            continue
+        for operand_key, entry in section.items():
+            operand = _parse_operand_value(operand_key)
+            if operand is None:
+                continue
+            info = _parse_helper_effect_entry(entry)
+            if info is None:
+                continue
+            target[operand] = info
+
+    return call_effects, tail_effects
+
+
+def _parse_helper_effect_entry(entry: Any) -> Optional[HelperEffectInfo]:
+    """Convert a JSON entry into :class:`HelperEffectInfo`."""
+
+    if isinstance(entry, str):
+        return HelperEffectInfo(kind=entry)
+
+    if not isinstance(entry, Mapping):
+        return None
+
+    kind = entry.get("kind")
+    if not isinstance(kind, str) or not kind:
+        return None
+
+    alias = entry.get("alias")
+    if alias is not None:
+        alias = str(alias)
+
+    role = entry.get("role")
+    if role is not None:
+        role = str(role)
+
+    ssa_kind = entry.get("ssa_kind")
+    if ssa_kind is not None:
+        ssa_kind = str(ssa_kind)
+
+    return HelperEffectInfo(kind=kind, alias=alias, role=role, ssa_kind=ssa_kind)
 
 
 def _parse_operand_value(key: Any) -> Optional[int]:
