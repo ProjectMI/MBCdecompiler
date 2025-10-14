@@ -841,6 +841,7 @@ class IRNormalizer:
         self._pass_tailcall_returns(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
+        self._pass_collect_return_epilogues(items)
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
 
@@ -4570,7 +4571,7 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
+        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "op_29_10", "fanout"):
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand
@@ -4850,6 +4851,64 @@ class IRNormalizer:
             index += 1
 
         self._sweep_indirect_configuration(items)
+
+    def _pass_collect_return_epilogues(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(
+                node,
+                (IRReturn, IRCallReturn, IRTailCall, IRTailcallReturn),
+            ):
+                index += 1
+                continue
+
+            effects: List[IRStackEffect] = []
+            collected_indices: List[int] = []
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, IRCallCleanup):
+                    if not self._is_epilogue_cleanup(candidate):
+                        break
+                    effects = list(candidate.steps) + effects
+                    collected_indices.append(scan)
+                    scan -= 1
+                    continue
+                if isinstance(candidate, IRConditionMask):
+                    effect = IRStackEffect(
+                        mnemonic=candidate.source,
+                        operand=candidate.mask,
+                        operand_role="mask",
+                    )
+                    effects.insert(0, effect)
+                    collected_indices.append(scan)
+                    scan -= 1
+                    continue
+                break
+
+            if not effects:
+                index += 1
+                continue
+
+            updated = self._append_epilogue_effects(node, effects)
+            if updated is None:
+                index += 1
+                continue
+
+            self._transfer_ssa(node, updated)
+            for pos in sorted(collected_indices, reverse=True):
+                items.pop(pos)
+                if pos < index:
+                    index -= 1
+
+            items.replace_slice(index, index + 1, [updated])
+            index += 1
+
+    def _is_epilogue_cleanup(self, cleanup: IRCallCleanup) -> bool:
+        if any(step.pops > 0 for step in cleanup.steps):
+            return True
+        return self._extract_cleanup_mask(cleanup.steps) is not None
 
     def _pass_epilogue_prologue_compaction(self, items: _ItemList) -> None:
         index = 0

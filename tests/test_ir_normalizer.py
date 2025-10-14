@@ -142,6 +142,52 @@ def test_epilogue_compaction_merges_raw_markers() -> None:
     assert [step.mnemonic for step in updated_return.cleanup] == ["op_02_00", "op_15_4A"]
 
 
+def test_collect_epilogue_cleanup_for_return() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    mask_effect = IRStackEffect(mnemonic="op_29_10", operand=RET_MASK, operand_role="mask")
+    teardown_effect = IRStackEffect(mnemonic="stack_teardown", pops=4)
+
+    cleanup_mask = IRCallCleanup(steps=(mask_effect,))
+    cleanup_teardown = IRCallCleanup(steps=(teardown_effect,))
+    return_node = IRReturn(values=("ret0",))
+
+    items = _ItemList([cleanup_mask, cleanup_teardown, return_node])
+    normalizer._pass_collect_return_epilogues(items)
+
+    assert len(items) == 1
+    updated_return = items[0]
+    assert isinstance(updated_return, IRReturn)
+    assert [step.mnemonic for step in updated_return.cleanup] == [
+        "op_29_10",
+        "stack_teardown",
+    ]
+    assert any(
+        effect.kind == "return_mask" and effect.operand == RET_MASK
+        for effect in updated_return.abi_effects
+    )
+
+
+def test_collect_epilogue_cleanup_for_tailcall() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    mask_effect = IRStackEffect(mnemonic="op_29_10", operand=RET_MASK, operand_role="mask")
+    cleanup_mask = IRCallCleanup(steps=(mask_effect,))
+    call = IRCall(target=0x1234, args=tuple(), tail=True)
+    tail_node = IRTailCall(call=call, returns=("ret0",))
+
+    items = _ItemList([cleanup_mask, tail_node])
+    normalizer._pass_collect_return_epilogues(items)
+
+    assert len(items) == 1
+    updated_tail = items[0]
+    assert isinstance(updated_tail, IRTailCall)
+    assert [step.mnemonic for step in updated_tail.cleanup] == ["op_29_10"]
+    assert updated_tail.cleanup_mask == RET_MASK
+
+
 def write_manual(path: Path) -> KnowledgeBase:
     manual = {
         "push_literal": {
