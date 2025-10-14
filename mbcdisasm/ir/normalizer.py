@@ -835,6 +835,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_condition_masks(items)
+        self._pass_return_epilogues(items)
         self._pass_call_predicates(items)
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
@@ -3664,6 +3665,90 @@ class IRNormalizer:
                     items.replace_slice(index, index + 1, [node])
                     continue
             index += 1
+
+    def _pass_return_epilogues(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCallCleanup):
+                index += 1
+                continue
+
+            start = index
+            cleanup_nodes: List[IRCallCleanup] = []
+            while index < len(items) and isinstance(items[index], IRCallCleanup):
+                cleanup_nodes.append(cast(IRCallCleanup, items[index]))
+                index += 1
+
+            mask_index = index
+            if mask_index >= len(items):
+                index = start + 1
+                continue
+
+            mask_node = items[mask_index]
+            if not (
+                isinstance(mask_node, IRConditionMask)
+                and mask_node.mask == RET_MASK
+            ):
+                index = start + 1
+                continue
+
+            index += 1
+
+            cleanup_steps: List[IRStackEffect] = []
+            for cleanup in cleanup_nodes:
+                cleanup_steps.extend(cleanup.steps)
+
+            if not cleanup_steps:
+                index = start + 1
+                continue
+
+            cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+            mask_value = mask_node.mask
+
+            following_index = index
+            following = items[following_index] if following_index < len(items) else None
+
+            for cleanup in cleanup_nodes:
+                self._ssa_bindings.pop(id(cleanup), None)
+
+            if isinstance(following, (IRReturn, IRTailCall, IRTailcallReturn)):
+                updated = self._append_epilogue_effects(following, cleanup_steps)
+                if updated is None:
+                    index = start + 1
+                    continue
+                abi_effects = self._merge_return_mask_effects(
+                    getattr(updated, "abi_effects", tuple()), mask_value
+                )
+                if isinstance(updated, IRReturn):
+                    updated = IRReturn(
+                        values=updated.values,
+                        varargs=updated.varargs,
+                        cleanup=updated.cleanup,
+                        abi_effects=abi_effects,
+                    )
+                elif isinstance(updated, IRTailCall):
+                    updated = replace(updated, abi_effects=abi_effects)
+                else:
+                    assert isinstance(updated, IRTailcallReturn)
+                    updated = replace(updated, abi_effects=abi_effects)
+
+                self._transfer_ssa(following, updated)
+                self._transfer_ssa(mask_node, updated)
+                items.replace_slice(start, following_index + 1, [updated])
+                index = start + 1
+                continue
+
+            abi_effects = self._merge_return_mask_effects(tuple(), mask_value)
+            return_node = IRReturn(
+                values=tuple(),
+                varargs=False,
+                cleanup=tuple(cleanup_steps),
+                abi_effects=abi_effects,
+            )
+            self._transfer_ssa(mask_node, return_node)
+            items.replace_slice(start, mask_index + 1, [return_node])
+            index = start + 1
 
     def _pass_call_predicates(self, items: _ItemList) -> None:
         index = 0

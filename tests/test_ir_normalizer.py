@@ -142,6 +142,60 @@ def test_epilogue_compaction_merges_raw_markers() -> None:
     assert [step.mnemonic for step in updated_return.cleanup] == ["op_02_00", "op_15_4A"]
 
 
+def test_return_epilogues_promote_cleanup_sequences() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="stack_teardown",
+                operand=0x002C,
+                pops=5,
+            ),
+        )
+    )
+    mask = IRConditionMask(source="terminator", mask=RET_MASK)
+
+    items = _ItemList([cleanup, mask])
+    normalizer._pass_return_epilogues(items)
+
+    assert len(items) == 1
+    result = items[0]
+    assert isinstance(result, IRReturn)
+    assert [step.mnemonic for step in result.cleanup] == ["stack_teardown"]
+    assert result.cleanup[0].pops == 5
+    assert result.mask == RET_MASK
+
+
+def test_return_epilogues_merge_into_existing_return() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="stack_teardown",
+                operand=0x002C,
+                pops=5,
+            ),
+        )
+    )
+    mask = IRConditionMask(source="terminator", mask=RET_MASK)
+    return_node = IRReturn(values=("ret0",), varargs=False)
+
+    items = _ItemList([cleanup, mask, return_node])
+    normalizer._pass_return_epilogues(items)
+
+    assert len(items) == 1
+    result = items[0]
+    assert isinstance(result, IRReturn)
+    assert result.values == ("ret0",)
+    assert [step.mnemonic for step in result.cleanup] == ["stack_teardown"]
+    assert result.cleanup[0].pops == 5
+    assert result.mask == RET_MASK
+
+
 def write_manual(path: Path) -> KnowledgeBase:
     manual = {
         "push_literal": {
