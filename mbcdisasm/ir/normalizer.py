@@ -838,6 +838,7 @@ class IRNormalizer:
         self._pass_call_predicates(items)
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
+        self._pass_cleanup_returns(items)
         self._pass_tailcall_returns(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
@@ -3638,6 +3639,79 @@ class IRNormalizer:
                     continue
             index += 1
 
+    def _pass_cleanup_returns(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCallCleanup):
+                index += 1
+                continue
+
+            start = index
+            cleanup_steps: List[IRStackEffect] = []
+            mask: Optional[int] = None
+
+            while index < len(items) and isinstance(items[index], IRCallCleanup):
+                cleanup = items[index]
+                cleanup_steps.extend(cleanup.steps)
+                mask = mask or self._extract_cleanup_mask(cleanup.steps)
+                index += 1
+
+            mask_effects: List[IRStackEffect] = []
+            while index < len(items) and isinstance(items[index], IRConditionMask):
+                condition = items[index]
+                mask = mask or condition.mask
+                mask_effects.append(
+                    IRStackEffect(
+                        mnemonic=condition.source,
+                        operand=condition.mask,
+                        operand_role="mask",
+                    )
+                )
+                index += 1
+
+            if not cleanup_steps and not mask_effects:
+                index = start + 1
+                continue
+
+            if index < len(items) and isinstance(items[index], IRReturn):
+                index = start + 1
+                continue
+
+            if mask is None or (mask != RET_MASK and mask not in IO_SLOT_ALIASES):
+                index = start + 1
+                continue
+
+            prev = start - 1
+            while prev >= 0 and isinstance(
+                items[prev], (IRLiteral, IRLiteralChunk, IRStringConstant, IRConditionMask)
+            ):
+                prev -= 1
+            if prev >= 0 and isinstance(items[prev], CallLike):
+                index = start + 1
+                continue
+
+            cleanup_steps.extend(mask_effects)
+            cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+            return_count = sum(step.pops for step in cleanup_steps if step.pops > 0)
+            values = tuple(f"ret{i}" for i in range(return_count))
+
+            replacement = IRReturn(
+                values=values,
+                varargs=False,
+                cleanup=tuple(cleanup_steps),
+                abi_effects=self._merge_return_mask_effects(tuple(), mask),
+            )
+
+            removed = list(items[start:index])
+            if removed:
+                self._transfer_ssa(removed[0], replacement)
+                for extra in removed[1:]:
+                    self._ssa_bindings.pop(id(extra), None)
+
+            items.replace_slice(start, index, [replacement])
+            index = start + 1
+
     def _pass_condition_masks(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -4570,7 +4644,7 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
-        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
+        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout", "terminator"):
             for step in steps:
                 if step.mnemonic == mnemonic:
                     return step.operand

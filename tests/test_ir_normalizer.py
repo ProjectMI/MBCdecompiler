@@ -256,6 +256,11 @@ def write_manual(path: Path) -> KnowledgeBase:
             "name": "op_29_10",
             "category": "call_mask",
         },
+        "terminator": {
+            "opcodes": ["0xFF:0x00"],
+            "name": "terminator",
+            "category": "terminator",
+        },
         "op_70_29": {
             "opcodes": ["0x70:0x29"],
             "name": "op_70_29",
@@ -1426,6 +1431,35 @@ def test_normalizer_attaches_epilogue_to_return(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic.startswith("stack_teardown")
         for node in block.nodes
     )
+
+
+def test_normalizer_promotes_cleanup_mask_sequence_to_return(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x01, 0xF0, 0x002C),  # stack_teardown_4 with helper operand
+        build_word(4, 0xFF, 0x00, RET_MASK),  # terminator with return mask
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    returns = [node for node in block.nodes if isinstance(node, IRReturn)]
+    assert len(returns) == 1
+    ret = returns[0]
+
+    assert ret.cleanup and ret.cleanup[0].mnemonic == "stack_teardown"
+    assert ret.cleanup[0].pops == 4
+    assert ret.mask == RET_MASK
+    assert ret.values == ("ret0", "ret1", "ret2", "ret3")
+    assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
+    assert not any(isinstance(node, IRConditionMask) for node in block.nodes)
 
 
 def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
