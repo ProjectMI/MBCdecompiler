@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
@@ -28,6 +28,7 @@ from ..ir.model import (
     IRTestSetBranch,
     IRTailCall,
     IRTailcallReturn,
+    IRTerminator,
     SSAValueKind,
 )
 from .model import (
@@ -126,6 +127,7 @@ class ASTBuilder:
         block_map: Dict[int, IRBlock] = {block.start_offset: block for block in segment.blocks}
         analyses = self._build_cfg(segment, block_map)
         entry_reasons = self._detect_entries(segment, block_map, analyses)
+        analyses, entry_reasons = self._compact_cfg(analyses, entry_reasons)
         self._current_analyses = analyses
         self._current_entry_reasons = entry_reasons
         self._current_block_labels = {offset: analysis.block.label for offset, analysis in analyses.items()}
@@ -202,6 +204,64 @@ class ASTBuilder:
                         reason = "tail_target" if getattr(node, "tail", False) else "call_target"
                         entry_reasons[target].add(reason)
         return {offset: tuple(sorted(reasons)) for offset, reasons in entry_reasons.items()}
+
+    def _compact_cfg(
+        self,
+        analyses: Mapping[int, _BlockAnalysis],
+        entry_reasons: Mapping[int, Tuple[str, ...]],
+    ) -> Tuple[Mapping[int, _BlockAnalysis], Mapping[int, Tuple[str, ...]]]:
+        """Collapse trivial cleanup/terminator blocks into their successors."""
+
+        trivial_targets: Dict[int, int] = {}
+        for offset, analysis in analyses.items():
+            if offset in entry_reasons:
+                continue
+            if analysis.exit_reasons:
+                continue
+            if len(analysis.successors) != 1:
+                continue
+            block = analysis.block
+            if not block.nodes:
+                trivial_targets[offset] = analysis.successors[0]
+                continue
+            if all(isinstance(node, (IRCallCleanup, IRTerminator)) for node in block.nodes):
+                trivial_targets[offset] = analysis.successors[0]
+
+        if not trivial_targets:
+            return analyses, entry_reasons
+
+        def resolve(target: int) -> int:
+            seen: Set[int] = set()
+            while target in trivial_targets and target not in seen:
+                seen.add(target)
+                target = trivial_targets[target]
+            return target
+
+        compacted: Dict[int, _BlockAnalysis] = {}
+        for offset, analysis in analyses.items():
+            if offset in trivial_targets:
+                continue
+            successors = tuple(
+                sorted({resolve(candidate) for candidate in analysis.successors})
+            )
+            fallthrough = analysis.fallthrough
+            if fallthrough is not None:
+                fallthrough = resolve(fallthrough)
+                if fallthrough == offset:
+                    fallthrough = None
+            compacted[offset] = replace(
+                analysis,
+                successors=successors,
+                fallthrough=fallthrough,
+            )
+
+        updated_entries = {
+            offset: reasons
+            for offset, reasons in entry_reasons.items()
+            if offset in compacted
+        }
+
+        return compacted, updated_entries
 
     def _group_procedures(
         self,
@@ -490,6 +550,8 @@ class ASTBuilder:
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
             return [ASTReturn(values=values, varargs=node.varargs)], []
         if isinstance(node, IRCallCleanup):
+            return [], []
+        if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
