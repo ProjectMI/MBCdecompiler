@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+from ..constants import CALL_SHUFFLE_STANDARD
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -23,6 +24,7 @@ from ..ir.model import (
     IRReturn,
     IRSegment,
     IRStackEffect,
+    IRSwitchDispatch,
     IRStore,
     IRTestSetBranch,
     IRTailCall,
@@ -46,6 +48,8 @@ from .model import (
     ASTIdentifier,
     ASTIndirectLoadExpr,
     ASTLiteral,
+    ASTSwitch,
+    ASTSwitchCase,
     ASTMetrics,
     ASTProcedure,
     ASTProgram,
@@ -58,6 +62,23 @@ from .model import (
     ASTTestSet,
     ASTUnknown,
 )
+
+
+_TAIL_HELPER_ALIASES = {
+    "tail_helper_72": "ui.flush",
+    "tail_helper_f0": "ui.flush",
+    "tail_helper_ed": "ui.flush",
+    "tail_helper_13d": "page.set",
+    "tail_helper_1ec": "ui.flush",
+    "tail_helper_1f1": "ui.flush",
+    "tail_helper_32c": "switch.dispatch",
+    "tail_helper_3e": "switch.dispatch",
+    "tail_helper_bf0": "ui.flush",
+    "tail_helper_ff0": "ui.flush",
+    "tail_helper_16f0": "ui.flush",
+}
+
+_STACK_SHUFFLE_VARIANTS = {CALL_SHUFFLE_STANDARD, 0x3032, 0x7223}
 
 
 @dataclass
@@ -275,6 +296,7 @@ class ASTBuilder:
                 node.tail,
                 node.varargs if hasattr(node, "varargs") else False,
                 value_state,
+                node.convention,
             )
             metrics.call_sites += 1
             metrics.observe_call_args(
@@ -290,6 +312,7 @@ class ASTBuilder:
                 node.tail,
                 node.varargs,
                 value_state,
+                node.convention,
             )
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
@@ -313,6 +336,7 @@ class ASTBuilder:
                 True,
                 node.varargs,
                 value_state,
+                node.call.convention,
             )
             metrics.call_sites += 1
             metrics.observe_call_args(
@@ -362,6 +386,19 @@ class ASTBuilder:
                     else_target=node.else_target,
                 )
             ]
+        if isinstance(node, IRSwitchDispatch):
+            cases = tuple(
+                ASTSwitchCase(key=case.key, target=case.target, symbol=case.symbol)
+                for case in node.cases
+            )
+            return [
+                ASTSwitch(
+                    helper=node.helper,
+                    helper_symbol=node.helper_symbol,
+                    cases=cases,
+                    default=node.default,
+                )
+            ]
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())]
 
     def _convert_call(
@@ -372,10 +409,26 @@ class ASTBuilder:
         tail: bool,
         varargs: bool,
         value_state: Mapping[str, ASTExpression],
+        convention: Optional[IRStackEffect],
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
-        arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
+        ordered_args = self._normalize_call_args(args, convention)
+        arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in ordered_args)
+        alias = _TAIL_HELPER_ALIASES.get(symbol or "")
+        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=alias or symbol, tail=tail, varargs=varargs)
         return call_expr, arg_exprs
+
+    def _normalize_call_args(
+        self, args: Sequence[str], convention: Optional[IRStackEffect]
+    ) -> Tuple[str, ...]:
+        if not args:
+            return tuple()
+        if convention is None or convention.mnemonic != "stack_shuffle":
+            return tuple(args)
+        operand = convention.operand or 0
+        reordered = list(args)
+        if operand in _STACK_SHUFFLE_VARIANTS and len(reordered) >= 2:
+            reordered[0], reordered[1] = reordered[1], reordered[0]
+        return tuple(reordered)
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:

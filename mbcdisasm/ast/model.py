@@ -222,6 +222,43 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass(frozen=True)
+class ASTSwitchCase:
+    """Single dispatch case emitted by a switch helper."""
+
+    key: int
+    target: int
+    symbol: str | None = None
+
+    def render(self) -> str:
+        destination = f"0x{self.target:04X}"
+        if self.symbol:
+            destination = f"{self.symbol}({destination})"
+        return f"{self.key}->{destination}"
+
+
+@dataclass(frozen=True)
+class ASTSwitch(ASTStatement):
+    """Structured representation of switch-style dispatch tables."""
+
+    helper: int | None
+    cases: Tuple[ASTSwitchCase, ...]
+    helper_symbol: str | None = None
+    default: int | None = None
+
+    def render(self) -> str:
+        helper_repr = "?"
+        if self.helper is not None:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+        entries = ", ".join(case.render() for case in self.cases)
+        text = f"switch helper={helper_repr} cases=[{entries}]"
+        if self.default is not None:
+            text += f" default=0x{self.default:04X}"
+        return text
+
+
+@dataclass(frozen=True)
 class ASTFrameFinalize(ASTStatement):
     """Collapse the helper scaffolding that discharges the active frame."""
 
