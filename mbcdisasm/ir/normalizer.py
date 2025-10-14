@@ -2541,10 +2541,17 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            table_base = self._dispatch_table_base(cases)
+            table_symbol = None
+            if table_base is not None:
+                table_symbol = self.knowledge.lookup_address(table_base)
+
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
                 helper_symbol=helper_symbol,
+                table=table_base,
+                table_symbol=table_symbol,
                 default=default,
             )
             items.replace_slice(index, index + 1, [dispatch])
@@ -2879,6 +2886,15 @@ class IRNormalizer:
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    @staticmethod
+    def _dispatch_table_base(cases: Sequence[IRDispatchCase]) -> Optional[int]:
+        if not cases:
+            return None
+        prefixes = {case.target & 0xFF00 for case in cases}
+        if len(prefixes) == 1:
+            return prefixes.pop()
+        return None
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0

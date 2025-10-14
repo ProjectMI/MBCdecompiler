@@ -798,6 +798,8 @@ class IRSwitchDispatch(IRNode):
     cases: Tuple[IRDispatchCase, ...]
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
+    table: Optional[int] = None
+    table_symbol: Optional[str] = None
     default: Optional[int] = None
 
     def describe(self) -> str:
@@ -807,6 +809,11 @@ class IRSwitchDispatch(IRNode):
             if self.helper_symbol:
                 helper_repr = f"{self.helper_symbol}({helper_repr})"
             helper_details = f"helper={helper_repr}"
+        if self.table is not None:
+            table_repr = f"0x{self.table:04X}"
+            if self.table_symbol:
+                table_repr = f"{self.table_symbol}({table_repr})"
+            helper_details += f" table={table_repr}"
         case_text = ", ".join(case.describe() for case in self.cases)
         description = f"dispatch {helper_details} cases=[{case_text}]"
         if self.default is not None:
