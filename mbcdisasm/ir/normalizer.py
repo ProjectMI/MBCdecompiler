@@ -53,6 +53,7 @@ from .model import (
     IRTerminator,
     IRSegment,
     IRSlot,
+    IRMetaInstruction,
     MemRef,
     IRStackEffect,
     IRStore,
@@ -875,10 +876,12 @@ class IRNormalizer:
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_wrapper, index
                 ):
+                    meta_node = self._meta_instruction_node(item)
+                    self._transfer_ssa(item, meta_node)
                     annotation = self._format_annotation(item)
                     if annotation:
-                        metrics.meta_remaining += 1
                         block_annotations.append(annotation)
+                    nodes.append(meta_node)
                     continue
                 metrics.raw_remaining += 1
                 nodes.append(
@@ -5940,6 +5943,17 @@ class IRNormalizer:
                 return True
             return any("ascii" in note for note in item.annotations)
         return False
+
+    def _meta_instruction_node(self, instruction: RawInstruction) -> IRMetaInstruction:
+        profile = instruction.profile
+        return IRMetaInstruction(
+            mnemonic=instruction.mnemonic,
+            operand=instruction.operand,
+            stack_delta=instruction.event.delta,
+            operand_role=profile.operand_role(),
+            operand_alias=profile.operand_alias(),
+            annotations=instruction.annotations,
+        )
 
     def _format_annotation(self, instruction: RawInstruction) -> str:
         parts = [f"0x{instruction.offset:06X}"]

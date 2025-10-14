@@ -1007,6 +1007,39 @@ class IRRaw(IRNode):
 
 
 @dataclass(frozen=True)
+class IRMetaInstruction(IRNode):
+    """Preserve stack-neutral instructions that previously became annotations."""
+
+    mnemonic: str
+    operand: int
+    stack_delta: int
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        parts = [self.mnemonic]
+        value = _format_operand(self.operand)
+        alias = self.operand_alias
+        if alias:
+            alias_text = str(alias)
+            if alias_text.upper().startswith("0X"):
+                alias_text = alias_text.upper()
+            if alias_text != value:
+                value = f"{alias_text}({value})"
+            else:
+                value = alias_text
+        detail = f"operand={value}" if not self.operand_role else f"{self.operand_role}={value}"
+        parts.append(detail)
+        if self.stack_delta:
+            parts.append(f"stackΔ={self.stack_delta:+d}")
+        if self.annotations:
+            parts.extend(self.annotations)
+        rendered = " ".join(parts)
+        return f"meta {rendered}" if parts else "meta"
+
+
+@dataclass(frozen=True)
 class IRTerminator(IRNode):
     """Explicit representation for VM terminator instructions."""
 
@@ -1219,6 +1252,7 @@ __all__ = [
     "IRSlot",
     "MemRef",
     "IRRaw",
+    "IRMetaInstruction",
     "MemSpace",
     "SSAValueKind",
     "NormalizerMetrics",
