@@ -28,6 +28,7 @@ from ..ir.model import (
     IRTestSetBranch,
     IRTailCall,
     IRTailcallReturn,
+    IRTerminator,
     SSAValueKind,
 )
 from .model import (
@@ -222,6 +223,10 @@ class ASTBuilder:
             block = analysis.block
             if offset in entry_reasons:
                 if current_blocks:
+                    self._compress_blocks(
+                        current_blocks,
+                        current_entry or current_blocks[0].start_offset,
+                    )
                     procedures.append(
                         self._finalise_procedure(
                             name=f"proc_{len(procedures)}",
@@ -241,6 +246,9 @@ class ASTBuilder:
             if analysis.exit_reasons:
                 exit_offsets.add(offset)
         if current_blocks:
+            self._compress_blocks(
+                current_blocks, current_entry or current_blocks[0].start_offset
+            )
             procedures.append(
                 self._finalise_procedure(
                     name=f"proc_{len(procedures)}",
@@ -268,6 +276,47 @@ class ASTBuilder:
             blocks=realised_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
         )
+
+    def _compress_blocks(self, blocks: List[_PendingBlock], entry_offset: int) -> None:
+        """Merge trivial bridge blocks back into their successors."""
+
+        redirect: Dict[int, int] = {}
+
+        while True:
+            updates: Dict[int, int] = {}
+            for block in blocks:
+                if block.start_offset == entry_offset:
+                    continue
+                if block.statements or block.branch_links:
+                    continue
+                if len(block.successors) != 1:
+                    continue
+                successor = self._resolve_redirect(block.successors[0], redirect)
+                if successor == block.start_offset:
+                    continue
+                updates[block.start_offset] = successor
+
+            if not updates:
+                break
+
+            redirect.update(updates)
+
+            def resolve(target: int) -> int:
+                return self._resolve_redirect(target, redirect)
+
+            for block in blocks:
+                block.successors = tuple(resolve(succ) for succ in block.successors)
+                for link in block.branch_links:
+                    link.then_target = resolve(link.then_target)
+                    link.else_target = resolve(link.else_target)
+
+            blocks[:] = [block for block in blocks if block.start_offset not in updates]
+
+    @staticmethod
+    def _resolve_redirect(offset: int, redirects: Mapping[int, int]) -> int:
+        while offset in redirects:
+            offset = redirects[offset]
+        return offset
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
@@ -490,6 +539,8 @@ class ASTBuilder:
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
             return [ASTReturn(values=values, varargs=node.varargs)], []
         if isinstance(node, IRCallCleanup):
+            return [], []
+        if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
