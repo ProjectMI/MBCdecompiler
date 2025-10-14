@@ -12,6 +12,8 @@ from mbcdisasm import (
     Disassembler,
     IRNormalizer,
     IRTextRenderer,
+    ASTBuilder,
+    ASTTextRenderer,
     KnowledgeBase,
     MbcContainer,
 )
@@ -49,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Override the default <mbc>.ir.txt output path",
+    )
+    parser.add_argument(
+        "--ast-out",
+        type=Path,
+        default=None,
+        help="Override the default <mbc>.ast.txt output path",
     )
     parser.add_argument(
         "--knowledge-base",
@@ -116,6 +124,11 @@ def main() -> None:
     ir_output_path = args.ir_out or mbc_path.with_suffix(".ir.txt")
     IRTextRenderer().write(program, ir_output_path)
     print(f"ir written to {ir_output_path}")
+
+    ast_program = ASTBuilder().build(program)
+    ast_output_path = args.ast_out or mbc_path.with_suffix(".ast.txt")
+    ASTTextRenderer().write(ast_program, ast_output_path)
+    print(f"ast written to {ast_output_path}")
 
     total_time = time.perf_counter() - start_time
     print(f"total execution time: {total_time:.2f}s")
