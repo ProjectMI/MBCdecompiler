@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Sequence
 
 from mbcdisasm import (
+    ASTBuilder,
+    ASTRenderer,
     Disassembler,
     IRNormalizer,
     IRTextRenderer,
@@ -49,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Override the default <mbc>.ir.txt output path",
+    )
+    parser.add_argument(
+        "--ast-out",
+        type=Path,
+        default=None,
+        help="Override the default <mbc>.ast.txt output path",
     )
     parser.add_argument(
         "--knowledge-base",
@@ -116,6 +124,12 @@ def main() -> None:
     ir_output_path = args.ir_out or mbc_path.with_suffix(".ir.txt")
     IRTextRenderer().write(program, ir_output_path)
     print(f"ir written to {ir_output_path}")
+
+    ast_builder = ASTBuilder()
+    ast_program = ast_builder.build(program)
+    ast_output_path = args.ast_out or mbc_path.with_suffix(".ast.txt")
+    ASTRenderer().write(ast_program, ast_output_path)
+    print(f"ast written to {ast_output_path}")
 
     total_time = time.perf_counter() - start_time
     print(f"total execution time: {total_time:.2f}s")
