@@ -2523,23 +2523,12 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            helper_target: Optional[int] = None
-            helper_symbol: Optional[str] = None
-            follow = index + 1
-            while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
-                follow += 1
-            if follow < len(items):
-                candidate = items[follow]
-                if isinstance(candidate, CallLike):
-                    target = getattr(candidate, "target", None)
-                    if isinstance(target, int) and target in {0x6623, 0x6624}:
-                        helper_target = target
-                        helper_symbol = self.knowledge.lookup_address(target)
-
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
                 index += 1
                 continue
+
+            helper_target, helper_symbol = self._resolve_dispatch_helper(items, index, cases)
 
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
@@ -2879,6 +2868,101 @@ class IRNormalizer:
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    _DISPATCH_LITERAL_SKIP_PREFIXES = {0x6900, 0x6910, 0x6920, 0x6930, 0x6940, 0x6950, 0x6960, 0x6970, 0x6980, 0x6990}
+
+    def _resolve_dispatch_helper(
+        self,
+        items: _ItemList,
+        index: int,
+        cases: Sequence[IRDispatchCase],
+    ) -> Tuple[Optional[int], Optional[str]]:
+        helper: Optional[int] = None
+        literal_candidates: List[int] = []
+
+        def scan(start: int, step: int) -> Optional[int]:
+            pos = start
+            while 0 <= pos < len(items):
+                node = items[pos]
+                if pos != index and isinstance(node, IRSwitchDispatch):
+                    break
+                extracted = self._dispatch_helper_from_node(node)
+                if extracted is not None:
+                    return extracted
+                literal = self._dispatch_literal_value(node)
+                if literal is not None:
+                    literal_candidates.append(literal)
+                if self._dispatch_context_allows_skip(node):
+                    pos += step
+                    continue
+                break
+            return None
+
+        helper = scan(index - 1, -1)
+        if helper is None:
+            helper = scan(index + 1, 1)
+
+        if helper is None:
+            for value in literal_candidates:
+                if value == 0:
+                    continue
+                if value & 0xFF00 in self._DISPATCH_LITERAL_SKIP_PREFIXES:
+                    continue
+                helper = value & 0xFFFF
+                if helper:
+                    break
+
+        if helper is None and len(cases) == 1:
+            helper = cases[0].target
+
+        if helper is not None:
+            helper &= 0xFFFF
+            return helper, self._helper_symbol(helper)
+        return None, None
+
+    def _dispatch_helper_from_node(self, node: Union[IRNode, RawInstruction]) -> Optional[int]:
+        if isinstance(node, CallLike):
+            target = getattr(node, "target", None)
+            if isinstance(target, int):
+                return target & 0xFFFF
+        if isinstance(node, IRCallCleanup):
+            for step in node.steps:
+                if step.mnemonic == "call_helpers":
+                    return step.operand & 0xFFFF
+        if isinstance(node, RawInstruction):
+            mnemonic = node.mnemonic
+            if mnemonic in {"call_helpers", "call_dispatch", "tailcall_dispatch"}:
+                return node.operand & 0xFFFF
+        return None
+
+    def _dispatch_literal_value(self, node: Union[IRNode, RawInstruction]) -> Optional[int]:
+        if isinstance(node, IRLiteral):
+            return node.value & 0xFFFF
+        if isinstance(node, RawInstruction) and node.mnemonic.startswith("op_00_"):
+            return node.operand & 0xFFFF
+        return None
+
+    def _dispatch_context_allows_skip(self, node: Union[IRNode, RawInstruction]) -> bool:
+        if isinstance(
+            node,
+            (
+                IRLiteral,
+                IRLiteralChunk,
+                IRCallCleanup,
+                IRStringConstant,
+                IRCallPreparation,
+                IRStackDrop,
+            ),
+        ):
+            return True
+        if isinstance(node, RawInstruction):
+            if self._is_dispatch_wrapper_instruction(node):
+                return True
+            if node.mnemonic.startswith("op_2C_"):
+                return True
+            if node.profile.kind in {InstructionKind.UNKNOWN, InstructionKind.META} and node.event.delta == 0:
+                return True
+        return False
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0
