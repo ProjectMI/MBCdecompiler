@@ -369,6 +369,29 @@ class IRLiteralChunk(IRNode):
 
 
 @dataclass(frozen=True)
+class IRMarker(IRNode):
+    """Opaque configuration or resource marker without side effects."""
+
+    mnemonic: str
+    operand: int
+    alias: Optional[str] = None
+    role: Optional[str] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        parts: List[str] = [f"operand=0x{self.operand:04X}"]
+        if self.alias:
+            parts.append(f"alias={self.alias}")
+        if self.role and self.role != self.alias:
+            parts.append(f"role={self.role}")
+        body = " ".join(parts)
+        rendered = f"marker({self.mnemonic} {body})" if body else f"marker({self.mnemonic})"
+        if self.annotations:
+            rendered += " " + ", ".join(self.annotations)
+        return rendered
+
+
+@dataclass(frozen=True)
 class IRStringConstant(IRNode):
     """Entry in the global ASCII constant pool."""
 
@@ -1208,6 +1231,7 @@ __all__ = [
     "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRMarker",
     "IRStringConstant",
     "IRAsciiPreamble",
     "IRCallPreparation",

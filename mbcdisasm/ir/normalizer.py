@@ -44,6 +44,7 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRMarker,
     IRPageRegister,
     IRLoad,
     IRNode,
@@ -80,7 +81,7 @@ from .model import (
 )
 
 
-ANNOTATION_MNEMONICS = {"literal_marker"}
+ANNOTATION_MNEMONICS: Set[str] = set()
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 
 
@@ -872,6 +873,11 @@ class IRNormalizer:
                     self._transfer_ssa(item, cleanup)
                     nodes.append(cleanup)
                     continue
+                marker = self._marker_from_instruction(item)
+                if marker is not None:
+                    self._transfer_ssa(item, marker)
+                    nodes.append(marker)
+                    continue
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_wrapper, index
                 ):
@@ -1174,8 +1180,13 @@ class IRNormalizer:
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
 
+        if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
+            "inline_ascii_chunk"
+        ):
+            data = instruction.profile.word.raw.to_bytes(4, "big")
+            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+
         if profile.is_literal_marker():
-            self._annotation_offsets.add(instruction.offset)
             hint = LITERAL_MARKER_HINTS.get(instruction.operand)
             if hint is not None:
                 return IRLiteral(
@@ -1184,13 +1195,13 @@ class IRNormalizer:
                     source=hint,
                     annotations=instruction.annotations,
                 )
-            return None
-
-        if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
-            "inline_ascii_chunk"
-        ):
-            data = instruction.profile.word.raw.to_bytes(4, "big")
-            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+            return IRMarker(
+                mnemonic=profile.mnemonic,
+                operand=instruction.operand,
+                alias=profile.operand_alias(),
+                role=profile.operand_role(),
+                annotations=instruction.annotations,
+            )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -5764,10 +5775,38 @@ class IRNormalizer:
     # ------------------------------------------------------------------
     # annotation helpers
     # ------------------------------------------------------------------
+    def _marker_from_instruction(self, instruction: RawInstruction) -> Optional[IRMarker]:
+        profile = instruction.profile
+        mnemonic = profile.mnemonic
+        if mnemonic == "literal_marker":
+            return None
+        if not mnemonic.startswith("op_"):
+            return None
+        event = instruction.event
+        if event.delta != 0:
+            return None
+        if event.pushed_types or event.popped_types:
+            return None
+        if profile.is_control():
+            return None
+        if self._has_profile_side_effects(instruction):
+            return None
+        kind = profile.kind
+        if kind not in {InstructionKind.UNKNOWN, InstructionKind.META}:
+            if not (kind is InstructionKind.LITERAL and not instruction.pushes_value()):
+                return None
+        alias = profile.operand_alias()
+        role = profile.operand_role()
+        return IRMarker(
+            mnemonic=mnemonic,
+            operand=instruction.operand,
+            alias=alias,
+            role=role,
+            annotations=instruction.annotations,
+        )
+
     def _is_annotation_only(self, instruction: RawInstruction) -> bool:
         if instruction.offset in self._annotation_offsets:
-            return True
-        if instruction.profile.is_literal_marker():
             return True
         if not instruction.annotations:
             return False

@@ -15,6 +15,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRMarker,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -921,7 +922,10 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     ir_block, metrics = normalizer._normalise_block(block)
 
     assert metrics.raw_remaining == 0
-    assert ir_block.annotations and any("op_AA_00" in note for note in ir_block.annotations)
+    assert any(
+        isinstance(node, IRMarker) and node.mnemonic == "op_AA_00"
+        for node in ir_block.nodes
+    )
     assert any(
         isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
     )
