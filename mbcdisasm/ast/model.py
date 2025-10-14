@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 from ..ir.model import IRSlot, MemRef, SSAValueKind
 
@@ -360,6 +360,47 @@ class ASTFlagCheck(ASTStatement):
 
 
 @dataclass
+class ASTDispatch(ASTStatement):
+    """Multi-way dispatch constructed from a helper table patch."""
+
+    helper: Optional[int] = None
+    helper_symbol: Optional[str] = None
+    cases: Tuple[int, ...] = tuple()
+    key_range: Optional[Tuple[int, int]] = None
+    case_targets: Dict[int, "ASTBlock"] = field(default_factory=dict)
+    case_hints: Dict[int, str] = field(default_factory=dict)
+    default_target: "ASTBlock | None" = None
+    default_hint: Optional[str] = None
+
+    def render(self) -> str:
+        helper_details = "helper=?"
+        if self.helper is not None:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+            helper_details = f"helper={helper_repr}"
+        case_parts = []
+        for key in self.cases:
+            target = self.case_targets.get(key)
+            if target is not None:
+                label = target.label
+            else:
+                label = self.case_hints.get(key, "?")
+            case_parts.append(f"0x{key:02X}->{label}")
+        description = f"dispatch {helper_details} cases=[{', '.join(case_parts)}]"
+        if self.default_target is not None or self.default_hint is not None:
+            if self.default_target is not None:
+                default_label = self.default_target.label
+            else:
+                default_label = self.default_hint or "?"
+            description += f" default={default_label}"
+        if self.key_range is not None:
+            start, end = self.key_range
+            description += f" range=0x{start:02X}-0x{end:02X}"
+        return description
+
+
+@dataclass
 class ASTFunctionPrologue(ASTStatement):
     """Reconstructed function prologue sequence."""
 
@@ -516,6 +557,7 @@ __all__ = [
     "ASTAssign",
     "ASTStore",
     "ASTCallStatement",
+    "ASTDispatch",
     "ASTIORead",
     "ASTIOWrite",
     "ASTTailCall",

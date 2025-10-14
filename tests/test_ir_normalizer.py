@@ -1501,6 +1501,7 @@ def test_normalizer_extracts_table_dispatch(tmp_path: Path) -> None:
     targets = {case.target for case in dispatch.cases}
 
     assert dispatch.helper == 0x6623
+    assert dispatch.key_range == (0x01, 0x02)
     assert keys == {0x01, 0x02}
     assert targets == {0x6623, 0x6624}
 

@@ -2536,7 +2536,7 @@ class IRNormalizer:
                         helper_target = target
                         helper_symbol = self.knowledge.lookup_address(target)
 
-            cases, default = self._extract_dispatch_cases(item.operations)
+            cases, default, key_range = self._extract_dispatch_cases(item.operations)
             if not cases:
                 index += 1
                 continue
@@ -2546,6 +2546,7 @@ class IRNormalizer:
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
+                key_range=key_range,
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
@@ -2862,8 +2863,8 @@ class IRNormalizer:
 
     def _extract_dispatch_cases(
         self, operations: Sequence[Tuple[str, int]]
-    ) -> Tuple[List[IRDispatchCase], Optional[int]]:
-        cases: List[IRDispatchCase] = []
+    ) -> Tuple[List[IRDispatchCase], Optional[int], Optional[Tuple[int, int]]]:
+        case_map: Dict[int, Tuple[int, Optional[str]]] = {}
         default_target: Optional[int] = None
         for mnemonic, operand in operations:
             if mnemonic.startswith("op_2C_"):
@@ -2874,11 +2875,27 @@ class IRNormalizer:
                     continue
                 target = operand & 0xFFFF
                 symbol = self.knowledge.lookup_address(target)
-                cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+                case_map[key] = (target, symbol)
                 continue
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
-        return cases, default_target
+
+        if not case_map:
+            return [], default_target, None
+
+        ordered: List[IRDispatchCase] = []
+        for key in sorted(case_map):
+            target, symbol = case_map[key]
+            ordered.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+
+        keys = [case.key for case in ordered]
+        key_range: Optional[Tuple[int, int]] = None
+        if keys:
+            first, last = keys[0], keys[-1]
+            if last - first + 1 == len(set(keys)):
+                key_range = (first, last)
+
+        return ordered, default_target, key_range
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0

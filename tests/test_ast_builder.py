@@ -30,6 +30,15 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     rendered = [statement.render() for statement in block.statements]
     assert any("call" in line for line in rendered)
     assert any(line.startswith("return") for line in rendered)
+    all_statements = [
+        statement.render()
+        for proc in segment.procedures
+        for blk in proc.blocks
+        for statement in blk.statements
+    ]
+    dispatch_statements = [line for line in all_statements if line.startswith("dispatch")]
+    if dispatch_statements:
+        assert all("cases=[" in line for line in dispatch_statements)
 
     summary = ast_program.metrics.describe()
     assert "procedures=" in summary

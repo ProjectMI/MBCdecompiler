@@ -21,6 +21,7 @@ from ..ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRLoad,
+    IRSwitchDispatch,
     IRProgram,
     IRReturn,
     IRSegment,
@@ -38,6 +39,7 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTDispatch,
     ASTComment,
     ASTExpression,
     ASTFlagCheck,
@@ -87,6 +89,16 @@ class _BranchLink:
 
 
 @dataclass
+class _DispatchLink:
+    """Pending target resolution for a dispatch statement."""
+
+    statement: ASTDispatch
+    case_targets: Dict[int, int]
+    default_target: Optional[int]
+    origin_offset: int
+
+
+@dataclass
 class _PendingBlock:
     """Block with unresolved successor references."""
 
@@ -95,6 +107,7 @@ class _PendingBlock:
     statements: List[ASTStatement]
     successors: Tuple[int, ...]
     branch_links: List[_BranchLink]
+    dispatch_links: List[_DispatchLink]
 
 
 class ASTBuilder:
@@ -157,6 +170,15 @@ class ASTBuilder:
             successors: Set[int] = set()
             exit_reasons: List[str] = []
             fallthrough = offsets[idx + 1] if idx + 1 < len(offsets) else None
+            dispatch_targets: Set[int] = set()
+            for node in block.nodes:
+                if isinstance(node, IRSwitchDispatch):
+                    dispatch_targets.update(case.target for case in node.cases)
+                    if node.default is not None:
+                        dispatch_targets.add(node.default)
+            if dispatch_targets:
+                successors.update(dispatch_targets)
+                exit_reasons.append("dispatch")
             for node in reversed(block.nodes):
                 if isinstance(node, IRReturn):
                     exit_reasons.append("return")
@@ -355,6 +377,26 @@ class ASTBuilder:
                     link.statement.else_hint = self._describe_branch_target(
                         link.origin_offset, link.else_target
                     )
+            for dispatch_link in pending.dispatch_links:
+                for key in dispatch_link.statement.cases:
+                    target_offset = dispatch_link.case_targets.get(key)
+                    if target_offset is None:
+                        continue
+                    target_block = block_map.get(target_offset)
+                    if target_block is not None:
+                        dispatch_link.statement.case_targets[key] = target_block
+                    else:
+                        dispatch_link.statement.case_hints[key] = self._describe_branch_target(
+                            dispatch_link.origin_offset, target_offset
+                        )
+                if dispatch_link.default_target is not None:
+                    target_block = block_map.get(dispatch_link.default_target)
+                    if target_block is not None:
+                        dispatch_link.statement.default_target = target_block
+                    else:
+                        dispatch_link.statement.default_hint = self._describe_branch_target(
+                            dispatch_link.origin_offset, dispatch_link.default_target
+                        )
             realised = block_map[pending.start_offset]
             realised.statements = tuple(pending.statements)
             realised.successors = tuple(
@@ -373,8 +415,9 @@ class ASTBuilder:
         block = analysis.block
         statements: List[ASTStatement] = []
         branch_links: List[_BranchLink] = []
+        dispatch_links: List[_DispatchLink] = []
         for node in block.nodes:
-            node_statements, node_links = self._convert_node(
+            node_statements, node_links, node_dispatch_links = self._convert_node(
                 node,
                 block.start_offset,
                 value_state,
@@ -382,12 +425,14 @@ class ASTBuilder:
             )
             statements.extend(node_statements)
             branch_links.extend(node_links)
+            dispatch_links.extend(node_dispatch_links)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
             statements=statements,
             successors=analysis.successors,
             branch_links=branch_links,
+            dispatch_links=dispatch_links,
         )
 
     def _convert_node(
@@ -396,23 +441,23 @@ class ASTBuilder:
         origin_offset: int,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
-    ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
+    ) -> Tuple[List[ASTStatement], List[_BranchLink], List[_DispatchLink]]:
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             expr = ASTSlotRef(node.slot)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
-            return [ASTAssign(target=target, value=expr)], []
+            return [ASTAssign(target=target, value=expr)], [], []
         if isinstance(node, IRStore):
             target_expr = ASTSlotRef(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(not isinstance(value_expr, ASTUnknown))
-            return [ASTStore(target=target_expr, value=value_expr)], []
+            return [ASTStore(target=target_expr, value=value_expr)], [], []
         if isinstance(node, IRIORead):
-            return [ASTIORead(port=node.port)], []
+            return [ASTIORead(port=node.port)], [], []
         if isinstance(node, IRIOWrite):
-            return [ASTIOWrite(port=node.port, mask=node.mask)], []
+            return [ASTIOWrite(port=node.port, mask=node.mask)], [], []
         if isinstance(node, IRBankedLoad):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None
@@ -439,7 +484,7 @@ class ASTBuilder:
                     target=ASTIdentifier(node.target, self._infer_kind(node.target)),
                     value=expr,
                 )
-            ], []
+            ], [], []
         if isinstance(node, IRBankedStore):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None
@@ -461,7 +506,7 @@ class ASTBuilder:
                 pointer=pointer_expr,
                 offset=offset_expr,
             )
-            return [ASTStore(target=target, value=value_expr)], []
+            return [ASTStore(target=target, value=value_expr)], [], []
         if isinstance(node, IRIndirectLoad):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
@@ -478,7 +523,7 @@ class ASTBuilder:
                     target=ASTIdentifier(node.target, self._infer_kind(node.target)),
                     value=expr,
                 )
-            ], []
+            ], [], []
         if isinstance(node, IRIndirectStore):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
@@ -491,7 +536,7 @@ class ASTBuilder:
                 not any(isinstance(expr, ASTUnknown) for expr in (pointer, offset_expr, value_expr))
             )
             target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
-            return [ASTStore(target=target, value=value_expr)], []
+            return [ASTStore(target=target, value=value_expr)], [], []
         if isinstance(node, IRCall):
             call_expr, _ = self._convert_call(
                 node.target,
@@ -506,7 +551,7 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
-            return [ASTCallStatement(call=call_expr)], []
+            return [ASTCallStatement(call=call_expr)], [], []
         if isinstance(node, IRCallReturn):
             call_expr, returns = self._convert_call(
                 node.target,
@@ -529,7 +574,7 @@ class ASTBuilder:
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
             statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
-            return statements, []
+            return statements, [], []
         if isinstance(node, IRTailCall):
             call_expr, returns = self._convert_call(
                 node.call.target,
@@ -545,14 +590,14 @@ class ASTBuilder:
                 len(call_expr.args),
             )
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            return [ASTTailCall(call=call_expr, returns=resolved_returns)], []
+            return [ASTTailCall(call=call_expr, returns=resolved_returns)], [], []
         if isinstance(node, IRReturn):
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            return [ASTReturn(values=values, varargs=node.varargs)], []
+            return [ASTReturn(values=values, varargs=node.varargs)], [], []
         if isinstance(node, IRCallCleanup):
-            return [], []
+            return [], [], []
         if isinstance(node, IRTerminator):
-            return [], []
+            return [], [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             branch = ASTBranch(condition=condition)
@@ -563,7 +608,7 @@ class ASTBuilder:
                     else_target=node.else_target,
                     origin_offset=origin_offset,
                 )
-            ]
+            ], []
         if isinstance(node, IRTestSetBranch):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
@@ -575,7 +620,7 @@ class ASTBuilder:
                     else_target=node.else_target,
                     origin_offset=origin_offset,
                 )
-            ]
+            ], []
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
@@ -587,7 +632,7 @@ class ASTBuilder:
                     else_target=node.else_target,
                     origin_offset=origin_offset,
                 )
-            ]
+            ], []
         if isinstance(node, IRFlagCheck):
             statement = ASTFlagCheck(flag=node.flag)
             return [statement], [
@@ -597,8 +642,23 @@ class ASTBuilder:
                     else_target=node.else_target,
                     origin_offset=origin_offset,
                 )
-            ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+            ], []
+        if isinstance(node, IRSwitchDispatch):
+            case_targets = {case.key: case.target for case in node.cases}
+            statement = ASTDispatch(
+                helper=node.helper,
+                helper_symbol=node.helper_symbol,
+                cases=tuple(sorted(case_targets)),
+                key_range=node.key_range,
+            )
+            link = _DispatchLink(
+                statement=statement,
+                case_targets=case_targets,
+                default_target=node.default,
+                origin_offset=origin_offset,
+            )
+            return [statement], [], [link]
+        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], [], []
 
     def _convert_call(
         self,
@@ -669,7 +729,7 @@ class ASTBuilder:
     def _format_exit_hint(self, exit_reasons: Tuple[str, ...]) -> str:
         if not exit_reasons:
             return ""
-        mapping = {"return": "return", "tail_call": "tail_call"}
+        mapping = {"return": "return", "tail_call": "tail_call", "dispatch": "dispatch"}
         return "|".join(mapping.get(reason, reason) for reason in exit_reasons)
 
     @staticmethod

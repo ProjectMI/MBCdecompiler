@@ -799,6 +799,7 @@ class IRSwitchDispatch(IRNode):
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
+    key_range: Optional[Tuple[int, int]] = None
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -812,6 +813,9 @@ class IRSwitchDispatch(IRNode):
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"
+        if self.key_range is not None:
+            start, end = self.key_range
+            description += f" range=0x{start:02X}-0x{end:02X}"
         return description
 
 
