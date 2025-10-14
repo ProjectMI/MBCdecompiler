@@ -632,6 +632,11 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._dispatch_table_symbols: Dict[
+            Tuple[Optional[int], Tuple[Tuple[int, int], ...], Optional[int]],
+            str,
+        ] = {}
+        self._dispatch_table_counters: Dict[str, int] = defaultdict(int)
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -2541,11 +2546,16 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            sorted_cases = tuple(sorted(cases, key=lambda entry: entry.key))
+            table_symbol = self._dispatch_table_symbol(
+                helper_target, helper_symbol, sorted_cases, default
+            )
             dispatch = IRSwitchDispatch(
-                cases=tuple(sorted(cases, key=lambda entry: entry.key)),
+                cases=sorted_cases,
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
+                table_symbol=table_symbol,
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
@@ -2879,6 +2889,62 @@ class IRNormalizer:
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    def _dispatch_table_symbol(
+        self,
+        helper_target: Optional[int],
+        helper_symbol: Optional[str],
+        cases: Sequence[IRDispatchCase],
+        default_target: Optional[int],
+    ) -> str:
+        signature = tuple(sorted((case.key, case.target) for case in cases))
+        key = (helper_target, signature, default_target)
+        cached = self._dispatch_table_symbols.get(key)
+        if cached is not None:
+            return cached
+
+        base = self._dispatch_table_symbol_base(
+            helper_target, helper_symbol, signature, default_target
+        )
+        index = self._dispatch_table_counters[base]
+        self._dispatch_table_counters[base] += 1
+        symbol = base if index == 0 else f"{base}_{index + 1}"
+        self._dispatch_table_symbols[key] = symbol
+        return symbol
+
+    def _dispatch_table_symbol_base(
+        self,
+        helper_target: Optional[int],
+        helper_symbol: Optional[str],
+        signature: Tuple[Tuple[int, int], ...],
+        default_target: Optional[int],
+    ) -> str:
+        tokens: List[str] = []
+        if helper_symbol:
+            tokens.append(helper_symbol)
+        elif helper_target is not None:
+            tokens.append(f"helper_{helper_target:04X}")
+        else:
+            targets = sorted({target for _, target in signature})
+            if targets:
+                if len(targets) == 1:
+                    tokens.append(f"dispatch_{targets[0]:04X}")
+                else:
+                    tokens.append(f"dispatch_{targets[0]:04X}_{len(targets)}")
+        if signature:
+            if len(signature) == 1:
+                tokens.append(f"key_{signature[0][0]:02X}")
+            else:
+                first_key = signature[0][0]
+                last_key = signature[-1][0]
+                tokens.append(f"keys_{first_key:02X}_{last_key:02X}")
+        if default_target is not None:
+            tokens.append(f"default_{default_target:04X}")
+
+        base = "_".join(tokens) or "dispatch_table"
+        sanitized = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in base)
+        sanitized = sanitized.strip("_") or "dispatch_table"
+        return sanitized
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0

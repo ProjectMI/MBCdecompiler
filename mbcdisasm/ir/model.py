@@ -799,6 +799,7 @@ class IRSwitchDispatch(IRNode):
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
+    table_symbol: Optional[str] = None
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -809,6 +810,8 @@ class IRSwitchDispatch(IRNode):
             helper_details = f"helper={helper_repr}"
         case_text = ", ".join(case.describe() for case in self.cases)
         description = f"dispatch {helper_details} cases=[{case_text}]"
+        if self.table_symbol:
+            description += f" table={self.table_symbol}"
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"
