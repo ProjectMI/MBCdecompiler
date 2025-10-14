@@ -275,15 +275,14 @@ class ASTBranch(ASTStatement):
     """Generic conditional branch."""
 
     condition: ASTExpression
-    then_target: int
-    else_target: int
+    then_block: "ASTBlock | None" = None
+    else_block: "ASTBlock | None" = None
 
     def render(self) -> str:
         condition = self.condition.render()
-        return (
-            f"if {condition} then 0x{self.then_target:04X} "
-            f"else 0x{self.else_target:04X}"
-        )
+        then_label = self.then_block.label if self.then_block else "?"
+        else_label = self.else_block.label if self.else_block else "?"
+        return f"if {condition} then {then_label} else {else_label}"
 
 
 @dataclass(frozen=True)
@@ -292,13 +291,15 @@ class ASTTestSet(ASTStatement):
 
     var: ASTExpression
     expr: ASTExpression
-    then_target: int
-    else_target: int
+    then_block: "ASTBlock | None" = None
+    else_block: "ASTBlock | None" = None
 
     def render(self) -> str:
+        then_label = self.then_block.label if self.then_block else "?"
+        else_label = self.else_block.label if self.else_block else "?"
         return (
             f"testset {self.var.render()} = {self.expr.render()} "
-            f"then 0x{self.then_target:04X} else 0x{self.else_target:04X}"
+            f"then {then_label} else {else_label}"
         )
 
 
@@ -307,14 +308,13 @@ class ASTFlagCheck(ASTStatement):
     """Branch that checks a VM flag."""
 
     flag: int
-    then_target: int
-    else_target: int
+    then_block: "ASTBlock | None" = None
+    else_block: "ASTBlock | None" = None
 
     def render(self) -> str:
-        return (
-            f"flag 0x{self.flag:04X} ? then 0x{self.then_target:04X} "
-            f"else 0x{self.else_target:04X}"
-        )
+        then_label = self.then_block.label if self.then_block else "?"
+        else_label = self.else_block.label if self.else_block else "?"
+        return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
 
 
 @dataclass(frozen=True)
@@ -323,13 +323,15 @@ class ASTFunctionPrologue(ASTStatement):
 
     var: ASTExpression
     expr: ASTExpression
-    then_target: int
-    else_target: int
+    then_block: "ASTBlock | None" = None
+    else_block: "ASTBlock | None" = None
 
     def render(self) -> str:
+        then_label = self.then_block.label if self.then_block else "?"
+        else_label = self.else_block.label if self.else_block else "?"
         return (
             f"prologue {self.var.render()} = {self.expr.render()} "
-            f"then 0x{self.then_target:04X} else 0x{self.else_target:04X}"
+            f"then {then_label} else {else_label}"
         )
 
 
@@ -348,14 +350,14 @@ class ASTComment(ASTStatement):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTBlock:
     """Single basic block in the reconstructed AST."""
 
     label: str
     start_offset: int
     statements: Tuple[ASTStatement, ...]
-    successors: Tuple[int, ...]
+    successors: Tuple["ASTBlock", ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

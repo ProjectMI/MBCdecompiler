@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple, Union
 
 from ..ir.model import (
     IRBlock,
@@ -67,6 +67,18 @@ class _BlockAnalysis:
     block: IRBlock
     successors: Tuple[int, ...]
     exit_reasons: Tuple[str, ...]
+
+
+BranchStatement = Union[ASTBranch, ASTTestSet, ASTFlagCheck, ASTFunctionPrologue]
+
+
+@dataclass
+class _PendingBranch:
+    """Link a branch-like statement to the offsets of its successors."""
+
+    statement: BranchStatement
+    then_offset: int
+    else_offset: int
 
 
 class ASTBuilder:
@@ -162,6 +174,8 @@ class ASTBuilder:
         current_reasons: Tuple[str, ...] = tuple()
         exit_offsets: Set[int] = set()
         value_state: Dict[str, ASTExpression] = {}
+        current_pending: List[_PendingBranch] = []
+        successor_offsets: Dict[int, Tuple[int, ...]] = {}
         sorted_offsets = sorted(analyses)
         for offset in sorted_offsets:
             analysis = analyses[offset]
@@ -169,57 +183,103 @@ class ASTBuilder:
             if offset in entry_reasons:
                 if current_blocks:
                     procedures.append(
-                        ASTProcedure(
+                        self._finalise_procedure(
                             name=f"proc_{len(procedures)}",
                             entry_offset=current_entry or current_blocks[0].start_offset,
                             entry_reasons=current_reasons,
-                            blocks=tuple(current_blocks),
-                            exit_offsets=tuple(sorted(exit_offsets)),
+                            blocks=current_blocks,
+                            exit_offsets=exit_offsets,
+                            pending=current_pending,
+                            successor_offsets=successor_offsets,
                         )
                     )
                     current_blocks = []
                     exit_offsets = set()
                     value_state = {}
+                    current_pending = []
+                    successor_offsets = {}
                 current_entry = offset
                 current_reasons = entry_reasons[offset]
-            ast_block = self._convert_block(analysis, value_state, metrics)
+            ast_block, pending_branches = self._convert_block(analysis, value_state, metrics)
             current_blocks.append(ast_block)
+            successor_offsets[ast_block.start_offset] = analysis.successors
+            current_pending.extend(pending_branches)
             if analysis.exit_reasons:
                 exit_offsets.add(offset)
         if current_blocks:
             procedures.append(
-                ASTProcedure(
+                self._finalise_procedure(
                     name=f"proc_{len(procedures)}",
                     entry_offset=current_entry or current_blocks[0].start_offset,
                     entry_reasons=current_reasons,
-                    blocks=tuple(current_blocks),
-                    exit_offsets=tuple(sorted(exit_offsets)),
+                    blocks=current_blocks,
+                    exit_offsets=exit_offsets,
+                    pending=current_pending,
+                    successor_offsets=successor_offsets,
                 )
             )
         return procedures
+
+    def _finalise_procedure(
+        self,
+        *,
+        name: str,
+        entry_offset: int,
+        entry_reasons: Tuple[str, ...],
+        blocks: List[ASTBlock],
+        exit_offsets: Set[int],
+        pending: List[_PendingBranch],
+        successor_offsets: Mapping[int, Tuple[int, ...]],
+    ) -> ASTProcedure:
+        block_map = {block.start_offset: block for block in blocks}
+        for block in blocks:
+            offsets = successor_offsets.get(block.start_offset, tuple())
+            block.successors = tuple(
+                block_map[offset] for offset in offsets if offset in block_map
+            )
+        for branch in pending:
+            if branch.then_offset in block_map:
+                object.__setattr__(
+                    branch.statement, "then_block", block_map[branch.then_offset]
+                )
+            if branch.else_offset in block_map:
+                object.__setattr__(
+                    branch.statement, "else_block", block_map[branch.else_offset]
+                )
+        return ASTProcedure(
+            name=name,
+            entry_offset=entry_offset,
+            entry_reasons=entry_reasons,
+            blocks=tuple(blocks),
+            exit_offsets=tuple(sorted(exit_offsets)),
+        )
 
     def _convert_block(
         self,
         analysis: _BlockAnalysis,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
-    ) -> ASTBlock:
+    ) -> Tuple[ASTBlock, List[_PendingBranch]]:
         block = analysis.block
         statements: List[ASTStatement] = []
+        pending: List[_PendingBranch] = []
         for node in block.nodes:
-            statements.extend(self._convert_node(node, value_state, metrics))
-        return ASTBlock(
+            statements.extend(
+                self._convert_node(node, value_state, metrics, pending)
+            )
+        ast_block = ASTBlock(
             label=block.label,
             start_offset=block.start_offset,
             statements=tuple(statements),
-            successors=analysis.successors,
         )
+        return ast_block, pending
 
     def _convert_node(
         self,
         node,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
+        pending: List[_PendingBranch],
     ) -> Iterable[ASTStatement]:
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
@@ -331,37 +391,49 @@ class ASTBuilder:
             return self._frame_finalize(node.steps)
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
-            return [ASTBranch(condition=condition, then_target=node.then_target, else_target=node.else_target)]
+            branch = ASTBranch(condition=condition)
+            pending.append(
+                _PendingBranch(
+                    statement=branch,
+                    then_offset=node.then_target,
+                    else_offset=node.else_target,
+                )
+            )
+            return [branch]
         if isinstance(node, IRTestSetBranch):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
-            return [
-                ASTTestSet(
-                    var=var_expr,
-                    expr=expr,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+            statement = ASTTestSet(var=var_expr, expr=expr)
+            pending.append(
+                _PendingBranch(
+                    statement=statement,
+                    then_offset=node.then_target,
+                    else_offset=node.else_target,
                 )
-            ]
+            )
+            return [statement]
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
-            return [
-                ASTFunctionPrologue(
-                    var=var_expr,
-                    expr=expr,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+            statement = ASTFunctionPrologue(var=var_expr, expr=expr)
+            pending.append(
+                _PendingBranch(
+                    statement=statement,
+                    then_offset=node.then_target,
+                    else_offset=node.else_target,
                 )
-            ]
+            )
+            return [statement]
         if isinstance(node, IRFlagCheck):
-            return [
-                ASTFlagCheck(
-                    flag=node.flag,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+            statement = ASTFlagCheck(flag=node.flag)
+            pending.append(
+                _PendingBranch(
+                    statement=statement,
+                    then_offset=node.then_target,
+                    else_offset=node.else_target,
                 )
-            ]
+            )
+            return [statement]
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())]
 
     def _convert_call(

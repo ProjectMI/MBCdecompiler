@@ -49,7 +49,7 @@ class ASTTextRenderer:
         yield ""
 
     def _render_block(self, block: ASTBlock) -> Iterable[str]:
-        successors = ", ".join(f"0x{target:04X}" for target in block.successors)
+        successors = ", ".join(target.label for target in block.successors)
         yield f"  block {block.label} offset=0x{block.start_offset:04X} succ=[{successors}]"
         for statement in block.statements:
             yield f"    {statement.render()}"
