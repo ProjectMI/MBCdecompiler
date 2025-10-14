@@ -216,8 +216,8 @@ class HeuristicEngine:
         for profile in profiles:
             operand = profile.operand
             alias = profile.operand_alias()
-            if operand in IO_SLOT_ALIASES or alias == "IO_SLOT":
-                alias_evidence.append(f"{profile.label}->IO_SLOT")
+            if operand in IO_SLOT_ALIASES or alias == "ChatOut":
+                alias_evidence.append(f"{profile.label}->ChatOut")
             elif operand == RET_MASK or alias == "RET_MASK":
                 alias_evidence.append(f"{profile.label}->RET_MASK")
             elif operand in {FANOUT_FLAGS_A, FANOUT_FLAGS_B} or alias == "FANOUT_FLAGS":
