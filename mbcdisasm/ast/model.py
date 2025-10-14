@@ -155,7 +155,7 @@ class ASTCallResult(ASTExpression):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTStatement:
     """Base class for AST statements."""
 
@@ -163,7 +163,7 @@ class ASTStatement:
         raise NotImplementedError
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTAssign(ASTStatement):
     """Assign an expression to a target identifier."""
 
@@ -174,7 +174,7 @@ class ASTAssign(ASTStatement):
         return f"{self.target.render()} = {self.value.render()}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTStore(ASTStatement):
     """Store ``value`` into the location described by ``target``."""
 
@@ -185,7 +185,7 @@ class ASTStore(ASTStatement):
         return f"store {self.value.render()} -> {self.target.render()}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTCallStatement(ASTStatement):
     """Call that yields one or more return values."""
 
@@ -199,7 +199,7 @@ class ASTCallStatement(ASTStatement):
         return f"{outputs} = {self.call.render()}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTIORead(ASTStatement):
     """I/O read effect emitted by helper façades."""
 
@@ -209,7 +209,7 @@ class ASTIORead(ASTStatement):
         return f"io.read({self.port})"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTIOWrite(ASTStatement):
     """I/O write effect emitted by helper façades."""
 
@@ -221,7 +221,7 @@ class ASTIOWrite(ASTStatement):
         return f"io.write({self.port}{mask})"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTFrameFinalize(ASTStatement):
     """Collapse the helper scaffolding that discharges the active frame."""
 
@@ -238,7 +238,7 @@ class ASTFrameFinalize(ASTStatement):
         return f"frame.finalize{suffix}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTTailCall(ASTStatement):
     """Tail call used as a return."""
 
@@ -248,10 +248,13 @@ class ASTTailCall(ASTStatement):
     def render(self) -> str:
         rendered = ", ".join(expr.render() for expr in self.returns)
         suffix = f" returns [{rendered}]" if rendered else ""
-        return f"tail {self.call.render()}{suffix}"
+        call_repr = self.call.render()
+        if self.call.tail and call_repr.startswith("tail "):
+            call_repr = call_repr[len("tail ") :]
+        return f"tail {call_repr}{suffix}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTReturn(ASTStatement):
     """Return from the current procedure."""
 
@@ -270,70 +273,80 @@ class ASTReturn(ASTStatement):
         return f"return {payload}{mask}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTBranch(ASTStatement):
-    """Generic conditional branch."""
+    """Generic conditional branch with CFG links."""
 
     condition: ASTExpression
-    then_target: int
-    else_target: int
+    then_branch: "ASTBlock | None" = None
+    else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
         condition = self.condition.render()
-        return (
-            f"if {condition} then 0x{self.then_target:04X} "
-            f"else 0x{self.else_target:04X}"
-        )
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        return f"if {condition} then {then_label} else {else_label}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTTestSet(ASTStatement):
     """Branch that stores a predicate before testing it."""
 
     var: ASTExpression
     expr: ASTExpression
-    then_target: int
-    else_target: int
+    then_branch: "ASTBlock | None" = None
+    else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (
             f"testset {self.var.render()} = {self.expr.render()} "
-            f"then 0x{self.then_target:04X} else 0x{self.else_target:04X}"
+            f"then {then_label} else {else_label}"
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTFlagCheck(ASTStatement):
     """Branch that checks a VM flag."""
 
     flag: int
-    then_target: int
-    else_target: int
+    then_branch: "ASTBlock | None" = None
+    else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
-        return (
-            f"flag 0x{self.flag:04X} ? then 0x{self.then_target:04X} "
-            f"else 0x{self.else_target:04X}"
-        )
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTFunctionPrologue(ASTStatement):
     """Reconstructed function prologue sequence."""
 
     var: ASTExpression
     expr: ASTExpression
-    then_target: int
-    else_target: int
+    then_branch: "ASTBlock | None" = None
+    else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (
             f"prologue {self.var.render()} = {self.expr.render()} "
-            f"then 0x{self.then_target:04X} else 0x{self.else_target:04X}"
+            f"then {then_label} else {else_label}"
         )
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTComment(ASTStatement):
     """Fallback wrapper for nodes that currently lack dedicated support."""
 
@@ -348,14 +361,14 @@ class ASTComment(ASTStatement):
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTBlock:
     """Single basic block in the reconstructed AST."""
 
     label: str
     start_offset: int
     statements: Tuple[ASTStatement, ...]
-    successors: Tuple[int, ...]
+    successors: Tuple["ASTBlock", ...]
 
 
 @dataclass(frozen=True)
