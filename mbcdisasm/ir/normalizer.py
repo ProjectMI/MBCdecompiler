@@ -351,6 +351,7 @@ EPILOGUE_ALLOWED_NODE_TYPES = (
 )
 
 IO_HELPER_MNEMONICS = {"call_helpers", "op_F0_4B", "op_4A_10"}
+CHATOUT_PRESERVE_MNEMONICS = {"op_3D_30"}
 CALL_HELPER_FACADE_MNEMONICS = {"op_05_F0", "op_FD_4A"}
 FANOUT_FACADE_MNEMONICS = {"op_10_32"}
 
@@ -839,6 +840,7 @@ class IRNormalizer:
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
+        self._split_preserved_cleanup_nodes(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
@@ -889,6 +891,18 @@ class IRNormalizer:
                     )
                 )
             else:
+                if isinstance(item, IRCallCleanup):
+                    absorbed, preserved = self._partition_cleanup_steps(item.steps)
+                    if absorbed and preserved:
+                        nodes.append(IRCallCleanup(steps=tuple(absorbed)))
+                        nodes.append(IRCallCleanup(steps=tuple(preserved)))
+                        continue
+                if isinstance(item, IRTailCall):
+                    preserved = tuple(
+                        step for step in item.cleanup if step.operand_alias == "ChatOut"
+                    )
+                    if preserved:
+                        nodes.append(IRCallCleanup(steps=preserved))
                 nodes.append(item)
 
         ir_block = IRBlock(
@@ -1821,6 +1835,7 @@ class IRNormalizer:
                 continue
 
             steps = self._coalesce_epilogue_steps(steps)
+            steps = self._reorder_cleanup_steps(steps)
 
             prev_index = start - 1
             while prev_index >= 0 and isinstance(
@@ -1842,7 +1857,23 @@ class IRNormalizer:
             if next_index < len(items) and isinstance(items[next_index], IRReturn):
                 return_node = items[next_index]
                 assert isinstance(return_node, IRReturn)
-                combined = return_node.cleanup + tuple(steps)
+                absorbed_steps, preserved_steps = self._partition_cleanup_steps(steps)
+                detached_steps = [
+                    step for step in absorbed_steps if step.operand_alias == "ChatOut"
+                ]
+                retained_absorbed = [
+                    step for step in absorbed_steps if step.operand_alias != "ChatOut"
+                ]
+                base_cleanup = return_node.cleanup + tuple(retained_absorbed)
+                include_preserved = False
+                if preserved_steps:
+                    if any(step.mnemonic == "op_F0_E8" for step in base_cleanup):
+                        include_preserved = True
+                if include_preserved:
+                    combined = base_cleanup + tuple(preserved_steps)
+                    preserved_steps = []
+                else:
+                    combined = base_cleanup
                 mask = self._extract_cleanup_mask(combined)
                 updated = IRReturn(
                     values=return_node.values,
@@ -1853,14 +1884,50 @@ class IRNormalizer:
                     ),
                 )
                 self._transfer_ssa(return_node, updated)
+                removed = end - start
                 items.replace_slice(start, end, [])
-                next_index -= len(steps)
-                items.replace_slice(next_index, next_index + 1, [updated])
-                index = next_index + 1
+                return_pos = next_index - removed
+                if detached_steps:
+                    items.insert(return_pos, IRCallCleanup(steps=tuple(detached_steps)))
+                    return_pos += 1
+                if preserved_steps:
+                    items.insert(return_pos, IRCallCleanup(steps=tuple(preserved_steps)))
+                    return_pos += 1
+                items.replace_slice(return_pos, return_pos + 1, [updated])
+                index = return_pos + 1
                 continue
 
-            items.replace_slice(start, end, [IRCallCleanup(steps=tuple(steps))])
-            index = start + 1
+            absorbed_steps, preserved_steps = self._partition_cleanup_steps(steps)
+            replacements: List[IRCallCleanup] = []
+            if absorbed_steps:
+                replacements.append(IRCallCleanup(steps=tuple(absorbed_steps)))
+            if preserved_steps:
+                replacements.append(IRCallCleanup(steps=tuple(preserved_steps)))
+            if replacements:
+                items.replace_slice(start, end, replacements)
+                index = start + len(replacements)
+            else:
+                items.replace_slice(start, end, [])
+            continue
+
+    def _split_preserved_cleanup_nodes(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, IRCallCleanup):
+                index += 1
+                continue
+
+            absorbed, preserved = self._partition_cleanup_steps(node.steps)
+            if absorbed and preserved:
+                replacements = [
+                    IRCallCleanup(steps=tuple(absorbed)),
+                    IRCallCleanup(steps=tuple(preserved)),
+                ]
+                items.replace_slice(index, index + 1, replacements)
+                index += len(replacements)
+                continue
+            index += 1
 
     def _pass_io_operations(self, items: _ItemList) -> None:
         index = 0
@@ -1978,20 +2045,42 @@ class IRNormalizer:
         self, cleanup: IRCallCleanup, *, trailing: bool
     ) -> Tuple[Tuple[IRStackEffect, ...], Tuple[IRStackEffect, ...]]:
         steps = list(cleanup.steps)
-        extracted: List[IRStackEffect] = []
         if trailing:
-            while steps and self._is_io_helper_step(steps[-1]):
-                extracted.insert(0, steps.pop())
+            index = len(steps) - 1
+            while index >= 0 and not self._is_io_helper_step(steps[index]):
+                index -= 1
+            if index < 0:
+                return tuple(), tuple(cleanup.steps)
+            start = index
+            while start >= 0 and self._is_io_helper_step(steps[start]):
+                start -= 1
+            start += 1
+            extracted = steps[start : index + 1]
+            remaining = steps[:start] + steps[index + 1 :]
         else:
-            while steps and self._is_io_helper_step(steps[0]):
-                extracted.append(steps.pop(0))
-        if not extracted:
-            return tuple(), tuple(cleanup.steps)
-        return tuple(extracted), tuple(steps)
+            index = 0
+            while index < len(steps) and not self._is_io_helper_step(steps[index]):
+                index += 1
+            if index >= len(steps):
+                return tuple(), tuple(cleanup.steps)
+            end = index
+            while end < len(steps) and self._is_io_helper_step(steps[end]):
+                end += 1
+            extracted = steps[index:end]
+            remaining = steps[:index] + steps[end:]
+        return tuple(extracted), tuple(remaining)
 
     @staticmethod
     def _is_io_helper_step(step: IRStackEffect) -> bool:
-        return step.mnemonic in IO_HELPER_MNEMONICS
+        if step.mnemonic not in IO_HELPER_MNEMONICS:
+            return False
+        if step.mnemonic != "call_helpers":
+            return True
+        alias = step.operand_alias
+        if not alias:
+            return True
+        lowered = alias.lower()
+        return lowered.startswith("io") or "bridge" in lowered
 
     def _io_facade_neighbor_index(
         self, items: _ItemList, index: int, *, direction: int
@@ -2920,8 +3009,21 @@ class IRNormalizer:
                 while pre >= 0 and isinstance(items[pre], (IRCallCleanup, IRConditionMask)):
                     prefix = items[pre]
                     if isinstance(prefix, IRCallCleanup):
-                        cleanup_steps = list(prefix.steps) + cleanup_steps
+                        absorbed, preserved = self._partition_cleanup_steps(prefix.steps)
                         mask = mask or self._extract_cleanup_mask(prefix.steps)
+                        if absorbed:
+                            cleanup_steps = absorbed + cleanup_steps
+                        if preserved and absorbed:
+                            items.replace_slice(pre, pre + 1, [IRCallCleanup(steps=tuple(preserved))])
+                            pre -= 1
+                            continue
+                        if preserved:
+                            pre -= 1
+                            continue
+                        items.pop(pre)
+                        index -= 1
+                        pre -= 1
+                        continue
                     else:
                         mask = mask or prefix.mask
                     items.pop(pre)
@@ -2932,13 +3034,27 @@ class IRNormalizer:
                 while follow < len(items) and isinstance(items[follow], (IRCallCleanup, IRConditionMask)):
                     suffix = items[follow]
                     if isinstance(suffix, IRCallCleanup):
-                        cleanup_steps.extend(suffix.steps)
+                        absorbed, preserved = self._partition_cleanup_steps(suffix.steps)
                         mask = mask or self._extract_cleanup_mask(suffix.steps)
+                        if absorbed:
+                            cleanup_steps.extend(absorbed)
+                        if preserved and absorbed:
+                            items.replace_slice(
+                                follow, follow + 1, [IRCallCleanup(steps=tuple(preserved))]
+                            )
+                            follow += 1
+                            continue
+                        if preserved:
+                            follow += 1
+                            continue
+                        items.pop(follow)
+                        continue
                     else:
                         mask = mask or suffix.mask
                     items.pop(follow)
 
                 cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+                cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
                 mask = mask or item.cleanup_mask
 
                 updated_call = IRCall(
@@ -2975,8 +3091,21 @@ class IRNormalizer:
             while pre >= 0 and isinstance(items[pre], (IRCallCleanup, IRConditionMask)):
                 prefix = items[pre]
                 if isinstance(prefix, IRCallCleanup):
-                    cleanup_steps = list(prefix.steps) + cleanup_steps
+                    absorbed, preserved = self._partition_cleanup_steps(prefix.steps)
                     mask = mask or self._extract_cleanup_mask(prefix.steps)
+                    if absorbed:
+                        cleanup_steps = absorbed + cleanup_steps
+                    if preserved and absorbed:
+                        items.replace_slice(pre, pre + 1, [IRCallCleanup(steps=tuple(preserved))])
+                        pre -= 1
+                        continue
+                    if preserved:
+                        pre -= 1
+                        continue
+                    items.pop(pre)
+                    index -= 1
+                    pre -= 1
+                    continue
                 else:
                     mask = mask or prefix.mask
                 items.pop(pre)
@@ -2987,13 +3116,27 @@ class IRNormalizer:
             while follow < len(items) and isinstance(items[follow], (IRCallCleanup, IRConditionMask)):
                 suffix = items[follow]
                 if isinstance(suffix, IRCallCleanup):
-                    cleanup_steps.extend(suffix.steps)
+                    absorbed, preserved = self._partition_cleanup_steps(suffix.steps)
                     mask = mask or self._extract_cleanup_mask(suffix.steps)
+                    if absorbed:
+                        cleanup_steps.extend(absorbed)
+                    if preserved and absorbed:
+                        items.replace_slice(
+                            follow, follow + 1, [IRCallCleanup(steps=tuple(preserved))]
+                        )
+                        follow += 1
+                        continue
+                    if preserved:
+                        follow += 1
+                        continue
+                    items.pop(follow)
+                    continue
                 else:
                     mask = mask or suffix.mask
                 items.pop(follow)
 
             cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
+            cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
             mask = mask or item.cleanup_mask
 
             returns = item.returns
@@ -4188,6 +4331,8 @@ class IRNormalizer:
     def _has_mask_operand(instruction: RawInstruction) -> bool:
         alias = instruction.profile.operand_alias()
         if alias and alias in MASK_OPERAND_ALIASES:
+            if alias == "ChatOut":
+                return False
             return True
         operand = instruction.operand
         if operand == RET_MASK or operand in IO_SLOT_ALIASES:
@@ -4210,6 +4355,9 @@ class IRNormalizer:
         return event.delta < 0
 
     def _is_neutral_cleanup_step(self, instruction: RawInstruction) -> bool:
+        if instruction.mnemonic in {"op_C8_06", "op_D4_06"}:
+            return False
+
         event = instruction.event
         if event.delta > 0:
             return False
@@ -4217,7 +4365,29 @@ class IRNormalizer:
             return False
         if self._is_stack_teardown_step(instruction):
             return True
-        return self._has_mask_operand(instruction)
+        if self._has_mask_operand(instruction):
+            return True
+
+        # Some helpers observed in massive dispatcher segments (for example the
+        # ``_pcontrol`` script) emit long chains of instructions that neither
+        # touch the stack nor expose any observable side effects.  The pipeline
+        # tracker therefore marks them as ``uncertain`` which previously caused
+        # the normaliser to leave them behind as ``meta`` annotations.  These
+        # opcodes always surround call / return sequences and effectively act as
+        # lightweight cleanup stubs.  Treat strictly stack-neutral and
+        # side-effect free instructions as cleanup candidates so they can be
+        # absorbed into the surrounding ``IRCallCleanup`` nodes instead of
+        # polluting the final IR with thousands of ``meta`` comments.
+        if (
+            event.delta == 0
+            and not event.popped_types
+            and instruction.event.uncertain
+            and not self._has_profile_side_effects(instruction)
+            and not instruction.profile.is_control()
+            and instruction.profile.kind not in STACK_NEUTRAL_CONTROL_KINDS
+        ):
+            return True
+        return False
 
     def _cleanup_accepts_literal(
         self, instruction: RawInstruction, cleanup: IRCallCleanup
@@ -4252,6 +4422,8 @@ class IRNormalizer:
         if profile.is_control():
             return False
         if profile.kind in STACK_NEUTRAL_CONTROL_KINDS:
+            return False
+        if profile.operand_alias():
             return False
         if self._has_profile_side_effects(instruction):
             return False
@@ -4544,6 +4716,47 @@ class IRNormalizer:
             combined.append(step)
             index += 1
         return combined
+
+    @staticmethod
+    def _reorder_cleanup_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:
+        if len(steps) <= 1:
+            return list(steps)
+
+        prefix: List[IRStackEffect] = []
+        suffix: List[IRStackEffect] = []
+        for step in steps:
+            if step.operand_alias == "ChatOut":
+                suffix.append(step)
+            else:
+                prefix.append(step)
+        return prefix + suffix
+
+    @staticmethod
+    def _preserve_cleanup_node(cleanup: IRCallCleanup) -> bool:
+        return any(step.operand_alias == "ChatOut" for step in cleanup.steps)
+
+    def _should_preserve_chatout_step(
+        self, step: IRStackEffect, steps: Sequence[IRStackEffect]
+    ) -> bool:
+        if step.operand_alias != "ChatOut":
+            return False
+        if step.mnemonic not in CHATOUT_PRESERVE_MNEMONICS:
+            return False
+        if any(other.mnemonic == "op_D4_06" for other in steps):
+            return False
+        return True
+
+    def _partition_cleanup_steps(
+        self, steps: Sequence[IRStackEffect]
+    ) -> Tuple[List[IRStackEffect], List[IRStackEffect]]:
+        absorbed: List[IRStackEffect] = []
+        preserved: List[IRStackEffect] = []
+        for step in steps:
+            if self._should_preserve_chatout_step(step, steps):
+                preserved.append(step)
+            else:
+                absorbed.append(step)
+        return absorbed, preserved
 
     @staticmethod
     def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
