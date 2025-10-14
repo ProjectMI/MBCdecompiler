@@ -1496,7 +1496,9 @@ def test_normalizer_extracts_table_dispatch(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    dispatch = next(
+        node for node in block.nodes if isinstance(node, IRSwitchDispatch) and not node.fragment
+    )
     keys = {case.key for case in dispatch.cases}
     targets = {case.target for case in dispatch.cases}
 

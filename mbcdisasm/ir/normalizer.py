@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
@@ -534,6 +534,39 @@ class _TableBuilderState:
     parameters: List[str]
 
 
+@dataclass
+class _DispatchTable:
+    """Aggregated dispatch information reconstructed from fragments."""
+
+    cases: Dict[int, IRDispatchCase] = field(default_factory=dict)
+    default: Optional[int] = None
+    sources: List[Tuple[Tuple[str, int], ...]] = field(default_factory=list)
+    reliable: bool = True
+
+    def register_fragment(
+        self,
+        cases: Sequence[IRDispatchCase],
+        default: Optional[int],
+        operations: Sequence[Tuple[str, int]],
+    ) -> None:
+        if not cases and default is None:
+            return
+        for case in cases:
+            current = self.cases.get(case.key)
+            if current is None:
+                self.cases[case.key] = case
+                continue
+            if current.target != case.target or current.symbol != case.symbol:
+                self.reliable = False
+        if default is not None:
+            if self.default is None:
+                self.default = default
+            elif self.default != default:
+                self.reliable = False
+        if operations:
+            self.sources.append(tuple(operations))
+
+
 class IRNormalizer:
     """Drive the multi-pass IR normalisation pipeline."""
 
@@ -632,6 +665,7 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._dispatch_tables: Dict[int, _DispatchTable] = defaultdict(_DispatchTable)
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -655,6 +689,7 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._dispatch_tables.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -823,6 +858,7 @@ class IRNormalizer:
         self._pass_table_patches(items)
         self._pass_table_dispatch(items)
         self._pass_dispatch_wrappers(items)
+        self._pass_promote_dispatch_calls(items)
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
@@ -2523,18 +2559,7 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            helper_target: Optional[int] = None
-            helper_symbol: Optional[str] = None
-            follow = index + 1
-            while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
-                follow += 1
-            if follow < len(items):
-                candidate = items[follow]
-                if isinstance(candidate, CallLike):
-                    target = getattr(candidate, "target", None)
-                    if isinstance(target, int) and target in {0x6623, 0x6624}:
-                        helper_target = target
-                        helper_symbol = self.knowledge.lookup_address(target)
+            helper_target, helper_symbol = self._resolve_dispatch_helper(items, index)
 
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
@@ -2546,7 +2571,11 @@ class IRNormalizer:
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
+                sources=(item.operations,),
+                fragment=True,
             )
+            if helper_target is not None:
+                self._register_dispatch_fragment(helper_target, cases, default, item.operations)
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
 
@@ -2554,7 +2583,7 @@ class IRNormalizer:
         index = 0
         while index < len(items):
             node = items[index]
-            if not isinstance(node, IRSwitchDispatch):
+            if not (isinstance(node, IRSwitchDispatch) and node.fragment):
                 index += 1
                 continue
 
@@ -2675,6 +2704,29 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _pass_promote_dispatch_calls(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if isinstance(node, CallLike):
+                target = getattr(node, "target", None)
+                if isinstance(target, int):
+                    helper = target & 0xFFFF
+                    table = self._dispatch_tables.get(helper)
+                    if table and table.reliable and table.cases:
+                        cases = tuple(sorted(table.cases.values(), key=lambda entry: entry.key))
+                        dispatch = IRSwitchDispatch(
+                            cases=cases,
+                            helper=helper,
+                            helper_symbol=self._helper_symbol(helper),
+                            default=table.default,
+                            sources=tuple(table.sources),
+                        )
+                        self._transfer_ssa(node, dispatch)
+                        items.replace_slice(index, index + 1, [dispatch])
+                        node = dispatch
+            index += 1
 
     def _pass_table_builders(self, items: _ItemList) -> None:
         state: Optional[_TableBuilderState] = None
@@ -2879,6 +2931,62 @@ class IRNormalizer:
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    def _register_dispatch_fragment(
+        self,
+        helper: int,
+        cases: Sequence[IRDispatchCase],
+        default: Optional[int],
+        operations: Sequence[Tuple[str, int]],
+    ) -> None:
+        table = self._dispatch_tables[helper & 0xFFFF]
+        table.register_fragment(cases, default, operations)
+
+    def _resolve_dispatch_helper(
+        self, items: _ItemList, index: int
+    ) -> Tuple[Optional[int], Optional[str]]:
+        helper_target: Optional[int] = None
+        helper_symbol: Optional[str] = None
+
+        scan = index + 1
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, CallLike):
+                target = getattr(candidate, "target", None)
+                if isinstance(target, int):
+                    helper_target = target & 0xFFFF
+                    helper_symbol = self._helper_symbol(helper_target)
+                break
+            if self._is_dispatch_wrapper_candidate(candidate):
+                scan += 1
+                continue
+            break
+
+        if helper_target is None:
+            scan = index - 1
+            while scan >= 0:
+                candidate = items[scan]
+                if isinstance(candidate, CallLike):
+                    target = getattr(candidate, "target", None)
+                    if isinstance(target, int):
+                        helper_target = target & 0xFFFF
+                        helper_symbol = self._helper_symbol(helper_target)
+                    break
+                if self._is_dispatch_wrapper_candidate(candidate):
+                    scan -= 1
+                    continue
+                break
+
+        return helper_target, helper_symbol
+
+    def _is_dispatch_wrapper_candidate(self, node: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(node, IRCallCleanup):
+            return True
+        if isinstance(node, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+            return True
+        if isinstance(node, RawInstruction):
+            return self._is_dispatch_wrapper_instruction(node)
+        return False
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0

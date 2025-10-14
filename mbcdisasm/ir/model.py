@@ -799,6 +799,8 @@ class IRSwitchDispatch(IRNode):
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
+    sources: Tuple[Tuple[Tuple[str, int], ...], ...] = field(default_factory=tuple)
+    fragment: bool = False
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -812,6 +814,8 @@ class IRSwitchDispatch(IRNode):
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"
+        if self.fragment:
+            description += " fragment"
         return description
 
 
