@@ -175,6 +175,41 @@ TAILCALL_HELPERS = {
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
+CALL_HELPER_ALIASES = {
+    0x0000: "fmt.buffer_reset",
+    0x0020: "fmt.helper_0020",
+    0x0029: "scheduler.mask_low",
+    0x002C: "scheduler.mask_high",
+    0x0041: "scheduler.mask_mid",
+    0x0069: "scheduler.mask_slot",
+    0x006C: "page.restore",
+    0x10E1: "io.bridge_setup",
+    0x2C04: "fmt.buffer_slice",
+    0x2DF0: "io.flush_batch",
+    0x2EF0: "io.flush_batch",
+    0x3100: "fmt.slot_commit",
+    0x3E4B: "fmt.banner_emit",
+    0x5B01: "fmt.chunk_emit",
+    0xED4D: "page.sync",
+    0xF0EB: "io.flush_mask",
+}
+
+
+TAIL_HELPER_ALIASES = {
+    0x003D: "fmt.aggregate_finalize",
+    0x003E: "fmt.aggregate_flush",
+    0x00ED: "fmt.aggregate_reset",
+    0x00F0: "io.flush_tail",
+    0x013D: "fmt.message_commit",
+    0x01EC: "fmt.template_apply",
+    0x01F1: "fmt.dispatch_commit",
+    0x032C: "fmt.dispatch_template",
+    0x0BF0: "io.flush_span",
+    0x0FF0: "io.flush_frame",
+    0x16F0: "io.flush_deferred",
+}
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -597,6 +632,14 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+
+    def _helper_symbol(self, helper: int) -> Optional[str]:
+        alias = TAIL_HELPER_ALIASES.get(helper)
+        if alias is None:
+            alias = CALL_HELPER_ALIASES.get(helper)
+        if alias is not None:
+            return alias
+        return self.knowledge.lookup_address(helper)
 
     # ------------------------------------------------------------------
     # public entry points
@@ -1167,12 +1210,12 @@ class IRNormalizer:
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
                 target = item.operand
-                symbol = self.knowledge.lookup_address(target)
+                symbol = self._helper_symbol(target)
                 if mnemonic == "tailcall_dispatch":
                     inline_target = self._extract_tail_dispatch_target(items, index)
                     if inline_target is not None:
                         target = inline_target
-                        symbol = self.knowledge.lookup_address(target)
+                        symbol = self._helper_symbol(target)
                         if args:
                             args = args[:-1]
                         if not args and start > 0:
@@ -3080,7 +3123,7 @@ class IRNormalizer:
             returns_node = next_node
             items.pop(index + 1)
 
-        symbol = self.knowledge.lookup_address(target)
+        symbol = self._helper_symbol(target)
 
         if cleanup_mask == RET_MASK and returns_node is not None:
             cleanup_chain = list(returns_node.cleanup)
@@ -3132,7 +3175,7 @@ class IRNormalizer:
     ) -> None:
         handshake_index = self._find_io_handshake(items, index)
         if handshake_index is None:
-            symbol = self.knowledge.lookup_address(target)
+            symbol = self._helper_symbol(target)
             replacement: CallLike
             cleanup: Tuple[IRStackEffect, ...] = tuple()
             args = getattr(node, "args", tuple())
@@ -4437,12 +4480,17 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
+        alias: Optional[str]
+        if mnemonic == "call_helpers":
+            alias = self._helper_symbol(operand)
+        else:
+            alias = instruction.profile.operand_alias()
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
             operand_role=instruction.profile.operand_role(),
-            operand_alias=instruction.profile.operand_alias(),
+            operand_alias=alias,
         )
 
     @staticmethod

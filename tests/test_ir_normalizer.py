@@ -712,6 +712,7 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
     assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "call_helpers"]
     assert cleanup.steps[1].operand == 0x3E4B
+    assert cleanup.steps[1].operand_alias == "fmt.banner_emit"
 
     io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
     assert len(io_writes) == 1
@@ -819,7 +820,7 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
-    assert any("call_helper_20" in text for text in descriptions)
+    assert any("fmt.helper_0020" in text for text in descriptions)
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:
