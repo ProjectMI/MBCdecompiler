@@ -1059,7 +1059,7 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "io.write(port=io.port_6910, mask=0x2910)" in descriptions
+    assert "io.write(port=ChatOut, mask=0x2910)" in descriptions
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
@@ -1724,7 +1724,7 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
 
     io_write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
     assert io_write.mask == 0x00FF
-    assert io_write.port == "io.port_6910"
+    assert io_write.port == "ChatOut"
 
 
 @pytest.mark.parametrize("operand", sorted(IO_SLOT_ALIASES - {IO_SLOT}))

@@ -332,7 +332,7 @@ STACK_NEUTRAL_CONTROL_KINDS = {
     InstructionKind.TAILCALL,
 }
 
-MASK_OPERAND_ALIASES = {"RET_MASK", "IO_SLOT", "FANOUT_FLAGS"}
+MASK_OPERAND_ALIASES = {"RET_MASK", "ChatOut", "FANOUT_FLAGS"}
 
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
@@ -4221,7 +4221,7 @@ class IRNormalizer:
             tokens.append(role.lower())
         if not tokens:
             return False
-        keywords = ("io_slot", "fanout", "ret_mask", "mask", "flag")
+        keywords = ("io_slot", "chatout", "fanout", "ret_mask", "mask", "flag")
         return any(any(keyword in text for keyword in keywords) for text in tokens)
 
     def _is_condition_mask_instruction(self, instruction: RawInstruction) -> bool:

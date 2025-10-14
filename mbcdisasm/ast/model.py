@@ -200,6 +200,45 @@ class ASTCallStatement(ASTStatement):
 
 
 @dataclass(frozen=True)
+class ASTIORead(ASTStatement):
+    """I/O read effect emitted by helper façades."""
+
+    port: str
+
+    def render(self) -> str:
+        return f"io.read({self.port})"
+
+
+@dataclass(frozen=True)
+class ASTIOWrite(ASTStatement):
+    """I/O write effect emitted by helper façades."""
+
+    port: str
+    mask: int | None = None
+
+    def render(self) -> str:
+        mask = "" if self.mask is None else f", mask=0x{self.mask:04X}"
+        return f"io.write({self.port}{mask})"
+
+
+@dataclass(frozen=True)
+class ASTFrameFinalize(ASTStatement):
+    """Collapse the helper scaffolding that discharges the active frame."""
+
+    pops: int = 0
+    notes: Tuple[str, ...] = field(default_factory=tuple)
+
+    def render(self) -> str:
+        parts = []
+        if self.pops:
+            parts.append(f"pops={self.pops}")
+        if self.notes:
+            parts.append("notes=[" + ", ".join(self.notes) + "]")
+        suffix = "" if not parts else " " + " ".join(parts)
+        return f"frame.finalize{suffix}"
+
+
+@dataclass(frozen=True)
 class ASTTailCall(ASTStatement):
     """Tail call used as a return."""
 
@@ -429,6 +468,9 @@ __all__ = [
     "ASTAssign",
     "ASTStore",
     "ASTCallStatement",
+    "ASTIORead",
+    "ASTIOWrite",
+    "ASTFrameFinalize",
     "ASTTailCall",
     "ASTReturn",
     "ASTBranch",

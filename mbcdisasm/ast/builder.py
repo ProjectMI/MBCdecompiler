@@ -9,8 +9,11 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequ
 from ..ir.model import (
     IRBlock,
     IRCall,
+    IRCallCleanup,
     IRCallReturn,
     IRFunctionPrologue,
+    IRIORead,
+    IRIOWrite,
     IRIf,
     IRFlagCheck,
     IRIndirectLoad,
@@ -19,6 +22,7 @@ from ..ir.model import (
     IRProgram,
     IRReturn,
     IRSegment,
+    IRStackEffect,
     IRStore,
     IRTestSetBranch,
     IRTailCall,
@@ -35,7 +39,10 @@ from .model import (
     ASTComment,
     ASTExpression,
     ASTFlagCheck,
+    ASTFrameFinalize,
     ASTFunctionPrologue,
+    ASTIORead,
+    ASTIOWrite,
     ASTIdentifier,
     ASTIndirectLoadExpr,
     ASTLiteral,
@@ -226,6 +233,10 @@ class ASTBuilder:
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(not isinstance(value_expr, ASTUnknown))
             return [ASTStore(target=target_expr, value=value_expr)]
+        if isinstance(node, IRIORead):
+            return [ASTIORead(port=node.port)]
+        if isinstance(node, IRIOWrite):
+            return [ASTIOWrite(port=node.port, mask=node.mask)]
         if isinstance(node, IRIndirectLoad):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
@@ -311,8 +322,13 @@ class ASTBuilder:
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
             return [ASTTailCall(call=call_expr, returns=resolved_returns)]
         if isinstance(node, IRReturn):
+            statements: List[ASTStatement] = []
+            statements.extend(self._frame_finalize(node.cleanup))
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            return [ASTReturn(values=values, varargs=node.varargs, mask=node.mask)]
+            statements.append(ASTReturn(values=values, varargs=node.varargs, mask=node.mask))
+            return statements
+        if isinstance(node, IRCallCleanup):
+            return self._frame_finalize(node.steps)
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             return [ASTBranch(condition=condition, then_target=node.then_target, else_target=node.else_target)]
@@ -398,6 +414,27 @@ class ASTBuilder:
         if lowered.startswith("id"):
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
+
+    def _frame_finalize(self, steps: Sequence[IRStackEffect]) -> List[ASTFrameFinalize]:
+        pops = sum(step.pops for step in steps)
+        notes: List[str] = []
+        for step in steps:
+            if step.mnemonic in {"stack_teardown", "call_helpers", "cleanup_call"}:
+                continue
+            alias = step.operand_alias
+            if alias:
+                notes.append(str(alias))
+                continue
+            if step.operand_role and step.operand:
+                notes.append(f"{step.operand_role}=0x{step.operand:04X}")
+                continue
+            if step.operand:
+                notes.append(f"0x{step.operand:04X}")
+                continue
+            notes.append(step.mnemonic)
+        if pops == 0 and not notes:
+            return []
+        return [ASTFrameFinalize(pops=pops, notes=tuple(notes))]
 
 
 __all__ = ["ASTBuilder"]
