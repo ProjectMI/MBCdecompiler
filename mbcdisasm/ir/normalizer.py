@@ -60,6 +60,7 @@ from .model import (
     IRStackDrop,
     IRStringConstant,
     IRTablePatch,
+    IRTableOperation,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
     IRTableBuilderCommit,
@@ -2270,14 +2271,14 @@ class IRNormalizer:
                 mode = item.profile.mode
                 start = index
                 scan = index
-                body_ops: List[Tuple[str, int]] = []
+                body_ops: List[IRTableOperation] = []
                 body_annotations: List[str] = []
 
                 while scan < len(items):
                     candidate = items[scan]
                     if self._is_opcode_table_body(candidate, mode):
                         assert isinstance(candidate, RawInstruction)
-                        body_ops.append((candidate.mnemonic, candidate.operand))
+                        body_ops.append(self._table_operation(candidate))
                         body_annotations.extend(candidate.annotations)
                         scan += 1
                         continue
@@ -2288,7 +2289,7 @@ class IRNormalizer:
                     continue
 
                 prefix = start
-                prefix_ops: List[Tuple[str, int]] = []
+                prefix_ops: List[IRTableOperation] = []
                 prefix_annotations: List[str] = []
                 affix = 0
                 while prefix > 0 and affix < self._OPCODE_TABLE_MAX_AFFIX:
@@ -2297,12 +2298,12 @@ class IRNormalizer:
                         break
                     assert isinstance(candidate, RawInstruction)
                     prefix -= 1
-                    prefix_ops.insert(0, (candidate.mnemonic, candidate.operand))
+                    prefix_ops.insert(0, self._table_operation(candidate))
                     prefix_annotations.extend(candidate.annotations)
                     affix += 1
 
                 suffix = scan
-                suffix_ops: List[Tuple[str, int]] = []
+                suffix_ops: List[IRTableOperation] = []
                 suffix_annotations: List[str] = []
                 affix = 0
                 while suffix < len(items) and affix < self._OPCODE_TABLE_MAX_AFFIX:
@@ -2310,7 +2311,7 @@ class IRNormalizer:
                     if not self._is_opcode_table_affix(candidate, mode):
                         break
                     assert isinstance(candidate, RawInstruction)
-                    suffix_ops.append((candidate.mnemonic, candidate.operand))
+                    suffix_ops.append(self._table_operation(candidate))
                     suffix_annotations.extend(candidate.annotations)
                     suffix += 1
                     affix += 1
@@ -2407,7 +2408,7 @@ class IRNormalizer:
 
     def _match_adaptive_table_run(
         self, items: _ItemList, index: int
-    ) -> Optional[Tuple[int, int, Tuple[Tuple[str, int], ...], Tuple[str, ...]]]:
+    ) -> Optional[Tuple[int, int, Tuple[IRTableOperation, ...], Tuple[str, ...]]]:
         seed = items[index]
         if not self._is_adaptive_table_seed(seed):
             return None
@@ -2416,7 +2417,7 @@ class IRNormalizer:
         kind = seed.profile.kind
         start = index
         scan = index
-        operations: List[Tuple[str, int]] = []
+        operations: List[IRTableOperation] = []
         annotations = ["adaptive_table", f"mode=0x{mode:02X}", f"kind={kind.name.lower()}"]
         seen_annotations = set(annotations)
 
@@ -2425,7 +2426,7 @@ class IRNormalizer:
             if not self._is_adaptive_table_body(candidate, mode, kind):
                 break
             assert isinstance(candidate, RawInstruction)
-            operations.append((candidate.mnemonic, candidate.operand))
+            operations.append(self._table_operation(candidate))
             for note in candidate.annotations:
                 if not note or note in seen_annotations:
                     continue
@@ -2479,35 +2480,77 @@ class IRNormalizer:
             return False
         return True
 
+    def _table_operation(
+        self, instruction: RawInstruction, *, mnemonic: Optional[str] = None
+    ) -> IRTableOperation:
+        word = instruction.profile.word
+        resolved = mnemonic or instruction.mnemonic
+        return IRTableOperation(
+            mnemonic=resolved,
+            operand=word.operand,
+            raw=word.raw,
+            offset=instruction.offset,
+            opcode=word.opcode,
+            mode=word.mode,
+        )
+
     def _pass_table_patches(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
             item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            word = item.profile.word
+            opcode = word.opcode
+            mode = word.mode
+            operand = word.operand
+
             if not (
-                isinstance(item, RawInstruction)
-                and item.mnemonic.startswith("op_2C_")
-                and 0x6600 <= item.operand <= 0x66FF
+                opcode == 0x2C
+                and 0x6600 <= operand <= 0x66FF
             ):
                 index += 1
                 continue
 
-            operations: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            operations: List[IRTableOperation] = [
+                self._table_operation(
+                    item,
+                    mnemonic=item.mnemonic
+                    if item.mnemonic.startswith("op_2C_")
+                    else f"op_2C_{mode:02X}",
+                )
+            ]
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
                 if isinstance(candidate, RawInstruction):
+                    candidate_word = candidate.profile.word
+                    candidate_opcode = candidate_word.opcode
+                    candidate_mode = candidate_word.mode
+                    candidate_operand = candidate_word.operand
                     if (
-                        candidate.mnemonic.startswith("op_2C_")
-                        and 0x6600 <= candidate.operand <= 0x66FF
+                        candidate_opcode == 0x2C
+                        and 0x6600 <= candidate_operand <= 0x66FF
                     ):
-                        operations.append((candidate.mnemonic, candidate.operand))
+                        operations.append(
+                            self._table_operation(
+                                candidate,
+                                mnemonic=candidate.mnemonic
+                                if candidate.mnemonic.startswith("op_2C_")
+                                else f"op_2C_{candidate_mode:02X}",
+                            )
+                        )
                         scan += 1
                         continue
                     extra = self._TABLE_PATCH_EXTRA_MNEMONICS.get(candidate.mnemonic)
                     if extra is not None:
                         if extra and candidate.operand not in extra:
                             break
-                        operations.append((candidate.mnemonic, candidate.operand))
+                        operations.append(
+                            self._table_operation(candidate)
+                        )
                         scan += 1
                         continue
                 break
@@ -2523,8 +2566,14 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            helper_target: Optional[int] = None
-            helper_symbol: Optional[str] = None
+            cases, default, inferred_helper = self._extract_dispatch_cases(item.operations)
+            helper_target: Optional[int] = inferred_helper
+            helper_symbol: Optional[str] = (
+                self.knowledge.lookup_address(helper_target)
+                if helper_target is not None
+                else None
+            )
+
             follow = index + 1
             while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
                 follow += 1
@@ -2536,7 +2585,6 @@ class IRNormalizer:
                         helper_target = target
                         helper_symbol = self.knowledge.lookup_address(target)
 
-            cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
                 index += 1
                 continue
@@ -2832,7 +2880,7 @@ class IRNormalizer:
                 except ValueError:
                     continue
         if table.operations:
-            mnemonic = table.operations[0][0]
+            mnemonic = table.operations[0].mnemonic
             if len(mnemonic) >= 8:
                 try:
                     return int(mnemonic[6:8], 16)
@@ -2861,24 +2909,35 @@ class IRNormalizer:
         return None
 
     def _extract_dispatch_cases(
-        self, operations: Sequence[Tuple[str, int]]
-    ) -> Tuple[List[IRDispatchCase], Optional[int]]:
-        cases: List[IRDispatchCase] = []
+        self, operations: Sequence[IRTableOperation]
+    ) -> Tuple[List[IRDispatchCase], Optional[int], Optional[int]]:
+        final_targets: Dict[int, int] = {}
+        first_targets: Dict[int, int] = {}
         default_target: Optional[int] = None
-        for mnemonic, operand in operations:
-            if mnemonic.startswith("op_2C_"):
-                suffix = mnemonic.split("_")[-1]
-                try:
-                    key = int(suffix, 16)
-                except ValueError:
-                    continue
-                target = operand & 0xFFFF
-                symbol = self.knowledge.lookup_address(target)
-                cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+        for operation in operations:
+            if operation.opcode == 0x2C:
+                key = operation.mode
+                target = operation.operand & 0xFFFF
+                if key not in first_targets:
+                    first_targets[key] = target
+                final_targets[key] = target
                 continue
-            if mnemonic == "fanout":
-                default_target = operand & 0xFFFF
-        return cases, default_target
+            if operation.mnemonic == "fanout":
+                default_target = (operation.raw >> 16) & 0xFFFF
+
+        helper: Optional[int] = None
+        if 0 in first_targets:
+            helper = first_targets[0]
+        elif first_targets:
+            helper = next(iter(first_targets.values()))
+
+        cases: List[IRDispatchCase] = []
+        for key in sorted(final_targets):
+            target = final_targets[key]
+            symbol = self.knowledge.lookup_address(target)
+            cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+
+        return cases, default_target, helper
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0

@@ -765,15 +765,29 @@ class IRTailcallFrame(IRNode):
 class IRTablePatch(IRNode):
     """Collapses the recurring 0x66xx table patch sequences."""
 
-    operations: Tuple[Tuple[str, int], ...]
+    operations: Tuple["IRTableOperation", ...]
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        rendered = ", ".join(
+            f"{operation.mnemonic}(0x{operation.operand:04X})" for operation in self.operations
+        )
         note = f"table_patch[{rendered}]"
         if self.annotations:
             note += " " + ", ".join(self.annotations)
         return note
+
+
+@dataclass(frozen=True)
+class IRTableOperation:
+    """Single instruction contributing to a table patch."""
+
+    mnemonic: str
+    operand: int
+    raw: int
+    offset: int
+    opcode: int
+    mode: int
 
 
 @dataclass(frozen=True)
@@ -839,12 +853,14 @@ class IRTableBuilderEmit(IRNode):
 
     mode: int
     kind: str
-    operations: Tuple[Tuple[str, int], ...]
+    operations: Tuple[IRTableOperation, ...]
     annotations: Tuple[str, ...] = field(default_factory=tuple)
     parameters: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        ops = ", ".join(
+            f"{operation.mnemonic}(0x{operation.operand:04X})" for operation in self.operations
+        )
         details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
         if self.parameters:
             params = ", ".join(self.parameters)

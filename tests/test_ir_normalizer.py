@@ -34,6 +34,7 @@ from mbcdisasm.ir.model import (
     IRBuildArray,
     IRSwitchDispatch,
     IRTablePatch,
+    IRTableOperation,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
     IRTableBuilderCommit,
@@ -1879,8 +1880,8 @@ def test_normalizer_absorbs_zero_mode_affixes_for_opcode_tables() -> None:
     assert len(ir_block.nodes) == 1
     node = ir_block.nodes[0]
     assert isinstance(node, IRTablePatch)
-    assert node.operations[0][0] == "op_08_00"
-    assert node.operations[-1][0] == "op_08_00"
+    assert node.operations[0].mnemonic == "op_08_00"
+    assert node.operations[-1].mnemonic == "op_08_00"
     assert len(node.operations) == len(raw_instructions)
 
 
@@ -1932,7 +1933,7 @@ def test_normalizer_absorbs_separator_affixes_for_opcode_tables() -> None:
     assert len(ir_block.nodes) == 1
     node = ir_block.nodes[0]
     assert isinstance(node, IRTablePatch)
-    assert [op for op, _ in node.operations] == [
+    assert [op.mnemonic for op in node.operations] == [
         "reduce_pair",
         "op_10_01",
         "op_11_01",
@@ -1981,7 +1982,7 @@ def test_normalizer_extends_table_patch_with_affixes() -> None:
     assert len(items) == 1
     node = items[0]
     assert isinstance(node, IRTablePatch)
-    assert [op for op, _ in node.operations] == [
+    assert [op.mnemonic for op in node.operations] == [
         "op_2C_10",
         "op_2C_11",
         "reduce_pair",
@@ -2031,7 +2032,24 @@ def test_normalizer_builds_table_pipeline_nodes() -> None:
     prologue = make_stack_neutral_instruction(0, "op_39_4D")
     literal = IRLiteralChunk(data=b"MODE", source="test", symbol="str_0000")
     table = IRTablePatch(
-        operations=(("op_82_4D", 0x0000), ("op_88_4D", 0x0000)),
+        operations=(
+            IRTableOperation(
+                mnemonic="op_82_4D",
+                operand=0x0000,
+                raw=0,
+                offset=0,
+                opcode=0x82,
+                mode=0x4D,
+            ),
+            IRTableOperation(
+                mnemonic="op_88_4D",
+                operand=0x0000,
+                raw=0,
+                offset=0,
+                opcode=0x88,
+                mode=0x4D,
+            ),
+        ),
         annotations=("adaptive_table", "mode=0x4D"),
     )
     guard = IRTestSetBranch(
@@ -2054,7 +2072,7 @@ def test_normalizer_builds_table_pipeline_nodes() -> None:
     assert emit.kind == "adaptive_table"
     assert emit.mode == 0x4D
     assert emit.parameters == ("str(str_0000)",)
-    assert emit.operations[0][0] == "op_82_4D"
+    assert emit.operations[0].mnemonic == "op_82_4D"
 
     assert isinstance(commit, IRTableBuilderCommit)
     assert commit.then_target == 0x0000
