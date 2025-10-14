@@ -388,6 +388,20 @@ class IRStringConstant(IRNode):
 
 
 @dataclass(frozen=True)
+class IRMarker(IRNode):
+    """Lightweight annotation emitted for meta-only opcodes."""
+
+    offset: int
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        payload = " ".join(self.annotations)
+        if payload:
+            return f"; 0x{self.offset:06X} {payload}"
+        return f"; 0x{self.offset:06X}"
+
+
+@dataclass(frozen=True)
 class IRBuildArray(IRNode):
     """Aggregate literal values into a positional container."""
 
@@ -1185,6 +1199,7 @@ __all__ = [
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
+    "IRMarker",
     "IRLiteralBlock",
     "IRIf",
     "IRTestSetBranch",

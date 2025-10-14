@@ -44,6 +44,7 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRMarker,
     IRPageRegister,
     IRLoad,
     IRNode,
@@ -311,6 +312,7 @@ IO_HANDSHAKE_BRIDGE_NODE_TYPES = IO_BRIDGE_NODE_TYPES + (
     IRLiteral,
     IRLiteralChunk,
     IRStringConstant,
+    IRMarker,
     IRStackEffect,
     IRStackDrop,
     IRStackDuplicate,
@@ -329,6 +331,7 @@ STRUCTURAL_SKIP_NODE_TYPES = (
     IRLiteral,
     IRLiteralChunk,
     IRStringConstant,
+    IRMarker,
     IRAsciiPreamble,
     IRAsciiFinalize,
     IRAsciiHeader,
@@ -345,6 +348,7 @@ EPILOGUE_ALLOWED_NODE_TYPES = (
     IRLiteral,
     IRLiteralChunk,
     IRStringConstant,
+    IRMarker,
     IRAsciiPreamble,
     IRAsciiFinalize,
     IRAsciiHeader,
@@ -873,10 +877,9 @@ class IRNormalizer:
                 if self._is_annotation_only(item) or self._is_stack_neutral_bridge(
                     item, final_wrapper, index
                 ):
-                    annotation = self._format_annotation(item)
-                    if annotation:
-                        metrics.meta_remaining += 1
-                        block_annotations.append(annotation)
+                    notes = item.annotations or (item.mnemonic,)
+                    marker = IRMarker(offset=item.offset, annotations=tuple(notes))
+                    nodes.append(marker)
                     continue
                 metrics.raw_remaining += 1
                 nodes.append(
