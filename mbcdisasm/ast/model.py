@@ -203,6 +203,27 @@ class ASTCallResult(ASTExpression):
 
 
 # ---------------------------------------------------------------------------
+# dispatch statements
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ASTDispatchCase:
+    """Single case within an indirect dispatch."""
+
+    key: int
+    symbol: str | None = None
+    target: "ASTBlock | None" = None
+    hint: str | None = None
+
+    def render(self) -> str:
+        label = self.target.label if self.target is not None else None
+        if label is None:
+            label = self.hint or (f"{self.symbol}" if self.symbol else "?")
+        return f"0x{self.key:02X}->{label}"
+
+
+# ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
 
@@ -389,6 +410,35 @@ class ASTComment(ASTStatement):
         return f"; {self.text}"
 
 
+@dataclass
+class ASTDispatch(ASTStatement):
+    """Representation of an indirect jump through a dispatch table."""
+
+    helper: int | None
+    helper_symbol: str | None
+    cases: Tuple[ASTDispatchCase, ...]
+    default: "ASTBlock | None" = None
+    default_hint: str | None = None
+
+    def render(self) -> str:
+        if self.helper is None:
+            helper_repr = "helper=?"
+        else:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+            helper_repr = f"helper={helper_repr}"
+        cases_repr = ", ".join(case.render() for case in self.cases)
+        description = f"dispatch {helper_repr} cases=[{cases_repr}]"
+        if self.default is not None or self.default_hint:
+            if self.default is not None:
+                default_label = self.default.label
+            else:
+                default_label = self.default_hint or "?"
+            description += f" default={default_label}"
+        return description
+
+
 # ---------------------------------------------------------------------------
 # containers
 # ---------------------------------------------------------------------------
@@ -512,6 +562,8 @@ __all__ = [
     "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
+    "ASTDispatchCase",
+    "ASTDispatch",
     "ASTStatement",
     "ASTAssign",
     "ASTStore",
