@@ -148,6 +148,7 @@ class IRCall(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    dispatch: bool = False
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
@@ -799,6 +800,9 @@ class IRSwitchDispatch(IRNode):
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
+    sources: Tuple[Tuple[Tuple[str, int], ...], ...] = field(default_factory=tuple)
+    duplicates: Tuple[int, ...] = field(default_factory=tuple)
+    holes: Tuple[int, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -812,6 +816,12 @@ class IRSwitchDispatch(IRNode):
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"
+        if self.duplicates:
+            dup_text = ",".join(f"0x{dup:02X}" for dup in self.duplicates)
+            description += f" duplicates=[{dup_text}]"
+        if self.holes:
+            hole_text = ",".join(f"0x{hole:02X}" for hole in self.holes)
+            description += f" holes=[{hole_text}]"
         return description
 
 
@@ -932,6 +942,7 @@ class IRCallReturn(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    dispatch: bool = False
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -1044,6 +1055,7 @@ class IRTailcallReturn(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    dispatch: bool = False
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"

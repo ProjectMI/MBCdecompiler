@@ -15,6 +15,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -1535,6 +1536,102 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     return_node = block.nodes[2]
     assert isinstance(return_node, IRReturn)
     assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
+
+
+def test_normalizer_merges_dispatch_cases_before_call(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x01, 0x6623),
+        build_word(4, 0x00, 0x00, 0x0001),
+        build_word(8, 0x2C, 0x02, 0x6624),
+        build_word(12, 0x28, 0x00, 0x1234),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 3
+    literal, dispatch, tail = block.nodes
+    assert isinstance(literal, IRLiteral)
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == 0x1234
+    assert {case.key for case in dispatch.cases} == {1, 2}
+    assert dispatch.duplicates == tuple()
+    assert dispatch.holes == tuple()
+    assert dispatch.sources == (
+        (("op_2C_01", 0x6623),),
+        (("op_2C_02", 0x6624),),
+    )
+    assert isinstance(tail, IRReturn)
+
+
+def test_normalizer_dispatch_records_duplicates(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x01, 0x6610),
+        build_word(4, 0x2C, 0x01, 0x6620),
+        build_word(8, 0x28, 0x00, 0x1234),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = block.nodes[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert [case.key for case in dispatch.cases] == [1]
+    assert [case.target for case in dispatch.cases] == [0x6620]
+    assert dispatch.duplicates == (1,)
+    assert dispatch.holes == tuple()
+    assert dispatch.sources == (
+        (("op_2C_01", 0x6610), ("op_2C_01", 0x6620)),
+    )
+
+
+def test_normalizer_lifts_dispatch_commit(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x01, 0x6610),
+        build_word(4, 0x2C, 0x02, 0x6620),
+        build_word(8, 0x2B, 0x00, 0x01F1),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 2
+    dispatch, tail = block.nodes
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == 0x01F1
+    assert dispatch.helper_symbol == "fmt.dispatch_commit"
+    assert {case.key for case in dispatch.cases} == {1, 2}
+    assert dispatch.sources == (
+        (("op_2C_01", 0x6610), ("op_2C_02", 0x6620)),
+    )
+    assert isinstance(tail, IRReturn)
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:
