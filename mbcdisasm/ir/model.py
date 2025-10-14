@@ -637,6 +637,17 @@ class IRBankedStore(IRNode):
 
 
 @dataclass(frozen=True)
+class IRIOHandshake(IRNode):
+    """Marker representing auxiliary IO port configuration steps."""
+
+    mnemonic: str
+    operand: int = 0
+
+    def describe(self) -> str:
+        return f"io.handshake {self.mnemonic}(operand=0x{self.operand:04X})"
+
+
+@dataclass(frozen=True)
 class IRIORead(IRNode):
     """Read a value from the shared IO port."""
 
@@ -1196,6 +1207,7 @@ __all__ = [
     "IRBankedLoad",
     "IRIndirectStore",
     "IRBankedStore",
+    "IRIOHandshake",
     "IRIORead",
     "IRIOWrite",
     "IRStackDuplicate",

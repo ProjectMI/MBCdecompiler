@@ -72,6 +72,7 @@ from .model import (
     IRBankedLoad,
     IRIndirectStore,
     IRBankedStore,
+    IRIOHandshake,
     IRIORead,
     IRIOWrite,
     MemSpace,
@@ -349,6 +350,15 @@ EPILOGUE_ALLOWED_NODE_TYPES = (
     IRAsciiFinalize,
     IRAsciiHeader,
 )
+
+IO_HANDSHAKE_EXTRA = {
+    "op_50_00",
+    "op_60_88",
+    "op_60_8B",
+    "op_FC_FF",
+    "op_EC_FF",
+    "op_44_00",
+}
 
 IO_HELPER_MNEMONICS = {"call_helpers", "op_F0_4B", "op_4A_10"}
 CALL_HELPER_FACADE_MNEMONICS = {"op_05_F0", "op_FD_4A"}
@@ -1928,6 +1938,17 @@ class IRNormalizer:
             self._transfer_ssa(item, node)
             items.replace_slice(index, index + 1, [node])
             continue
+
+        handshake_mnemonics = IO_BRIDGE_MNEMONICS | IO_HANDSHAKE_EXTRA
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, RawInstruction) and item.mnemonic in handshake_mnemonics:
+                node = IRIOHandshake(mnemonic=item.mnemonic, operand=item.operand)
+                self._transfer_ssa(item, node)
+                items.replace_slice(index, index + 1, [node])
+                continue
+            index += 1
 
     def _pass_io_facade(self, items: _ItemList) -> None:
         index = 0
