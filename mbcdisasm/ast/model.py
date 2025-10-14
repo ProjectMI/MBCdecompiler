@@ -120,6 +120,58 @@ class ASTIndirectLoadExpr(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTBankedRefExpr(ASTExpression):
+    """Reference to a banked memory location."""
+
+    ref: MemRef
+    register: int
+    register_value: int | None = None
+    pointer: ASTExpression | None = None
+    offset: ASTExpression | None = None
+
+    def render(self) -> str:
+        parts = [self.ref.describe()]
+        if self.pointer is not None:
+            parts.append(f"ptr={self.pointer.render()}")
+        if self.offset is not None:
+            parts.append(f"offset={self.offset.render()}")
+        if self.register_value is not None:
+            parts.append(f"page=0x{self.register_value:04X}")
+        else:
+            parts.append(f"page_reg=0x{self.register:04X}")
+        return "banked_ref " + " ".join(parts)
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.POINTER
+
+
+@dataclass(frozen=True)
+class ASTBankedLoadExpr(ASTExpression):
+    """Load a value from banked memory."""
+
+    ref: MemRef
+    register: int
+    register_value: int | None = None
+    pointer: ASTExpression | None = None
+    offset: ASTExpression | None = None
+
+    def render(self) -> str:
+        parts = [self.ref.describe()]
+        if self.pointer is not None:
+            parts.append(f"ptr={self.pointer.render()}")
+        if self.offset is not None:
+            parts.append(f"offset={self.offset.render()}")
+        if self.register_value is not None:
+            parts.append(f"page=0x{self.register_value:04X}")
+        else:
+            parts.append(f"page_reg=0x{self.register:04X}")
+        return "banked_load " + " ".join(parts)
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.WORD
+
+
+@dataclass(frozen=True)
 class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
@@ -222,23 +274,6 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
-class ASTFrameFinalize(ASTStatement):
-    """Collapse the helper scaffolding that discharges the active frame."""
-
-    pops: int = 0
-    notes: Tuple[str, ...] = field(default_factory=tuple)
-
-    def render(self) -> str:
-        parts = []
-        if self.pops:
-            parts.append(f"pops={self.pops}")
-        if self.notes:
-            parts.append("notes=[" + ", ".join(self.notes) + "]")
-        suffix = "" if not parts else " " + " ".join(parts)
-        return f"frame.finalize{suffix}"
-
-
-@dataclass
 class ASTTailCall(ASTStatement):
     """Tail call used as a return."""
 
@@ -260,7 +295,6 @@ class ASTReturn(ASTStatement):
 
     values: Tuple[ASTExpression, ...]
     varargs: bool = False
-    mask: int | None = None
 
     def render(self) -> str:
         if self.varargs:
@@ -269,8 +303,7 @@ class ASTReturn(ASTStatement):
         else:
             rendered = ", ".join(expr.render() for expr in self.values)
             payload = f"[{rendered}]"
-        mask = "" if self.mask is None else f" mask=0x{self.mask:04X}"
-        return f"return {payload}{mask}"
+        return f"return {payload}"
 
 
 @dataclass
@@ -475,6 +508,8 @@ __all__ = [
     "ASTSlotRef",
     "ASTMemRefExpr",
     "ASTIndirectLoadExpr",
+    "ASTBankedRefExpr",
+    "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
     "ASTStatement",
@@ -483,7 +518,6 @@ __all__ = [
     "ASTCallStatement",
     "ASTIORead",
     "ASTIOWrite",
-    "ASTFrameFinalize",
     "ASTTailCall",
     "ASTReturn",
     "ASTBranch",

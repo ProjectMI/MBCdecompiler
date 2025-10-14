@@ -24,6 +24,7 @@ from mbcdisasm.ir.model import (
     IRFunctionPrologue,
     IRStackEffect,
     IRTestSetBranch,
+    IRBankedLoad,
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
@@ -2104,9 +2105,9 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
     assert page_node.value == "lit(0x4B10)"
     assert page_node.literal == 0x4B10
 
-    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+    load_node = next(node for node in block.nodes if isinstance(node, IRBankedLoad))
     assert load_node.ref is not None
-    assert load_node.ref.bank == 0x4B10
+    assert load_node.register_value == 0x4B10
 
 
 def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
@@ -2138,11 +2139,11 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    load_node = next(node for node in block.nodes if isinstance(node, IRIndirectLoad))
+    load_node = next(node for node in block.nodes if isinstance(node, IRBankedLoad))
     page_nodes = [node for node in block.nodes if isinstance(node, IRPageRegister)]
 
     assert load_node.ref is not None
-    assert load_node.ref.bank == 0x4B0C
+    assert load_node.register_value == 0x4B0C
     assert any(page.register == 0x06C8 for page in page_nodes)
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))

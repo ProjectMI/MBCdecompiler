@@ -15,6 +15,7 @@ from ..constants import (
     MEMORY_BANK_ALIASES,
     MEMORY_PAGE_ALIASES,
     RET_MASK,
+    OPERAND_ALIASES,
 )
 from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
@@ -38,6 +39,7 @@ from .model import (
     IRTailcallReturn,
     IRConditionMask,
     IRFlagCheck,
+    IRAbiEffect,
     IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
@@ -67,7 +69,9 @@ from .model import (
     IRTestSetBranch,
     IRIf,
     IRIndirectLoad,
+    IRBankedLoad,
     IRIndirectStore,
+    IRBankedStore,
     IRIORead,
     IRIOWrite,
     MemSpace,
@@ -1796,10 +1800,14 @@ class IRNormalizer:
                 return_node = items[next_index]
                 assert isinstance(return_node, IRReturn)
                 combined = return_node.cleanup + tuple(steps)
+                mask = self._extract_cleanup_mask(combined)
                 updated = IRReturn(
                     values=return_node.values,
                     varargs=return_node.varargs,
                     cleanup=combined,
+                    abi_effects=self._merge_return_mask_effects(
+                        return_node.abi_effects, mask
+                    ),
                 )
                 self._transfer_ssa(return_node, updated)
                 items.replace_slice(start, end, [])
@@ -2175,9 +2183,9 @@ class IRNormalizer:
                 tail=tail,
                 arity=arity,
                 convention=convention,
-                cleanup_mask=cleanup_mask,
                 cleanup=cleanup_steps,
                 symbol=call.symbol,
+                abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
             )
             self._transfer_ssa(call, updated)
             items.replace_slice(index, index + 1, [updated])
@@ -2896,17 +2904,17 @@ class IRNormalizer:
                     tail=True,
                     arity=item.arity,
                     convention=item.convention,
-                    cleanup_mask=mask,
                     cleanup=item.call.cleanup,
                     symbol=item.symbol,
                     predicate=item.predicate,
+                    abi_effects=self._merge_return_mask_effects(item.call.abi_effects, mask),
                 )
                 updated = IRTailCall(
                     call=updated_call,
                     returns=item.returns,
                     varargs=item.varargs,
                     cleanup=tuple(cleanup_steps),
-                    cleanup_mask=mask,
+                    abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
                 )
                 self._transfer_ssa(item, updated)
                 items.replace_slice(index, index + 1, [updated])
@@ -2961,10 +2969,10 @@ class IRNormalizer:
                 tail=True,
                 arity=item.arity,
                 convention=item.convention,
-                cleanup_mask=mask,
                 cleanup=tuple(),
                 symbol=item.symbol,
                 predicate=item.predicate,
+                abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
             )
 
             tail_call = IRTailCall(
@@ -2972,7 +2980,7 @@ class IRNormalizer:
                 returns=values,
                 varargs=item.varargs,
                 cleanup=tuple(cleanup_steps),
-                cleanup_mask=mask,
+                abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
             )
             self._transfer_ssa(item, tail_call)
             items.replace_slice(index, index + 1, [tail_call])
@@ -3083,6 +3091,7 @@ class IRNormalizer:
                 values=returns_node.values,
                 varargs=returns_node.varargs,
                 cleanup=tuple(cleanup_chain),
+                abi_effects=returns_node.abi_effects,
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
@@ -3103,9 +3112,9 @@ class IRNormalizer:
             tail=True,
             arity=arity,
             convention=None,
-            cleanup_mask=None,
             symbol=symbol,
             predicate=predicate,
+            abi_effects=self._merge_return_mask_effects(getattr(node, "abi_effects", tuple()), cleanup_mask),
         )
         self._transfer_ssa(node, tailcall)
         items.replace_slice(index, index + 1, [tailcall])
@@ -3137,9 +3146,9 @@ class IRNormalizer:
                     arity=arity,
                     convention=None,
                     cleanup=cleanup,
-                    cleanup_mask=None,
                     symbol=symbol,
                     predicate=predicate,
+                    abi_effects=tuple(),
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3151,9 +3160,9 @@ class IRNormalizer:
                     cleanup=cleanup,
                     arity=arity,
                     convention=None,
-                    cleanup_mask=None,
                     symbol=symbol,
                     predicate=predicate,
+                    abi_effects=tuple(),
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3165,9 +3174,9 @@ class IRNormalizer:
                     cleanup=cleanup,
                     arity=arity,
                     convention=None,
-                    cleanup_mask=None,
                     symbol=symbol,
                     predicate=predicate,
+                    abi_effects=tuple(),
                 )
             elif isinstance(node, IRTailCall):
                 updated_call = IRCall(
@@ -3176,17 +3185,17 @@ class IRNormalizer:
                     tail=True,
                     arity=arity,
                     convention=None,
-                    cleanup_mask=None,
                     cleanup=tuple(),
                     symbol=symbol,
                     predicate=predicate,
+                    abi_effects=tuple(),
                 )
                 replacement = IRTailCall(
                     call=updated_call,
                     returns=getattr(node, "returns", tuple()),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
-                    cleanup_mask=None,
+                    abi_effects=tuple(),
                 )
             else:
                 replacement = IRTailcallReturn(
@@ -3198,9 +3207,9 @@ class IRNormalizer:
                     tail=getattr(node, "tail", True),
                     arity=arity,
                     convention=None,
-                    cleanup_mask=None,
                     symbol=symbol,
                     predicate=predicate,
+                    abi_effects=tuple(),
                 )
             self._transfer_ssa(node, replacement)
             items.replace_slice(index, index + 1, [replacement])
@@ -3559,9 +3568,9 @@ class IRNormalizer:
                             tail=True,
                             arity=call.arity,
                             convention=call.convention,
-                            cleanup_mask=cleanup_mask,
                             symbol=call.symbol,
                             predicate=call.predicate,
+                            abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
                         )
                     else:
                         tail = base_tail and consumed == 0 and not return_node.cleanup
@@ -3576,9 +3585,9 @@ class IRNormalizer:
                             cleanup=combined_cleanup,
                             arity=call.arity,
                             convention=call.convention,
-                            cleanup_mask=cleanup_mask,
                             symbol=call.symbol,
                             predicate=call.predicate,
+                            abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
                         )
                     self._transfer_ssa(call, node)
                     end = offset + 1
@@ -3729,10 +3738,10 @@ class IRNormalizer:
                 tail=node.tail,
                 arity=node.arity,
                 convention=node.convention,
-                cleanup_mask=node.cleanup_mask,
                 cleanup=node.cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
             )
 
         if isinstance(node, IRCallReturn):
@@ -3745,9 +3754,9 @@ class IRNormalizer:
                 cleanup=node.cleanup,
                 arity=node.arity,
                 convention=node.convention,
-                cleanup_mask=node.cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
             )
 
         if isinstance(node, IRTailCall):
@@ -3757,17 +3766,17 @@ class IRNormalizer:
                 tail=True,
                 arity=node.arity,
                 convention=node.convention,
-                cleanup_mask=node.cleanup_mask,
                 cleanup=node.call.cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=self._merge_return_mask_effects(node.call.abi_effects, node.cleanup_mask),
             )
             return IRTailCall(
                 call=updated_call,
                 returns=node.returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
-                cleanup_mask=node.cleanup_mask,
+                abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
             )
 
         if isinstance(node, IRTailcallReturn):
@@ -3780,9 +3789,9 @@ class IRNormalizer:
                 tail=node.tail,
                 arity=node.arity,
                 convention=node.convention,
-                cleanup_mask=node.cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
             )
 
         return node
@@ -4041,6 +4050,8 @@ class IRNormalizer:
         target: int,
         signature: CallSignature,
     ) -> CallLike:
+        existing_effects = getattr(node, "abi_effects", tuple())
+        abi_effects = self._merge_return_mask_effects(existing_effects, cleanup_mask)
         if isinstance(node, IRCall):
             return IRCall(
                 target=target,
@@ -4048,10 +4059,10 @@ class IRNormalizer:
                 tail=tail,
                 arity=arity,
                 convention=convention,
-                cleanup_mask=cleanup_mask,
                 cleanup=cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=abi_effects,
             )
 
         if isinstance(node, IRCallReturn):
@@ -4068,9 +4079,9 @@ class IRNormalizer:
                 cleanup=cleanup,
                 arity=arity,
                 convention=convention,
-                cleanup_mask=cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=abi_effects,
             )
 
         if isinstance(node, IRTailCall):
@@ -4084,17 +4095,17 @@ class IRNormalizer:
                 tail=True,
                 arity=arity,
                 convention=convention,
-                cleanup_mask=cleanup_mask,
                 cleanup=node.call.cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=abi_effects,
             )
             return IRTailCall(
                 call=updated_call,
                 returns=returns,
                 varargs=node.varargs,
                 cleanup=cleanup,
-                cleanup_mask=cleanup_mask,
+                abi_effects=abi_effects,
             )
 
         if isinstance(node, IRTailcallReturn):
@@ -4110,9 +4121,9 @@ class IRNormalizer:
                 tail=tail,
                 arity=arity,
                 convention=convention,
-                cleanup_mask=cleanup_mask,
                 symbol=node.symbol,
                 predicate=predicate,
+                abi_effects=abi_effects,
             )
 
         return node
@@ -4517,6 +4528,19 @@ class IRNormalizer:
                     return step.operand
         return None
 
+    @staticmethod
+    def _return_mask_effect(mask: Optional[int]) -> Tuple[IRAbiEffect, ...]:
+        if mask is None:
+            return tuple()
+        alias = OPERAND_ALIASES.get(mask)
+        return (IRAbiEffect(kind="return_mask", operand=mask, alias=alias),)
+
+    def _merge_return_mask_effects(
+        self, effects: Sequence[IRAbiEffect], mask: Optional[int]
+    ) -> Tuple[IRAbiEffect, ...]:
+        base = tuple(effect for effect in effects if effect.kind != "return_mask")
+        return base + self._return_mask_effect(mask)
+
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
         if isinstance(item, IRLiteral):
@@ -4713,14 +4737,23 @@ class IRNormalizer:
                 if base_name is not None:
                     base_alias = self._render_ssa(base_name)
                 pointer_alias = base_alias
-                node = IRIndirectLoad(
-                    base=base_alias,
-                    offset=item.operand,
-                    target=target_alias,
-                    base_slot=base_slot,
-                    ref=memref,
-                    pointer=pointer_alias,
-                )
+                if memref is not None and memref.bank is not None:
+                    node = IRBankedLoad(
+                        ref=memref,
+                        target=target_alias,
+                        register=PAGE_REGISTER,
+                        register_value=memref.bank,
+                        pointer=pointer_alias if base_sources else None,
+                    )
+                else:
+                    node = IRIndirectLoad(
+                        base=base_alias,
+                        offset=item.operand,
+                        target=target_alias,
+                        base_slot=base_slot,
+                        ref=memref,
+                        pointer=pointer_alias,
+                    )
                 self._transfer_ssa(item, node)
                 items.replace_slice(index, index + 1, [node])
                 self._consume_indirect_configuration(items, index, node)
@@ -4744,14 +4777,23 @@ class IRNormalizer:
                 if base_name:
                     base_alias = self._render_ssa(base_name)
                 pointer_alias = base_alias
-                node = IRIndirectStore(
-                    base=base_alias,
-                    value=value_alias,
-                    offset=item.operand,
-                    base_slot=base_slot,
-                    ref=memref,
-                    pointer=pointer_alias,
-                )
+                if memref is not None and memref.bank is not None:
+                    node = IRBankedStore(
+                        ref=memref,
+                        value=value_alias,
+                        register=PAGE_REGISTER,
+                        register_value=memref.bank,
+                        pointer=pointer_alias if base_sources else None,
+                    )
+                else:
+                    node = IRIndirectStore(
+                        base=base_alias,
+                        value=value_alias,
+                        offset=item.operand,
+                        base_slot=base_slot,
+                        ref=memref,
+                        pointer=pointer_alias,
+                    )
                 items.replace_slice(index, index + 1, [node])
                 self._consume_indirect_configuration(items, index, node)
                 metrics.stores += 1
@@ -4896,20 +4938,31 @@ class IRNormalizer:
         if isinstance(target, IRReturn):
             cleanup = list(effects) + list(target.cleanup)
             combined = tuple(self._coalesce_epilogue_steps(cleanup))
+            mask = self._extract_cleanup_mask(combined)
             return IRReturn(
                 values=target.values,
                 varargs=target.varargs,
                 cleanup=combined,
-                mask=target.mask,
+                abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
             )
         if isinstance(target, IRTailCall):
             cleanup = list(effects) + list(target.cleanup)
             combined = tuple(self._coalesce_epilogue_steps(cleanup))
-            return replace(target, cleanup=combined)
+            mask = self._extract_cleanup_mask(combined)
+            return replace(
+                target,
+                cleanup=combined,
+                abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
+            )
         if isinstance(target, IRTailcallReturn):
             cleanup = list(effects) + list(target.cleanup)
             combined = tuple(self._coalesce_epilogue_steps(cleanup))
-            return replace(target, cleanup=combined)
+            mask = self._extract_cleanup_mask(combined)
+            return replace(
+                target,
+                cleanup=combined,
+                abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
+            )
         if isinstance(target, IRFunctionPrologue):
             return target
         return None
@@ -5117,7 +5170,7 @@ class IRNormalizer:
         self,
         items: _ItemList,
         index: int,
-        node: Union[IRIndirectLoad, IRIndirectStore],
+        node: Union[IRIndirectLoad, IRIndirectStore, IRBankedLoad, IRBankedStore],
     ) -> None:
         scan = index + 1
         pending_literal_index: Optional[int] = None
