@@ -31,6 +31,7 @@ from ..ir.model import (
     IRTerminator,
     SSAValueKind,
 )
+from ..optimizer import classify_node_traits
 from .model import (
     ASTAssign,
     ASTBlock,
@@ -224,7 +225,7 @@ class ASTBuilder:
             if not block.nodes:
                 trivial_targets[offset] = analysis.successors[0]
                 continue
-            if all(isinstance(node, (IRCallCleanup, IRTerminator)) for node in block.nodes):
+            if all(not classify_node_traits(node).merge_barrier for node in block.nodes):
                 trivial_targets[offset] = analysis.successors[0]
 
         if not trivial_targets:
