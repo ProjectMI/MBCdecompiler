@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
@@ -607,6 +607,7 @@ class IRNormalizer:
         InstructionKind.TABLE_LOOKUP,
         InstructionKind.META,
     }
+    _DISPATCH_COMMIT_HELPERS = {0x01F1, 0x032C}
 
     _SSA_PRIORITY = {
         SSAValueKind.UNKNOWN: 0,
@@ -680,6 +681,8 @@ class IRNormalizer:
             blocks.append(ir_block)
             metrics.observe(block_metrics)
             self._update_tail_helper_hints(block)
+
+        blocks = self._promote_dispatch_switches(blocks)
 
         return IRSegment(
             index=segment.index,
@@ -2675,6 +2678,126 @@ class IRNormalizer:
                 break
 
             index = follow
+
+    def _promote_dispatch_switches(self, blocks: Sequence[IRBlock]) -> List[IRBlock]:
+        mutable_nodes: List[List[Optional[IRNode]]] = [list(block.nodes) for block in blocks]
+        pending: List[Tuple[int, int, IRSwitchDispatch]] = []
+
+        for block_index, block in enumerate(blocks):
+            nodes = mutable_nodes[block_index]
+            position = 0
+            while position < len(nodes):
+                node = nodes[position]
+                if isinstance(node, IRSwitchDispatch):
+                    pending.append((block_index, position, node))
+                    position += 1
+                    continue
+
+                commit_target = self._dispatch_commit_target(node)
+                if commit_target is not None and pending:
+                    helper_symbol = getattr(node, "symbol", None)
+                    dispatch = self._collapse_dispatch_cases(
+                        tuple(
+                            (entry_node, blocks[idx].label)
+                            for idx, _, entry_node in pending
+                        ),
+                        commit_target,
+                        helper_symbol,
+                    )
+                    for entry_block_idx, entry_pos, _ in pending:
+                        mutable_nodes[entry_block_idx][entry_pos] = None
+                    nodes.insert(position, dispatch)
+                    position += 1
+                    pending.clear()
+                    continue
+
+                position += 1
+
+        promoted: List[IRBlock] = []
+        for block, nodes in zip(blocks, mutable_nodes):
+            filtered = tuple(node for node in nodes if node is not None)
+            promoted.append(
+                IRBlock(
+                    label=block.label,
+                    start_offset=block.start_offset,
+                    nodes=filtered,
+                    annotations=block.annotations,
+                )
+            )
+
+        return promoted
+
+    def _dispatch_commit_target(self, node: IRNode) -> Optional[int]:
+        target = getattr(node, "target", None)
+        if isinstance(target, int) and target in self._DISPATCH_COMMIT_HELPERS:
+            return target
+        return None
+
+    def _collapse_dispatch_cases(
+        self,
+        entries: Sequence[Tuple[IRSwitchDispatch, str]],
+        helper_target: Optional[int],
+        helper_symbol: Optional[str],
+    ) -> IRSwitchDispatch:
+        aggregate_helper = helper_target
+        aggregate_symbol = helper_symbol
+        default_target: Optional[int] = None
+
+        cases_by_key: Dict[int, Dict[str, Any]] = {}
+
+        for node, label in entries:
+            if aggregate_helper is None and node.helper is not None:
+                aggregate_helper = node.helper
+            if aggregate_symbol is None and node.helper_symbol:
+                aggregate_symbol = node.helper_symbol
+            if node.default is not None:
+                default_target = node.default
+
+            for case in node.cases:
+                info = cases_by_key.get(case.key)
+                sources = list(case.sources)
+                if label not in sources:
+                    sources.append(label)
+                if info is None:
+                    cases_by_key[case.key] = {
+                        "target": case.target,
+                        "symbol": case.symbol,
+                        "sources": sources,
+                    }
+                    continue
+
+                info_sources = info["sources"]
+                for source in sources:
+                    if source not in info_sources:
+                        info_sources.append(source)
+                if case.symbol and not info["symbol"]:
+                    info["symbol"] = case.symbol
+                info["target"] = case.target
+
+        if aggregate_helper is None:
+            aggregate_helper = next(
+                (node.helper for node, _ in entries if node.helper is not None),
+                None,
+            )
+        if aggregate_symbol is None and aggregate_helper is not None:
+            aggregate_symbol = self._helper_symbol(aggregate_helper)
+
+        combined_cases = [
+            IRDispatchCase(
+                key=key,
+                target=info["target"],
+                symbol=info.get("symbol"),
+                sources=tuple(info["sources"]),
+            )
+            for key, info in sorted(cases_by_key.items(), key=lambda item: item[0])
+        ]
+
+        return IRSwitchDispatch(
+            cases=tuple(combined_cases),
+            helper=aggregate_helper,
+            helper_symbol=aggregate_symbol,
+            default=default_target,
+        )
 
     def _pass_table_builders(self, items: _ItemList) -> None:
         state: Optional[_TableBuilderState] = None

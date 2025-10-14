@@ -13,9 +13,11 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRBlock,
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRLiteral,
     IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
@@ -32,6 +34,7 @@ from mbcdisasm.ir.model import (
     IRIOWrite,
     IRBuildTuple,
     IRBuildArray,
+    IRDispatchCase,
     IRSwitchDispatch,
     IRTablePatch,
     IRTableBuilderBegin,
@@ -1535,6 +1538,66 @@ def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     return_node = block.nodes[2]
     assert isinstance(return_node, IRReturn)
     assert any(step.mnemonic == "op_10_8C" for step in return_node.cleanup)
+
+
+def test_normalizer_promotes_dispatch_switches(tmp_path: Path) -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge"))
+    normalizer = IRNormalizer(knowledge)
+
+    case_a = IRDispatchCase(key=1, target=0x6611)
+    case_b = IRDispatchCase(key=1, target=0x6622)
+    case_c = IRDispatchCase(key=2, target=0x6696)
+
+    block_a = IRBlock(
+        label="case_a",
+        start_offset=0,
+        nodes=(IRSwitchDispatch(cases=(case_a,), helper=None),),
+    )
+    block_b = IRBlock(
+        label="case_b",
+        start_offset=4,
+        nodes=(IRSwitchDispatch(cases=(case_b,), helper=None),),
+    )
+    block_c = IRBlock(
+        label="case_c",
+        start_offset=8,
+        nodes=(IRSwitchDispatch(cases=(case_c,), helper=None),),
+    )
+
+    commit_call = IRCall(target=0x01F1, args=tuple(), tail=True, cleanup=tuple())
+    commit_tail = IRTailCall(call=commit_call, returns=tuple())
+    commit_block = IRBlock(
+        label="commit",
+        start_offset=12,
+        nodes=(commit_tail,),
+    )
+
+    promoted = normalizer._promote_dispatch_switches(
+        [block_a, block_b, block_c, commit_block]
+    )
+
+    assert all(
+        not any(isinstance(node, IRSwitchDispatch) for node in block.nodes)
+        for block in promoted[:-1]
+    )
+
+    commit_nodes = promoted[-1].nodes
+    assert len(commit_nodes) == 2
+    dispatch = commit_nodes[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == 0x01F1
+    assert dispatch.helper_symbol == normalizer._helper_symbol(0x01F1)
+
+    keys = [case.key for case in dispatch.cases]
+    assert keys == [1, 2]
+
+    first_case, second_case = dispatch.cases
+    assert first_case.target == 0x6622
+    assert first_case.sources == ("case_a", "case_b")
+    assert second_case.target == 0x6696
+    assert second_case.sources == ("case_c",)
+
+    assert isinstance(commit_nodes[1], IRTailCall)
 
 
 def test_normalizer_folds_nested_reduce_pair(tmp_path: Path) -> None:

@@ -783,12 +783,17 @@ class IRDispatchCase:
     key: int
     target: int
     symbol: Optional[str] = None
+    sources: Tuple[str, ...] = tuple()
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
-        return f"{self.key}->{target_repr}"
+        description = f"{self.key}->{target_repr}"
+        if self.sources:
+            rendered = ", ".join(self.sources)
+            description += f" origin=[{rendered}]"
+        return description
 
 
 @dataclass(frozen=True)
