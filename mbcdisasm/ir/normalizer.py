@@ -335,6 +335,7 @@ STRUCTURAL_SKIP_NODE_TYPES = (
     IRBuildArray,
     IRBuildMap,
     IRBuildTuple,
+    IRCallCleanup,
 )
 
 EPILOGUE_ALLOWED_NODE_TYPES = (

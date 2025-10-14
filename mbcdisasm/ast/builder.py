@@ -158,6 +158,8 @@ class ASTBuilder:
             exit_reasons: List[str] = []
             fallthrough = offsets[idx + 1] if idx + 1 < len(offsets) else None
             for node in reversed(block.nodes):
+                if isinstance(node, IRCallCleanup):
+                    continue
                 if isinstance(node, IRReturn):
                     exit_reasons.append("return")
                     successors.clear()
@@ -213,8 +215,10 @@ class ASTBuilder:
         """Collapse trivial cleanup/terminator blocks into their successors."""
 
         trivial_targets: Dict[int, int] = {}
+        forwarded_entries: Dict[int, Set[str]] = defaultdict(set)
         for offset, analysis in analyses.items():
-            if offset in entry_reasons:
+            reasons = entry_reasons.get(offset)
+            if reasons and "segment_start" in reasons:
                 continue
             if analysis.exit_reasons:
                 continue
@@ -223,9 +227,13 @@ class ASTBuilder:
             block = analysis.block
             if not block.nodes:
                 trivial_targets[offset] = analysis.successors[0]
+                if reasons:
+                    forwarded_entries[analysis.successors[0]].update(reasons)
                 continue
             if all(isinstance(node, (IRCallCleanup, IRTerminator)) for node in block.nodes):
                 trivial_targets[offset] = analysis.successors[0]
+                if reasons:
+                    forwarded_entries[analysis.successors[0]].update(reasons)
 
         if not trivial_targets:
             return analyses, entry_reasons
@@ -236,6 +244,12 @@ class ASTBuilder:
                 seen.add(target)
                 target = trivial_targets[target]
             return target
+
+        if forwarded_entries:
+            resolved_entries: Dict[int, Set[str]] = defaultdict(set)
+            for target, reasons in forwarded_entries.items():
+                resolved_entries[resolve(target)].update(reasons)
+            forwarded_entries = resolved_entries
 
         compacted: Dict[int, _BlockAnalysis] = {}
         for offset, analysis in analyses.items():
@@ -255,11 +269,19 @@ class ASTBuilder:
                 fallthrough=fallthrough,
             )
 
-        updated_entries = {
-            offset: reasons
-            for offset, reasons in entry_reasons.items()
-            if offset in compacted
-        }
+        updated_entries: Dict[int, Tuple[str, ...]] = {}
+        for offset, reasons in entry_reasons.items():
+            if offset in trivial_targets:
+                continue
+            combined = set(reasons)
+            extra = forwarded_entries.get(offset)
+            if extra:
+                combined.update(extra)
+            updated_entries[offset] = tuple(sorted(combined))
+
+        for target, reasons in forwarded_entries.items():
+            if target not in updated_entries:
+                updated_entries[target] = tuple(sorted(reasons))
 
         return compacted, updated_entries
 
