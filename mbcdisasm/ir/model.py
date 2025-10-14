@@ -762,14 +762,29 @@ class IRTailcallFrame(IRNode):
 
 
 @dataclass(frozen=True)
+class IRTableOperation:
+    """Single opcode participating in a table patch sequence."""
+
+    mnemonic: str
+    operand: int
+    offset: Optional[int] = None
+
+    def render(self) -> str:
+        text = f"{self.mnemonic}(0x{self.operand:04X})"
+        if self.offset is not None:
+            text += f"@0x{self.offset:04X}"
+        return text
+
+
+@dataclass(frozen=True)
 class IRTablePatch(IRNode):
     """Collapses the recurring 0x66xx table patch sequences."""
 
-    operations: Tuple[Tuple[str, int], ...]
+    operations: Tuple[IRTableOperation, ...]
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        rendered = ", ".join(operation.render() for operation in self.operations)
         note = f"table_patch[{rendered}]"
         if self.annotations:
             note += " " + ", ".join(self.annotations)
@@ -783,12 +798,17 @@ class IRDispatchCase:
     key: int
     target: int
     symbol: Optional[str] = None
+    sources: Tuple[int, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
-        return f"{self.key}->{target_repr}"
+        details = f"{self.key}->{target_repr}"
+        if self.sources:
+            coords = ",".join(f"0x{offset:04X}" for offset in self.sources)
+            details += f" @{coords}"
+        return details
 
 
 @dataclass(frozen=True)
@@ -839,12 +859,12 @@ class IRTableBuilderEmit(IRNode):
 
     mode: int
     kind: str
-    operations: Tuple[Tuple[str, int], ...]
+    operations: Tuple[IRTableOperation, ...]
     annotations: Tuple[str, ...] = field(default_factory=tuple)
     parameters: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        ops = ", ".join(operation.render() for operation in self.operations)
         details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
         if self.parameters:
             params = ", ".join(self.parameters)

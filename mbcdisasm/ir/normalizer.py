@@ -59,6 +59,7 @@ from .model import (
     IRStackDuplicate,
     IRStackDrop,
     IRStringConstant,
+    IRTableOperation,
     IRTablePatch,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
@@ -2270,14 +2271,18 @@ class IRNormalizer:
                 mode = item.profile.mode
                 start = index
                 scan = index
-                body_ops: List[Tuple[str, int]] = []
+                body_ops: List[IRTableOperation] = []
                 body_annotations: List[str] = []
 
                 while scan < len(items):
                     candidate = items[scan]
                     if self._is_opcode_table_body(candidate, mode):
                         assert isinstance(candidate, RawInstruction)
-                        body_ops.append((candidate.mnemonic, candidate.operand))
+                        body_ops.append(
+                            IRTableOperation(
+                                candidate.mnemonic, candidate.operand, candidate.offset
+                            )
+                        )
                         body_annotations.extend(candidate.annotations)
                         scan += 1
                         continue
@@ -2288,7 +2293,7 @@ class IRNormalizer:
                     continue
 
                 prefix = start
-                prefix_ops: List[Tuple[str, int]] = []
+                prefix_ops: List[IRTableOperation] = []
                 prefix_annotations: List[str] = []
                 affix = 0
                 while prefix > 0 and affix < self._OPCODE_TABLE_MAX_AFFIX:
@@ -2297,12 +2302,17 @@ class IRNormalizer:
                         break
                     assert isinstance(candidate, RawInstruction)
                     prefix -= 1
-                    prefix_ops.insert(0, (candidate.mnemonic, candidate.operand))
+                    prefix_ops.insert(
+                        0,
+                        IRTableOperation(
+                            candidate.mnemonic, candidate.operand, candidate.offset
+                        ),
+                    )
                     prefix_annotations.extend(candidate.annotations)
                     affix += 1
 
                 suffix = scan
-                suffix_ops: List[Tuple[str, int]] = []
+                suffix_ops: List[IRTableOperation] = []
                 suffix_annotations: List[str] = []
                 affix = 0
                 while suffix < len(items) and affix < self._OPCODE_TABLE_MAX_AFFIX:
@@ -2310,7 +2320,11 @@ class IRNormalizer:
                     if not self._is_opcode_table_affix(candidate, mode):
                         break
                     assert isinstance(candidate, RawInstruction)
-                    suffix_ops.append((candidate.mnemonic, candidate.operand))
+                    suffix_ops.append(
+                        IRTableOperation(
+                            candidate.mnemonic, candidate.operand, candidate.offset
+                        )
+                    )
                     suffix_annotations.extend(candidate.annotations)
                     suffix += 1
                     affix += 1
@@ -2407,7 +2421,7 @@ class IRNormalizer:
 
     def _match_adaptive_table_run(
         self, items: _ItemList, index: int
-    ) -> Optional[Tuple[int, int, Tuple[Tuple[str, int], ...], Tuple[str, ...]]]:
+    ) -> Optional[Tuple[int, int, Tuple[IRTableOperation, ...], Tuple[str, ...]]]:
         seed = items[index]
         if not self._is_adaptive_table_seed(seed):
             return None
@@ -2416,7 +2430,7 @@ class IRNormalizer:
         kind = seed.profile.kind
         start = index
         scan = index
-        operations: List[Tuple[str, int]] = []
+        operations: List[IRTableOperation] = []
         annotations = ["adaptive_table", f"mode=0x{mode:02X}", f"kind={kind.name.lower()}"]
         seen_annotations = set(annotations)
 
@@ -2425,7 +2439,9 @@ class IRNormalizer:
             if not self._is_adaptive_table_body(candidate, mode, kind):
                 break
             assert isinstance(candidate, RawInstruction)
-            operations.append((candidate.mnemonic, candidate.operand))
+            operations.append(
+                IRTableOperation(candidate.mnemonic, candidate.operand, candidate.offset)
+            )
             for note in candidate.annotations:
                 if not note or note in seen_annotations:
                     continue
@@ -2491,7 +2507,9 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            operations: List[Tuple[str, int]] = [(item.mnemonic, item.operand)]
+            operations: List[IRTableOperation] = [
+                IRTableOperation(item.mnemonic, item.operand, item.offset)
+            ]
             scan = index + 1
             while scan < len(items):
                 candidate = items[scan]
@@ -2500,14 +2518,22 @@ class IRNormalizer:
                         candidate.mnemonic.startswith("op_2C_")
                         and 0x6600 <= candidate.operand <= 0x66FF
                     ):
-                        operations.append((candidate.mnemonic, candidate.operand))
+                        operations.append(
+                            IRTableOperation(
+                                candidate.mnemonic, candidate.operand, candidate.offset
+                            )
+                        )
                         scan += 1
                         continue
                     extra = self._TABLE_PATCH_EXTRA_MNEMONICS.get(candidate.mnemonic)
                     if extra is not None:
                         if extra and candidate.operand not in extra:
                             break
-                        operations.append((candidate.mnemonic, candidate.operand))
+                        operations.append(
+                            IRTableOperation(
+                                candidate.mnemonic, candidate.operand, candidate.offset
+                            )
+                        )
                         scan += 1
                         continue
                 break
@@ -2832,7 +2858,7 @@ class IRNormalizer:
                 except ValueError:
                     continue
         if table.operations:
-            mnemonic = table.operations[0][0]
+            mnemonic = table.operations[0].mnemonic
             if len(mnemonic) >= 8:
                 try:
                     return int(mnemonic[6:8], 16)
@@ -2861,11 +2887,13 @@ class IRNormalizer:
         return None
 
     def _extract_dispatch_cases(
-        self, operations: Sequence[Tuple[str, int]]
+        self, operations: Sequence[IRTableOperation]
     ) -> Tuple[List[IRDispatchCase], Optional[int]]:
-        cases: List[IRDispatchCase] = []
+        cases: Dict[int, Tuple[int, Optional[str], List[int]]] = {}
         default_target: Optional[int] = None
-        for mnemonic, operand in operations:
+        for operation in operations:
+            mnemonic = operation.mnemonic
+            operand = operation.operand
             if mnemonic.startswith("op_2C_"):
                 suffix = mnemonic.split("_")[-1]
                 try:
@@ -2874,11 +2902,28 @@ class IRNormalizer:
                     continue
                 target = operand & 0xFFFF
                 symbol = self.knowledge.lookup_address(target)
-                cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+                entry = cases.get(key)
+                if entry is None:
+                    sources: List[int] = []
+                else:
+                    _, _, sources = entry
+                if operation.offset is not None:
+                    sources.append(operation.offset)
+                cases[key] = (target, symbol, sources)
                 continue
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
-        return cases, default_target
+        collapsed: List[IRDispatchCase] = []
+        for key, (target, symbol, sources) in cases.items():
+            collapsed.append(
+                IRDispatchCase(
+                    key=key,
+                    target=target,
+                    symbol=symbol,
+                    sources=tuple(sources),
+                )
+            )
+        return collapsed, default_target
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0
