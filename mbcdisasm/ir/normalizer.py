@@ -842,6 +842,7 @@ class IRNormalizer:
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
+        self._pass_absorb_neutral_prefixes(items)
         self._pass_promote_push_literals(items, metrics)
 
         final_items = list(items)
@@ -3500,6 +3501,23 @@ class IRNormalizer:
     def _pass_ascii_headers(self, items: _ItemList) -> None:
         if not items:
             return
+        # Drop leading literal markers and similar annotation-only bridges so
+        # header detection can consume the following ASCII chunks.
+        while items:
+            first = items[0]
+            if not isinstance(first, RawInstruction):
+                break
+            if first.event.delta != 0:
+                break
+            if first.event.pushed_types or first.event.popped_types:
+                break
+            if not self._is_annotation_only(first):
+                break
+            self._annotation_offsets.add(first.offset)
+            self._ssa_bindings.pop(id(first), None)
+            items.pop(0)
+        if not items:
+            return
         chunk_nodes: List[IRLiteralChunk] = []
         index = 0
         while index < len(items) and isinstance(items[index], IRLiteralChunk):
@@ -4929,6 +4947,57 @@ class IRNormalizer:
             operand_alias=instruction.profile.operand_alias(),
         )
 
+    def _pass_absorb_neutral_prefixes(self, items: _ItemList) -> None:
+        structural_types = (
+            IRCall,
+            IRCallCleanup,
+            IRCallPreparation,
+            IRReturn,
+            IRTailCall,
+            IRTailcallReturn,
+            IRSwitchDispatch,
+            IRIORead,
+            IRIOWrite,
+        )
+        literal_followers = (
+            IRLiteral,
+            IRLiteralChunk,
+            IRLiteralBlock,
+            IRAsciiPreamble,
+            IRAsciiFinalize,
+            IRAsciiHeader,
+            IRStringConstant,
+        )
+        index = 0
+        while index < len(items):
+            scan = index
+            neutral_positions: List[int] = []
+            while scan < len(items):
+                candidate = items[scan]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                event = candidate.event
+                if event.delta != 0 or event.pushed_types or event.popped_types:
+                    break
+                if self._has_profile_side_effects(candidate):
+                    break
+                if candidate.profile.kind in STACK_NEUTRAL_CONTROL_KINDS:
+                    break
+                neutral_positions.append(scan)
+                scan += 1
+            if not neutral_positions:
+                index += 1
+                continue
+            follower: Optional[Union[RawInstruction, IRNode]] = items[scan] if scan < len(items) else None
+            if isinstance(follower, structural_types + literal_followers):
+                for pos in reversed(neutral_positions):
+                    raw = items.pop(pos)
+                    assert isinstance(raw, RawInstruction)
+                    self._annotation_offsets.add(raw.offset)
+                    self._ssa_bindings.pop(id(raw), None)
+                continue
+            index = neutral_positions[0] + 1
+
     def _pass_promote_push_literals(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
         while index < len(items):
@@ -5449,7 +5518,11 @@ class IRNormalizer:
 
     @staticmethod
     def _is_memref_bridge(node: Union[RawInstruction, IRNode]) -> bool:
-        return isinstance(node, (IRLoad, IRStackDuplicate))
+        if isinstance(node, (IRLoad, IRStackDuplicate)):
+            return True
+        if isinstance(node, ASCII_NEIGHBOR_NODE_TYPES):
+            return True
+        return False
 
     def _memref_component(self, instruction: RawInstruction) -> Optional[int]:
         if instruction.event.delta != 0:
