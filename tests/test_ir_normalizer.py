@@ -623,6 +623,18 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
     assert tail_targets == {0x3D30, 0x3032}
     assert any(node.cleanup and node.cleanup[0].mnemonic == "op_4C_00" for node in tail_nodes)
 
+    helper_steps = [
+        step
+        for node in tail_nodes
+        for step in node.cleanup
+        if step.mnemonic == "tail_helper"
+    ]
+    assert helper_steps
+    assert {(step.operand_alias, step.details) for step in helper_steps} == {
+        ("io.write", (("target", 0x3D30),)),
+        ("tail_helper_72", (("target", 0x3032),)),
+    }
+
     assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
 
     ascii_finalize = [node for node in flattened if isinstance(node, IRAsciiFinalize)]
@@ -711,7 +723,10 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
     assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "call_helpers"]
-    assert cleanup.steps[1].operand == 0x3E4B
+    helper_step = cleanup.steps[1]
+    assert helper_step.operand == 0x3E4B
+    assert helper_step.operand_alias == "format"
+    assert helper_step.details == (("slot", 0x3E), ("mode", 0x4B))
 
     io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
     assert len(io_writes) == 1
@@ -720,6 +735,8 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
     assert io_write.mask == 0x109C
     assert [step.mnemonic for step in io_write.pre_helpers] == ["call_helpers"]
     assert [step.operand for step in io_write.pre_helpers] == [0x0100]
+    assert io_write.pre_helpers[0].details == (("slot", 0x01), ("flags", 0x00))
+    assert io_write.pre_helpers[0].operand_alias == "format"
     assert [step.mnemonic for step in io_write.post_helpers] == ["op_F0_4B", "op_4A_10"]
 
     raw_mnemonics = {node.mnemonic for node in block.nodes if isinstance(node, IRRaw)}
@@ -748,7 +765,9 @@ def test_normalizer_converts_call_helper_variants(tmp_path: Path) -> None:
     node = block.nodes[0]
     assert isinstance(node, IRReturn)
     assert [step.mnemonic for step in node.cleanup] == ["call_helpers"]
-    assert [step.operand for step in node.cleanup] == [0x9D01]
+    helper_step = node.cleanup[0]
+    assert helper_step.operand == 0x9D01
+    assert helper_step.details == (("slot", 0x9D), ("flags", 0x01))
 
 
 def test_normalizer_attaches_f0_helper_cleanup(tmp_path: Path) -> None:
@@ -776,6 +795,9 @@ def test_normalizer_attaches_f0_helper_cleanup(tmp_path: Path) -> None:
     assert cleanup_mnemonics and cleanup_mnemonics[0] in {"page_register", "op_6C_01"}
     helper_cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
     assert [step.mnemonic for step in helper_cleanup.steps] == ["call_helpers"]
+    helper_step = helper_cleanup.steps[0]
+    assert helper_step.operand_alias == "io_service"
+    assert helper_step.details == (("slot", 0x4B), ("mask", 0x76))
 
 
 def test_normalizer_labels_fanout_cleanup(tmp_path: Path) -> None:
@@ -1176,6 +1198,10 @@ def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
     ret = next(node for node in block.nodes if isinstance(node, IRReturn))
     cleanup_mnemonics = [step.mnemonic for step in ret.cleanup]
     assert cleanup_mnemonics == ["op_D0_04", "call_helpers", "op_D0_06"]
+    helper_step = ret.cleanup[1]
+    assert helper_step.operand == 0x3D30
+    assert helper_step.operand_alias == "io_flush"
+    assert helper_step.details == (("slot", 0x3D), ("mask", 0x30))
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D0_04", "op_D0_06"}
         for node in block.nodes
@@ -1233,6 +1259,7 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
         "stack_teardown",
     ]
     assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
+    assert call_return.cleanup[0].details == (("slot", 0x00), ("flags", 0x01))
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
     assert call_return.symbol == "test_helper_1234"

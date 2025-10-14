@@ -251,11 +251,12 @@ class IRStackEffect:
     pops: int = 0
     operand_role: Optional[str] = None
     operand_alias: Optional[str] = None
+    details: Tuple[Tuple[str, int], ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        details = []
+        parts: List[str] = []
         if self.pops:
-            details.append(f"pop={self.pops}")
+            parts.append(f"pop={self.pops}")
         include_operand = bool(self.operand_role or self.operand_alias)
         if not include_operand:
             include_operand = bool(self.operand) or self.mnemonic not in {"stack_teardown"}
@@ -269,13 +270,17 @@ class IRStackEffect:
                 value = alias_text if alias_text == hex_value else f"{alias_text}({hex_value})"
             else:
                 value = hex_value
-            if self.operand_role:
-                details.append(f"{self.operand_role}={value}")
-            else:
-                details.append(f"operand={value}")
-        if not details:
+            role = self.operand_role or "operand"
+            parts.append(f"{role}={value}")
+        if self.details:
+            extra: List[str] = []
+            for name, value in self.details:
+                width = 4 if value > 0xFF else 2
+                extra.append(f"{name}=0x{value:0{width}X}")
+            parts.extend(extra)
+        if not parts:
             return self.mnemonic
-        inner = ", ".join(details)
+        inner = ", ".join(parts)
         return f"{self.mnemonic}({inner})"
 
 

@@ -175,6 +175,23 @@ TAILCALL_HELPERS = {
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
+CALL_HELPER_SLOT_DETAILS: Dict[int, Tuple[str, str]] = {
+    0xF0: ("io_service", "mask"),
+    0x4B: ("io_service", "mask"),
+    0x3D: ("io_flush", "mask"),
+    0x3E: ("format", "mode"),
+    0xED: ("format", "mode"),
+    0x2D: ("format", "mode"),
+    0x2E: ("format", "mode"),
+    0x31: ("page_setup", "mode"),
+    0x10: ("return_scheduler", "flags"),
+    0x00: ("format", "flags"),
+    0x01: ("format", "flags"),
+}
+
+
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -1168,9 +1185,17 @@ class IRNormalizer:
                 args, start = self._collect_call_arguments(items, index)
                 target = item.operand
                 symbol = self.knowledge.lookup_address(target)
+                helper_operand: Optional[int] = None
+                helper_alias: Optional[str] = None
+                if mnemonic == "tailcall_dispatch" and target in TAILCALL_HELPERS:
+                    helper_operand = target
+                    helper_alias = symbol or self.knowledge.lookup_address(target)
                 if mnemonic == "tailcall_dispatch":
                     inline_target = self._extract_tail_dispatch_target(items, index)
                     if inline_target is not None:
+                        if helper_operand is None and target in TAILCALL_HELPERS:
+                            helper_operand = target
+                            helper_alias = symbol or self.knowledge.lookup_address(target)
                         target = inline_target
                         symbol = self.knowledge.lookup_address(target)
                         if args:
@@ -1192,6 +1217,13 @@ class IRNormalizer:
                     tail=mnemonic == "tailcall_dispatch",
                     symbol=symbol,
                 )
+                if helper_operand in TAILCALL_HELPERS:
+                    helper_effect = IRAbiEffect(
+                        kind="tail_helper",
+                        operand=helper_operand,
+                        alias=helper_alias or self.knowledge.lookup_address(helper_operand),
+                    )
+                    call = replace(call, abi_effects=call.abi_effects + (helper_effect,))
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
@@ -2862,8 +2894,8 @@ class IRNormalizer:
             if helper_target in {0x003D, 0x00F0}:
                 self._rewrite_tail_helper_io(items, index, item, helper_target, new_target)
                 continue
-
             index += 1
+
 
     def _pass_tailcall_returns(self, items: _ItemList) -> None:
         index = 0
@@ -3095,6 +3127,10 @@ class IRNormalizer:
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
+            helper_effect = self._tail_helper_effect(0x0072, target, mask=cleanup_mask)
+            self._attach_tail_helper_cleanup(items, index, helper_effect)
+            if teardown is not None:
+                self._attach_tail_helper_cleanup(items, index, teardown)
             return
 
         returns = 0
@@ -3119,6 +3155,8 @@ class IRNormalizer:
         self._transfer_ssa(node, tailcall)
         items.replace_slice(index, index + 1, [tailcall])
 
+        helper_effect = self._tail_helper_effect(0x0072, target, mask=cleanup_mask)
+        self._attach_tail_helper_cleanup(items, index, helper_effect)
         if teardown is not None:
             self._attach_tail_helper_cleanup(items, index, teardown)
 
@@ -3213,6 +3251,8 @@ class IRNormalizer:
                 )
             self._transfer_ssa(node, replacement)
             items.replace_slice(index, index + 1, [replacement])
+            helper_effect = self._tail_helper_effect(helper, target)
+            self._attach_tail_helper_cleanup(items, index, helper_effect)
             return
 
         mask = self._io_mask_value(items, handshake_index)
@@ -3228,6 +3268,14 @@ class IRNormalizer:
         if slice_end < len(items) and isinstance(items[slice_end], IRReturn):
             slice_end += 1
         items.replace_slice(handshake_index, slice_end, [io_node])
+
+        helper_effect = self._tail_helper_effect(helper, target, mask=mask)
+        inserted = items[handshake_index]
+        assert isinstance(inserted, (IRIORead, IRIOWrite))
+        updated_helpers = inserted.post_helpers + (helper_effect,)
+        updated = replace(inserted, post_helpers=updated_helpers)
+        self._transfer_ssa(inserted, updated)
+        items.replace_slice(handshake_index, handshake_index + 1, [updated])
 
     @staticmethod
     def _apply_call_shuffle(args: Sequence[str], operand: int) -> List[str]:
@@ -4427,6 +4475,9 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         pops = 0
+        operand_role = instruction.profile.operand_role()
+        operand_alias = instruction.profile.operand_alias()
+        extra_details: Tuple[Tuple[str, int], ...] = tuple()
         if mnemonic in CALL_HELPER_FACADE_MNEMONICS:
             mnemonic = "call_helpers"
         elif mnemonic in FANOUT_FACADE_MNEMONICS:
@@ -4437,12 +4488,60 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
+        if mnemonic == "call_helpers":
+            helper_alias, helper_details = self._call_helper_metadata(operand)
+            operand_alias = operand_alias or helper_alias
+            operand_role = operand_role or "helper"
+            extra_details = helper_details
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
-            operand_role=instruction.profile.operand_role(),
-            operand_alias=instruction.profile.operand_alias(),
+            operand_role=operand_role,
+            operand_alias=operand_alias,
+            details=extra_details,
+        )
+
+    def _call_helper_metadata(self, operand: int) -> Tuple[str, Tuple[Tuple[str, int], ...]]:
+        slot = (operand >> 8) & 0xFF
+        payload = operand & 0xFF
+        alias, detail_name = CALL_HELPER_SLOT_DETAILS.get(slot, (f"slot_0x{slot:02X}", "flags"))
+        details: List[Tuple[str, int]] = [("slot", slot)]
+        if detail_name:
+            details.append((detail_name, payload))
+        return alias, tuple(details)
+
+    def _tail_helper_metadata(
+        self,
+        helper: int,
+        target: Optional[int],
+        *,
+        mask: Optional[int] = None,
+    ) -> Tuple[str, Tuple[Tuple[str, int], ...]]:
+        alias = self.knowledge.lookup_address(target or helper) or self.knowledge.lookup_address(helper)
+        if not alias:
+            alias = f"0x{helper:04X}"
+        details: List[Tuple[str, int]] = []
+        if target is not None:
+            details.append(("target", target & 0xFFFF))
+        if mask is not None:
+            details.append(("mask", mask & 0xFFFF))
+        return alias, tuple(details)
+
+    def _tail_helper_effect(
+        self,
+        helper: int,
+        target: Optional[int],
+        *,
+        mask: Optional[int] = None,
+    ) -> IRStackEffect:
+        alias, details = self._tail_helper_metadata(helper, target, mask=mask)
+        return IRStackEffect(
+            mnemonic="tail_helper",
+            operand=helper,
+            operand_role="helper",
+            operand_alias=alias,
+            details=details,
         )
 
     @staticmethod
