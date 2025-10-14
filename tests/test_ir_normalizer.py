@@ -39,6 +39,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
+    IRAbiEffect,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -710,8 +711,15 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "call_helpers"]
-    assert cleanup.steps[1].operand == 0x3E4B
+    mnemonics = [step.mnemonic for step in cleanup.steps]
+    assert "stack_teardown" in mnemonics
+    assert "call_helpers" not in mnemonics
+
+    helper_effects = [node for node in block.nodes if isinstance(node, IRAbiEffect)]
+    helper_operands = [effect.operand for effect in helper_effects]
+    assert 0x3E4B in helper_operands
+    effect = next(effect for effect in helper_effects if effect.operand == 0x3E4B)
+    assert effect.kind == "helper.io_service"
 
     io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
     assert len(io_writes) == 1
@@ -747,8 +755,9 @@ def test_normalizer_converts_call_helper_variants(tmp_path: Path) -> None:
     assert len(block.nodes) == 1
     node = block.nodes[0]
     assert isinstance(node, IRReturn)
-    assert [step.mnemonic for step in node.cleanup] == ["call_helpers"]
-    assert [step.operand for step in node.cleanup] == [0x9D01]
+    assert node.cleanup == ()
+    helper_effects = [effect for effect in node.abi_effects if effect.kind.startswith("helper.")]
+    assert [effect.operand for effect in helper_effects] == [0x9D01]
 
 
 def test_normalizer_attaches_f0_helper_cleanup(tmp_path: Path) -> None:
@@ -770,12 +779,14 @@ def test_normalizer_attaches_f0_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    assert any(isinstance(node, IRCallCleanup) for node in block.nodes)
     return_node = next(node for node in block.nodes if isinstance(node, IRReturn))
     cleanup_mnemonics = [step.mnemonic for step in return_node.cleanup]
     assert cleanup_mnemonics and cleanup_mnemonics[0] in {"page_register", "op_6C_01"}
-    helper_cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in helper_cleanup.steps] == ["call_helpers"]
+
+    helper_effects = [
+        node for node in block.nodes if isinstance(node, IRAbiEffect) and node.operand == 0x4B76
+    ]
+    assert helper_effects and helper_effects[0].kind == "helper.formatting"
 
 
 def test_normalizer_labels_fanout_cleanup(tmp_path: Path) -> None:
@@ -1175,7 +1186,9 @@ def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
 
     ret = next(node for node in block.nodes if isinstance(node, IRReturn))
     cleanup_mnemonics = [step.mnemonic for step in ret.cleanup]
-    assert cleanup_mnemonics == ["op_D0_04", "call_helpers", "op_D0_06"]
+    assert cleanup_mnemonics == ["op_D0_04", "op_D0_06"]
+    helper_effects = [effect for effect in ret.abi_effects if effect.kind.startswith("helper.")]
+    assert [effect.operand for effect in helper_effects] == [0x3D30]
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D0_04", "op_D0_06"}
         for node in block.nodes
@@ -1227,12 +1240,11 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
 
     call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
     assert [step.mnemonic for step in call_return.cleanup] == [
-        "call_helpers",
         "op_32_29",
         "op_29_10",
         "stack_teardown",
     ]
-    assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
+    assert [step.operand for step in call_return.cleanup[:2]] == [0x1000, 0x2910]
     assert call_return.cleanup[-1].pops == 4
     assert call_return.target == 0x1234
     assert call_return.symbol == "test_helper_1234"
@@ -1240,6 +1252,9 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert call_return.convention.operand == 0x4B08
     assert call_return.cleanup_mask == 0x1000
     assert call_return.arity is None
+
+    helper_effects = [effect for effect in call_return.abi_effects if effect.kind.startswith("helper.")]
+    assert [effect.operand for effect in helper_effects] == [0x0001]
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)

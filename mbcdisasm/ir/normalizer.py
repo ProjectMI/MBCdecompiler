@@ -8,6 +8,8 @@ from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, 
 
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
+    FANOUT_FLAGS_A,
+    FANOUT_FLAGS_B,
     IO_PORT_NAME,
     IO_SLOT,
     IO_SLOT_ALIASES,
@@ -171,6 +173,16 @@ TAILCALL_HELPERS = {
     0x0FF0,
     0x16F0,
 }
+
+# Helper operand classifiers used to promote the raw ``call_helpers`` scaffolding
+# into typed ABI effects.  The values are deliberately broad to cover new helper
+# IDs that follow the same prefix conventions as the existing ones.  The
+# categories roughly map to the major subsystems observed in the helper code:
+# formatting pipelines, IO services, page-register setup and the return
+# scheduler that configures the RET_MASK fan-out helpers.
+HELPER_IO_PREFIXES = {0x3D00, 0x3E00}
+HELPER_RETURN_LOW_NIBBLES = {0x10, 0x29, 0x2C}
+TAIL_RETURN_HELPERS = {0x0BF0, 0x0FF0, 0x16F0}
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
@@ -783,6 +795,7 @@ class IRNormalizer:
         self._pass_ascii_finalize(items)
         self._pass_tail_helpers(items)
         self._pass_tailcall_returns(items)
+        self._pass_helper_effects(items)
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
@@ -796,6 +809,7 @@ class IRNormalizer:
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
+        self._pass_helper_effects(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
@@ -4540,6 +4554,296 @@ class IRNormalizer:
     ) -> Tuple[IRAbiEffect, ...]:
         base = tuple(effect for effect in effects if effect.kind != "return_mask")
         return base + self._return_mask_effect(mask)
+
+    def _split_helper_effects(
+        self, steps: Sequence[IRStackEffect]
+    ) -> Tuple[Tuple[IRStackEffect, ...], Tuple[IRAbiEffect, ...]]:
+        remaining: List[IRStackEffect] = []
+        effects: List[IRAbiEffect] = []
+        for step in steps:
+            if step.mnemonic != "call_helpers":
+                remaining.append(step)
+                continue
+            effect = self._build_helper_effect(step.operand)
+            effects.append(effect)
+        return tuple(remaining), tuple(effects)
+
+    def _build_helper_effect(self, operand: int) -> IRAbiEffect:
+        kind = self._classify_helper_operand(operand)
+        alias = OPERAND_ALIASES.get(operand)
+        return IRAbiEffect(kind=f"helper.{kind}", operand=operand, alias=alias)
+
+    def _classify_helper_operand(self, operand: int) -> str:
+        if operand in IO_SLOT_ALIASES:
+            return "io_service"
+        prefix = operand & 0xFF00
+        if prefix in HELPER_IO_PREFIXES or (operand & 0x00FF) == (IO_SLOT & 0x00FF):
+            return "io_service"
+        if operand == PAGE_REGISTER or (operand & 0xFF00) == (PAGE_REGISTER & 0xFF00) or (operand & 0x00FF) == (PAGE_REGISTER & 0x00FF):
+            return "page_setup"
+        if (
+            operand == RET_MASK
+            or operand in {FANOUT_FLAGS_A, FANOUT_FLAGS_B}
+            or prefix in {0x2900, 0x2C00}
+            or (operand & 0x00FF) in HELPER_RETURN_LOW_NIBBLES
+        ):
+            return "return_scheduler"
+        return "formatting"
+
+    def _tail_helper_effect(self, target: int) -> Optional[IRAbiEffect]:
+        if target not in TAILCALL_HELPERS:
+            return None
+        alias = self.knowledge.lookup_address(target)
+        if target in TAIL_RETURN_HELPERS:
+            kind = "return_scheduler"
+        elif target in {0x003D, 0x00F0}:
+            kind = "io_service"
+        else:
+            kind = "formatting"
+        return IRAbiEffect(kind=f"tail.{kind}", operand=target, alias=alias)
+
+    @staticmethod
+    def _combine_abi_effects(
+        base: Sequence[IRAbiEffect], extras: Sequence[IRAbiEffect], tail_effect: Optional[IRAbiEffect]
+    ) -> Tuple[IRAbiEffect, ...]:
+        combined: List[IRAbiEffect] = list(base)
+        if extras:
+            combined.extend(extras)
+        if tail_effect is not None:
+            combined.append(tail_effect)
+        return tuple(combined)
+
+    def _update_call_like_helper_effects(self, node: CallLike) -> CallLike:
+        if isinstance(node, IRCall):
+            cleanup, effects = self._split_helper_effects(node.cleanup)
+            tail_effect = self._tail_helper_effect(node.target)
+            abi_effects = self._combine_abi_effects(node.abi_effects, effects, tail_effect)
+            if cleanup == node.cleanup and abi_effects == node.abi_effects:
+                return node
+            return IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup=cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+
+        if isinstance(node, IRCallReturn):
+            cleanup, effects = self._split_helper_effects(node.cleanup)
+            tail_effect = self._tail_helper_effect(node.target)
+            abi_effects = self._combine_abi_effects(node.abi_effects, effects, tail_effect)
+            if cleanup == node.cleanup and abi_effects == node.abi_effects:
+                return node
+            return IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+
+        if isinstance(node, IRTailcallReturn):
+            cleanup, effects = self._split_helper_effects(node.cleanup)
+            tail_effect = self._tail_helper_effect(node.target)
+            abi_effects = self._combine_abi_effects(node.abi_effects, effects, tail_effect)
+            if cleanup == node.cleanup and abi_effects == node.abi_effects:
+                return node
+            return IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+
+        if isinstance(node, IRTailCall):
+            call_cleanup, call_effects = self._split_helper_effects(node.call.cleanup)
+            tail_cleanup, tail_effects = self._split_helper_effects(node.cleanup)
+            tail_effect = self._tail_helper_effect(node.target)
+            updated_call = IRCall(
+                target=node.call.target,
+                args=node.call.args,
+                tail=True,
+                arity=node.call.arity,
+                convention=node.call.convention,
+                cleanup=call_cleanup,
+                symbol=node.call.symbol,
+                predicate=node.call.predicate,
+                abi_effects=self._combine_abi_effects(
+                    node.call.abi_effects,
+                    call_effects,
+                    tail_effect,
+                ),
+            )
+            abi_effects = self._combine_abi_effects(node.abi_effects, tail_effects, None)
+            if (
+                call_cleanup == node.call.cleanup
+                and tail_cleanup == node.cleanup
+                and abi_effects == node.abi_effects
+                and updated_call == node.call
+            ):
+                return node
+            return IRTailCall(
+                call=updated_call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=tail_cleanup,
+                abi_effects=abi_effects,
+            )
+
+        return node
+
+    def _update_return_helper_effects(self, node: IRReturn) -> IRReturn:
+        cleanup, effects = self._split_helper_effects(node.cleanup)
+        if not effects and cleanup == node.cleanup:
+            return node
+        abi_effects = self._combine_abi_effects(node.abi_effects, effects, None)
+        return IRReturn(
+            values=node.values,
+            varargs=node.varargs,
+            cleanup=cleanup,
+            abi_effects=abi_effects,
+        )
+
+    def _attach_helper_effects_to_node(
+        self, node: Union[CallLike, IRReturn], effects: Sequence[IRAbiEffect]
+    ) -> Union[CallLike, IRReturn]:
+        if not effects:
+            return node
+        if isinstance(node, IRReturn):
+            abi_effects = self._combine_abi_effects(node.abi_effects, effects, None)
+            return IRReturn(
+                values=node.values,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                abi_effects=abi_effects,
+            )
+        tail_effect = None
+        target = getattr(node, "target", None)
+        if target is not None:
+            tail_effect = self._tail_helper_effect(target)
+        abi_effects = self._combine_abi_effects(getattr(node, "abi_effects", tuple()), effects, tail_effect)
+        if isinstance(node, IRCall):
+            return IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup=node.cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+        if isinstance(node, IRCallReturn):
+            return IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+        if isinstance(node, IRTailcallReturn):
+            return IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+        if isinstance(node, IRTailCall):
+            updated_call = self._attach_helper_effects_to_node(node.call, effects)
+            assert isinstance(updated_call, IRCall)
+            return IRTailCall(
+                call=updated_call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                abi_effects=node.abi_effects,
+            )
+        return node
+
+    def _pass_helper_effects(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if isinstance(node, CallLike):
+                updated = self._update_call_like_helper_effects(node)
+                if updated is not node:
+                    self._transfer_ssa(node, updated)
+                    items.replace_slice(index, index + 1, [updated])
+                    node = updated
+                index += 1
+                continue
+            if isinstance(node, IRReturn):
+                updated_return = self._update_return_helper_effects(node)
+                if updated_return is not node:
+                    self._transfer_ssa(node, updated_return)
+                    items.replace_slice(index, index + 1, [updated_return])
+                index += 1
+                continue
+            if isinstance(node, IRCallCleanup):
+                remaining, effects = self._split_helper_effects(node.steps)
+                if effects:
+                    attached = False
+                    for direction in (1, -1):
+                        neighbor_index = index + direction
+                        while 0 <= neighbor_index < len(items):
+                            neighbor = items[neighbor_index]
+                            if isinstance(neighbor, IRCallCleanup):
+                                neighbor_index += direction
+                                continue
+                            if isinstance(neighbor, (CallLike, IRReturn)):
+                                updated_neighbor = self._attach_helper_effects_to_node(neighbor, effects)
+                                if updated_neighbor is not neighbor:
+                                    self._transfer_ssa(neighbor, updated_neighbor)
+                                    items.replace_slice(neighbor_index, neighbor_index + 1, [updated_neighbor])
+                                attached = True
+                            break
+                        if attached:
+                            break
+                    replacements: List[IRNode] = []
+                    if remaining:
+                        replacements.append(IRCallCleanup(steps=remaining))
+                    if not attached:
+                        replacements.extend(effects)
+                    if replacements:
+                        items.replace_slice(index, index + 1, replacements)
+                        index += len(replacements)
+                        continue
+                    items.pop(index)
+                    continue
+                index += 1
+                continue
+            index += 1
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
