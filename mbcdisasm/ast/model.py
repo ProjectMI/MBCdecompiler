@@ -200,6 +200,33 @@ class ASTCallStatement(ASTStatement):
 
 
 @dataclass(frozen=True)
+class ASTFrameFinalize(ASTStatement):
+    """Tear down the temporary frame created for a helper call."""
+
+    pops: int = 0
+
+    def render(self) -> str:
+        if self.pops:
+            return f"frame.finalize(pop={self.pops})"
+        return "frame.finalize()"
+
+
+@dataclass(frozen=True)
+class ASTIOEffect(ASTStatement):
+    """Interaction with a symbolic IO port."""
+
+    operation: str
+    port: str
+    mask: int | None = None
+
+    def render(self) -> str:
+        payload = f"port={self.port}"
+        if self.operation == "write" and self.mask is not None:
+            payload += f", mask=0x{self.mask:04X}"
+        return f"io.{self.operation}({payload})"
+
+
+@dataclass(frozen=True)
 class ASTTailCall(ASTStatement):
     """Tail call used as a return."""
 

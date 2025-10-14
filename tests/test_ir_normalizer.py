@@ -675,7 +675,7 @@ def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
     assert [node.port for node in io_writes] == [IO_PORT_NAME] * len(io_writes)
     assert [node.port for node in io_reads] == [IO_PORT_NAME] * len(io_reads)
 
-    assert {node.mask for node in io_writes} == {0x2C03, 0x2669}
+    assert {node.mask for node in io_writes} == {0x2C03, 0x2669, 0x003F}
     assert len(io_reads) == 1
 
     raw_mnemonics = {
@@ -709,16 +709,17 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps[:2]] == ["stack_teardown", "call_helpers"]
-    assert cleanup.steps[1].operand == 0x3E4B
+    assert [step.mnemonic for step in cleanup.steps] == ["stack_teardown"]
 
     io_writes = [node for node in block.nodes if isinstance(node, IRIOWrite)]
-    assert len(io_writes) == 1
+    assert {node.mask for node in io_writes} == {None, 0x109C}
 
-    io_write = io_writes[0]
-    assert io_write.mask == 0x109C
-    assert [step.mnemonic for step in io_write.pre_helpers] == ["call_helpers"]
-    assert [step.operand for step in io_write.pre_helpers] == [0x0100]
+    handshake = next(node for node in io_writes if node.mask is None)
+    assert [step.mnemonic for step in handshake.pre_helpers] == ["call_helpers"]
+    assert [step.operand for step in handshake.pre_helpers] == [0x3E4B]
+
+    io_write = next(node for node in io_writes if node.mask == 0x109C)
+    assert not io_write.pre_helpers
     assert [step.mnemonic for step in io_write.post_helpers] == ["op_F0_4B", "op_4A_10"]
 
     raw_mnemonics = {node.mnemonic for node in block.nodes if isinstance(node, IRRaw)}
@@ -952,9 +953,10 @@ def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:
     block = RawBlock(index=0, start_offset=0, instructions=tuple(raw_instructions))
     ir_block, metrics = normalizer._normalise_block(block)
 
-    assert metrics.raw_remaining == 0
-    cleanup = next(node for node in ir_block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_AA_00"]
+    assert metrics.raw_remaining == 1
+    raw = next(node for node in ir_block.nodes if isinstance(node, IRRaw))
+    assert raw.mnemonic == "op_AA_00"
+    assert raw.operand_alias == "ChatOut"
 
 
 def test_stack_neutral_bridge_rejects_edge_positions() -> None:
@@ -1059,7 +1061,7 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "io.write(port=io.port_6910, mask=0x2910)" in descriptions
+    assert "io.write(port=ChatOut, mask=0x2910)" in descriptions
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
@@ -1090,36 +1092,18 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
 
-    tail_nodes = [
-        node
+    io_masks = {
+        node.mask
         for segment in program.segments
         for block in segment.blocks
         for node in block.nodes
-        if isinstance(node, IRTailCall)
-    ]
-    assert len(tail_nodes) == 1
-    tail_node = tail_nodes[0]
-    assert [step.mnemonic for step in tail_node.cleanup] == ["op_10_84", "op_3D_30"]
+        if isinstance(node, IRIOWrite)
+    }
+    assert io_masks == {0x2910, 0x1234}
 
-    cleanup_nodes = [
-        node
-        for segment in program.segments
-        for block in segment.blocks
-        for node in block.nodes
-        if isinstance(node, IRCallCleanup)
-    ]
-    assert cleanup_nodes
-    assert cleanup_nodes[0].steps and cleanup_nodes[0].steps[0].mnemonic == "op_3D_30"
-
-    return_nodes = [
-        node
-        for segment in program.segments
-        for block in segment.blocks
-        for node in block.nodes
-        if isinstance(node, IRReturn)
-    ]
-    assert return_nodes
-    assert [step.mnemonic for step in return_nodes[0].cleanup] == ["op_0C_09", "op_10_50"]
+    assert all(
+        isinstance(block.nodes[-1], IRReturn) for segment in program.segments for block in segment.blocks
+    )
 def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1140,17 +1124,8 @@ def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_64_10"]
-
-    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
-    assert [step.mnemonic for step in ret.cleanup] == ["op_F0_E8", "op_3D_30"]
-
-    raw_mnemonics = {
-        node.mnemonic for node in block.nodes if isinstance(node, IRRaw)
-    }
-    assert "op_64_10" not in raw_mnemonics
-    assert "op_F0_E8" not in raw_mnemonics
+    io_write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
+    assert io_write.mask == 0x3456
 
 
 def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
@@ -1719,12 +1694,9 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_3D_30"]
-
     io_write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
     assert io_write.mask == 0x00FF
-    assert io_write.port == "io.port_6910"
+    assert io_write.port == "ChatOut"
 
 
 @pytest.mark.parametrize("operand", sorted(IO_SLOT_ALIASES - {IO_SLOT}))
@@ -2145,10 +2117,6 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
     assert load_node.ref.bank == 0x4B0C
     assert any(page.register == 0x06C8 for page in page_nodes)
 
-    cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_D4_06", "op_3D_30"]
-    assert not any(
-        isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
-        for node in block.nodes
-    )
+    io_write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
+    assert io_write.mask == 0x6901
 

@@ -9,13 +9,17 @@ from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequ
 from ..ir.model import (
     IRBlock,
     IRCall,
+    IRCallCleanup,
     IRCallReturn,
     IRFunctionPrologue,
     IRIf,
     IRFlagCheck,
     IRIndirectLoad,
     IRIndirectStore,
+    IRIORead,
+    IRIOWrite,
     IRLoad,
+    IRStackEffect,
     IRProgram,
     IRReturn,
     IRSegment,
@@ -34,8 +38,10 @@ from .model import (
     ASTCallStatement,
     ASTComment,
     ASTExpression,
+    ASTFrameFinalize,
     ASTFlagCheck,
     ASTFunctionPrologue,
+    ASTIOEffect,
     ASTIdentifier,
     ASTIndirectLoadExpr,
     ASTLiteral,
@@ -256,6 +262,20 @@ class ASTBuilder:
             )
             target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
             return [ASTStore(target=target, value=value_expr)]
+        if isinstance(node, IRIOWrite):
+            statements: List[ASTStatement] = []
+            statements.extend(self._convert_cleanup_effects(node.pre_helpers))
+            statements.append(ASTIOEffect(operation="write", port=node.port, mask=node.mask))
+            statements.extend(self._convert_cleanup_effects(node.post_helpers))
+            return statements
+        if isinstance(node, IRIORead):
+            statements: List[ASTStatement] = []
+            statements.extend(self._convert_cleanup_effects(node.pre_helpers))
+            statements.append(ASTIOEffect(operation="read", port=node.port))
+            statements.extend(self._convert_cleanup_effects(node.post_helpers))
+            return statements
+        if isinstance(node, IRCallCleanup):
+            return self._convert_cleanup_effects(node.steps)
         if isinstance(node, IRCall):
             call_expr, _ = self._convert_call(
                 node.target,
@@ -270,7 +290,9 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
-            return [ASTCallStatement(call=call_expr)]
+            statements: List[ASTStatement] = [ASTCallStatement(call=call_expr)]
+            statements.extend(self._convert_cleanup_effects(node.cleanup))
+            return statements
         if isinstance(node, IRCallReturn):
             call_expr, returns = self._convert_call(
                 node.target,
@@ -293,6 +315,7 @@ class ASTBuilder:
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
             statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
+            statements.extend(self._convert_cleanup_effects(node.cleanup))
             return statements
         if isinstance(node, IRTailCall):
             call_expr, returns = self._convert_call(
@@ -311,8 +334,10 @@ class ASTBuilder:
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
             return [ASTTailCall(call=call_expr, returns=resolved_returns)]
         if isinstance(node, IRReturn):
+            statements = self._convert_cleanup_effects(node.cleanup)
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            return [ASTReturn(values=values, varargs=node.varargs, mask=node.mask)]
+            statements.append(ASTReturn(values=values, varargs=node.varargs, mask=node.mask))
+            return statements
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             return [ASTBranch(condition=condition, then_target=node.then_target, else_target=node.else_target)]
@@ -347,6 +372,21 @@ class ASTBuilder:
                 )
             ]
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())]
+
+    def _convert_cleanup_effects(self, effects: Sequence[IRStackEffect]) -> List[ASTStatement]:
+        statements: List[ASTStatement] = []
+        for effect in effects:
+            statements.extend(self._convert_stack_effect(effect))
+        return statements
+
+    def _convert_stack_effect(self, effect: IRStackEffect) -> List[ASTStatement]:
+        mnemonic = effect.mnemonic
+        if mnemonic.startswith("stack_teardown"):
+            pops = effect.pops or effect.operand
+            return [ASTFrameFinalize(pops=pops)]
+        if mnemonic == "call_helpers":
+            return []
+        return [ASTComment(effect.describe())]
 
     def _convert_call(
         self,
@@ -393,7 +433,7 @@ class ASTBuilder:
             return SSAValueKind.POINTER
         if lowered.startswith("page"):
             return SSAValueKind.PAGE_REGISTER
-        if lowered.startswith("io"):
+        if lowered.startswith("io") or lowered.startswith("chatout"):
             return SSAValueKind.IO
         if lowered.startswith("id"):
             return SSAValueKind.IDENTIFIER
