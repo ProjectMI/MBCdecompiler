@@ -248,7 +248,10 @@ class ASTTailCall(ASTStatement):
     def render(self) -> str:
         rendered = ", ".join(expr.render() for expr in self.returns)
         suffix = f" returns [{rendered}]" if rendered else ""
-        return f"tail {self.call.render()}{suffix}"
+        call_repr = self.call.render()
+        if self.call.tail and call_repr.startswith("tail "):
+            call_repr = call_repr[len("tail ") :]
+        return f"tail {call_repr}{suffix}"
 
 
 @dataclass
@@ -277,11 +280,13 @@ class ASTBranch(ASTStatement):
     condition: ASTExpression
     then_branch: "ASTBlock | None" = None
     else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
         condition = self.condition.render()
-        then_label = self.then_branch.label if self.then_branch else "?"
-        else_label = self.else_branch.label if self.else_branch else "?"
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return f"if {condition} then {then_label} else {else_label}"
 
 
@@ -293,10 +298,12 @@ class ASTTestSet(ASTStatement):
     expr: ASTExpression
     then_branch: "ASTBlock | None" = None
     else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else "?"
-        else_label = self.else_branch.label if self.else_branch else "?"
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (
             f"testset {self.var.render()} = {self.expr.render()} "
             f"then {then_label} else {else_label}"
@@ -310,10 +317,12 @@ class ASTFlagCheck(ASTStatement):
     flag: int
     then_branch: "ASTBlock | None" = None
     else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else "?"
-        else_label = self.else_branch.label if self.else_branch else "?"
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
 
 
@@ -325,10 +334,12 @@ class ASTFunctionPrologue(ASTStatement):
     expr: ASTExpression
     then_branch: "ASTBlock | None" = None
     else_branch: "ASTBlock | None" = None
+    then_hint: str | None = None
+    else_hint: str | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else "?"
-        else_label = self.else_branch.label if self.else_branch else "?"
+        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
+        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (
             f"prologue {self.var.render()} = {self.expr.render()} "
             f"then {then_label} else {else_label}"
