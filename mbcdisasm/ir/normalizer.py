@@ -501,6 +501,7 @@ class _ItemList:
 
     def __init__(self, items: Sequence[Union[RawInstruction, IRNode]]):
         self._items: List[Union[RawInstruction, IRNode]] = list(items)
+        self.block_annotations: List[str] = []
 
     def __iter__(self) -> Iterator[Union[RawInstruction, IRNode]]:
         return iter(self._items)
@@ -843,7 +844,9 @@ class IRNormalizer:
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
+        self._pass_literal_marker_bridges(items, metrics)
 
+        extra_annotations = list(getattr(items, "block_annotations", []))
         final_items = list(items)
         final_wrapper = _ItemList(final_items)
         nodes: List[IRNode] = []
@@ -891,6 +894,7 @@ class IRNormalizer:
             else:
                 nodes.append(item)
 
+        block_annotations.extend(extra_annotations)
         ir_block = IRBlock(
             label=f"block_{block.index}",
             start_offset=block.start_offset,
@@ -4949,6 +4953,149 @@ class IRNormalizer:
             self._transfer_ssa(item, literal)
             items.replace_slice(index, index + 1, [literal])
             metrics.literals += 1
+            continue
+
+    def _pass_literal_marker_bridges(
+        self, items: _ItemList, metrics: NormalizerMetrics
+    ) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+            annotation_note = self._format_annotation(item)
+            note_recorded = False
+            if item.profile.kind is InstructionKind.ASCII_CHUNK or item.mnemonic.startswith(
+                "inline_ascii_chunk"
+            ):
+                chunk = self._make_literal_chunk(
+                    item.profile.word.raw.to_bytes(4, "big"),
+                    item.profile.mnemonic,
+                    item.annotations,
+                )
+                self._transfer_ssa(item, chunk)
+                items.replace_slice(index, index + 1, [chunk])
+                metrics.literal_chunks += 1
+                if annotation_note:
+                    items.block_annotations.append(annotation_note)
+                    note_recorded = True
+                continue
+            if not self._has_trivial_stack_effect(item):
+                index += 1
+                continue
+
+            marker_notes = tuple(
+                note for note in item.annotations if note.startswith("literal_marker")
+            )
+
+            literal_types = (IRLiteral, IRLiteralChunk, IRLiteralBlock)
+            bridge_node_types = (
+                IRLiteral,
+                IRCallCleanup,
+                IRCallPreparation,
+                IRCall,
+                IRCallReturn,
+                IRCallCleanup,
+                IRSwitchDispatch,
+                IRStackEffect,
+                IRStackDrop,
+                IRStackDuplicate,
+                IRIndirectStore,
+                IRIndirectLoad,
+                IRIOWrite,
+                IRIORead,
+                IRReturn,
+            )
+
+            def locate_target(start: int, step: int, skip_markers: bool) -> Optional[int]:
+                scan = start
+                while 0 <= scan < len(items):
+                    candidate = items[scan]
+                    if isinstance(candidate, RawInstruction):
+                        if not self._has_trivial_stack_effect(candidate):
+                            return None
+                        if skip_markers and any(
+                            note.startswith("literal_marker") for note in candidate.annotations
+                        ):
+                            scan += step
+                            continue
+                        if self._has_profile_side_effects(candidate):
+                            return None
+                        scan += step
+                        continue
+                    if isinstance(candidate, literal_types):
+                        return scan
+                    if isinstance(candidate, bridge_node_types):
+                        scan += step
+                        continue
+                    return None
+                return None
+
+            target_index: Optional[int] = None
+            if marker_notes:
+                forward = locate_target(index + 1, 1, True)
+                backward = locate_target(index - 1, -1, True)
+                if forward is not None:
+                    target_index = forward
+                elif backward is not None:
+                    target_index = backward
+                if target_index is None:
+                    items.replace_slice(index, index + 1, [])
+                    if annotation_note:
+                        items.block_annotations.append(annotation_note)
+                        note_recorded = True
+                    continue
+                target = items[target_index]
+                annotations = getattr(target, "annotations", None)
+                if annotations is None:
+                    index += 1
+                    continue
+                merged = list(annotations)
+                for note in marker_notes:
+                    if note not in merged:
+                        merged.append(note)
+                replacement = replace(target, annotations=tuple(merged))
+                items.replace_slice(target_index, target_index + 1, [replacement])
+                items.replace_slice(index, index + 1, [])
+                if target_index < index:
+                    index = max(index - 1, 0)
+                continue
+
+            if self._has_profile_side_effects(item):
+                index += 1
+                continue
+
+            forward = locate_target(index + 1, 1, False)
+            backward = locate_target(index - 1, -1, False)
+            if forward is not None:
+                target_index = forward
+            elif backward is not None:
+                target_index = backward
+
+            if target_index is None:
+                items.replace_slice(index, index + 1, [])
+                if annotation_note:
+                    items.block_annotations.append(annotation_note)
+                    note_recorded = True
+                continue
+
+            target = items[target_index]
+            annotations = getattr(target, "annotations", None)
+            if annotations is None:
+                index += 1
+                continue
+            merged = list(annotations)
+            note = self._format_annotation(item)
+            if note not in merged:
+                merged.append(note)
+            replacement = replace(target, annotations=tuple(merged))
+            items.replace_slice(target_index, target_index + 1, [replacement])
+            items.replace_slice(index, index + 1, [])
+            if target_index < index:
+                index = max(index - 1, 0)
+            if annotation_note and not note_recorded:
+                items.block_annotations.append(annotation_note)
             continue
 
     def _can_promote_push_literal(
