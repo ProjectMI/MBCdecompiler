@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
     IRBlock,
@@ -67,6 +67,29 @@ class _BlockAnalysis:
     block: IRBlock
     successors: Tuple[int, ...]
     exit_reasons: Tuple[str, ...]
+
+
+BranchStatement = ASTBranch | ASTTestSet | ASTFlagCheck | ASTFunctionPrologue
+
+
+@dataclass
+class _BranchLink:
+    """Pending control-flow link for a branch-like statement."""
+
+    statement: BranchStatement
+    then_target: int
+    else_target: int
+
+
+@dataclass
+class _PendingBlock:
+    """Block with unresolved successor references."""
+
+    label: str
+    start_offset: int
+    statements: List[ASTStatement]
+    successors: Tuple[int, ...]
+    branch_links: List[_BranchLink]
 
 
 class ASTBuilder:
@@ -157,7 +180,7 @@ class ASTBuilder:
         metrics: ASTMetrics,
     ) -> Sequence[ASTProcedure]:
         procedures: List[ASTProcedure] = []
-        current_blocks: List[ASTBlock] = []
+        current_blocks: List[_PendingBlock] = []
         current_entry: Optional[int] = None
         current_reasons: Tuple[str, ...] = tuple()
         exit_offsets: Set[int] = set()
@@ -169,12 +192,12 @@ class ASTBuilder:
             if offset in entry_reasons:
                 if current_blocks:
                     procedures.append(
-                        ASTProcedure(
+                        self._finalise_procedure(
                             name=f"proc_{len(procedures)}",
                             entry_offset=current_entry or current_blocks[0].start_offset,
                             entry_reasons=current_reasons,
-                            blocks=tuple(current_blocks),
-                            exit_offsets=tuple(sorted(exit_offsets)),
+                            blocks=current_blocks,
+                            exit_offsets=exit_offsets,
                         )
                     )
                     current_blocks = []
@@ -188,31 +211,77 @@ class ASTBuilder:
                 exit_offsets.add(offset)
         if current_blocks:
             procedures.append(
-                ASTProcedure(
+                self._finalise_procedure(
                     name=f"proc_{len(procedures)}",
                     entry_offset=current_entry or current_blocks[0].start_offset,
                     entry_reasons=current_reasons,
-                    blocks=tuple(current_blocks),
-                    exit_offsets=tuple(sorted(exit_offsets)),
+                    blocks=current_blocks,
+                    exit_offsets=exit_offsets,
                 )
             )
         return procedures
+
+    def _finalise_procedure(
+        self,
+        name: str,
+        entry_offset: int,
+        entry_reasons: Tuple[str, ...],
+        blocks: Sequence[_PendingBlock],
+        exit_offsets: Set[int],
+    ) -> ASTProcedure:
+        realised_blocks = self._realise_blocks(blocks)
+        return ASTProcedure(
+            name=name,
+            entry_offset=entry_offset,
+            entry_reasons=entry_reasons,
+            blocks=realised_blocks,
+            exit_offsets=tuple(sorted(exit_offsets)),
+        )
+
+    def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
+        block_map: Dict[int, ASTBlock] = {
+            block.start_offset: ASTBlock(
+                label=block.label,
+                start_offset=block.start_offset,
+                statements=tuple(),
+                successors=tuple(),
+            )
+            for block in blocks
+        }
+        for pending in blocks:
+            for link in pending.branch_links:
+                then_block = block_map.get(link.then_target)
+                else_block = block_map.get(link.else_target)
+                link.statement.then_branch = then_block
+                link.statement.else_branch = else_block
+            realised = block_map[pending.start_offset]
+            realised.statements = tuple(pending.statements)
+            realised.successors = tuple(
+                block_map[target]
+                for target in pending.successors
+                if target in block_map
+            )
+        return tuple(block_map[block.start_offset] for block in blocks)
 
     def _convert_block(
         self,
         analysis: _BlockAnalysis,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
-    ) -> ASTBlock:
+    ) -> _PendingBlock:
         block = analysis.block
         statements: List[ASTStatement] = []
+        branch_links: List[_BranchLink] = []
         for node in block.nodes:
-            statements.extend(self._convert_node(node, value_state, metrics))
-        return ASTBlock(
+            node_statements, node_links = self._convert_node(node, value_state, metrics)
+            statements.extend(node_statements)
+            branch_links.extend(node_links)
+        return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
-            statements=tuple(statements),
+            statements=statements,
             successors=analysis.successors,
+            branch_links=branch_links,
         )
 
     def _convert_node(
@@ -220,23 +289,23 @@ class ASTBuilder:
         node,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
-    ) -> Iterable[ASTStatement]:
+    ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             expr = ASTSlotRef(node.slot)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
-            return [ASTAssign(target=target, value=expr)]
+            return [ASTAssign(target=target, value=expr)], []
         if isinstance(node, IRStore):
             target_expr = ASTSlotRef(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(not isinstance(value_expr, ASTUnknown))
-            return [ASTStore(target=target_expr, value=value_expr)]
+            return [ASTStore(target=target_expr, value=value_expr)], []
         if isinstance(node, IRIORead):
-            return [ASTIORead(port=node.port)]
+            return [ASTIORead(port=node.port)], []
         if isinstance(node, IRIOWrite):
-            return [ASTIOWrite(port=node.port, mask=node.mask)]
+            return [ASTIOWrite(port=node.port, mask=node.mask)], []
         if isinstance(node, IRIndirectLoad):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
@@ -253,7 +322,7 @@ class ASTBuilder:
                     target=ASTIdentifier(node.target, self._infer_kind(node.target)),
                     value=expr,
                 )
-            ]
+            ], []
         if isinstance(node, IRIndirectStore):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
@@ -266,7 +335,7 @@ class ASTBuilder:
                 not any(isinstance(expr, ASTUnknown) for expr in (pointer, offset_expr, value_expr))
             )
             target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
-            return [ASTStore(target=target, value=value_expr)]
+            return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRCall):
             call_expr, _ = self._convert_call(
                 node.target,
@@ -281,7 +350,7 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
-            return [ASTCallStatement(call=call_expr)]
+            return [ASTCallStatement(call=call_expr)], []
         if isinstance(node, IRCallReturn):
             call_expr, returns = self._convert_call(
                 node.target,
@@ -304,7 +373,7 @@ class ASTBuilder:
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
             statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
-            return statements
+            return statements, []
         if isinstance(node, IRTailCall):
             call_expr, returns = self._convert_call(
                 node.call.target,
@@ -320,25 +389,28 @@ class ASTBuilder:
                 len(call_expr.args),
             )
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            return [ASTTailCall(call=call_expr, returns=resolved_returns)]
+            return [ASTTailCall(call=call_expr, returns=resolved_returns)], []
         if isinstance(node, IRReturn):
             statements: List[ASTStatement] = []
             statements.extend(self._frame_finalize(node.cleanup))
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
             statements.append(ASTReturn(values=values, varargs=node.varargs, mask=node.mask))
-            return statements
+            return statements, []
         if isinstance(node, IRCallCleanup):
-            return self._frame_finalize(node.steps)
+            return self._frame_finalize(node.steps), []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
-            return [ASTBranch(condition=condition, then_target=node.then_target, else_target=node.else_target)]
+            branch = ASTBranch(condition=condition)
+            return [branch], [
+                _BranchLink(statement=branch, then_target=node.then_target, else_target=node.else_target)
+            ]
         if isinstance(node, IRTestSetBranch):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
-            return [
-                ASTTestSet(
-                    var=var_expr,
-                    expr=expr,
+            statement = ASTTestSet(var=var_expr, expr=expr)
+            return [statement], [
+                _BranchLink(
+                    statement=statement,
                     then_target=node.then_target,
                     else_target=node.else_target,
                 )
@@ -346,23 +418,24 @@ class ASTBuilder:
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
-            return [
-                ASTFunctionPrologue(
-                    var=var_expr,
-                    expr=expr,
+            statement = ASTFunctionPrologue(var=var_expr, expr=expr)
+            return [statement], [
+                _BranchLink(
+                    statement=statement,
                     then_target=node.then_target,
                     else_target=node.else_target,
                 )
             ]
         if isinstance(node, IRFlagCheck):
-            return [
-                ASTFlagCheck(
-                    flag=node.flag,
+            statement = ASTFlagCheck(flag=node.flag)
+            return [statement], [
+                _BranchLink(
+                    statement=statement,
                     then_target=node.then_target,
                     else_target=node.else_target,
                 )
             ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())]
+        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     def _convert_call(
         self,
