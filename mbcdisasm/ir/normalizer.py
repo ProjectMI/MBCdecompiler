@@ -632,6 +632,8 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._dispatch_helper_hint: Optional[int] = None
+        self._dispatch_target_hints: Dict[int, Optional[int]] = {}
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -655,6 +657,7 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._dispatch_target_hints.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -674,6 +677,7 @@ class IRNormalizer:
         blocks: List[IRBlock] = []
         metrics = NormalizerMetrics()
         self._pending_tail_targets.clear()
+        self._dispatch_helper_hint = None
 
         for block in raw_blocks:
             ir_block, block_metrics = self._normalise_block(block)
@@ -2517,8 +2521,17 @@ class IRNormalizer:
 
     def _pass_table_dispatch(self, items: _ItemList) -> None:
         index = 0
+        helper_hint = self._dispatch_helper_hint
         while index < len(items):
             item = items[index]
+
+            if isinstance(item, CallLike):
+                target = getattr(item, "target", None)
+                if isinstance(target, int):
+                    helper_hint = target
+                index += 1
+                continue
+
             if not isinstance(item, IRTablePatch):
                 index += 1
                 continue
@@ -2532,14 +2545,35 @@ class IRNormalizer:
                 candidate = items[follow]
                 if isinstance(candidate, CallLike):
                     target = getattr(candidate, "target", None)
-                    if isinstance(target, int) and target in {0x6623, 0x6624}:
+                    if isinstance(target, int):
                         helper_target = target
                         helper_symbol = self.knowledge.lookup_address(target)
+                        helper_hint = target
+
+            if helper_target is None and helper_hint is not None:
+                helper_target = helper_hint
+                helper_symbol = self.knowledge.lookup_address(helper_target)
 
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
                 index += 1
                 continue
+
+            if helper_target is None:
+                ambiguous = False
+                helpers: Set[int] = set()
+                for case in cases:
+                    if case.target in self._dispatch_target_hints:
+                        hint = self._dispatch_target_hints[case.target]
+                        if hint is None:
+                            ambiguous = True
+                            break
+                        helpers.add(hint)
+                if not ambiguous and helpers:
+                    if len(helpers) == 1:
+                        helper_target = next(iter(helpers))
+                        helper_symbol = self.knowledge.lookup_address(helper_target)
+                        helper_hint = helper_target
 
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
@@ -2547,8 +2581,45 @@ class IRNormalizer:
                 helper_symbol=helper_symbol,
                 default=default,
             )
+            if helper_target is not None:
+                helper_hint = helper_target
+                missing = object()
+                for case in cases:
+                    existing = self._dispatch_target_hints.get(case.target, missing)
+                    if existing is missing:
+                        self._dispatch_target_hints[case.target] = helper_target
+                    elif existing is not None and existing != helper_target:
+                        self._dispatch_target_hints[case.target] = None
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
+
+        self._dispatch_helper_hint = helper_hint
+
+        for position, node in enumerate(items):
+            if not isinstance(node, IRSwitchDispatch) or node.helper is not None:
+                continue
+            ambiguous = False
+            helpers: Set[int] = set()
+            for case in node.cases:
+                if case.target in self._dispatch_target_hints:
+                    hint = self._dispatch_target_hints[case.target]
+                    if hint is None:
+                        ambiguous = True
+                        break
+                    helpers.add(hint)
+            if ambiguous or not helpers:
+                continue
+            if len(helpers) != 1:
+                continue
+            helper_target = next(iter(helpers))
+            helper_symbol = self.knowledge.lookup_address(helper_target)
+            updated = IRSwitchDispatch(
+                cases=node.cases,
+                helper=helper_target,
+                helper_symbol=helper_symbol,
+                default=node.default,
+            )
+            items.replace_slice(position, position + 1, [updated])
 
     def _pass_dispatch_wrappers(self, items: _ItemList) -> None:
         index = 0
