@@ -19,6 +19,11 @@ class IRTextRenderer:
             for const in program.string_pool:
                 lines.append(f"{const.describe()}")
             lines.append("")
+        if getattr(program, "formatters", ()):  # pragma: no cover - defensive
+            lines.append("; formatter pool")
+            for formatter in program.formatters:
+                lines.append(f"{formatter.describe()}")
+            lines.append("")
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"

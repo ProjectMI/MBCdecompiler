@@ -433,6 +433,28 @@ class IRBuildTuple(IRNode):
         return f"tuple([{values}])"
 
 
+def _render_literal_block(
+    triplets: Tuple[Tuple[int, int, int], ...],
+    tail: Tuple[int, ...],
+    reducer: Optional[str],
+    reducer_operand: Optional[int],
+    annotations: Tuple[str, ...],
+) -> str:
+    chunks = []
+    for a, b, c in triplets:
+        chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
+    base = "literal_block[" + ", ".join(chunks) + "]"
+    if tail:
+        tail_repr = ", ".join(f"0x{value:04X}" for value in tail)
+        base += f" tail=[{tail_repr}]"
+    if reducer:
+        operand = f" 0x{reducer_operand:04X}" if reducer_operand is not None else ""
+        base += f" via {reducer}{operand}"
+    if annotations:
+        base += " " + ", ".join(annotations)
+    return base
+
+
 @dataclass(frozen=True)
 class IRLiteralBlock(IRNode):
     """Canonical representation of literal marker chains."""
@@ -442,23 +464,41 @@ class IRLiteralBlock(IRNode):
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
-        chunks = []
-        for a, b, c in self.triplets:
-            chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        base = "literal_block[" + ", ".join(chunks) + "]"
-        if self.tail:
-            tail_repr = ", ".join(f"0x{value:04X}" for value in self.tail)
-            base += f" tail=[{tail_repr}]"
-        if self.reducer:
-            operand = (
-                f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
-            )
-            base += f" via {self.reducer}{operand}"
-        if self.annotations:
-            base += " " + ", ".join(self.annotations)
-        return base
+        rendered = _render_literal_block(
+            self.triplets,
+            self.tail,
+            self.reducer,
+            self.reducer_operand,
+            self.annotations,
+        )
+        if self.symbol:
+            return rendered.replace("literal_block", f"literal_block {self.symbol}", 1)
+        return rendered
+
+
+@dataclass(frozen=True)
+class IRLiteralFormatter:
+    """Pooled literal formatter shared across multiple nodes."""
+
+    symbol: str
+    triplets: Tuple[Tuple[int, int, int], ...]
+    reducer: Optional[str] = None
+    reducer_operand: Optional[int] = None
+    tail: Tuple[int, ...] = tuple()
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        rendered = _render_literal_block(
+            self.triplets,
+            self.tail,
+            self.reducer,
+            self.reducer_operand,
+            self.annotations,
+        )
+        return f"formatter {self.symbol} = {rendered}"
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1169,7 @@ class IRProgram:
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
     string_pool: Tuple[IRStringConstant, ...] = tuple()
+    formatters: Tuple[IRLiteralFormatter, ...] = tuple()
 
 
 @dataclass
@@ -1199,6 +1240,7 @@ __all__ = [
     "IRBuildMap",
     "IRBuildTuple",
     "IRLiteralBlock",
+    "IRLiteralFormatter",
     "IRIf",
     "IRTestSetBranch",
     "IRFlagCheck",

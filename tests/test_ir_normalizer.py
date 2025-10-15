@@ -15,6 +15,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteralBlock,
     IRLiteralChunk,
     IRPageRegister,
     IRTailCall,
@@ -821,6 +822,62 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
     assert any("fmt.helper_0020" in text for text in descriptions)
+
+
+def test_literal_formatter_pool_consolidates_duplicates(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    segments: list[Segment] = []
+    offset = 0
+
+    def add_segment(words: list[InstructionWord]) -> None:
+        nonlocal offset
+        data = encode_instructions(words)
+        descriptor = SegmentDescriptor(len(segments), offset, offset + len(data))
+        segments.append(Segment(descriptor, data))
+        offset += len(data)
+
+    pattern = [
+        build_word(0, 0x04, 0x00, 0x0000),
+        build_word(4, 0x00, 0x00, 0x0067),
+        build_word(8, 0x00, 0x00, 0x0400),
+        build_word(12, 0x00, 0x00, 0x6704),
+        build_word(16, 0x00, 0x00, 0x0067),
+        build_word(20, 0x00, 0x00, 0x0400),
+        build_word(24, 0x00, 0x00, 0x6704),
+        build_word(28, 0x00, 0x00, 0x6910),
+        build_word(32, 0x30, 0x00, 0x0000),
+    ]
+
+    add_segment(pattern)
+    add_segment(pattern)
+
+    container = MbcContainer(Path("dummy"), segments)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    literal_blocks = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRLiteralBlock)
+    ]
+
+    assert len(literal_blocks) == 2
+    symbols = {block.symbol for block in literal_blocks}
+    assert len(symbols) == 1
+    assert program.formatters
+    assert len(program.formatters) == 1
+    formatter = program.formatters[0]
+    symbol = next(iter(symbols))
+    assert formatter.symbol == symbol
+    assert formatter.triplets == literal_blocks[0].triplets
+    assert formatter.tail == literal_blocks[0].tail
+
+    text = IRTextRenderer().render(program)
+    assert "; formatter pool" in text
+    assert any(symbol in line for line in text.splitlines())
 
 
 def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> None:

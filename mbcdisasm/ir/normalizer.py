@@ -43,6 +43,7 @@ from .model import (
     IRFunctionPrologue,
     IRLiteral,
     IRLiteralBlock,
+    IRLiteralFormatter,
     IRLiteralChunk,
     IRDataMarker,
     IRPageRegister,
@@ -659,6 +660,11 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._literal_formatter_pool: Dict[
+            Tuple[Tuple[Tuple[int, int, int], ...], Tuple[int, ...], Optional[str], Optional[int]],
+            IRLiteralFormatter,
+        ] = {}
+        self._literal_formatter_order: List[IRLiteralFormatter] = []
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -682,6 +688,8 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._literal_formatter_pool.clear()
+        self._literal_formatter_order.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -690,10 +698,24 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
+        used_formatter_symbols: Set[str] = set()
+        for segment in segments:
+            for block in segment.blocks:
+                for node in block.nodes:
+                    if isinstance(node, IRLiteralBlock) and node.symbol:
+                        used_formatter_symbols.add(node.symbol)
+
+        formatter_pool = [
+            formatter
+            for formatter in self._literal_formatter_order
+            if formatter.symbol in used_formatter_symbols
+        ]
+
         return IRProgram(
             segments=tuple(segments),
             metrics=aggregate_metrics,
             string_pool=tuple(self._string_pool_order),
+            formatters=tuple(formatter_pool),
         )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
@@ -1238,6 +1260,32 @@ class IRNormalizer:
         self._string_pool_order.append(constant)
         return constant
 
+    def _intern_literal_formatter(
+        self,
+        triplets: Tuple[Tuple[int, int, int], ...],
+        tail: Tuple[int, ...],
+        reducer: Optional[str],
+        operand: Optional[int],
+        annotations: Sequence[str] = (),
+    ) -> IRLiteralFormatter:
+        key = (triplets, tail, reducer, operand)
+        existing = self._literal_formatter_pool.get(key)
+        if existing is not None:
+            return existing
+
+        symbol = f"formatter_{len(self._literal_formatter_order):04d}"
+        formatter = IRLiteralFormatter(
+            symbol=symbol,
+            triplets=triplets,
+            reducer=reducer,
+            reducer_operand=operand,
+            tail=tail,
+            annotations=tuple(annotations),
+        )
+        self._literal_formatter_pool[key] = formatter
+        self._literal_formatter_order.append(formatter)
+        return formatter
+
     def _make_literal_chunk(
         self, data: bytes, source: str, annotations: Sequence[str]
     ) -> IRLiteralChunk:
@@ -1667,12 +1715,29 @@ class IRNormalizer:
         if normalized is None:
             return None
 
+        return self._literal_block_from_normalized(
+            normalized,
+            reducer=reducer,
+            operand=operand,
+        )
+
+    def _literal_block_from_normalized(
+        self,
+        normalized: Tuple[Tuple[Tuple[int, int, int], ...], Tuple[int, ...]],
+        *,
+        reducer: Optional[str] = None,
+        operand: Optional[int] = None,
+        annotations: Sequence[str] = (),
+    ) -> IRLiteralBlock:
         triplets, tail = normalized
+        formatter = self._intern_literal_formatter(triplets, tail, reducer, operand, annotations)
         return IRLiteralBlock(
             triplets=triplets,
             reducer=reducer,
             reducer_operand=operand,
             tail=tail,
+            annotations=tuple(annotations),
+            symbol=formatter.symbol,
         )
 
     def _pass_literal_block_reducers(
@@ -1685,11 +1750,11 @@ class IRNormalizer:
             if isinstance(first, RawInstruction) and first.mnemonic.startswith("reduce"):
                 if isinstance(second, IRLiteralBlock):
                     if second.reducer is None:
-                        updated = IRLiteralBlock(
-                            triplets=second.triplets,
+                        updated = self._literal_block_from_normalized(
+                            (second.triplets, second.tail),
                             reducer=first.mnemonic,
-                            reducer_operand=first.operand,
-                            tail=second.tail,
+                            operand=first.operand,
+                            annotations=second.annotations,
                         )
                         self._transfer_ssa(first, updated)
                         items.replace_slice(index, index + 2, [updated])
