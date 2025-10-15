@@ -105,11 +105,13 @@ class ASTBuilder:
         self._current_entry_reasons: Mapping[int, Tuple[str, ...]] = {}
         self._current_block_labels: Mapping[int, str] = {}
         self._current_exit_hints: Mapping[int, str] = {}
+        self._procedure_counter: int = 0
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
     def build(self, program: IRProgram) -> ASTProgram:
+        self._procedure_counter = 0
         segments: List[ASTSegment] = []
         metrics = ASTMetrics()
         for segment in program.segments:
@@ -284,7 +286,7 @@ class ASTBuilder:
                 if current_blocks:
                     procedures.append(
                         self._finalise_procedure(
-                            name=f"proc_{len(procedures)}",
+                            name=self._next_procedure_name(),
                             entry_offset=current_entry or current_blocks[0].start_offset,
                             entry_reasons=current_reasons,
                             blocks=current_blocks,
@@ -298,12 +300,12 @@ class ASTBuilder:
                 current_reasons = entry_reasons[offset]
             ast_block = self._convert_block(analysis, value_state, metrics)
             current_blocks.append(ast_block)
-            if analysis.exit_reasons:
+            if self._is_exit_block(offset, analysis, analyses, entry_reasons):
                 exit_offsets.add(offset)
         if current_blocks:
             procedures.append(
                 self._finalise_procedure(
-                    name=f"proc_{len(procedures)}",
+                    name=self._next_procedure_name(),
                     entry_offset=current_entry or current_blocks[0].start_offset,
                     entry_reasons=current_reasons,
                     blocks=current_blocks,
@@ -328,6 +330,29 @@ class ASTBuilder:
             blocks=realised_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
         )
+
+    def _next_procedure_name(self) -> str:
+        name = f"proc_{self._procedure_counter}"
+        self._procedure_counter += 1
+        return name
+
+    def _is_exit_block(
+        self,
+        offset: int,
+        analysis: _BlockAnalysis,
+        analyses: Mapping[int, _BlockAnalysis],
+        entry_reasons: Mapping[int, Tuple[str, ...]],
+    ) -> bool:
+        if analysis.exit_reasons:
+            return True
+        if not analysis.successors:
+            return True
+        for target in analysis.successors:
+            if target not in analyses:
+                return True
+            if target in entry_reasons and target != offset:
+                return True
+        return False
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {

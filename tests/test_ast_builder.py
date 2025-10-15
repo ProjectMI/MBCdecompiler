@@ -14,6 +14,13 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     builder = ASTBuilder()
     ast_program = builder.build(program)
 
+    procedure_names = [
+        procedure.name
+        for segment in ast_program.segments
+        for procedure in segment.procedures
+    ]
+    assert len(procedure_names) == len(set(procedure_names))
+
     assert ast_program.metrics.procedure_count >= 1
     assert ast_program.metrics.block_count >= 1
     assert ast_program.metrics.call_sites >= 1
@@ -30,6 +37,10 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     rendered = [statement.render() for statement in block.statements]
     assert any("call" in line for line in rendered)
     assert any(line.startswith("return") for line in rendered)
+
+    segment = ast_program.segments[1]
+    assert segment.procedures[0].exit_offsets
+    assert segment.procedures[1].exit_offsets
 
     summary = ast_program.metrics.describe()
     assert "procedures=" in summary
