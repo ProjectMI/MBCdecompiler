@@ -714,6 +714,49 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
     assert ascii_finalize and all(node.helper in {0x3D30, 0x7223, 0xF172} for node in ascii_finalize)
 
 
+def test_tail_helper_return_mask_shapes_returns() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge"))
+
+    words = [
+        InstructionWord(0, int("306C0104", 16)),
+        InstructionWord(4, int("0B00005F", 16)),
+        InstructionWord(8, int("0000002C", 16)),
+        InstructionWord(12, int("0163D3FE", 16)),
+        InstructionWord(16, int("FFFF3032", 16)),
+        InstructionWord(20, int("29100072", 16)),
+        InstructionWord(24, int("302810FC", 16)),
+        InstructionWord(28, int("012C0066", 16)),
+        InstructionWord(32, int("27291000", 16)),
+        InstructionWord(36, int("6C01040B", 16)),
+        InstructionWord(40, int("00005F00", 16)),
+        InstructionWord(44, int("00006C01", 16)),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    tail_nodes = [
+        node
+        for block in program.segments[0].blocks
+        for node in block.nodes
+        if isinstance(node, IRTailCall)
+    ]
+
+    assert tail_nodes
+
+    for node in tail_nodes:
+        if node.call.target == 0x3032:
+            assert node.returns == ("ret0", "ret1", "ret2", "ret3")
+            break
+    else:  # pragma: no cover - sanity guard
+        pytest.fail("expected helper tail call not found")
+
+
 def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

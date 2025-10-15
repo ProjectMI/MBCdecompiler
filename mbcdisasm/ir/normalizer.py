@@ -3352,6 +3352,10 @@ class IRNormalizer:
                 values = returns
             else:
                 count = max(int(returns), 0)
+                if count == 0:
+                    mask_arity = self._return_mask_arity(mask)
+                    if mask_arity:
+                        count = mask_arity
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
             if item.varargs and not values:
                 values = ("ret*",)
@@ -3475,14 +3479,26 @@ class IRNormalizer:
 
         symbol = self._helper_symbol(target)
 
+        mask_arity = self._return_mask_arity(cleanup_mask)
+        if not mask_arity:
+            mask_arity = self._return_mask_arity(RET_MASK)
+
+        return_values: Tuple[str, ...] = tuple()
+        return_varargs = False
+        if returns_node is not None:
+            return_values = returns_node.values
+            if mask_arity and len(return_values) > mask_arity:
+                return_values = return_values[:mask_arity]
+            return_varargs = returns_node.varargs
+
         if cleanup_mask == RET_MASK and returns_node is not None:
             cleanup_chain = list(returns_node.cleanup)
             if teardown is not None:
                 cleanup_chain.append(teardown)
                 teardown = None
             new_return = IRReturn(
-                values=returns_node.values,
-                varargs=returns_node.varargs,
+                values=return_values,
+                varargs=return_varargs,
                 cleanup=tuple(cleanup_chain),
                 abi_effects=returns_node.abi_effects,
             )
@@ -3490,16 +3506,15 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [new_return])
             return
 
-        returns = 0
-        varargs = False
-        if returns_node is not None:
-            returns = len(returns_node.values)
-            varargs = returns_node.varargs
+        return_spec: Union[int, Tuple[str, ...]] = return_values if return_values else 0
+        varargs = return_varargs
+        if not return_values and mask_arity:
+            return_spec = tuple(f"ret{i}" for i in range(mask_arity))
 
         tailcall = IRTailcallReturn(
             target=target,
             args=tuple(args),
-            returns=returns,
+            returns=return_spec,
             varargs=varargs,
             cleanup=tuple(retained_cleanup),
             tail=True,
@@ -5036,6 +5051,12 @@ class IRNormalizer:
             return tuple()
         alias = OPERAND_ALIASES.get(mask)
         return (IRAbiEffect(kind="return_mask", operand=mask, alias=alias),)
+
+    @staticmethod
+    def _return_mask_arity(mask: Optional[int]) -> int:
+        if mask is None:
+            return 0
+        return mask.bit_count()
 
     def _merge_return_mask_effects(
         self, effects: Sequence[IRAbiEffect], mask: Optional[int]
