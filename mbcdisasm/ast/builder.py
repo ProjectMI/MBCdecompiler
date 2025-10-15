@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
@@ -97,6 +97,15 @@ class _PendingBlock:
     branch_links: List[_BranchLink]
 
 
+@dataclass
+class _ProcedureAccumulator:
+    """Partial reconstruction state for a single procedure."""
+
+    entry_offset: int
+    entry_reasons: Set[str] = field(default_factory=set)
+    blocks: Dict[int, _PendingBlock] = field(default_factory=dict)
+
+
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
 
@@ -175,7 +184,7 @@ class ASTBuilder:
                 if isinstance(node, IRFunctionPrologue):
                     successors.update({node.then_target, node.else_target})
                     break
-            if not successors and fallthrough is not None:
+            if not successors and fallthrough is not None and not exit_reasons:
                 successors.add(fallthrough)
             analyses[block.start_offset] = _BlockAnalysis(
                 block=block,
@@ -270,46 +279,55 @@ class ASTBuilder:
         entry_reasons: Mapping[int, Tuple[str, ...]],
         metrics: ASTMetrics,
     ) -> Sequence[ASTProcedure]:
+        assigned: Dict[int, int] = {}
+        accumulators: Dict[int, _ProcedureAccumulator] = {}
+        order: List[int] = []
+
+        for entry in sorted(entry_reasons):
+            if entry not in analyses:
+                continue
+            reachable = self._collect_entry_blocks(entry, analyses, entry_reasons, assigned)
+            if not reachable:
+                continue
+            accumulator = _ProcedureAccumulator(entry_offset=entry)
+            accumulator.entry_reasons.update(entry_reasons[entry])
+            order.append(entry)
+            state: Dict[str, ASTExpression] = {}
+            for offset in sorted(reachable):
+                assigned[offset] = entry
+                analysis = analyses[offset]
+                accumulator.entry_reasons.update(entry_reasons.get(offset, ()))
+                accumulator.blocks[offset] = self._convert_block(analysis, state, metrics)
+            accumulators[entry] = accumulator
+
+        for offset in sorted(analyses):
+            if offset in assigned:
+                continue
+            reachable = self._collect_component(offset, analyses, assigned)
+            if not reachable:
+                continue
+            accumulator = _ProcedureAccumulator(entry_offset=offset)
+            order.append(offset)
+            state: Dict[str, ASTExpression] = {}
+            for node in sorted(reachable):
+                assigned[node] = offset
+                analysis = analyses[node]
+                accumulator.entry_reasons.update(entry_reasons.get(node, ()))
+                accumulator.blocks[node] = self._convert_block(analysis, state, metrics)
+            accumulators[offset] = accumulator
+
         procedures: List[ASTProcedure] = []
-        current_blocks: List[_PendingBlock] = []
-        current_entry: Optional[int] = None
-        current_reasons: Tuple[str, ...] = tuple()
-        exit_offsets: Set[int] = set()
-        value_state: Dict[str, ASTExpression] = {}
-        sorted_offsets = sorted(analyses)
-        for offset in sorted_offsets:
-            analysis = analyses[offset]
-            block = analysis.block
-            if offset in entry_reasons:
-                if current_blocks:
-                    procedures.append(
-                        self._finalise_procedure(
-                            name=f"proc_{len(procedures)}",
-                            entry_offset=current_entry or current_blocks[0].start_offset,
-                            entry_reasons=current_reasons,
-                            blocks=current_blocks,
-                            exit_offsets=exit_offsets,
-                        )
-                    )
-                    current_blocks = []
-                    exit_offsets = set()
-                    value_state = {}
-                current_entry = offset
-                current_reasons = entry_reasons[offset]
-            ast_block = self._convert_block(analysis, value_state, metrics)
-            current_blocks.append(ast_block)
-            if analysis.exit_reasons:
-                exit_offsets.add(offset)
-        if current_blocks:
-            procedures.append(
-                self._finalise_procedure(
-                    name=f"proc_{len(procedures)}",
-                    entry_offset=current_entry or current_blocks[0].start_offset,
-                    entry_reasons=current_reasons,
-                    blocks=current_blocks,
-                    exit_offsets=exit_offsets,
-                )
+        for index, entry in enumerate(order):
+            accumulator = accumulators[entry]
+            pending_blocks = [accumulator.blocks[offset] for offset in sorted(accumulator.blocks)]
+            name = f"proc_{accumulator.entry_offset:04X}"
+            procedure = self._finalise_procedure(
+                name=name,
+                entry_offset=accumulator.entry_offset,
+                entry_reasons=tuple(sorted(accumulator.entry_reasons)),
+                blocks=pending_blocks,
             )
+            procedures.append(procedure)
         return procedures
 
     def _finalise_procedure(
@@ -318,9 +336,9 @@ class ASTBuilder:
         entry_offset: int,
         entry_reasons: Tuple[str, ...],
         blocks: Sequence[_PendingBlock],
-        exit_offsets: Set[int],
     ) -> ASTProcedure:
         realised_blocks = self._realise_blocks(blocks)
+        exit_offsets = self._compute_exit_offsets(blocks)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
@@ -328,6 +346,128 @@ class ASTBuilder:
             blocks=realised_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
         )
+
+    def _collect_entry_blocks(
+        self,
+        entry: int,
+        analyses: Mapping[int, _BlockAnalysis],
+        entry_reasons: Mapping[int, Tuple[str, ...]],
+        assigned: Mapping[int, int],
+    ) -> Set[int]:
+        reachable: Set[int] = set()
+        stack: List[int] = [entry]
+        while stack:
+            offset = stack.pop()
+            if offset in reachable:
+                continue
+            if offset in assigned and assigned[offset] != entry:
+                continue
+            analysis = analyses.get(offset)
+            if analysis is None:
+                continue
+            reachable.add(offset)
+            for successor in analysis.successors:
+                if successor not in analyses:
+                    continue
+                if successor in entry_reasons and successor != entry:
+                    continue
+                stack.append(successor)
+        return reachable
+
+    def _collect_component(
+        self,
+        start: int,
+        analyses: Mapping[int, _BlockAnalysis],
+        assigned: Mapping[int, int],
+    ) -> Set[int]:
+        reachable: Set[int] = set()
+        stack: List[int] = [start]
+        while stack:
+            offset = stack.pop()
+            if offset in reachable or offset in assigned:
+                continue
+            analysis = analyses.get(offset)
+            if analysis is None:
+                continue
+            reachable.add(offset)
+            for successor in analysis.successors:
+                if successor not in analyses:
+                    continue
+                stack.append(successor)
+        return reachable
+
+    def _compute_exit_offsets(self, blocks: Sequence[_PendingBlock]) -> Tuple[int, ...]:
+        if not blocks:
+            return tuple()
+
+        exit_node = "__exit__"
+        offsets = {block.start_offset for block in blocks}
+        nodes = set(offsets)
+        nodes.add(exit_node)
+
+        postdom: Dict[int | str, Set[int | str]] = {
+            offset: set(nodes) for offset in offsets
+        }
+        postdom[exit_node] = {exit_node}
+
+        successors: Dict[int, Set[int | str]] = {}
+        for block in blocks:
+            analysis = self._current_analyses.get(block.start_offset)
+            succ: Set[int | str] = set()
+            if analysis is not None:
+                if not analysis.successors:
+                    succ.add(exit_node)
+                for candidate in analysis.successors:
+                    if candidate in offsets:
+                        succ.add(candidate)
+                    else:
+                        succ.add(exit_node)
+                if analysis.exit_reasons:
+                    succ.add(exit_node)
+            else:
+                succ.add(exit_node)
+            if not succ:
+                succ.add(exit_node)
+            successors[block.start_offset] = succ
+
+        changed = True
+        while changed:
+            changed = False
+            for offset in offsets:
+                succ = successors.get(offset)
+                if not succ:
+                    succ = {exit_node}
+                intersection = set(nodes)
+                for candidate in succ:
+                    intersection &= postdom[candidate]
+                updated = {offset} | intersection
+                if updated != postdom[offset]:
+                    postdom[offset] = updated
+                    changed = True
+
+        exit_offsets: Set[int] = set()
+        for offset in offsets:
+            succ = successors.get(offset, {exit_node})
+            if exit_node not in succ:
+                continue
+            candidates = postdom[offset] - {offset}
+            if not candidates:
+                continue
+            immediate: Optional[int | str] = None
+            for candidate in candidates:
+                dominated = False
+                for other in candidates:
+                    if other == candidate:
+                        continue
+                    if candidate in postdom[other]:
+                        dominated = True
+                        break
+                if not dominated:
+                    immediate = candidate
+                    break
+            if immediate == exit_node or (immediate is None and exit_node in candidates):
+                exit_offsets.add(offset)
+        return tuple(sorted(exit_offsets))
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
