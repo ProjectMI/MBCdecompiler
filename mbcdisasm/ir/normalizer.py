@@ -659,6 +659,7 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._string_pool_by_name: Dict[str, IRStringConstant] = {}
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -682,6 +683,7 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._string_pool_by_name.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -689,6 +691,8 @@ class IRNormalizer:
             normalised = self.normalise_segment(segment)
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
+
+        self._prune_string_pool(segments)
 
         return IRProgram(
             segments=tuple(segments),
@@ -833,6 +837,7 @@ class IRNormalizer:
         self._pass_data_markers(items)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
+        self._pass_formatter_literals(items)
         self._pass_stack_manipulation(items, metrics)
         self._pass_calls_and_returns(items, metrics)
         self._pass_aggregates(items, metrics)
@@ -1223,19 +1228,36 @@ class IRNormalizer:
 
             index += 1
 
-    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
+    def _intern_string_constant(
+        self,
+        data: bytes,
+        source: str,
+        *,
+        segments: Optional[Sequence[bytes]] = None,
+    ) -> IRStringConstant:
         constant = self._string_pool.get(data)
         if constant is not None:
+            if segments is not None and constant.segments != tuple(segments):
+                constant = self._update_string_constant(
+                    constant,
+                    data,
+                    segments,
+                    source=source,
+                )
             return constant
 
-        if data:
-            segments = (data,)
-        else:
-            segments = (b"",)
+        if segments is None:
+            segments = (data,) if data else (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
-        constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
+        constant = IRStringConstant(
+            name=name,
+            data=data,
+            segments=tuple(segments),
+            source=source,
+        )
         self._string_pool[data] = constant
         self._string_pool_order.append(constant)
+        self._string_pool_by_name[constant.name] = constant
         return constant
 
     def _make_literal_chunk(
@@ -1248,6 +1270,32 @@ class IRNormalizer:
             annotations=tuple(annotations),
             symbol=constant.name,
         )
+
+    def _find_string_constant(self, name: str) -> Optional[IRStringConstant]:
+        return self._string_pool_by_name.get(name)
+
+    def _update_string_constant(
+        self,
+        constant: IRStringConstant,
+        data: bytes,
+        segments: Sequence[bytes],
+        *,
+        source: Optional[str] = None,
+    ) -> IRStringConstant:
+        updated = replace(
+            constant,
+            data=data,
+            segments=tuple(segments) if segments else ((data,) if data else (b"",)),
+            source=source if source is not None else constant.source,
+        )
+        self._string_pool.pop(constant.data, None)
+        self._string_pool[data] = updated
+        self._string_pool_by_name[updated.name] = updated
+        for index, existing in enumerate(self._string_pool_order):
+            if existing.name == updated.name:
+                self._string_pool_order[index] = updated
+                break
+        return updated
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
@@ -1377,6 +1425,147 @@ class IRNormalizer:
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
+
+    def _pass_formatter_literals(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, IRLiteralChunk):
+                index += 1
+                continue
+
+            positions = [index]
+            chunks = [node]
+            scan = index
+
+            while True:
+                cleanup_index = scan + 1
+                literal_index = scan + 2
+                if literal_index >= len(items):
+                    break
+                cleanup = items[cleanup_index]
+                next_node = items[literal_index]
+                if not (
+                    isinstance(cleanup, IRCallCleanup)
+                    and isinstance(next_node, IRLiteralChunk)
+                    and self._cleanup_has_formatter_emit(cleanup)
+                ):
+                    break
+                positions.append(literal_index)
+                chunks.append(next_node)
+                scan = literal_index
+
+            if len(chunks) >= 2:
+                self._assign_formatter_symbol(items, positions, chunks)
+                index = positions[-1] + 1
+                continue
+
+            index += 1
+
+    @staticmethod
+    def _cleanup_has_formatter_emit(cleanup: IRCallCleanup) -> bool:
+        for step in cleanup.steps:
+            if step.mnemonic == "call_helpers" and step.operand_alias == "fmt.chunk_emit":
+                return True
+        return False
+
+    def _assign_formatter_symbol(
+        self,
+        items: _ItemList,
+        positions: Sequence[int],
+        chunks: Sequence[IRLiteralChunk],
+    ) -> None:
+        segments = [chunk.data for chunk in chunks]
+        aggregated = b"".join(segments)
+        existing = self._string_pool.get(aggregated)
+        if existing is not None:
+            constant = existing
+        else:
+            first = chunks[0]
+            symbol = first.symbol
+            constant = None
+            if symbol:
+                constant = self._find_string_constant(symbol)
+                if constant is not None:
+                    source = first.source or constant.source
+                    constant = self._update_string_constant(
+                        constant,
+                        aggregated,
+                        segments,
+                        source=source,
+                    )
+            if constant is None:
+                source = chunks[0].source if chunks[0].source else "formatter"
+                constant = self._intern_string_constant(
+                    aggregated,
+                    source,
+                    segments=segments,
+                )
+
+        symbol = constant.name
+        for position, chunk in zip(positions, chunks):
+            bindings = self._ssa_bindings.pop(id(chunk), None)
+            updated = replace(chunk, symbol=symbol)
+            if bindings:
+                self._ssa_bindings[id(updated)] = bindings
+            items.replace_slice(position, position + 1, [updated])
+
+    @staticmethod
+    def _extract_string_symbols(text: str) -> Set[str]:
+        names: Set[str] = set()
+        start = 0
+        while True:
+            index = text.find("str(", start)
+            if index < 0:
+                break
+            index += 4
+            end = text.find(")", index)
+            if end < 0:
+                break
+            name = text[index:end].strip()
+            if name:
+                names.add(name)
+            start = end + 1
+        return names
+
+    def _prune_string_pool(self, segments: Sequence[IRSegment]) -> None:
+        used: Set[str] = set()
+
+        for segment in segments:
+            for block in segment.blocks:
+                for node in block.nodes:
+                    if isinstance(node, IRLiteralChunk) and node.symbol:
+                        used.add(node.symbol)
+                    elif isinstance(node, IRAsciiHeader):
+                        used.update(node.chunks)
+                    elif isinstance(node, IRAsciiFinalize):
+                        used.update(self._extract_string_symbols(node.summary))
+                    elif isinstance(node, IRTableBuilderEmit):
+                        for param in node.parameters:
+                            used.update(self._extract_string_symbols(param))
+                    elif isinstance(node, IRStringConstant):
+                        used.add(node.name)
+
+        if not used:
+            self._string_pool.clear()
+            self._string_pool_order.clear()
+            self._string_pool_by_name.clear()
+            return
+
+        filtered: List[IRStringConstant] = []
+        rebuilt: Dict[bytes, IRStringConstant] = {}
+        rebuilt_by_name: Dict[str, IRStringConstant] = {}
+
+        for constant in self._string_pool_order:
+            if constant.name not in used:
+                continue
+            filtered.append(constant)
+            rebuilt[constant.data] = constant
+            rebuilt_by_name[constant.name] = constant
+
+        self._string_pool_order = filtered
+        self._string_pool = rebuilt
+        self._string_pool_by_name = rebuilt_by_name
 
     def _pass_ascii_glue(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
