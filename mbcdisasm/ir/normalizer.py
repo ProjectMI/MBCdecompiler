@@ -2777,24 +2777,14 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            helper_target: Optional[int] = None
-            helper_symbol: Optional[str] = None
-            follow = index + 1
-            while follow < len(items) and isinstance(items[follow], IRLiteralChunk):
-                follow += 1
-            if follow < len(items):
-                candidate = items[follow]
-                if isinstance(candidate, CallLike):
-                    target = getattr(candidate, "target", None)
-                    if isinstance(target, int) and target in {0x6623, 0x6624}:
-                        helper_target = target
-                        helper_symbol = self.knowledge.lookup_address(target)
-
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
                 index += 1
                 continue
 
+            helper_target, helper_symbol = self._resolve_dispatch_helper(
+                items, index, cases, default
+            )
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
@@ -3008,6 +2998,13 @@ class IRNormalizer:
             index += 1
 
     _TABLE_BUILDER_LOOKAHEAD = 24
+    _DISPATCH_HELPER_LOOKAHEAD = 8
+    _DISPATCH_HELPER_SKIP_TYPES = STRUCTURAL_SKIP_NODE_TYPES + (
+        IRCallCleanup,
+        IRCallPreparation,
+        IRPageRegister,
+        IRConditionMask,
+    )
 
     def _match_table_builder_prologue(self, items: _ItemList, index: int) -> int:
         if index >= len(items):
@@ -3133,6 +3130,51 @@ class IRNormalizer:
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    def _resolve_dispatch_helper(
+        self,
+        items: _ItemList,
+        index: int,
+        cases: Sequence[IRDispatchCase],
+        default: Optional[int],
+    ) -> Tuple[Optional[int], Optional[str]]:
+        for direction in (1, -1):
+            call = self._find_dispatch_calllike(items, index, direction)
+            if call is not None:
+                target = getattr(call, "target", None)
+                if isinstance(target, int):
+                    return target, self._helper_symbol(target)
+
+        unique_targets = {case.target for case in cases}
+        if len(unique_targets) == 1:
+            helper = next(iter(unique_targets))
+            return helper, self._helper_symbol(helper)
+
+        if default is not None:
+            return default, self._helper_symbol(default)
+
+        if cases:
+            helper = cases[0].target
+            return helper, self._helper_symbol(helper)
+
+        return None, None
+
+    def _find_dispatch_calllike(
+        self, items: _ItemList, index: int, direction: int
+    ) -> Optional[CallLike]:
+        limit = self._DISPATCH_HELPER_LOOKAHEAD
+        pos = index + direction
+        steps = 0
+        while 0 <= pos < len(items) and steps < limit:
+            node = items[pos]
+            if isinstance(node, self._DISPATCH_HELPER_SKIP_TYPES):
+                pos += direction
+                steps += 1
+                continue
+            if isinstance(node, CallLike):
+                return cast(CallLike, node)
+            break
+        return None
 
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0

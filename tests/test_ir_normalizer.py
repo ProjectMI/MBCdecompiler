@@ -1614,6 +1614,73 @@ def test_normalizer_extracts_table_dispatch(tmp_path: Path) -> None:
     assert targets == {0x6623, 0x6624}
 
 
+def test_normalizer_assigns_dispatch_helper_from_trailing_call(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x02, 0x6625),
+        build_word(4, 0x2B, 0x00, 0x00F0),
+        build_word(8, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.helper == 0x00F0
+
+
+def test_normalizer_assigns_dispatch_helper_from_leading_call(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x01F1),
+        build_word(4, 0x2C, 0x01, 0x661D),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.helper == 0x01F1
+
+
+def test_normalizer_defaults_dispatch_helper_to_case_target(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x04, 0x6615),
+        build_word(4, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.helper == 0x6615
+
+
 def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
