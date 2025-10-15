@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
     IRBlock,
@@ -97,6 +97,16 @@ class _PendingBlock:
     branch_links: List[_BranchLink]
 
 
+@dataclass(frozen=True)
+class _BlockTemplate:
+    """Snapshot of a realised block suitable for later reconstruction."""
+
+    label: str
+    start_offset: int
+    statements: Tuple[ASTStatement, ...]
+    successors: Tuple[int, ...]
+
+
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
 
@@ -115,10 +125,18 @@ class ASTBuilder:
         for segment in program.segments:
             segment_result = self._build_segment(segment, metrics)
             segments.append(segment_result)
-        metrics.procedure_count = sum(len(seg.procedures) for seg in segments)
-        metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
-        metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
-        return ASTProgram(segments=tuple(segments), metrics=metrics)
+        merged_segments = self._merge_duplicate_procedures(segments)
+        metrics.procedure_count = sum(len(seg.procedures) for seg in merged_segments)
+        metrics.block_count = sum(
+            len(proc.blocks) for seg in merged_segments for proc in seg.procedures
+        )
+        metrics.edge_count = sum(
+            len(block.successors)
+            for seg in merged_segments
+            for proc in seg.procedures
+            for block in proc.blocks
+        )
+        return ASTProgram(segments=merged_segments, metrics=metrics)
 
     # ------------------------------------------------------------------
     # helpers
@@ -321,12 +339,13 @@ class ASTBuilder:
         exit_offsets: Set[int],
     ) -> ASTProcedure:
         realised_blocks = self._realise_blocks(blocks)
+        computed_exits = self._determine_exit_offsets(realised_blocks, exit_offsets)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=realised_blocks,
-            exit_offsets=tuple(sorted(exit_offsets)),
+            exit_offsets=computed_exits,
         )
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
@@ -389,6 +408,19 @@ class ASTBuilder:
             successors=analysis.successors,
             branch_links=branch_links,
         )
+
+    def _determine_exit_offsets(
+        self,
+        blocks: Sequence[ASTBlock],
+        exit_offsets: Iterable[int] = (),
+    ) -> Tuple[int, ...]:
+        """Infer exit offsets using the realised successor graph."""
+
+        exits: Set[int] = set(exit_offsets)
+        for block in blocks:
+            if not block.successors:
+                exits.add(block.start_offset)
+        return tuple(sorted(exits))
 
     def _convert_node(
         self,
@@ -650,6 +682,110 @@ class ASTBuilder:
         if lowered.startswith("id"):
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
+
+    def _merge_duplicate_procedures(
+        self, segments: Sequence[ASTSegment]
+    ) -> Tuple[ASTSegment, ...]:
+        """Coalesce procedures that share the same generated name."""
+
+        name_map: Dict[str, List[Tuple[int, int, ASTProcedure]]] = defaultdict(list)
+        for seg_index, segment in enumerate(segments):
+            for proc_index, procedure in enumerate(segment.procedures):
+                name_map[procedure.name].append((seg_index, proc_index, procedure))
+
+        if all(len(entries) == 1 for entries in name_map.values()):
+            return tuple(segments)
+
+        procedures_per_segment: List[List[ASTProcedure]] = [
+            list(segment.procedures) for segment in segments
+        ]
+
+        for occurrences in name_map.values():
+            if len(occurrences) == 1:
+                continue
+            combined = self._combine_procedures([entry[2] for entry in occurrences])
+            first_segment, first_index, _ = occurrences[0]
+            procedures_per_segment[first_segment][first_index] = combined
+            for seg_index, proc_index, _ in sorted(
+                occurrences[1:], key=lambda item: (item[0], item[1]), reverse=True
+            ):
+                procedures_per_segment[seg_index].pop(proc_index)
+
+        return tuple(
+            ASTSegment(
+                index=segments[idx].index,
+                start=segments[idx].start,
+                length=segments[idx].length,
+                procedures=tuple(procedures_per_segment[idx]),
+            )
+            for idx in range(len(segments))
+        )
+
+    def _combine_procedures(self, procedures: Sequence[ASTProcedure]) -> ASTProcedure:
+        """Merge several procedure fragments into a single reconstructed body."""
+
+        entry_offset = min(proc.entry_offset for proc in procedures)
+        entry_reasons = tuple(
+            sorted({reason for proc in procedures for reason in proc.entry_reasons})
+        )
+        exit_offsets: Set[int] = {
+            offset for proc in procedures for offset in proc.exit_offsets
+        }
+
+        templates: Dict[int, _BlockTemplate] = {}
+        for procedure in procedures:
+            for block in procedure.blocks:
+                successor_offsets = tuple(
+                    successor.start_offset for successor in block.successors
+                )
+                template = _BlockTemplate(
+                    label=block.label,
+                    start_offset=block.start_offset,
+                    statements=block.statements,
+                    successors=successor_offsets,
+                )
+                existing = templates.get(block.start_offset)
+                if existing is None:
+                    templates[block.start_offset] = template
+                    continue
+                merged_successors = tuple(
+                    sorted(set(existing.successors) | set(template.successors))
+                )
+                templates[block.start_offset] = _BlockTemplate(
+                    label=existing.label,
+                    start_offset=existing.start_offset,
+                    statements=existing.statements,
+                    successors=merged_successors,
+                )
+
+        block_instances: Dict[int, ASTBlock] = {}
+        for offset in sorted(templates):
+            template = templates[offset]
+            block_instances[offset] = ASTBlock(
+                label=template.label,
+                start_offset=template.start_offset,
+                statements=template.statements,
+                successors=tuple(),
+            )
+
+        for offset in sorted(templates):
+            template = templates[offset]
+            block = block_instances[offset]
+            block.successors = tuple(
+                block_instances[target]
+                for target in template.successors
+                if target in block_instances
+            )
+
+        blocks = tuple(block_instances[offset] for offset in sorted(block_instances))
+        computed_exits = self._determine_exit_offsets(blocks, exit_offsets)
+        return ASTProcedure(
+            name=procedures[0].name,
+            entry_offset=entry_offset,
+            entry_reasons=entry_reasons,
+            blocks=blocks,
+            exit_offsets=computed_exits,
+        )
 
     def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:
         if target_offset in self._current_block_labels:
