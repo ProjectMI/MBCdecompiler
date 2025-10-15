@@ -148,6 +148,7 @@ class IRCall(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
@@ -168,6 +169,8 @@ class IRCall(IRNode):
             details.append(f"abi=[{rendered}]")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
+        if self.annotations:
+            details.extend(self.annotations)
         extra = f" {' '.join(details)}" if details else ""
         return f"call{suffix} target={target_repr} args=[{args}]{extra}"
 
@@ -188,6 +191,7 @@ class IRTailCall(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def target(self) -> int:
@@ -231,6 +235,8 @@ class IRTailCall(IRNode):
         if self.abi_effects:
             rendered = ", ".join(effect.describe() for effect in self.abi_effects)
             details.append(f"abi=[{rendered}]")
+        if self.annotations:
+            details.extend(self.annotations)
         suffix = "" if not details else " " + " ".join(details)
         return f"tailcall {call_repr}{suffix}"
 
@@ -309,21 +315,27 @@ class IRReturn(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        cleanup = ""
+        suffix_parts: List[str] = []
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
-            cleanup = f" cleanup=[{rendered}]"
+            suffix_parts.append(f"cleanup=[{rendered}]")
         if self.abi_effects:
             rendered = ", ".join(effect.describe() for effect in self.abi_effects)
-            cleanup = f" abi=[{rendered}]{cleanup}"
+            suffix_parts.insert(0, f"abi=[{rendered}]")
+        if self.annotations:
+            suffix_parts.extend(self.annotations)
+        suffix = ""
+        if suffix_parts:
+            suffix = " " + " ".join(suffix_parts)
         if self.varargs:
             if self.values:
-                return f"return varargs({', '.join(self.values)}){cleanup}"
-            return f"return varargs{cleanup}"
+                return f"return varargs({', '.join(self.values)}){suffix}"
+            return f"return varargs{suffix}"
         values = ", ".join(self.values)
-        return f"return [{values}]{cleanup}"
+        return f"return [{values}]{suffix}"
 
     @property
     def mask(self) -> Optional[int]:
@@ -945,6 +957,7 @@ class IRCallReturn(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -969,6 +982,8 @@ class IRCallReturn(IRNode):
             details.append(f"convention={self.convention.describe()}")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
+        if self.annotations:
+            details.extend(self.annotations)
         extra = f" {' '.join(details)}" if details else ""
         return (
             f"{prefix} target={target_repr} args=[{args}] returns=[{ret}]"

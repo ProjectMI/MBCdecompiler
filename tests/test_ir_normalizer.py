@@ -1398,6 +1398,85 @@ def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:
     assert branch.condition == predicate.var
 
 
+def test_normalizer_marks_suspicious_call_arity() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    call = IRCall(
+        target=0x1000,
+        args=("ssa0",),
+        tail=False,
+        arity=63,
+        convention=None,
+        cleanup=tuple(),
+        symbol=None,
+        predicate=None,
+        abi_effects=tuple(),
+        annotations=tuple(),
+    )
+
+    items = _ItemList([call])
+    normalizer._pass_call_conventions(items)
+
+    assert len(items) == 1
+    updated = items[0]
+    assert isinstance(updated, IRCall)
+    assert "abi:suspicious_arity" in updated.annotations
+
+
+def test_tail_call_annotations_cover_returns_and_cleanup() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    base_call = normalizer._make_call(
+        target=0x2000,
+        args=("ssa0", "ssa1"),
+        tail=True,
+        arity=2,
+        convention=None,
+        cleanup=tuple(),
+        symbol=None,
+        predicate=None,
+        abi_effects=tuple(),
+    )
+    cleanup = (
+        IRStackEffect(mnemonic="stack_teardown", pops=6),
+        IRStackEffect(mnemonic="stack_teardown", pops=4),
+    )
+    returns = tuple(f"ret{i}" for i in range(20))
+
+    tail = normalizer._make_tail_call(
+        call=base_call,
+        returns=returns,
+        varargs=False,
+        cleanup=cleanup,
+        abi_effects=tuple(),
+    )
+
+    assert "abi:suspicious_returns" in tail.annotations
+    assert "stack:complex_teardown" in tail.annotations
+
+
+def test_make_return_marks_suspicious_cleanup() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup = (
+        IRStackEffect(mnemonic="stack_teardown", pops=6),
+        IRStackEffect(mnemonic="stack_teardown", pops=4),
+    )
+    values = tuple(f"ret{i}" for i in range(20))
+
+    result = normalizer._make_return(
+        values=values,
+        varargs=False,
+        cleanup=cleanup,
+    )
+
+    assert "abi:suspicious_returns" in result.annotations
+    assert "stack:complex_teardown" in result.annotations
+
+
 def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

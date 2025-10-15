@@ -645,6 +645,10 @@ class IRNormalizer:
         SSAValueKind.PAGE_REGISTER: 5,
         SSAValueKind.BOOLEAN: 6,
     }
+    _SUSPICIOUS_CALL_ARITY = 32
+    _SUSPICIOUS_RETURN_VALUE_COUNT = 16
+    _SUSPICIOUS_STACK_POP_THRESHOLD = 8
+    _SUSPICIOUS_STACK_TEARDOWN_COUNT = 2
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
@@ -659,6 +663,154 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+
+    def _extend_annotations(
+        self, base: Sequence[str], notes: Sequence[str]
+    ) -> Tuple[str, ...]:
+        merged = list(base)
+        for note in notes:
+            if note and note not in merged:
+                merged.append(note)
+        return tuple(merged)
+
+    def _is_suspicious_cleanup(self, cleanup: Sequence[IRStackEffect]) -> bool:
+        if not cleanup:
+            return False
+        teardown = 0
+        total_pops = 0
+        max_pop = 0
+        for effect in cleanup:
+            pops = effect.pops or 0
+            total_pops += pops
+            if pops > max_pop:
+                max_pop = pops
+            if effect.mnemonic == "stack_teardown":
+                teardown += 1
+        if teardown >= self._SUSPICIOUS_STACK_TEARDOWN_COUNT:
+            return True
+        if max_pop >= self._SUSPICIOUS_STACK_POP_THRESHOLD:
+            return True
+        if total_pops >= self._SUSPICIOUS_STACK_POP_THRESHOLD:
+            return True
+        return False
+
+    def _make_call(
+        self,
+        *,
+        target: int,
+        args: Sequence[str],
+        tail: bool,
+        arity: Optional[int],
+        convention: Optional[IRStackEffect],
+        cleanup: Sequence[IRStackEffect],
+        symbol: Optional[str],
+        predicate: Optional[CallPredicate],
+        abi_effects: Sequence[IRAbiEffect],
+        annotations: Sequence[str] = tuple(),
+    ) -> IRCall:
+        notes: List[str] = []
+        if arity is not None and arity >= self._SUSPICIOUS_CALL_ARITY:
+            notes.append("abi:suspicious_arity")
+        merged = self._extend_annotations(annotations, notes)
+        return IRCall(
+            target=target,
+            args=tuple(args),
+            tail=tail,
+            arity=arity,
+            convention=convention,
+            cleanup=tuple(cleanup),
+            symbol=symbol,
+            predicate=predicate,
+            abi_effects=tuple(abi_effects),
+            annotations=merged,
+        )
+
+    def _make_return(
+        self,
+        *,
+        values: Sequence[str],
+        varargs: bool,
+        cleanup: Sequence[IRStackEffect] = tuple(),
+        abi_effects: Sequence[IRAbiEffect] = tuple(),
+        annotations: Sequence[str] = tuple(),
+    ) -> IRReturn:
+        notes: List[str] = []
+        if len(values) >= self._SUSPICIOUS_RETURN_VALUE_COUNT:
+            notes.append("abi:suspicious_returns")
+        if self._is_suspicious_cleanup(cleanup):
+            notes.append("stack:complex_teardown")
+        merged = self._extend_annotations(annotations, notes)
+        return IRReturn(
+            values=tuple(values),
+            varargs=varargs,
+            cleanup=tuple(cleanup),
+            abi_effects=tuple(abi_effects),
+            annotations=merged,
+        )
+
+    def _make_tail_call(
+        self,
+        *,
+        call: IRCall,
+        returns: Sequence[str],
+        varargs: bool,
+        cleanup: Sequence[IRStackEffect],
+        abi_effects: Sequence[IRAbiEffect],
+        annotations: Sequence[str] = tuple(),
+    ) -> IRTailCall:
+        notes: List[str] = []
+        if len(returns) >= self._SUSPICIOUS_RETURN_VALUE_COUNT:
+            notes.append("abi:suspicious_returns")
+        if self._is_suspicious_cleanup(cleanup):
+            notes.append("stack:complex_teardown")
+        merged = self._extend_annotations(annotations, notes)
+        return IRTailCall(
+            call=call,
+            returns=tuple(returns),
+            varargs=varargs,
+            cleanup=tuple(cleanup),
+            abi_effects=tuple(abi_effects),
+            annotations=merged,
+        )
+
+    def _make_call_return(
+        self,
+        *,
+        target: int,
+        args: Sequence[str],
+        tail: bool,
+        returns: Sequence[str],
+        varargs: bool,
+        cleanup: Sequence[IRStackEffect],
+        arity: Optional[int],
+        convention: Optional[IRStackEffect],
+        symbol: Optional[str],
+        predicate: Optional[CallPredicate],
+        abi_effects: Sequence[IRAbiEffect],
+        annotations: Sequence[str] = tuple(),
+    ) -> IRCallReturn:
+        notes: List[str] = []
+        if arity is not None and arity >= self._SUSPICIOUS_CALL_ARITY:
+            notes.append("abi:suspicious_arity")
+        if len(returns) >= self._SUSPICIOUS_RETURN_VALUE_COUNT:
+            notes.append("abi:suspicious_returns")
+        if self._is_suspicious_cleanup(cleanup):
+            notes.append("stack:complex_teardown")
+        merged = self._extend_annotations(annotations, notes)
+        return IRCallReturn(
+            target=target,
+            args=tuple(args),
+            tail=tail,
+            returns=tuple(returns),
+            varargs=varargs,
+            cleanup=tuple(cleanup),
+            arity=arity,
+            convention=convention,
+            symbol=symbol,
+            predicate=predicate,
+            abi_effects=tuple(abi_effects),
+            annotations=merged,
+        )
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -1362,11 +1514,16 @@ class IRNormalizer:
                                 source = getattr(prior, "source", "")
                                 if source in {"op_00_52", "push_literal"} or prior.value == 0:
                                     start = literal_index
-                call = IRCall(
+                call = self._make_call(
                     target=target,
-                    args=tuple(args),
+                    args=args,
                     tail=mnemonic == "tailcall_dispatch",
+                    arity=None,
+                    convention=None,
+                    cleanup=tuple(),
                     symbol=symbol,
+                    predicate=None,
+                    abi_effects=tuple(),
                 )
                 metrics.calls += 1
                 if call.tail:
@@ -1382,7 +1539,11 @@ class IRNormalizer:
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
-                items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
+                items.replace_slice(
+                    index,
+                    index + 1,
+                    [self._make_return(values=values, varargs=varargs)],
+                )
                 metrics.returns += 1
                 continue
 
@@ -1537,7 +1698,13 @@ class IRNormalizer:
                 items.replace_slice(
                     index,
                     index + 1,
-                    [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
+                    [
+                        self._make_return(
+                            values=values,
+                            varargs=varargs,
+                            cleanup=tuple(collected_cleanup),
+                        )
+                    ],
                 )
                 metrics.returns += 1
                 return
@@ -1994,13 +2161,14 @@ class IRNormalizer:
                 else:
                     combined = base_cleanup
                 mask = self._extract_cleanup_mask(combined)
-                updated = IRReturn(
+                updated = self._make_return(
                     values=return_node.values,
                     varargs=return_node.varargs,
                     cleanup=combined,
                     abi_effects=self._merge_return_mask_effects(
                         return_node.abi_effects, mask
                     ),
+                    annotations=return_node.annotations,
                 )
                 self._transfer_ssa(return_node, updated)
                 removed = end - start
@@ -2457,7 +2625,7 @@ class IRNormalizer:
             if not tail and cleanup_mask == RET_MASK:
                 tail = True
 
-            updated = IRCall(
+            updated = self._make_call(
                 target=call.target,
                 args=call.args,
                 tail=tail,
@@ -2465,7 +2633,9 @@ class IRNormalizer:
                 convention=convention,
                 cleanup=cleanup_steps,
                 symbol=call.symbol,
+                predicate=call.predicate,
                 abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                annotations=call.annotations,
             )
             self._transfer_ssa(call, updated)
             items.replace_slice(index, index + 1, [updated])
@@ -3205,7 +3375,7 @@ class IRNormalizer:
                 cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
                 mask = mask or item.cleanup_mask
 
-                updated_call = IRCall(
+                updated_call = self._make_call(
                     target=item.target,
                     args=item.args,
                     tail=True,
@@ -3215,13 +3385,15 @@ class IRNormalizer:
                     symbol=item.symbol,
                     predicate=item.predicate,
                     abi_effects=self._merge_return_mask_effects(item.call.abi_effects, mask),
+                    annotations=item.call.annotations,
                 )
-                updated = IRTailCall(
+                updated = self._make_tail_call(
                     call=updated_call,
                     returns=item.returns,
                     varargs=item.varargs,
-                    cleanup=tuple(cleanup_steps),
+                    cleanup=cleanup_steps,
                     abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
+                    annotations=item.annotations,
                 )
                 self._transfer_ssa(item, updated)
                 items.replace_slice(index, index + 1, [updated])
@@ -3297,7 +3469,7 @@ class IRNormalizer:
             if item.varargs and not values:
                 values = ("ret*",)
 
-            call = IRCall(
+            call = self._make_call(
                 target=item.target,
                 args=item.args,
                 tail=True,
@@ -3309,11 +3481,11 @@ class IRNormalizer:
                 abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
             )
 
-            tail_call = IRTailCall(
+            tail_call = self._make_tail_call(
                 call=call,
                 returns=values,
                 varargs=item.varargs,
-                cleanup=tuple(cleanup_steps),
+                cleanup=cleanup_steps,
                 abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
             )
             self._transfer_ssa(item, tail_call)
@@ -3421,11 +3593,12 @@ class IRNormalizer:
             if teardown is not None:
                 cleanup_chain.append(teardown)
                 teardown = None
-            new_return = IRReturn(
+            new_return = self._make_return(
                 values=returns_node.values,
                 varargs=returns_node.varargs,
                 cleanup=tuple(cleanup_chain),
                 abi_effects=returns_node.abi_effects,
+                annotations=returns_node.annotations,
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
@@ -3473,7 +3646,7 @@ class IRNormalizer:
             predicate = getattr(node, "predicate", None)
             arity = getattr(node, "arity", None)
             if isinstance(node, IRCall):
-                replacement = IRCall(
+                replacement = self._make_call(
                     target=target,
                     args=args,
                     tail=getattr(node, "tail", False),
@@ -3483,13 +3656,17 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    annotations=getattr(node, "annotations", tuple()),
                 )
             elif isinstance(node, IRCallReturn):
-                replacement = IRCallReturn(
+                returns = getattr(node, "returns", tuple())
+                if isinstance(returns, int):
+                    returns = tuple(f"ret{i}" for i in range(max(returns, 0)))
+                replacement = self._make_call_return(
                     target=target,
                     args=args,
                     tail=getattr(node, "tail", False),
-                    returns=getattr(node, "returns", tuple()),
+                    returns=returns,
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     arity=arity,
@@ -3497,23 +3674,10 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
-                )
-            elif isinstance(node, IRCallReturn):
-                replacement = IRCallReturn(
-                    target=target,
-                    args=args,
-                    tail=getattr(node, "tail", False),
-                    returns=getattr(node, "returns", tuple()),
-                    varargs=getattr(node, "varargs", False),
-                    cleanup=cleanup,
-                    arity=arity,
-                    convention=None,
-                    symbol=symbol,
-                    predicate=predicate,
-                    abi_effects=tuple(),
+                    annotations=getattr(node, "annotations", tuple()),
                 )
             elif isinstance(node, IRTailCall):
-                updated_call = IRCall(
+                updated_call = self._make_call(
                     target=target,
                     args=args,
                     tail=True,
@@ -3523,13 +3687,15 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    annotations=node.call.annotations,
                 )
-                replacement = IRTailCall(
+                replacement = self._make_tail_call(
                     call=updated_call,
                     returns=getattr(node, "returns", tuple()),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     abi_effects=tuple(),
+                    annotations=node.annotations,
                 )
             else:
                 replacement = IRTailcallReturn(
@@ -3910,7 +4076,7 @@ class IRNormalizer:
                         tail = base_tail and consumed == 0 and not return_node.cleanup
                         if not tail and cleanup_mask == RET_MASK and consumed == 0 and not return_node.cleanup:
                             tail = True
-                        node = IRCallReturn(
+                        node = self._make_call_return(
                             target=call.target,
                             args=call.args,
                             tail=tail,
@@ -3921,7 +4087,10 @@ class IRNormalizer:
                             convention=call.convention,
                             symbol=call.symbol,
                             predicate=call.predicate,
-                            abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                            abi_effects=self._merge_return_mask_effects(
+                                call.abi_effects, cleanup_mask
+                            ),
+                            annotations=call.annotations,
                         )
                     self._transfer_ssa(call, node)
                     end = offset + 1
@@ -4066,7 +4235,7 @@ class IRNormalizer:
         predicate: CallPredicate,
     ) -> CallLike:
         if isinstance(node, IRCall):
-            return IRCall(
+            return self._make_call(
                 target=node.target,
                 args=node.args,
                 tail=node.tail,
@@ -4076,10 +4245,11 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRCallReturn):
-            return IRCallReturn(
+            return self._make_call_return(
                 target=node.target,
                 args=node.args,
                 tail=node.tail,
@@ -4091,10 +4261,11 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRTailCall):
-            updated_call = IRCall(
+            updated_call = self._make_call(
                 target=node.target,
                 args=node.args,
                 tail=True,
@@ -4104,13 +4275,15 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.call.abi_effects, node.cleanup_mask),
+                annotations=node.call.annotations,
             )
-            return IRTailCall(
+            return self._make_tail_call(
                 call=updated_call,
                 returns=node.returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRTailcallReturn):
@@ -4387,7 +4560,7 @@ class IRNormalizer:
         existing_effects = getattr(node, "abi_effects", tuple())
         abi_effects = self._merge_return_mask_effects(existing_effects, cleanup_mask)
         if isinstance(node, IRCall):
-            return IRCall(
+            return self._make_call(
                 target=target,
                 args=node.args,
                 tail=tail,
@@ -4397,6 +4570,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRCallReturn):
@@ -4404,7 +4578,7 @@ class IRNormalizer:
             if signature.returns is not None and not node.varargs:
                 count = max(signature.returns, 0)
                 returns = tuple(f"ret{i}" for i in range(count))
-            return IRCallReturn(
+            return self._make_call_return(
                 target=target,
                 args=node.args,
                 tail=tail,
@@ -4416,6 +4590,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRTailCall):
@@ -4423,7 +4598,7 @@ class IRNormalizer:
             if signature.returns is not None and not node.varargs:
                 count = max(signature.returns, 0)
                 returns = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-            updated_call = IRCall(
+            updated_call = self._make_call(
                 target=target,
                 args=node.args,
                 tail=True,
@@ -4433,13 +4608,15 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                annotations=node.call.annotations,
             )
-            return IRTailCall(
+            return self._make_tail_call(
                 call=updated_call,
                 returns=returns,
                 varargs=node.varargs,
                 cleanup=cleanup,
                 abi_effects=abi_effects,
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRTailcallReturn):
@@ -5348,20 +5525,24 @@ class IRNormalizer:
             cleanup = list(effects) + list(target.cleanup)
             combined = tuple(self._coalesce_epilogue_steps(cleanup))
             mask = self._extract_cleanup_mask(combined)
-            return IRReturn(
+            return self._make_return(
                 values=target.values,
                 varargs=target.varargs,
                 cleanup=combined,
                 abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
+                annotations=target.annotations,
             )
         if isinstance(target, IRTailCall):
             cleanup = list(effects) + list(target.cleanup)
             combined = tuple(self._coalesce_epilogue_steps(cleanup))
             mask = self._extract_cleanup_mask(combined)
-            return replace(
-                target,
+            return self._make_tail_call(
+                call=target.call,
+                returns=target.returns,
+                varargs=target.varargs,
                 cleanup=combined,
                 abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
+                annotations=target.annotations,
             )
         if isinstance(target, IRTailcallReturn):
             cleanup = list(effects) + list(target.cleanup)
