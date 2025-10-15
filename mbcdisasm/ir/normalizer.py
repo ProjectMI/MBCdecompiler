@@ -1561,31 +1561,48 @@ class IRNormalizer:
         mode = instruction.profile.mode
         nibble = lo & 0x0F
 
+        count: Optional[int] = None
+        varargs = False
+
         if mode in RETURN_NIBBLE_MODES:
             if nibble:
-                return nibble, False
-            hint = self._stack_teardown_hint(items, index)
-            if hint is not None:
-                return hint, False
-            base = hi & 0x1F
-            if base:
-                return base, False
-            return 0, True
+                count = nibble
+            else:
+                hint = self._stack_teardown_hint(items, index)
+                if hint is not None:
+                    count = hint
+                else:
+                    base = hi & 0x1F
+                    if base:
+                        count = base
+                    else:
+                        count = 0
+                        varargs = True
+        else:
+            if lo:
+                if lo > 0x3F:
+                    narrowed = lo & 0x0F
+                    if narrowed:
+                        count = narrowed
+                    else:
+                        count = lo
+                else:
+                    count = lo
+            elif hi:
+                count = hi
+            else:
+                hint = self._stack_teardown_hint(items, index)
+                if hint is not None:
+                    count = hint
+                else:
+                    count = 1
 
-        if lo:
-            if lo > 0x3F:
-                narrowed = lo & 0x0F
-                if narrowed:
-                    return narrowed, False
-            return lo, False
-        if hi:
-            return hi, False
+        depth = max(instruction.event.depth_before, instruction.event.depth_after, 0)
+        if depth and not varargs:
+            if not count or count > depth:
+                count = depth
 
-        hint = self._stack_teardown_hint(items, index)
-        if hint is not None:
-            return hint, False
-
-        return 1, False
+        return count or 0, varargs
 
     def _stack_teardown_hint(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
@@ -4823,6 +4840,32 @@ class IRNormalizer:
         while index < len(steps):
             step = steps[index]
             next_step = steps[index + 1] if index + 1 < len(steps) else None
+            if step.mnemonic == "stack_teardown":
+                total_pops = step.pops
+                operand = step.operand
+                operand_role = step.operand_role
+                operand_alias = step.operand_alias
+                advance = index + 1
+                while (
+                    advance < len(steps)
+                    and steps[advance].mnemonic == "stack_teardown"
+                    and steps[advance].operand == operand
+                    and steps[advance].operand_role == operand_role
+                    and steps[advance].operand_alias == operand_alias
+                ):
+                    total_pops += steps[advance].pops
+                    advance += 1
+                combined.append(
+                    IRStackEffect(
+                        mnemonic="stack_teardown",
+                        operand=operand,
+                        pops=total_pops,
+                        operand_role=operand_role,
+                        operand_alias=operand_alias,
+                    )
+                )
+                index = advance
+                continue
             if (
                 step.mnemonic == "op_52_05"
                 and next_step is not None
@@ -4919,14 +4962,22 @@ class IRNormalizer:
     def _decode_call_arity(value: int) -> Optional[int]:
         if value <= 0:
             return None
-        high = (value >> 8) & 0xFF
+
+        alias = OPERAND_ALIASES.get(value)
+        if alias is not None:
+            return None
+
         low = value & 0xFF
-        if high and low == 0:
+        if 0 < low <= 0x0F:
+            return low
+
+        high = (value >> 8) & 0xFF
+        if low == 0 and 0 < high <= 0x0F:
             return high
-        if high:
-            return high
-        if value <= 0x3F:
+
+        if value <= 0x0F:
             return value
+
         return None
 
     @staticmethod

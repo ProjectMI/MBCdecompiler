@@ -142,6 +142,52 @@ def test_epilogue_compaction_merges_raw_markers() -> None:
     assert [step.mnemonic for step in updated_return.cleanup] == ["op_02_00", "op_15_4A"]
 
 
+def test_vararg_return_remains_packed_despite_depth() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    call = make_stack_neutral_instruction(0, "call_dispatch", kind=InstructionKind.CALL)
+
+    return_word = build_word(4, 0x30, 0x29, 0x0000)
+    return_profile = InstructionProfile(
+        word=return_word,
+        info=None,
+        mnemonic="return_values",
+        summary=None,
+        category=None,
+        control_flow=None,
+        stack_hint=StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=1.0),
+        kind=InstructionKind.RETURN,
+        traits={},
+    )
+    return_event = StackEvent(
+        profile=return_profile,
+        delta=0,
+        minimum=0,
+        maximum=0,
+        confidence=1.0,
+        depth_before=5,
+        depth_after=5,
+        kind=InstructionKind.RETURN,
+    )
+    return_instruction = RawInstruction(
+        profile=return_profile,
+        event=return_event,
+        annotations=tuple(),
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+
+    items = _ItemList([call, return_instruction])
+    metrics = NormalizerMetrics()
+
+    normalizer._collapse_tail_return(items, 0, metrics)
+
+    assert isinstance(items[1], IRReturn)
+    assert items[1].varargs
+    assert items[1].values == ("ret*",)
+
+
 def write_manual(path: Path) -> KnowledgeBase:
     manual = {
         "push_literal": {
@@ -449,6 +495,45 @@ def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBas
 
     container = MbcContainer(Path("dummy"), segments)
     return container, knowledge
+
+
+def test_decode_call_arity_filters_encoded_masks() -> None:
+    decode = IRNormalizer._decode_call_arity
+    assert decode(RET_MASK) is None
+    assert decode(0x2C10) is None
+    assert decode(0x6910) is None
+    assert decode(0x003F) is None
+    assert decode(0x0002) == 2
+    assert decode(0x0200) == 2
+
+
+def test_coalesce_epilogue_steps_merges_stack_teardown() -> None:
+    effect_a = IRStackEffect(mnemonic="stack_teardown", operand=0x2000, pops=4)
+    effect_b = IRStackEffect(mnemonic="stack_teardown", operand=0x2000, pops=6)
+    combined = IRNormalizer._coalesce_epilogue_steps([effect_a, effect_b])
+    assert len(combined) == 1
+    assert combined[0].pops == 10
+
+
+def test_normalizer_clamps_return_count_to_stack_depth(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0001),
+        build_word(4, 0x30, 0x00, 0x003F),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    ret = next(node for node in block.nodes if isinstance(node, IRReturn))
+    assert len(ret.values) == 1
 
 
 def test_normalizer_builds_ir(tmp_path: Path) -> None:
