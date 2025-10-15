@@ -199,6 +199,8 @@ TAILCALL_HELPERS = {
 
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
+DISPATCH_HELPER_IDS = {0x6623, 0x6624}
+
 
 CALL_HELPER_ALIASES = {
     0x0000: "fmt.buffer_reset",
@@ -1343,6 +1345,7 @@ class IRNormalizer:
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
                 args, start = self._collect_call_arguments(items, index)
                 target = item.operand
+                helper_operand = target & 0xFFFF
                 symbol = self._helper_symbol(target)
                 if mnemonic == "tailcall_dispatch":
                     inline_target = self._extract_tail_dispatch_target(items, index)
@@ -1367,6 +1370,7 @@ class IRNormalizer:
                     args=tuple(args),
                     tail=mnemonic == "tailcall_dispatch",
                     symbol=symbol,
+                    dispatch_helper=helper_operand,
                 )
                 metrics.calls += 1
                 if call.tail:
@@ -2483,6 +2487,7 @@ class IRNormalizer:
                 cleanup=cleanup_steps,
                 symbol=call.symbol,
                 abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                dispatch_helper=call.dispatch_helper,
             )
             self._transfer_ssa(call, updated)
             items.replace_slice(index, index + 1, [updated])
@@ -2785,15 +2790,20 @@ class IRNormalizer:
             if follow < len(items):
                 candidate = items[follow]
                 if isinstance(candidate, CallLike):
-                    target = getattr(candidate, "target", None)
-                    if isinstance(target, int) and target in {0x6623, 0x6624}:
-                        helper_target = target
-                        helper_symbol = self.knowledge.lookup_address(target)
+                    helper_target = self._dispatch_helper_target(candidate)
+                    if helper_target is not None:
+                        helper_symbol = self.knowledge.lookup_address(helper_target)
 
             cases, default = self._extract_dispatch_cases(item.operations)
             if not cases:
                 index += 1
                 continue
+
+            if helper_target is None and cases:
+                candidate_target = cases[0].target
+                if candidate_target in DISPATCH_HELPER_IDS:
+                    helper_target = candidate_target
+                    helper_symbol = self.knowledge.lookup_address(candidate_target)
 
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
@@ -3134,6 +3144,18 @@ class IRNormalizer:
                 default_target = operand & 0xFFFF
         return cases, default_target
 
+    def _dispatch_helper_target(self, candidate: CallLike) -> Optional[int]:
+        helper = getattr(candidate, "dispatch_helper", None)
+        if helper is None and hasattr(candidate, "call"):
+            helper = getattr(candidate.call, "dispatch_helper", None)
+        if helper is None:
+            target = getattr(candidate, "target", None)
+            if isinstance(target, int) and target in DISPATCH_HELPER_IDS:
+                helper = target
+        if isinstance(helper, int):
+            return helper & 0xFFFF
+        return None
+
     def _pass_tail_helpers(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -3232,6 +3254,7 @@ class IRNormalizer:
                     symbol=item.symbol,
                     predicate=item.predicate,
                     abi_effects=self._merge_return_mask_effects(item.call.abi_effects, mask),
+                    dispatch_helper=item.call.dispatch_helper,
                 )
                 updated = IRTailCall(
                     call=updated_call,
@@ -3324,6 +3347,7 @@ class IRNormalizer:
                 symbol=item.symbol,
                 predicate=item.predicate,
                 abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
+                dispatch_helper=item.dispatch_helper,
             )
 
             tail_call = IRTailCall(
@@ -3466,6 +3490,7 @@ class IRNormalizer:
             symbol=symbol,
             predicate=predicate,
             abi_effects=self._merge_return_mask_effects(getattr(node, "abi_effects", tuple()), cleanup_mask),
+            dispatch_helper=getattr(node, "dispatch_helper", None),
         )
         self._transfer_ssa(node, tailcall)
         items.replace_slice(index, index + 1, [tailcall])
@@ -3500,6 +3525,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    dispatch_helper=node.dispatch_helper,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3514,6 +3540,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    dispatch_helper=node.dispatch_helper,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3528,6 +3555,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    dispatch_helper=node.dispatch_helper,
                 )
             elif isinstance(node, IRTailCall):
                 updated_call = IRCall(
@@ -3540,6 +3568,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    dispatch_helper=node.call.dispatch_helper,
                 )
                 replacement = IRTailCall(
                     call=updated_call,
@@ -3561,6 +3590,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    dispatch_helper=getattr(node, "dispatch_helper", None),
                 )
             self._transfer_ssa(node, replacement)
             items.replace_slice(index, index + 1, [replacement])
@@ -3922,6 +3952,7 @@ class IRNormalizer:
                             symbol=call.symbol,
                             predicate=call.predicate,
                             abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                            dispatch_helper=call.dispatch_helper,
                         )
                     else:
                         tail = base_tail and consumed == 0 and not return_node.cleanup
@@ -3939,6 +3970,7 @@ class IRNormalizer:
                             symbol=call.symbol,
                             predicate=call.predicate,
                             abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                            dispatch_helper=call.dispatch_helper,
                         )
                     self._transfer_ssa(call, node)
                     end = offset + 1
@@ -4093,6 +4125,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                dispatch_helper=node.dispatch_helper,
             )
 
         if isinstance(node, IRCallReturn):
@@ -4108,6 +4141,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                dispatch_helper=node.dispatch_helper,
             )
 
         if isinstance(node, IRTailCall):
@@ -4121,6 +4155,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.call.abi_effects, node.cleanup_mask),
+                dispatch_helper=node.call.dispatch_helper,
             )
             return IRTailCall(
                 call=updated_call,
@@ -4143,6 +4178,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                dispatch_helper=node.dispatch_helper,
             )
 
         return node
@@ -4414,6 +4450,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                dispatch_helper=node.dispatch_helper,
             )
 
         if isinstance(node, IRCallReturn):
@@ -4433,6 +4470,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                dispatch_helper=node.dispatch_helper,
             )
 
         if isinstance(node, IRTailCall):
@@ -4450,6 +4488,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                dispatch_helper=node.call.dispatch_helper,
             )
             return IRTailCall(
                 call=updated_call,
@@ -4475,6 +4514,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                dispatch_helper=node.dispatch_helper,
             )
 
         return node

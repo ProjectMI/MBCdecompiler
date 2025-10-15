@@ -13,6 +13,8 @@
   "0x16F0": "tail_helper_16f0",
   "0x4B10": "sys.helper",
   "0x3D30": "io.write",
+  "0x6623": "dispatch.helper",
+  "0x6624": "dispatch.helper_tail",
   "0x1234": "test_helper_1234",
   "0x0020": "call_helper_20"
 }

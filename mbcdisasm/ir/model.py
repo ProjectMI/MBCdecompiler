@@ -148,6 +148,7 @@ class IRCall(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    dispatch_helper: Optional[int] = None
 
     def describe(self) -> str:
         suffix = " tail" if self.tail else ""
@@ -216,6 +217,10 @@ class IRTailCall(IRNode):
     @property
     def predicate(self) -> Optional[CallPredicate]:
         return self.call.predicate
+
+    @property
+    def dispatch_helper(self) -> Optional[int]:
+        return self.call.dispatch_helper
 
     def describe(self) -> str:
         call_repr = self.call.describe()
@@ -945,6 +950,7 @@ class IRCallReturn(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    dispatch_helper: Optional[int] = None
 
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
@@ -1057,6 +1063,7 @@ class IRTailcallReturn(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    dispatch_helper: Optional[int] = None
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"
