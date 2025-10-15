@@ -1379,9 +1379,7 @@ class IRNormalizer:
 
             if mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-                if varargs and not values:
-                    values = ("ret*",)
+                values = self._render_return_values(count, varargs)
                 items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
                 metrics.returns += 1
                 continue
@@ -1531,9 +1529,7 @@ class IRNormalizer:
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-                if varargs and not values:
-                    values = ("ret*",)
+                values = self._render_return_values(count, varargs)
                 items.replace_slice(
                     index,
                     index + 1,
@@ -1603,6 +1599,22 @@ class IRNormalizer:
                 count = depth
 
         return count or 0, varargs
+
+    @staticmethod
+    def _render_return_values(count: int, varargs: bool) -> Tuple[str, ...]:
+        values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+        if varargs:
+            if not values or values[-1] != "ret*":
+                values = values + ("ret*",)
+        return values
+
+    @staticmethod
+    def _fixed_return_count(values: Sequence[str], varargs: bool) -> int:
+        if not varargs:
+            return len(values)
+        if values and values[-1] == "ret*":
+            return len(values) - 1
+        return len(values)
 
     def _stack_teardown_hint(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
@@ -3308,11 +3320,11 @@ class IRNormalizer:
             values: Tuple[str, ...]
             if isinstance(returns, tuple):
                 values = returns
+                if item.varargs and (not values or values[-1] != "ret*"):
+                    values = values + ("ret*",)
             else:
                 count = max(int(returns), 0)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-            if item.varargs and not values:
-                values = ("ret*",)
+                values = self._render_return_values(count, item.varargs)
 
             call = IRCall(
                 target=item.target,
@@ -3451,7 +3463,7 @@ class IRNormalizer:
         returns = 0
         varargs = False
         if returns_node is not None:
-            returns = len(returns_node.values)
+            returns = self._fixed_return_count(returns_node.values, returns_node.varargs)
             varargs = returns_node.varargs
 
         tailcall = IRTailcallReturn(
@@ -3904,7 +3916,7 @@ class IRNormalizer:
                     return_node = items[offset]
                     combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
                     varargs = return_node.varargs
-                    return_count = len(return_node.values)
+                    return_count = self._fixed_return_count(return_node.values, varargs)
                     should_bundle = tail_hint and (
                         base_tail or (return_count == 0 and not varargs)
                     )
@@ -4420,7 +4432,9 @@ class IRNormalizer:
             returns = node.returns
             if signature.returns is not None and not node.varargs:
                 count = max(signature.returns, 0)
-                returns = tuple(f"ret{i}" for i in range(count))
+                returns = self._render_return_values(count, False)
+            elif node.varargs and (not returns or returns[-1] != "ret*"):
+                returns = returns + ("ret*",)
             return IRCallReturn(
                 target=target,
                 args=node.args,
@@ -4439,7 +4453,9 @@ class IRNormalizer:
             returns = node.returns
             if signature.returns is not None and not node.varargs:
                 count = max(signature.returns, 0)
-                returns = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+                returns = self._render_return_values(count, False)
+            elif node.varargs and (not returns or returns[-1] != "ret*"):
+                returns = returns + ("ret*",)
             updated_call = IRCall(
                 target=target,
                 args=node.args,

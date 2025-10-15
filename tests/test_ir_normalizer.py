@@ -142,6 +142,39 @@ def test_epilogue_compaction_merges_raw_markers() -> None:
     assert [step.mnemonic for step in updated_return.cleanup] == ["op_02_00", "op_15_4A"]
 
 
+def test_vararg_return_uses_pack_placeholder() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    instruction = make_stack_neutral_instruction(
+        0,
+        "return_values",
+        operand=0x0000,
+        kind=InstructionKind.RETURN,
+    )
+    word = build_word(0, 0x30, 0x29, 0x0000)
+    profile = replace(instruction.profile, word=word)
+    event = replace(instruction.event, profile=profile)
+    instruction = replace(instruction, profile=profile, event=event)
+
+    items = _ItemList([instruction])
+    metrics = NormalizerMetrics()
+    normalizer._pass_calls_and_returns(items, metrics)
+
+    assert len(items) == 1
+    node = items[0]
+    assert isinstance(node, IRReturn)
+    assert node.varargs is True
+    assert node.values == ("ret*",)
+
+
+def test_render_return_values_appends_varargs_marker() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    packed = normalizer._render_return_values(2, True)
+    assert packed == ("ret0", "ret1", "ret*")
+    assert normalizer._fixed_return_count(packed, True) == 2
+
 def write_manual(path: Path) -> KnowledgeBase:
     manual = {
         "push_literal": {
