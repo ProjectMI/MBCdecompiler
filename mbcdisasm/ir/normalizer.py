@@ -44,6 +44,7 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRLiteralMarker,
     IRPageRegister,
     IRLoad,
     IRNode,
@@ -852,6 +853,21 @@ class IRNormalizer:
         block_annotations: List[str] = []
         for index, item in enumerate(final_items):
             if isinstance(item, RawInstruction):
+                profile_kind = item.profile.kind
+                if profile_kind is InstructionKind.ASCII_CHUNK or item.mnemonic.startswith(
+                    "inline_ascii_chunk"
+                ):
+                    chunk = self._literal_from_instruction(item)
+                    if isinstance(chunk, IRLiteralChunk):
+                        metrics.literal_chunks += 1
+                        self._transfer_ssa(item, chunk)
+                        nodes.append(chunk)
+                        continue
+                marker_node = self._literal_marker_from_instruction(item, final_wrapper, index)
+                if marker_node is not None:
+                    self._transfer_ssa(item, marker_node)
+                    nodes.append(marker_node)
+                    continue
                 if item.mnemonic == "terminator" or item.profile.kind is InstructionKind.TERMINATOR:
                     node = IRTerminator(
                         operand=item.operand,
@@ -1174,6 +1190,12 @@ class IRNormalizer:
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
 
+        if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
+            "inline_ascii_chunk"
+        ):
+            data = instruction.profile.word.raw.to_bytes(4, "big")
+            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+
         if profile.is_literal_marker():
             self._annotation_offsets.add(instruction.offset)
             hint = LITERAL_MARKER_HINTS.get(instruction.operand)
@@ -1185,12 +1207,6 @@ class IRNormalizer:
                     annotations=instruction.annotations,
                 )
             return None
-
-        if profile.kind is InstructionKind.ASCII_CHUNK or profile.mnemonic.startswith(
-            "inline_ascii_chunk"
-        ):
-            data = instruction.profile.word.raw.to_bytes(4, "big")
-            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -5818,6 +5834,127 @@ class IRNormalizer:
             if isinstance(prev_item, io_types) or isinstance(next_item, io_types):
                 return True
         return self._has_ascii_neighbor(items, index)
+
+    def _is_literal_context(
+        self,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        literal_nodes = (
+            IRLiteral,
+            IRLiteralChunk,
+            IRLiteralBlock,
+            IRBuildArray,
+            IRBuildTuple,
+            IRBuildMap,
+            IRAsciiHeader,
+            IRLiteralMarker,
+        )
+        def scan(direction: int) -> bool:
+            pos = index + direction
+            while 0 <= pos < len(items):
+                candidate = items[pos]
+                if isinstance(candidate, literal_nodes):
+                    return True
+                if isinstance(candidate, RawInstruction):
+                    event = candidate.event
+                    if (
+                        not candidate.profile.is_control()
+                        and not self._has_profile_side_effects(candidate)
+                        and (
+                            event.delta == 0
+                            or (event.delta < 0 and not candidate.event.pushed_types)
+                        )
+                    ):
+                        pos += direction
+                        continue
+                break
+            return False
+
+        if scan(-1) or scan(1):
+            return True
+        return False
+
+    def _is_call_context(
+        self,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> bool:
+        call_nodes = (IRCall, IRTailCall, IRTailcallReturn, IRCallCleanup, IRCallPreparation)
+
+        def scan(direction: int) -> bool:
+            pos = index + direction
+            while 0 <= pos < len(items):
+                candidate = items[pos]
+                if isinstance(candidate, RawInstruction):
+                    event = candidate.event
+                    if (
+                        not candidate.profile.is_control()
+                        and not self._has_profile_side_effects(candidate)
+                        and (
+                            event.delta == 0
+                            or (event.delta < 0 and not candidate.event.pushed_types)
+                        )
+                    ):
+                        pos += direction
+                        continue
+                return isinstance(candidate, call_nodes)
+            return False
+
+        if scan(-1) or scan(1):
+            return True
+        return False
+
+    def _literal_marker_from_instruction(
+        self,
+        instruction: RawInstruction,
+        items: Sequence[Union[RawInstruction, IRNode]],
+        index: int,
+    ) -> Optional[IRLiteralMarker]:
+        mnemonic = instruction.mnemonic
+        if mnemonic == "literal_marker":
+            return IRLiteralMarker(
+                kind="literal_marker",
+                operand=instruction.operand,
+                annotations=instruction.annotations,
+            )
+        if "literal_marker" in instruction.annotations:
+            return IRLiteralMarker(
+                kind=mnemonic,
+                operand=instruction.operand,
+                annotations=instruction.annotations,
+            )
+        if "inline_ascii_chunk" in instruction.annotations:
+            if instruction.profile.kind is InstructionKind.ASCII_CHUNK:
+                return None
+            return IRLiteralMarker(
+                kind="inline_ascii_chunk",
+                operand=instruction.operand,
+                annotations=instruction.annotations,
+            )
+        if mnemonic == "op_DE_00":
+            event = instruction.event
+            if not event.uncertain or event.delta != 0:
+                return None
+            if not self._is_literal_context(items, index):
+                return None
+            return IRLiteralMarker(
+                kind=mnemonic,
+                operand=instruction.operand,
+                annotations=instruction.annotations,
+            )
+        event = instruction.event
+        if (
+            event.delta == 0
+            and event.uncertain
+            and not self._has_profile_side_effects(instruction)
+        ):
+            return IRLiteralMarker(
+                kind=mnemonic,
+                operand=instruction.operand,
+                annotations=instruction.annotations,
+            )
+        return None
 
     def _has_profile_side_effects(self, instruction: RawInstruction) -> bool:
         profile = instruction.profile

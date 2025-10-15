@@ -7,6 +7,7 @@ from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
 from dataclasses import replace
+from typing import Union
 
 from mbcdisasm.ir.model import (
     IRCall,
@@ -16,6 +17,7 @@ from mbcdisasm.ir.model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRLiteralMarker,
     IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
@@ -28,6 +30,7 @@ from mbcdisasm.ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRRaw,
+    IRNode,
     IRConditionMask,
     IRIOWrite,
     IRBuildTuple,
@@ -921,10 +924,51 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     ir_block, metrics = normalizer._normalise_block(block)
 
     assert metrics.raw_remaining == 0
-    assert ir_block.annotations and any("op_AA_00" in note for note in ir_block.annotations)
+    markers = [node for node in ir_block.nodes if isinstance(node, IRLiteralMarker)]
+    assert markers and any(marker.kind == "op_AA_00" for marker in markers)
     assert any(
         isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
     )
+
+
+def test_literal_marker_promoted_in_literal_context() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    bridge = make_stack_neutral_instruction(4, "op_DE_00")
+    bridge = replace(bridge, event=replace(bridge.event, uncertain=True))
+
+    literal_items: list[Union[RawInstruction, IRNode]] = [
+        IRLiteralChunk(data=b"HEAD", source="ascii"),
+        bridge,
+        IRLiteralChunk(data=b"TAIL", source="ascii"),
+    ]
+
+    marker = normalizer._literal_marker_from_instruction(
+        bridge, _ItemList(literal_items), 1
+    )
+
+    assert marker is not None
+    assert marker.kind == "op_DE_00"
+
+
+def test_literal_marker_fallback_promotes_uncertain_neutral_call_bridge() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    bridge = make_stack_neutral_instruction(4, "op_AB_00")
+    bridge = replace(bridge, event=replace(bridge.event, uncertain=True))
+
+    call_items: list[Union[RawInstruction, IRNode]] = [
+        IRCall(target=0x1234, args=tuple()),
+        bridge,
+        IRCallCleanup(steps=tuple()),
+    ]
+
+    marker = normalizer._literal_marker_from_instruction(
+        bridge, _ItemList(call_items), 1
+    )
+
+    assert marker is not None
+    assert marker.kind == "op_AB_00"
 
 
 def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:

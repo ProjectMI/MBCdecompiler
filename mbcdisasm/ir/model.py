@@ -369,6 +369,24 @@ class IRLiteralChunk(IRNode):
 
 
 @dataclass(frozen=True)
+class IRLiteralMarker(IRNode):
+    """Explicit marker used by literal emission helpers."""
+
+    kind: str
+    operand: Optional[int] = None
+    annotations: Tuple[str, ...] = field(default_factory=tuple)
+
+    def describe(self) -> str:
+        details: List[str] = []
+        if self.operand is not None:
+            details.append(f"operand=0x{self.operand:04X}")
+        if self.annotations:
+            details.extend(self.annotations)
+        suffix = "" if not details else f" {', '.join(details)}"
+        return f"literal_marker[{self.kind}]{suffix}"
+
+
+@dataclass(frozen=True)
 class IRStringConstant(IRNode):
     """Entry in the global ASCII constant pool."""
 
