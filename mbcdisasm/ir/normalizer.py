@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, fields, is_dataclass
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
@@ -690,10 +690,17 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
+        used_strings = self._collect_string_pool_references(segments)
+        string_pool = tuple(
+            constant
+            for constant in self._string_pool_order
+            if constant.name in used_strings
+        )
+
         return IRProgram(
             segments=tuple(segments),
             metrics=aggregate_metrics,
-            string_pool=tuple(self._string_pool_order),
+            string_pool=string_pool,
         )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
@@ -715,6 +722,40 @@ class IRNormalizer:
             blocks=tuple(blocks),
             metrics=metrics,
         )
+
+    def _collect_string_pool_references(self, segments: Sequence[IRSegment]) -> Set[str]:
+        if not self._string_pool_order:
+            return set()
+
+        constant_names = {constant.name for constant in self._string_pool_order}
+        referenced: Set[str] = set()
+
+        def visit(value: object) -> None:
+            if isinstance(value, str):
+                if value in constant_names:
+                    referenced.add(value)
+                return
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                return
+            if isinstance(value, IRStringConstant):
+                referenced.add(value.name)
+                return
+            if is_dataclass(value):
+                for field in fields(value):
+                    visit(getattr(value, field.name))
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    visit(item)
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    visit(item)
+
+        for segment in segments:
+            visit(segment)
+
+        return referenced
 
     # ------------------------------------------------------------------
     # parsing helpers
