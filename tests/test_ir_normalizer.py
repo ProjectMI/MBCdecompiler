@@ -1475,6 +1475,49 @@ def test_normalizer_collapses_tailcall_teardown(tmp_path: Path) -> None:
     assert tail_call.cleanup[-1].pops == 4
 
 
+def test_normalizer_marks_suspicious_tailcall() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    call = IRCall(target=0x1000, args=("ssa0",), tail=True, arity=44)
+    cleanup = (
+        IRStackEffect(mnemonic="stack_teardown", pops=10),
+        IRStackEffect(mnemonic="stack_teardown", pops=4),
+    )
+    returns = tuple(f"ret{i}" for i in range(20))
+    tail = IRTailCall(call=call, returns=returns, cleanup=cleanup)
+
+    items = _ItemList([tail])
+    normalizer._pass_mark_suspicious_conventions(items)
+
+    updated = items[0]
+    assert isinstance(updated, IRTailCall)
+    assert updated.annotations
+    note = updated.annotations[0]
+    assert note.startswith("tailcall_suspicious")
+    assert "arity=44" in note
+    assert "returns=20" in note
+    assert "cleanup=stack_teardownx2" in note
+    assert "cleanup=max_pop=10" in note
+
+
+def test_normalizer_marks_suspicious_return_cleanup() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    cleanup = (
+        IRStackEffect(mnemonic="stack_teardown", pops=4),
+        IRStackEffect(mnemonic="stack_teardown", pops=4),
+    )
+    ret = IRReturn(values=("ssa0",), cleanup=cleanup)
+
+    items = _ItemList([ret])
+    normalizer._pass_mark_suspicious_conventions(items)
+
+    updated = items[0]
+    assert isinstance(updated, IRReturn)
+    assert updated.annotations
+    note = updated.annotations[0]
+    assert note.startswith("return_suspicious")
+    assert "cleanup=stack_teardownx2" in note
+
+
 def test_normalizer_coalesces_call_bridge(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

@@ -645,6 +645,9 @@ class IRNormalizer:
         SSAValueKind.PAGE_REGISTER: 5,
         SSAValueKind.BOOLEAN: 6,
     }
+    _SUSPICIOUS_TAILCALL_ARITY_THRESHOLD = 16
+    _SUSPICIOUS_TAILCALL_RETURN_THRESHOLD = 16
+    _SUSPICIOUS_CLEANUP_POP_THRESHOLD = 9
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
@@ -910,6 +913,7 @@ class IRNormalizer:
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
         self._split_preserved_cleanup_nodes(items)
+        self._pass_mark_suspicious_conventions(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
@@ -2077,6 +2081,88 @@ class IRNormalizer:
                 continue
             index += 1
 
+    def _pass_mark_suspicious_conventions(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            annotation = ""
+            if isinstance(node, IRTailCall):
+                annotation = self._tailcall_annotation(node)
+                if annotation:
+                    updated = replace(node, annotations=self._append_annotation(node.annotations, annotation))
+                    items.replace_slice(index, index + 1, [updated])
+            elif isinstance(node, IRTailcallReturn):
+                annotation = self._tailcall_return_annotation(node)
+                if annotation:
+                    updated = replace(node, annotations=self._append_annotation(node.annotations, annotation))
+                    items.replace_slice(index, index + 1, [updated])
+            elif isinstance(node, IRReturn):
+                annotation = self._return_annotation(node)
+                if annotation:
+                    updated = replace(node, annotations=self._append_annotation(node.annotations, annotation))
+                    items.replace_slice(index, index + 1, [updated])
+            index += 1
+
+    def _tailcall_annotation(self, node: IRTailCall) -> str:
+        details = self._tailcall_anomaly_details(node)
+        return self._compose_annotation("tailcall_suspicious", details)
+
+    def _tailcall_return_annotation(self, node: IRTailcallReturn) -> str:
+        details = self._tailcall_return_anomaly_details(node)
+        return self._compose_annotation("tailcall_suspicious", details)
+
+    def _return_annotation(self, node: IRReturn) -> str:
+        details = self._cleanup_anomaly_details(node.cleanup)
+        return self._compose_annotation("return_suspicious", details)
+
+    def _tailcall_anomaly_details(self, node: IRTailCall) -> List[str]:
+        details: List[str] = []
+        arity = node.arity
+        if arity is not None and arity >= self._SUSPICIOUS_TAILCALL_ARITY_THRESHOLD:
+            details.append(f"arity={arity}")
+        real_returns = [value for value in node.returns if value != "ret*"]
+        if real_returns and len(real_returns) >= self._SUSPICIOUS_TAILCALL_RETURN_THRESHOLD:
+            details.append(f"returns={len(real_returns)}")
+        details.extend(self._cleanup_anomaly_details(node.cleanup))
+        return details
+
+    def _tailcall_return_anomaly_details(self, node: IRTailcallReturn) -> List[str]:
+        details: List[str] = []
+        if node.returns >= self._SUSPICIOUS_TAILCALL_RETURN_THRESHOLD:
+            details.append(f"returns={node.returns}")
+        if node.arity is not None and node.arity >= self._SUSPICIOUS_TAILCALL_ARITY_THRESHOLD:
+            details.append(f"arity={node.arity}")
+        details.extend(self._cleanup_anomaly_details(node.cleanup))
+        return details
+
+    def _cleanup_anomaly_details(self, steps: Sequence[IRStackEffect]) -> List[str]:
+        details: List[str] = []
+        if not steps:
+            return details
+        teardown_count = sum(1 for step in steps if step.mnemonic == "stack_teardown")
+        if teardown_count > 1:
+            details.append(f"cleanup=stack_teardownx{teardown_count}")
+        pops = [step.pops for step in steps if step.pops > 0]
+        if pops:
+            max_pop = max(pops)
+            if max_pop >= self._SUSPICIOUS_CLEANUP_POP_THRESHOLD:
+                details.append(f"cleanup=max_pop={max_pop}")
+        return details
+
+    @staticmethod
+    def _compose_annotation(prefix: str, details: Sequence[str]) -> str:
+        if not details:
+            return ""
+        return f"{prefix} {' '.join(details)}"
+
+    @staticmethod
+    def _append_annotation(existing: Sequence[str], note: str) -> Tuple[str, ...]:
+        if not note:
+            return tuple(existing)
+        if note in existing:
+            return tuple(existing)
+        return tuple(existing) + (note,)
+
     def _pass_io_operations(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -2466,6 +2552,7 @@ class IRNormalizer:
                 cleanup=cleanup_steps,
                 symbol=call.symbol,
                 abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                annotations=call.annotations,
             )
             self._transfer_ssa(call, updated)
             items.replace_slice(index, index + 1, [updated])
@@ -3215,6 +3302,7 @@ class IRNormalizer:
                     symbol=item.symbol,
                     predicate=item.predicate,
                     abi_effects=self._merge_return_mask_effects(item.call.abi_effects, mask),
+                    annotations=item.call.annotations,
                 )
                 updated = IRTailCall(
                     call=updated_call,
@@ -3222,6 +3310,7 @@ class IRNormalizer:
                     varargs=item.varargs,
                     cleanup=tuple(cleanup_steps),
                     abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
+                    annotations=item.annotations,
                 )
                 self._transfer_ssa(item, updated)
                 items.replace_slice(index, index + 1, [updated])
@@ -3315,6 +3404,7 @@ class IRNormalizer:
                 varargs=item.varargs,
                 cleanup=tuple(cleanup_steps),
                 abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
+                annotations=item.annotations,
             )
             self._transfer_ssa(item, tail_call)
             items.replace_slice(index, index + 1, [tail_call])
@@ -3483,6 +3573,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    annotations=node.annotations,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -3523,6 +3614,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    annotations=node.call.annotations,
                 )
                 replacement = IRTailCall(
                     call=updated_call,
@@ -3530,6 +3622,7 @@ class IRNormalizer:
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     abi_effects=tuple(),
+                    annotations=node.annotations,
                 )
             else:
                 replacement = IRTailcallReturn(
@@ -3544,6 +3637,7 @@ class IRNormalizer:
                     symbol=symbol,
                     predicate=predicate,
                     abi_effects=tuple(),
+                    annotations=getattr(node, "annotations", tuple()),
                 )
             self._transfer_ssa(node, replacement)
             items.replace_slice(index, index + 1, [replacement])
@@ -4076,6 +4170,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRCallReturn):
@@ -4104,6 +4199,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.call.abi_effects, node.cleanup_mask),
+                annotations=node.call.annotations,
             )
             return IRTailCall(
                 call=updated_call,
@@ -4111,6 +4207,7 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRTailcallReturn):
@@ -4126,6 +4223,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=self._merge_return_mask_effects(node.abi_effects, node.cleanup_mask),
+                annotations=node.annotations,
             )
 
         return node
@@ -4397,6 +4495,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRCallReturn):
@@ -4433,6 +4532,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                annotations=node.call.annotations,
             )
             return IRTailCall(
                 call=updated_call,
@@ -4440,6 +4540,7 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=cleanup,
                 abi_effects=abi_effects,
+                annotations=node.annotations,
             )
 
         if isinstance(node, IRTailcallReturn):
@@ -4458,6 +4559,7 @@ class IRNormalizer:
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,
+                annotations=node.annotations,
             )
 
         return node
