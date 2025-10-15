@@ -1,14 +1,17 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.ast import ASTBuilder
+from mbcdisasm.ast import ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
 from mbcdisasm.ir.model import (
     IRBlock,
+    IRCall,
+    IRDispatchCase,
     IRIf,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
+    IRSwitchDispatch,
     IRSlot,
     MemSpace,
     NormalizerMetrics,
@@ -120,3 +123,68 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     procedure = ast_segment.procedures[0]
     assert tuple(sorted(procedure.exit_offsets)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
+
+
+def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x01, target=0x2222, symbol="proc_2222"),),
+        helper=0x1111,
+        helper_symbol="helper_1111",
+        default=0x3333,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0100,
+        nodes=(dispatch, IRCall(target=0x1111, args=(), symbol="helper_1111"), IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert isinstance(statements[0], ASTDispatchTable)
+    assert isinstance(statements[1], ASTSwitch)
+    assert statements[1].helper == 0x1111
+    assert statements[1].cases[0].key == 0x01
+    assert statements[1].cases[0].target == 0x2222
+    assert isinstance(statements[2], ASTReturn)
+
+
+def test_ast_builder_converts_dispatch_with_leading_call() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x02, target=0x4444, symbol=None),),
+        helper=0x5555,
+        helper_symbol=None,
+        default=None,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0200,
+        nodes=(IRCall(target=0x5555, args=()), dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert isinstance(statements[0], ASTDispatchTable)
+    assert isinstance(statements[1], ASTSwitch)
+    assert statements[1].helper == 0x5555
+    assert statements[1].cases[0].key == 0x02
+    assert statements[1].cases[0].target == 0x4444

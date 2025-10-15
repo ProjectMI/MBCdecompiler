@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import List, Tuple
 
 from ..ir.model import IRSlot, MemRef, SSAValueKind
 
@@ -387,6 +387,70 @@ class ASTComment(ASTStatement):
 
     def render(self) -> str:
         return f"; {self.text}"
+
+
+@dataclass
+class ASTSwitchCase:
+    """Single case handled by a helper dispatch."""
+
+    key: int
+    target: int
+    symbol: str | None = None
+
+    def render(self) -> str:
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        return f"0x{self.key:04X}->{target_repr}"
+
+
+@dataclass
+class ASTDispatchTable(ASTStatement):
+    """Address table extracted from a helper-driven dispatch."""
+
+    cases: Tuple[ASTSwitchCase, ...]
+    helper: int | None = None
+    helper_symbol: str | None = None
+    default: int | None = None
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.helper is not None:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+            parts.append(f"helper={helper_repr}")
+        if self.default is not None:
+            parts.append(f"default=0x{self.default:04X}")
+        prefix = "dispatch.data"
+        if parts:
+            prefix += " " + " ".join(parts)
+        rendered_cases = ", ".join(case.render() for case in self.cases)
+        return f"{prefix} cases=[{rendered_cases}]"
+
+
+@dataclass
+class ASTSwitch(ASTStatement):
+    """Explicit switch extracted from a helper dispatch call."""
+
+    selector: ASTExpression
+    cases: Tuple[ASTSwitchCase, ...]
+    helper: int | None = None
+    helper_symbol: str | None = None
+    default: int | None = None
+
+    def render(self) -> str:
+        helper_note = ""
+        if self.helper is not None:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+            helper_note = f" helper={helper_repr}"
+        default_note = ""
+        if self.default is not None:
+            default_note = f" default=0x{self.default:04X}"
+        rendered_cases = ", ".join(case.render() for case in self.cases)
+        return f"switch {self.selector.render()} cases=[{rendered_cases}]{default_note}{helper_note}"
 
 
 # ---------------------------------------------------------------------------

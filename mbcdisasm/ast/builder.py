@@ -16,6 +16,7 @@ from ..ir.model import (
     IRIOWrite,
     IRIf,
     IRFlagCheck,
+    IRDispatchCase,
     IRBankedLoad,
     IRBankedStore,
     IRIndirectLoad,
@@ -25,6 +26,7 @@ from ..ir.model import (
     IRReturn,
     IRSegment,
     IRStore,
+    IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
     IRTailcallReturn,
@@ -40,6 +42,7 @@ from .model import (
     ASTCallStatement,
     ASTComment,
     ASTExpression,
+    ASTDispatchTable,
     ASTFlagCheck,
     ASTFunctionPrologue,
     ASTIORead,
@@ -57,6 +60,8 @@ from .model import (
     ASTSlotRef,
     ASTStatement,
     ASTStore,
+    ASTSwitch,
+    ASTSwitchCase,
     ASTTailCall,
     ASTTestSet,
     ASTUnknown,
@@ -104,6 +109,23 @@ class _ProcedureAccumulator:
     entry_offset: int
     entry_reasons: Set[str] = field(default_factory=set)
     blocks: Dict[int, _PendingBlock] = field(default_factory=dict)
+
+
+@dataclass
+class _PendingDispatchCall:
+    """Call statement awaiting an accompanying dispatch table."""
+
+    helper: int
+    index: int
+    call: ASTCallExpr
+
+
+@dataclass
+class _PendingDispatchTable:
+    """Dispatch table awaiting a matching helper call."""
+
+    dispatch: IRSwitchDispatch
+    index: int
 
 
 class ASTBuilder:
@@ -513,7 +535,27 @@ class ASTBuilder:
         block = analysis.block
         statements: List[ASTStatement] = []
         branch_links: List[_BranchLink] = []
+        pending_calls: List[_PendingDispatchCall] = []
+        pending_tables: List[_PendingDispatchTable] = []
         for node in block.nodes:
+            if isinstance(node, IRCall):
+                self._handle_dispatch_call(
+                    node,
+                    value_state,
+                    metrics,
+                    statements,
+                    pending_calls,
+                    pending_tables,
+                )
+                continue
+            if isinstance(node, IRSwitchDispatch):
+                self._handle_dispatch_table(
+                    node,
+                    statements,
+                    pending_calls,
+                    pending_tables,
+                )
+                continue
             node_statements, node_links = self._convert_node(
                 node,
                 block.start_offset,
@@ -528,6 +570,129 @@ class ASTBuilder:
             statements=statements,
             successors=analysis.successors,
             branch_links=branch_links,
+        )
+
+    def _handle_dispatch_call(
+        self,
+        node: IRCall,
+        value_state: MutableMapping[str, ASTExpression],
+        metrics: ASTMetrics,
+        statements: List[ASTStatement],
+        pending_calls: List[_PendingDispatchCall],
+        pending_tables: List[_PendingDispatchTable],
+    ) -> None:
+        call_expr, _ = self._convert_call(
+            node.target,
+            node.args,
+            node.symbol,
+            node.tail,
+            node.varargs if hasattr(node, "varargs") else False,
+            value_state,
+        )
+        metrics.call_sites += 1
+        metrics.observe_call_args(
+            sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+            len(call_expr.args),
+        )
+        dispatch = self._pop_dispatch_table(node.target, pending_tables)
+        if dispatch is not None:
+            statements.append(self._build_dispatch_switch(call_expr, dispatch))
+            return
+        index = len(statements)
+        statements.append(ASTCallStatement(call=call_expr))
+        pending_calls.append(
+            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+        )
+
+    def _handle_dispatch_table(
+        self,
+        dispatch: IRSwitchDispatch,
+        statements: List[ASTStatement],
+        pending_calls: List[_PendingDispatchCall],
+        pending_tables: List[_PendingDispatchTable],
+    ) -> None:
+        table_statement = self._build_dispatch_table(dispatch)
+        call_info = self._pop_dispatch_call(dispatch, pending_calls)
+        if call_info is not None:
+            insert_index = call_info.index
+            statements.insert(insert_index, table_statement)
+            switch_statement = self._build_dispatch_switch(call_info.call, dispatch)
+            statements[insert_index + 1] = switch_statement
+            self._adjust_pending_indices(pending_calls, insert_index)
+            self._adjust_table_indices(pending_tables, insert_index)
+            return
+        index = len(statements)
+        statements.append(table_statement)
+        pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
+
+    def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
+        if dispatch.helper is not None:
+            return dispatch.helper == helper
+        return False
+
+    def _pop_dispatch_table(
+        self, helper: int, pending_tables: List[_PendingDispatchTable]
+    ) -> Optional[IRSwitchDispatch]:
+        for index in range(len(pending_tables) - 1, -1, -1):
+            entry = pending_tables[index]
+            if self._dispatch_helper_matches(helper, entry.dispatch):
+                pending_tables.pop(index)
+                return entry.dispatch
+        return None
+
+    def _pop_dispatch_call(
+        self, dispatch: IRSwitchDispatch, pending_calls: List[_PendingDispatchCall]
+    ) -> Optional[_PendingDispatchCall]:
+        helper = dispatch.helper
+        if helper is None:
+            return None
+        for index in range(len(pending_calls) - 1, -1, -1):
+            entry = pending_calls[index]
+            if entry.helper == helper:
+                return pending_calls.pop(index)
+        return None
+
+    def _adjust_pending_indices(
+        self, pending_calls: List[_PendingDispatchCall], insert_index: int
+    ) -> None:
+        for entry in pending_calls:
+            if entry.index >= insert_index:
+                entry.index += 1
+
+    def _adjust_table_indices(
+        self, pending_tables: List[_PendingDispatchTable], insert_index: int
+    ) -> None:
+        for entry in pending_tables:
+            if entry.index >= insert_index:
+                entry.index += 1
+
+    def _build_dispatch_switch(
+        self, call_expr: ASTCallExpr, dispatch: IRSwitchDispatch
+    ) -> ASTSwitch:
+        cases = self._build_dispatch_cases(dispatch.cases)
+        return ASTSwitch(
+            selector=call_expr,
+            cases=cases,
+            helper=dispatch.helper,
+            helper_symbol=dispatch.helper_symbol,
+            default=dispatch.default,
+        )
+
+    def _build_dispatch_table(self, dispatch: IRSwitchDispatch) -> ASTDispatchTable:
+        cases = self._build_dispatch_cases(dispatch.cases)
+        return ASTDispatchTable(
+            cases=cases,
+            helper=dispatch.helper,
+            helper_symbol=dispatch.helper_symbol,
+            default=dispatch.default,
+        )
+
+    def _build_dispatch_cases(
+        self, cases: Sequence[IRDispatchCase]
+    ) -> Tuple[ASTSwitchCase, ...]:
+        return tuple(
+            ASTSwitchCase(key=case.key, target=case.target, symbol=case.symbol)
+            for case in cases
         )
 
     def _convert_node(
@@ -632,21 +797,6 @@ class ASTBuilder:
             )
             target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
             return [ASTStore(target=target, value=value_expr)], []
-        if isinstance(node, IRCall):
-            call_expr, _ = self._convert_call(
-                node.target,
-                node.args,
-                node.symbol,
-                node.tail,
-                node.varargs if hasattr(node, "varargs") else False,
-                value_state,
-            )
-            metrics.call_sites += 1
-            metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-                len(call_expr.args),
-            )
-            return [ASTCallStatement(call=call_expr)], []
         if isinstance(node, IRCallReturn):
             call_expr, returns = self._convert_call(
                 node.target,
