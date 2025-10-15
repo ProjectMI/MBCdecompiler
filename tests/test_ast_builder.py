@@ -1,12 +1,20 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.ast import ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
+from mbcdisasm.ast import (
+    ASTBuilder,
+    ASTComment,
+    ASTDispatchTable,
+    ASTReturn,
+    ASTSwitch,
+)
 from mbcdisasm.ir.model import (
     IRBlock,
     IRCall,
+    IRDataMarker,
     IRDispatchCase,
     IRIf,
+    IRLiteral,
     IRLoad,
     IRProgram,
     IRReturn,
@@ -188,3 +196,66 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].helper == 0x5555
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
+
+
+def test_ast_builder_prunes_literal_markers_from_blocks() -> None:
+    block = IRBlock(
+        label="block_marker",
+        start_offset=0x0100,
+        nodes=(
+            IRLiteral(value=0x1234, mode=0, source="test"),
+            IRDataMarker(mnemonic="literal_marker"),
+            IRReturn(values=("ret0",), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert all(not isinstance(statement, ASTComment) for statement in statements)
+    assert any(isinstance(statement, ASTReturn) for statement in statements)
+
+
+def test_ast_builder_discards_stack_top_branch_and_collapses_empty_blocks() -> None:
+    entry = IRBlock(
+        label="block_entry",
+        start_offset=0x0200,
+        nodes=(IRLiteral(value=0x0001, mode=0, source="test"), IRIf(condition="stack_top", then_target=0, else_target=0x0210)),
+    )
+    intermediate = IRBlock(
+        label="block_mid",
+        start_offset=0x0210,
+        nodes=(IRLiteral(value=0x0000, mode=0, source="test"), IRIf(condition="stack_top", then_target=0, else_target=0x0220)),
+    )
+    tail = IRBlock(
+        label="block_tail",
+        start_offset=0x0220,
+        nodes=(IRReturn(values=("ret0",), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x40,
+        blocks=(entry, intermediate, tail),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+
+    entry_block = procedure.blocks[0]
+    assert all(not isinstance(statement, ASTComment) for statement in entry_block.statements)
+    assert all(not isinstance(statement, ASTComment) for statement in procedure.blocks[-1].statements)
+    assert entry_block.successors
+    assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0220}

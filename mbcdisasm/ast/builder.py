@@ -7,25 +7,33 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
+    IRBankedLoad,
+    IRBankedStore,
     IRBlock,
+    IRBuildArray,
+    IRBuildMap,
+    IRBuildTuple,
     IRCall,
     IRCallCleanup,
     IRCallReturn,
+    IRDataMarker,
+    IRDispatchCase,
+    IRFlagCheck,
     IRFunctionPrologue,
     IRIORead,
     IRIOWrite,
     IRIf,
-    IRFlagCheck,
-    IRDispatchCase,
-    IRBankedLoad,
-    IRBankedStore,
     IRIndirectLoad,
     IRIndirectStore,
+    IRLiteral,
+    IRLiteralBlock,
+    IRLiteralChunk,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
     IRStore,
+    IRStringConstant,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -359,7 +367,7 @@ class ASTBuilder:
         entry_reasons: Tuple[str, ...],
         blocks: Sequence[_PendingBlock],
     ) -> ASTProcedure:
-        realised_blocks = self._realise_blocks(blocks)
+        realised_blocks = self._realise_blocks(entry_offset, blocks)
         exit_offsets = self._compute_exit_offsets(blocks)
         return ASTProcedure(
             name=name,
@@ -491,7 +499,9 @@ class ASTBuilder:
                 exit_offsets.add(offset)
         return tuple(sorted(exit_offsets))
 
-    def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
+    def _realise_blocks(
+        self, entry_offset: int, blocks: Sequence[_PendingBlock]
+    ) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
             block.start_offset: ASTBlock(
                 label=block.label,
@@ -518,13 +528,138 @@ class ASTBuilder:
                         link.origin_offset, link.else_target
                     )
             realised = block_map[pending.start_offset]
-            realised.statements = tuple(pending.statements)
+            filtered = self._filter_statements(pending.statements)
+            realised.statements = tuple(filtered)
             realised.successors = tuple(
                 block_map[target]
                 for target in pending.successors
                 if target in block_map
             )
-        return tuple(block_map[block.start_offset] for block in blocks)
+
+        simplified = self._simplify_ast_cfg(block_map, entry_offset)
+        return simplified
+
+    def _filter_statements(self, statements: Sequence[ASTStatement]) -> List[ASTStatement]:
+        filtered: List[ASTStatement] = []
+        for statement in statements:
+            if isinstance(statement, ASTComment):
+                text = statement.text
+                if self._is_technical_comment(text):
+                    continue
+            filtered.append(statement)
+        return filtered
+
+    def _simplify_ast_cfg(
+        self, block_map: Mapping[int, ASTBlock], entry_offset: int
+    ) -> Tuple[ASTBlock, ...]:
+        entry_block = block_map.get(entry_offset)
+        blocks = list(block_map.values())
+        if not blocks:
+            return tuple()
+
+        def compute_predecessors() -> Dict[int, List[ASTBlock]]:
+            preds: Dict[int, List[ASTBlock]] = {id(block): [] for block in blocks}
+            for block in blocks:
+                for successor in block.successors:
+                    preds.setdefault(id(successor), []).append(block)
+            return preds
+
+        preds = compute_predecessors()
+        removed = True
+        while removed:
+            removed = False
+            for block in list(blocks):
+                if block is entry_block:
+                    continue
+                block_id = id(block)
+                if block_id not in preds:
+                    continue
+                if block.statements:
+                    continue
+                successors = block.successors
+                if len(successors) != 1:
+                    continue
+                predecessor_list = preds.get(block_id, [])
+                if len(predecessor_list) != 1:
+                    continue
+                predecessor = predecessor_list[0]
+                successor = successors[0]
+                if successor is block:
+                    continue
+                updated_successors = [
+                    successor if candidate is block else candidate
+                    for candidate in predecessor.successors
+                ]
+                predecessor.successors = tuple(updated_successors)
+                self._redirect_branch_references(predecessor, block, successor)
+                blocks.remove(block)
+                removed = True
+                break
+            if removed:
+                preds = compute_predecessors()
+
+        ordered = sorted(blocks, key=lambda block: block.start_offset)
+        return tuple(ordered)
+
+    def _redirect_branch_references(
+        self, block: ASTBlock, old: ASTBlock, new: ASTBlock
+    ) -> None:
+        for statement in block.statements:
+            if isinstance(statement, BranchStatement):
+                if statement.then_branch is old:
+                    statement.then_branch = new
+                if statement.else_branch is old:
+                    statement.else_branch = new
+
+    @staticmethod
+    def _is_technical_comment(text: str) -> bool:
+        prefixes = (
+            "lit(",
+            "marker ",
+            "ascii(",
+            "ascii_header",
+            "str(",
+            "tuple(",
+            "map(",
+            "array(",
+            "cleanup_call",
+            "prep_call_args",
+            "drop ",
+            "literal_block",
+        )
+        return text.startswith(prefixes)
+
+    def _should_drop_stack_top_branch(
+        self,
+        expr: ASTExpression,
+        analysis: _BlockAnalysis,
+        targets: Tuple[int, int],
+    ) -> bool:
+        if not (self._expr_is_stack_top(expr) or isinstance(expr, ASTLiteral)):
+            return False
+        block_offset = analysis.block.start_offset
+
+        def normalise(candidates: Sequence[int]) -> Set[int]:
+            return {
+                target
+                for target in candidates
+                if target and target != block_offset
+            }
+
+        unique_targets = normalise(targets)
+        if not unique_targets:
+            unique_targets = normalise(analysis.successors)
+        if len(unique_targets) > 1:
+            return False
+        return True
+
+    @staticmethod
+    def _expr_is_stack_top(expr: ASTExpression) -> bool:
+        if isinstance(expr, ASTIdentifier) and expr.name == "stack_top":
+            return True
+        if isinstance(expr, ASTUnknown) and expr.token == "stack_top":
+            return True
+        return expr.render() == "stack_top"
 
     def _convert_block(
         self,
@@ -561,9 +696,12 @@ class ASTBuilder:
                 block.start_offset,
                 value_state,
                 metrics,
+                analysis,
             )
             statements.extend(node_statements)
             branch_links.extend(node_links)
+            if not isinstance(node, (IRLiteral, IRLiteralChunk, IRDataMarker, IRLiteralBlock)):
+                value_state.pop("stack_top", None)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
@@ -701,7 +839,32 @@ class ASTBuilder:
         origin_offset: int,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
+        analysis: _BlockAnalysis,
     ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
+        if isinstance(node, IRLiteral):
+            value_state["stack_top"] = ASTLiteral(node.value)
+            return [], []
+        if isinstance(node, IRLiteralChunk):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
+        if isinstance(node, IRLiteralBlock):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
+        if isinstance(node, IRDataMarker):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
+        if isinstance(node, IRBuildTuple):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
+        if isinstance(node, IRBuildArray):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
+        if isinstance(node, IRBuildMap):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
+        if isinstance(node, IRStringConstant):
+            value_state["stack_top"] = ASTUnknown(node.describe())
+            return [], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             expr = ASTSlotRef(node.slot)
@@ -845,6 +1008,10 @@ class ASTBuilder:
             return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
+            if self._should_drop_stack_top_branch(
+                condition, analysis, (node.then_target, node.else_target)
+            ):
+                return [], []
             branch = ASTBranch(condition=condition)
             return [branch], [
                 _BranchLink(
@@ -857,6 +1024,11 @@ class ASTBuilder:
         if isinstance(node, IRTestSetBranch):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
+            value_state[node.var] = expr
+            if self._should_drop_stack_top_branch(
+                expr, analysis, (node.then_target, node.else_target)
+            ):
+                return [], []
             statement = ASTTestSet(var=var_expr, expr=expr)
             return [statement], [
                 _BranchLink(
@@ -869,6 +1041,11 @@ class ASTBuilder:
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
+            value_state[node.var] = expr
+            if self._should_drop_stack_top_branch(
+                expr, analysis, (node.then_target, node.else_target)
+            ):
+                return [], []
             statement = ASTFunctionPrologue(var=var_expr, expr=expr)
             return [statement], [
                 _BranchLink(
