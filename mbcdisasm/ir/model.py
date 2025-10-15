@@ -434,6 +434,26 @@ class IRBuildTuple(IRNode):
 
 
 @dataclass(frozen=True)
+class IRFormatterConstant(IRNode):
+    """Entry in the global formatter pool derived from literal blocks."""
+
+    name: str
+    triplets: Tuple[Tuple[int, int, int], ...]
+    reducer: Optional[str] = None
+    reducer_operand: Optional[int] = None
+    tail: Tuple[int, ...] = tuple()
+
+    def describe(self) -> str:
+        return _render_formatter(
+            prefix=f"formatter {self.name}",
+            triplets=self.triplets,
+            tail=self.tail,
+            reducer=self.reducer,
+            reducer_operand=self.reducer_operand,
+        )
+
+
+@dataclass(frozen=True)
 class IRLiteralBlock(IRNode):
     """Canonical representation of literal marker chains."""
 
@@ -442,23 +462,40 @@ class IRLiteralBlock(IRNode):
     reducer_operand: Optional[int] = None
     tail: Tuple[int, ...] = tuple()
     annotations: Tuple[str, ...] = field(default_factory=tuple)
+    symbol: Optional[str] = None
 
     def describe(self) -> str:
-        chunks = []
-        for a, b, c in self.triplets:
-            chunks.append(f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})")
-        base = "literal_block[" + ", ".join(chunks) + "]"
-        if self.tail:
-            tail_repr = ", ".join(f"0x{value:04X}" for value in self.tail)
-            base += f" tail=[{tail_repr}]"
-        if self.reducer:
-            operand = (
-                f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
-            )
-            base += f" via {self.reducer}{operand}"
+        prefix = "literal_block" if self.symbol is None else f"literal_block {self.symbol}"
+        rendered = _render_formatter(
+            prefix=prefix,
+            triplets=self.triplets,
+            tail=self.tail,
+            reducer=self.reducer,
+            reducer_operand=self.reducer_operand,
+        )
         if self.annotations:
-            base += " " + ", ".join(self.annotations)
-        return base
+            rendered += " " + ", ".join(self.annotations)
+        return rendered
+
+
+def _render_formatter(
+    *,
+    prefix: str,
+    triplets: Tuple[Tuple[int, int, int], ...],
+    tail: Tuple[int, ...],
+    reducer: Optional[str],
+    reducer_operand: Optional[int],
+) -> str:
+    chunks = [f"(0x{a:04X}, 0x{b:04X}, 0x{c:04X})" for a, b, c in triplets]
+    body = f"[{', '.join(chunks)}]"
+    text = f"{prefix}{body}"
+    if tail:
+        tail_repr = ", ".join(f"0x{value:04X}" for value in tail)
+        text += f" tail=[{tail_repr}]"
+    if reducer:
+        operand = f" 0x{reducer_operand:04X}" if reducer_operand is not None else ""
+        text += f" via {reducer}{operand}"
+    return text
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1166,7 @@ class IRProgram:
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
     string_pool: Tuple[IRStringConstant, ...] = tuple()
+    formatter_pool: Tuple[IRFormatterConstant, ...] = tuple()
 
 
 @dataclass
@@ -1198,6 +1236,7 @@ __all__ = [
     "IRBuildArray",
     "IRBuildMap",
     "IRBuildTuple",
+    "IRFormatterConstant",
     "IRLiteralBlock",
     "IRIf",
     "IRTestSetBranch",

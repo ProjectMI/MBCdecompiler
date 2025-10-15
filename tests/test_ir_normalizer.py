@@ -16,6 +16,7 @@ from mbcdisasm.ir.model import (
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
+    IRLiteralBlock,
     IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
@@ -38,6 +39,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderEmit,
     IRTableBuilderCommit,
     NormalizerMetrics,
+    IRFormatterConstant,
     IRIORead,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
@@ -857,6 +859,41 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert constant.data == b"A\x00B\x00\x00C\x00D"
     assert constant.segments == (constant.data,)
     assert "lit(0x6704)" in descriptions
+
+
+def test_normalizer_pools_literal_blocks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x00, 0x00, 0x0067),
+        build_word(4, 0x00, 0x00, 0x0400),
+        build_word(8, 0x00, 0x00, 0x6704),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    size = len(data)
+    segments = [
+        Segment(SegmentDescriptor(0, 0, size), data),
+        Segment(SegmentDescriptor(1, size, size * 2), data),
+    ]
+
+    container = MbcContainer(Path("dummy"), segments)
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    assert len(program.formatter_pool) == 1
+    formatter = program.formatter_pool[0]
+    assert isinstance(formatter, IRFormatterConstant)
+
+    for segment in program.segments:
+        block = segment.blocks[0]
+        literal_block = next(
+            node for node in block.nodes if isinstance(node, IRLiteralBlock)
+        )
+        assert literal_block.symbol == formatter.name
+        assert literal_block.triplets == formatter.triplets
 
 
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
