@@ -1379,9 +1379,12 @@ class IRNormalizer:
 
             if mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-                if varargs and not values:
-                    values = ("ret*",)
+                values = self._select_return_names(
+                    tuple(),
+                    count=count,
+                    varargs=varargs,
+                    mask=None,
+                )
                 items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
                 metrics.returns += 1
                 continue
@@ -1531,9 +1534,12 @@ class IRNormalizer:
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-                if varargs and not values:
-                    values = ("ret*",)
+                values = self._select_return_names(
+                    tuple(),
+                    count=count,
+                    varargs=varargs,
+                    mask=None,
+                )
                 items.replace_slice(
                     index,
                     index + 1,
@@ -3347,14 +3353,21 @@ class IRNormalizer:
             mask = mask or item.cleanup_mask
 
             returns = item.returns
-            values: Tuple[str, ...]
             if isinstance(returns, tuple):
-                values = returns
+                values = self._select_return_names(
+                    returns,
+                    count=len(returns),
+                    varargs=item.varargs,
+                    mask=mask,
+                )
             else:
                 count = max(int(returns), 0)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
-            if item.varargs and not values:
-                values = ("ret*",)
+                values = self._select_return_names(
+                    tuple(),
+                    count=count,
+                    varargs=item.varargs,
+                    mask=mask,
+                )
 
             call = IRCall(
                 target=item.target,
@@ -4459,10 +4472,20 @@ class IRNormalizer:
             )
 
         if isinstance(node, IRCallReturn):
-            returns = node.returns
-            if signature.returns is not None and not node.varargs:
-                count = max(signature.returns, 0)
-                returns = tuple(f"ret{i}" for i in range(count))
+            count_hint: Optional[int]
+            if signature.return_values:
+                count_hint = len(signature.return_values)
+            elif signature.returns is not None and not node.varargs:
+                count_hint = max(signature.returns, 0)
+            else:
+                count_hint = len(node.returns)
+            returns = self._select_return_names(
+                node.returns,
+                count=count_hint,
+                varargs=node.varargs,
+                mask=cleanup_mask,
+                signature=signature,
+            )
             return IRCallReturn(
                 target=target,
                 args=node.args,
@@ -4478,10 +4501,19 @@ class IRNormalizer:
             )
 
         if isinstance(node, IRTailCall):
-            returns = node.returns
-            if signature.returns is not None and not node.varargs:
-                count = max(signature.returns, 0)
-                returns = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+            if signature.return_values:
+                count_hint = len(signature.return_values)
+            elif signature.returns is not None and not node.varargs:
+                count_hint = max(signature.returns, 0)
+            else:
+                count_hint = len(node.returns)
+            returns = self._select_return_names(
+                node.returns,
+                count=count_hint,
+                varargs=node.varargs,
+                mask=cleanup_mask,
+                signature=signature,
+            )
             updated_call = IRCall(
                 target=target,
                 args=node.args,
@@ -4503,7 +4535,9 @@ class IRNormalizer:
 
         if isinstance(node, IRTailcallReturn):
             returns = node.returns
-            if signature.returns is not None and not node.varargs:
+            if signature.return_values and not node.varargs:
+                returns = len(signature.return_values)
+            elif signature.returns is not None and not node.varargs:
                 returns = max(signature.returns, 0)
             return IRTailcallReturn(
                 target=target,
@@ -5042,6 +5076,63 @@ class IRNormalizer:
     ) -> Tuple[IRAbiEffect, ...]:
         base = tuple(effect for effect in effects if effect.kind != "return_mask")
         return base + self._return_mask_effect(mask)
+
+    @staticmethod
+    def _generic_return_names(count: int) -> Tuple[str, ...]:
+        if count <= 0:
+            return tuple()
+        return tuple(f"word_ret{i}" for i in range(count))
+
+    @staticmethod
+    def _mask_return_names(mask: Optional[int], count: int) -> Tuple[str, ...]:
+        if count <= 0:
+            return tuple()
+        if mask is None:
+            return IRNormalizer._generic_return_names(count)
+        slots: List[str] = []
+        for bit_index in range(16):
+            bit = 1 << bit_index
+            if mask & bit:
+                slots.append(f"word_ret{len(slots)}")
+                if len(slots) >= count:
+                    break
+        if len(slots) < count:
+            slots.extend(
+                f"word_ret{len(slots) + offset}"
+                for offset in range(count - len(slots))
+            )
+        return tuple(slots[:count])
+
+    def _select_return_names(
+        self,
+        existing: Sequence[str],
+        *,
+        count: Optional[int],
+        varargs: bool,
+        mask: Optional[int],
+        signature: Optional[CallSignature] = None,
+    ) -> Tuple[str, ...]:
+        resolved_count = count if count is not None else len(existing)
+        if resolved_count is None:
+            resolved_count = len(existing)
+        if resolved_count < 0:
+            resolved_count = 0
+
+        preferred: Tuple[str, ...]
+        if signature is not None and signature.return_values:
+            preferred = signature.return_values[:resolved_count]
+        else:
+            preferred = tuple(existing[:resolved_count])
+
+        if len(preferred) < resolved_count or any(
+            name.startswith("ret") for name in preferred
+        ):
+            preferred = self._mask_return_names(mask, resolved_count)
+
+        if varargs and not preferred:
+            return ("word_ret*",)
+
+        return preferred
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]

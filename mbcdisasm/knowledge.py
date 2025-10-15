@@ -126,6 +126,7 @@ class CallSignature:
     target: int
     arity: Optional[int] = None
     returns: Optional[int] = None
+    return_values: Tuple[str, ...] = tuple()
     shuffle: Optional[int] = None
     shuffle_options: Tuple[int, ...] = tuple()
     cleanup_mask: Optional[int] = None
@@ -490,6 +491,13 @@ def _parse_call_signature_entry(
 
     arity = _parse_optional_int(entry.get("arity"))
     returns = _parse_optional_int(entry.get("returns"))
+    return_values: Tuple[str, ...] = tuple(
+        str(value)
+        for value in _ensure_sequence(entry.get("return_values"))
+        if isinstance(value, str) and value
+    )
+    if returns is None and return_values:
+        returns = len(return_values)
     shuffle = _parse_optional_int(entry.get("shuffle"))
 
     shuffle_options: Tuple[int, ...] = tuple(
@@ -537,6 +545,7 @@ def _parse_call_signature_entry(
         target=target,
         arity=arity,
         returns=returns,
+        return_values=return_values,
         shuffle=shuffle,
         shuffle_options=shuffle_options,
         cleanup_mask=cleanup_mask,

@@ -185,7 +185,7 @@ def test_vararg_return_remains_packed_despite_depth() -> None:
 
     assert isinstance(items[1], IRReturn)
     assert items[1].varargs
-    assert items[1].values == ("ret*",)
+    assert items[1].values == ("word_ret*",)
 
 
 def write_manual(path: Path) -> KnowledgeBase:
@@ -332,6 +332,7 @@ def write_manual(path: Path) -> KnowledgeBase:
         "0x0072": {
             "arity": 2,
             "cleanup_mask": "0x2910",
+            "return_values": ["word_ret0"],
             "cleanup": [
                 {"mnemonic": "stack_teardown", "pops": 1},
             ],
@@ -1855,7 +1856,7 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.call.target == 0x1234
     assert tail_call.call.symbol == "test_helper_1234"
     assert tail_call.call.args == ()
-    assert tail_call.returns == ("ret0",)
+    assert tail_call.returns == ("word_ret0",)
 
 
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
