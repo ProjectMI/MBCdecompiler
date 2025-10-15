@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.ast import ASTBuilder
+from mbcdisasm.ast import ASTBuilder, ASTDispatchSwitch, ASTDispatchTable
+from mbcdisasm.mbc import MbcContainer
 from mbcdisasm.ir.model import (
     IRBlock,
     IRIf,
@@ -14,7 +15,14 @@ from mbcdisasm.ir.model import (
     NormalizerMetrics,
 )
 
-from tests.test_ir_normalizer import build_container
+from tests.test_ir_normalizer import (
+    Segment,
+    SegmentDescriptor,
+    build_container,
+    build_word,
+    encode_instructions,
+    write_manual,
+)
 
 
 def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
@@ -46,6 +54,47 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     summary = ast_program.metrics.describe()
     assert "procedures=" in summary
     assert "calls=" in summary
+
+
+def test_ast_builder_expands_switch_dispatch(tmp_path: Path) -> None:
+    base = tmp_path / "dispatch"
+    base.mkdir()
+    knowledge = write_manual(base)
+
+    words = [
+        build_word(0, 0x2C, 0x01, 0x6623),
+        build_word(4, 0x2C, 0x02, 0x6624),
+        build_word(8, 0x28, 0x00, 0x6623),
+        build_word(12, 0x30, 0x00, 0x0000),
+    ]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    block = procedure.blocks[0]
+    statements = block.statements
+
+    assert isinstance(statements[0], ASTDispatchTable)
+    assert isinstance(statements[1], ASTDispatchSwitch)
+    table = statements[0]
+    switch = statements[1]
+
+    assert switch.table is table
+    assert table.helper == 0x6623
+    assert [case.key for case in table.cases] == [0x01, 0x02]
+    assert {case.target.address for case in table.cases} == {0x6623, 0x6624}
+    assert tuple(ret.name for ret in switch.returns) == ("ret0",)
+
+    rendered = [stmt.render() for stmt in statements[:2]]
+    assert any(render.startswith("dispatch_table") for render in rendered)
+    assert any(render.startswith("ret0") or "switch" in render for render in rendered)
 
 
 def test_ast_builder_splits_after_return_sequences() -> None:

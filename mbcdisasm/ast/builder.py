@@ -24,6 +24,7 @@ from ..ir.model import (
     IRProgram,
     IRReturn,
     IRSegment,
+    IRSwitchDispatch,
     IRStore,
     IRTestSetBranch,
     IRTailCall,
@@ -39,6 +40,10 @@ from .model import (
     ASTCallResult,
     ASTCallStatement,
     ASTComment,
+    ASTDispatchCase,
+    ASTDispatchSwitch,
+    ASTDispatchTable,
+    ASTDispatchTarget,
     ASTExpression,
     ASTFlagCheck,
     ASTFunctionPrologue,
@@ -114,6 +119,10 @@ class ASTBuilder:
         self._current_entry_reasons: Mapping[int, Tuple[str, ...]] = {}
         self._current_block_labels: Mapping[int, str] = {}
         self._current_exit_hints: Mapping[int, str] = {}
+        self._pending_dispatch_by_target: Dict[int, List[ASTDispatchTable]] = defaultdict(list)
+        self._pending_dispatch_by_symbol: Dict[str, List[ASTDispatchTable]] = defaultdict(list)
+        self._pending_dispatch_queue: List[ASTDispatchTable] = []
+        self._dispatch_counter = 0
 
     # ------------------------------------------------------------------
     # public API
@@ -121,6 +130,10 @@ class ASTBuilder:
     def build(self, program: IRProgram) -> ASTProgram:
         segments: List[ASTSegment] = []
         metrics = ASTMetrics()
+        self._dispatch_counter = 0
+        self._pending_dispatch_by_target.clear()
+        self._pending_dispatch_by_symbol.clear()
+        self._pending_dispatch_queue.clear()
         for segment in program.segments:
             segment_result = self._build_segment(segment, metrics)
             segments.append(segment_result)
@@ -646,6 +659,9 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
+            dispatch_table = self._consume_dispatch_table(call_expr)
+            if dispatch_table is not None:
+                return [ASTDispatchSwitch(call=call_expr, table=dispatch_table)], []
             return [ASTCallStatement(call=call_expr)], []
         if isinstance(node, IRCallReturn):
             call_expr, returns = self._convert_call(
@@ -668,7 +684,17 @@ class ASTBuilder:
                 value_state[name] = ASTCallResult(call_expr, index)
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
-            statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
+            dispatch_table = self._consume_dispatch_table(call_expr)
+            if dispatch_table is not None:
+                statements.append(
+                    ASTDispatchSwitch(
+                        call=call_expr,
+                        table=dispatch_table,
+                        returns=tuple(return_identifiers),
+                    )
+                )
+            else:
+                statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
             return statements, []
         if isinstance(node, IRTailCall):
             call_expr, returns = self._convert_call(
@@ -738,6 +764,9 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRSwitchDispatch):
+            table = self._build_dispatch_table(node, origin_offset)
+            return [table], []
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     def _convert_call(
@@ -752,6 +781,76 @@ class ASTBuilder:
         arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
         call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
         return call_expr, arg_exprs
+
+    def _build_dispatch_table(
+        self, node: IRSwitchDispatch, origin_offset: int
+    ) -> ASTDispatchTable:
+        self._dispatch_counter += 1
+        name = f"dispatch_table_{origin_offset:04X}_{self._dispatch_counter:02d}"
+        cases = tuple(
+            ASTDispatchCase(
+                key=case.key,
+                target=ASTDispatchTarget(address=case.target, symbol=case.symbol),
+            )
+            for case in node.cases
+        )
+        default = (
+            ASTDispatchTarget(address=node.default)
+            if node.default is not None
+            else None
+        )
+        table = ASTDispatchTable(
+            name=name,
+            cases=cases,
+            default=default,
+            helper=node.helper,
+            helper_symbol=node.helper_symbol,
+        )
+        if node.helper is not None:
+            self._pending_dispatch_by_target[node.helper].append(table)
+        if node.helper_symbol:
+            self._pending_dispatch_by_symbol[node.helper_symbol].append(table)
+        self._pending_dispatch_queue.append(table)
+        return table
+
+    def _consume_dispatch_table(self, call: ASTCallExpr) -> Optional[ASTDispatchTable]:
+        table: Optional[ASTDispatchTable] = None
+        bucket = self._pending_dispatch_by_target.get(call.target)
+        if bucket:
+            table = bucket[0]
+        if table is None and call.symbol:
+            bucket = self._pending_dispatch_by_symbol.get(call.symbol)
+            if bucket:
+                table = bucket[0]
+        if table is None and len(self._pending_dispatch_queue) == 1:
+            table = self._pending_dispatch_queue[0]
+        if table is not None:
+            self._remove_dispatch_table(table)
+        return table
+
+    def _remove_dispatch_table(self, table: ASTDispatchTable) -> None:
+        if table.helper is not None:
+            bucket = self._pending_dispatch_by_target.get(table.helper)
+            if bucket:
+                try:
+                    bucket.remove(table)
+                except ValueError:
+                    pass
+                if not bucket:
+                    self._pending_dispatch_by_target.pop(table.helper, None)
+        if table.helper_symbol:
+            bucket = self._pending_dispatch_by_symbol.get(table.helper_symbol)
+            if bucket:
+                try:
+                    bucket.remove(table)
+                except ValueError:
+                    pass
+                if not bucket:
+                    self._pending_dispatch_by_symbol.pop(table.helper_symbol, None)
+        try:
+            self._pending_dispatch_queue.remove(table)
+        except ValueError:
+            pass
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
@@ -827,6 +926,9 @@ class ASTBuilder:
         self._current_entry_reasons = {}
         self._current_block_labels = {}
         self._current_exit_hints = {}
+        self._pending_dispatch_by_target.clear()
+        self._pending_dispatch_by_symbol.clear()
+        self._pending_dispatch_queue.clear()
 
 
 __all__ = ["ASTBuilder"]

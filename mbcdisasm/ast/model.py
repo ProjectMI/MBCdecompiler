@@ -202,6 +202,31 @@ class ASTCallResult(ASTExpression):
         return f"{self.call.render()}[{self.index}]"
 
 
+@dataclass(frozen=True)
+class ASTDispatchTarget:
+    """Address reference used by dispatch tables."""
+
+    address: int
+    symbol: str | None = None
+
+    def render(self) -> str:
+        target = f"0x{self.address:04X}"
+        if self.symbol:
+            return f"{self.symbol}({target})"
+        return target
+
+
+@dataclass(frozen=True)
+class ASTDispatchCase:
+    """Single case entry in a dispatch table."""
+
+    key: int
+    target: ASTDispatchTarget
+
+    def render(self) -> str:
+        return f"0x{self.key:02X} -> {self.target.render()}"
+
+
 # ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
@@ -249,6 +274,51 @@ class ASTCallStatement(ASTStatement):
             return self.call.render()
         outputs = ", ".join(ret.render() for ret in self.returns)
         return f"{outputs} = {self.call.render()}"
+
+
+@dataclass
+class ASTDispatchTable(ASTStatement):
+    """Data definition holding dispatch helper targets."""
+
+    name: str
+    cases: Tuple[ASTDispatchCase, ...]
+    default: ASTDispatchTarget | None = None
+    helper: int | None = None
+    helper_symbol: str | None = None
+
+    def render(self) -> str:
+        entries = ", ".join(case.render() for case in self.cases)
+        parts = [f"{self.name} entries=[{entries}]"]
+        if self.default is not None:
+            parts.append(f"default={self.default.render()}")
+        if self.helper is not None:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+            parts.append(f"helper={helper_repr}")
+        return "dispatch_table " + " ".join(parts)
+
+
+@dataclass
+class ASTDispatchSwitch(ASTStatement):
+    """Explicit switch expansion for dispatch helpers."""
+
+    call: ASTCallExpr
+    table: ASTDispatchTable
+    returns: Tuple[ASTIdentifier, ...] = field(default_factory=tuple)
+
+    def render(self) -> str:
+        prefix = ""
+        if self.returns:
+            prefix = ", ".join(ret.render() for ret in self.returns) + " = "
+        call_repr = self.call.render()
+        components = [f"{prefix}switch {call_repr}", f"using {self.table.name}"]
+        if self.table.cases:
+            case_text = ", ".join(case.render() for case in self.table.cases)
+            components.append(f"cases=[{case_text}]")
+        if self.table.default is not None:
+            components.append(f"default={self.table.default.render()}")
+        return " ".join(components)
 
 
 @dataclass
@@ -512,6 +582,10 @@ __all__ = [
     "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
+    "ASTDispatchTarget",
+    "ASTDispatchCase",
+    "ASTDispatchTable",
+    "ASTDispatchSwitch",
     "ASTStatement",
     "ASTAssign",
     "ASTStore",
