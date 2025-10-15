@@ -1,14 +1,17 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.ast import ASTBuilder
+from mbcdisasm.ast import ASTBuilder, ASTDataArray, ASTDispatchSwitch
 from mbcdisasm.ir.model import (
+    IRBuildArray,
     IRBlock,
+    IRDispatchCase,
     IRIf,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
+    IRSwitchDispatch,
     IRSlot,
     MemSpace,
     NormalizerMetrics,
@@ -120,3 +123,71 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     procedure = ast_segment.procedures[0]
     assert tuple(sorted(procedure.exit_offsets)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
+
+
+def test_ast_builder_renders_dispatch_switch() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x01, target=0x6623, symbol="dispatch_helper_6623"),
+            IRDispatchCase(key=0x02, target=0x6624, symbol=None),
+        ),
+        helper=0x6623,
+        helper_symbol="dispatch_helper_6623",
+        default=0x6615,
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0000,
+        length=0x10,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x0000,
+                nodes=(dispatch, IRReturn(values=(), varargs=False)),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    statement = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(statement, ASTDispatchSwitch)
+    assert statement.helper == 0x6623
+    assert statement.default == 0x6615
+    assert {case.key for case in statement.cases} == {0x01, 0x02}
+    rendered = statement.render()
+    assert rendered.startswith("switch")
+    assert "0x6623" in rendered
+
+
+def test_ast_builder_converts_address_arrays_to_data() -> None:
+    array = IRBuildArray(elements=("lit(0x0001)", "lit(0x0002)", "lit(0x0003)"))
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x1000,
+                nodes=(array, IRReturn(values=(), varargs=False)),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    statement = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(statement, ASTDataArray)
+    assert [element.render() for element in statement.elements] == [
+        "0x0001",
+        "0x0002",
+        "0x0003",
+    ]
+    assert statement.render() == "data [0x0001, 0x0002, 0x0003]"

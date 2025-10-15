@@ -203,6 +203,27 @@ class ASTCallResult(ASTExpression):
 
 
 # ---------------------------------------------------------------------------
+# data containers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ASTDispatchCase:
+    """Single branch inside a helper driven dispatch table."""
+
+    key: int
+    target: int
+    symbol: str | None = None
+
+    def render(self) -> str:
+        key_repr = f"0x{self.key:02X}"
+        target_repr = f"0x{self.target:04X}"
+        if self.symbol:
+            target_repr = f"{self.symbol}({target_repr})"
+        return f"case {key_repr} -> {target_repr}"
+
+
+# ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
 
@@ -389,6 +410,41 @@ class ASTComment(ASTStatement):
         return f"; {self.text}"
 
 
+@dataclass
+class ASTDataArray(ASTStatement):
+    """Inline data block that materialises an ordered container."""
+
+    elements: Tuple[ASTExpression, ...]
+
+    def render(self) -> str:
+        payload = ", ".join(element.render() for element in self.elements)
+        return f"data [{payload}]"
+
+
+@dataclass
+class ASTDispatchSwitch(ASTStatement):
+    """Explicit representation of VM dispatch helper jump tables."""
+
+    helper: int | None
+    cases: Tuple[ASTDispatchCase, ...]
+    helper_symbol: str | None = None
+    default: int | None = None
+
+    def render(self) -> str:
+        if self.helper is None:
+            helper_repr = "?"
+        else:
+            helper_repr = f"0x{self.helper:04X}"
+            if self.helper_symbol:
+                helper_repr = f"{self.helper_symbol}({helper_repr})"
+        case_body = "; ".join(case.render() for case in self.cases)
+        default_repr = ""
+        if self.default is not None:
+            default_target = f"0x{self.default:04X}"
+            default_repr = f"; default -> {default_target}"
+        return f"switch {helper_repr} {{{case_body}{default_repr}}}"
+
+
 # ---------------------------------------------------------------------------
 # containers
 # ---------------------------------------------------------------------------
@@ -512,12 +568,15 @@ __all__ = [
     "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
+    "ASTDispatchCase",
     "ASTStatement",
     "ASTAssign",
     "ASTStore",
     "ASTCallStatement",
     "ASTIORead",
     "ASTIOWrite",
+    "ASTDataArray",
+    "ASTDispatchSwitch",
     "ASTTailCall",
     "ASTReturn",
     "ASTBranch",

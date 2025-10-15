@@ -16,6 +16,7 @@ from ..ir.model import (
     IRIOWrite,
     IRIf,
     IRFlagCheck,
+    IRBuildArray,
     IRBankedLoad,
     IRBankedStore,
     IRIndirectLoad,
@@ -29,6 +30,7 @@ from ..ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRTerminator,
+    IRSwitchDispatch,
     SSAValueKind,
 )
 from .model import (
@@ -39,6 +41,9 @@ from .model import (
     ASTCallResult,
     ASTCallStatement,
     ASTComment,
+    ASTDataArray,
+    ASTDispatchCase,
+    ASTDispatchSwitch,
     ASTExpression,
     ASTFlagCheck,
     ASTFunctionPrologue,
@@ -544,6 +549,9 @@ class ASTBuilder:
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
             return [ASTAssign(target=target, value=expr)], []
+        if isinstance(node, IRBuildArray):
+            elements = tuple(self._resolve_expr(token, value_state) for token in node.elements)
+            return [ASTDataArray(elements=elements)], []
         if isinstance(node, IRStore):
             target_expr = ASTSlotRef(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
@@ -647,6 +655,18 @@ class ASTBuilder:
                 len(call_expr.args),
             )
             return [ASTCallStatement(call=call_expr)], []
+        if isinstance(node, IRSwitchDispatch):
+            cases = tuple(
+                ASTDispatchCase(key=case.key, target=case.target, symbol=case.symbol)
+                for case in node.cases
+            )
+            statement = ASTDispatchSwitch(
+                helper=node.helper,
+                helper_symbol=node.helper_symbol,
+                cases=cases,
+                default=node.default,
+            )
+            return [statement], []
         if isinstance(node, IRCallReturn):
             call_expr, returns = self._convert_call(
                 node.target,
