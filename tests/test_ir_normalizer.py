@@ -893,6 +893,27 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     assert constant.segments == (constant.data,)
 
 
+def test_normalizer_drops_intermediate_ascii_chunks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_ascii_word(0, "ABCD"),
+        build_ascii_word(4, "EFGH"),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    assert len(program.string_pool) == 1
+    constant = program.string_pool[0]
+    assert constant.data == b"ABCDEFGH"
+
+
 def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     knowledge = KnowledgeBase({})
     normalizer = IRNormalizer(knowledge)
