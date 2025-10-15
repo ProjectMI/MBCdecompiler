@@ -3,9 +3,11 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.ast import ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
 from mbcdisasm.ir.model import (
+    IRAbiEffect,
     IRBlock,
     IRCall,
     IRDispatchCase,
+    IRFunctionPrologue,
     IRIf,
     IRLoad,
     IRProgram,
@@ -188,3 +190,45 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].helper == 0x5555
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
+
+
+def test_ast_builder_tracks_frame_and_return_mask() -> None:
+    block = IRBlock(
+        label="entry",
+        start_offset=0x0300,
+        nodes=(
+            IRFunctionPrologue(
+                var="slot(0x0002)", expr="param0", then_target=0x0304, else_target=0x0304
+            ),
+            IRReturn(
+                values=("ret0", "ret1"),
+                varargs=False,
+                abi_effects=(IRAbiEffect(kind="return_mask", operand=0x2910),),
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+
+    assert [param.render() for param in procedure.parameters] == ["param0"]
+    assert [(slot.name, slot.index) for slot in procedure.frame.slots] == [("slot_0002", 0x0002)]
+    assert procedure.frame.slots[0].value.render() == "param0"
+    assert procedure.return_mask == 0x0110
+
+    returns = [
+        stmt
+        for block in procedure.blocks
+        for stmt in block.statements
+        if isinstance(stmt, ASTReturn)
+    ]
+    assert returns and returns[0].mask == 0x0110

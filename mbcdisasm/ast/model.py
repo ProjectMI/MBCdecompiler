@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from ..ir.model import IRSlot, MemRef, SSAValueKind
 
@@ -202,6 +202,32 @@ class ASTCallResult(ASTExpression):
         return f"{self.call.render()}[{self.index}]"
 
 
+@dataclass(frozen=True)
+class ASTFrameSlot:
+    """Binding between a frame slot and the value stored within it."""
+
+    name: str
+    index: Optional[int]
+    value: ASTExpression
+
+    def describe(self) -> str:
+        slot_index = f"0x{self.index:04X}" if self.index is not None else "?"
+        return f"{self.name}@{slot_index}={self.value.render()}"
+
+
+@dataclass(frozen=True)
+class ASTStackFrame:
+    """Model describing the reconstructed stack frame layout."""
+
+    slots: Tuple[ASTFrameSlot, ...] = tuple()
+
+    def describe(self) -> str:
+        if not self.slots:
+            return "frame[]"
+        rendered = ", ".join(slot.describe() for slot in self.slots)
+        return f"frame[{rendered}]"
+
+
 # ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
@@ -279,10 +305,13 @@ class ASTTailCall(ASTStatement):
 
     call: ASTCallExpr
     returns: Tuple[ASTExpression, ...]
+    mask: Optional[int] = None
 
     def render(self) -> str:
         rendered = ", ".join(expr.render() for expr in self.returns)
         suffix = f" returns [{rendered}]" if rendered else ""
+        if self.mask is not None:
+            suffix += f" mask=0x{self.mask:04X}"
         call_repr = self.call.render()
         if self.call.tail and call_repr.startswith("tail "):
             call_repr = call_repr[len("tail ") :]
@@ -295,6 +324,7 @@ class ASTReturn(ASTStatement):
 
     values: Tuple[ASTExpression, ...]
     varargs: bool = False
+    mask: Optional[int] = None
 
     def render(self) -> str:
         if self.varargs:
@@ -303,7 +333,8 @@ class ASTReturn(ASTStatement):
         else:
             rendered = ", ".join(expr.render() for expr in self.values)
             payload = f"[{rendered}]"
-        return f"return {payload}"
+        mask_note = f" mask=0x{self.mask:04X}" if (self.mask is not None and not self.varargs) else ""
+        return f"return {payload}{mask_note}"
 
 
 @dataclass
@@ -477,6 +508,9 @@ class ASTProcedure:
     entry_reasons: Tuple[str, ...]
     blocks: Tuple[ASTBlock, ...]
     exit_offsets: Tuple[int, ...]
+    parameters: Tuple[ASTIdentifier, ...] = field(default_factory=tuple)
+    frame: ASTStackFrame = field(default_factory=ASTStackFrame)
+    return_mask: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -576,6 +610,8 @@ __all__ = [
     "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
+    "ASTFrameSlot",
+    "ASTStackFrame",
     "ASTStatement",
     "ASTAssign",
     "ASTStore",

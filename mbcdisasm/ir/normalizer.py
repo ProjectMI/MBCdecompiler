@@ -5942,17 +5942,20 @@ class IRNormalizer:
         if bank is None:
             return "mem", None
 
+        if bank == PAGE_REGISTER or (bank & 0xFFF0) == PAGE_REGISTER:
+            return "page.register", None
+
         normalized = bank & 0xFFF0
         alias = MEMORY_BANK_ALIASES.get(normalized)
         page_alias = self._memref_page_alias(normalized, page)
         if alias is not None:
-            return alias, page_alias
+            return f"bank.{alias}", page_alias
 
         label = self._memref_regions.get(bank)
         if label is None:
             label = f"bank_{bank:04X}"
             self._memref_regions[bank] = label
-        return label, page_alias
+        return f"bank.{label}", page_alias
 
     def _memref_page_alias(
         self, bank: Optional[int], page: Optional[int]

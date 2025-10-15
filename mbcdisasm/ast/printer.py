@@ -44,9 +44,21 @@ class ASTTextRenderer:
             f"procedure {procedure.name} entry=0x{procedure.entry_offset:04X} "
             f"reasons={reasons} exits=[{exits}]"
         )
+        for line in self._render_procedure_metadata(procedure):
+            yield line
         for block in procedure.blocks:
             yield from self._render_block(block)
         yield ""
+
+    def _render_procedure_metadata(self, procedure: ASTProcedure) -> Iterable[str]:
+        if procedure.parameters:
+            rendered = ", ".join(param.render() for param in procedure.parameters)
+            yield f"    ; parameters: {rendered}"
+        if procedure.return_mask is not None:
+            yield f"    ; return_mask=0x{procedure.return_mask:04X}"
+        if procedure.frame.slots:
+            rendered_slots = ", ".join(slot.describe() for slot in procedure.frame.slots)
+            yield f"    ; frame: {rendered_slots}"
 
     def _render_block(self, block: ASTBlock) -> Iterable[str]:
         successors = ", ".join(target.label for target in block.successors)

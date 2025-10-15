@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
@@ -41,6 +41,7 @@ from .model import (
     ASTCallResult,
     ASTCallStatement,
     ASTComment,
+    ASTFrameSlot,
     ASTExpression,
     ASTDispatchTable,
     ASTFlagCheck,
@@ -57,6 +58,7 @@ from .model import (
     ASTProgram,
     ASTReturn,
     ASTSegment,
+    ASTStackFrame,
     ASTSlotRef,
     ASTStatement,
     ASTStore,
@@ -361,13 +363,90 @@ class ASTBuilder:
     ) -> ASTProcedure:
         realised_blocks = self._realise_blocks(blocks)
         exit_offsets = self._compute_exit_offsets(blocks)
+        parameters, frame = self._collect_frame_model(realised_blocks)
+        return_mask = self._collect_return_mask(realised_blocks)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=realised_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
+            parameters=parameters,
+            frame=frame,
+            return_mask=return_mask,
         )
+
+    def _collect_frame_model(
+        self, blocks: Sequence[ASTBlock]
+    ) -> Tuple[Tuple[ASTIdentifier, ...], ASTStackFrame]:
+        slot_map: "OrderedDict[str, ASTFrameSlot]" = OrderedDict()
+        parameters: List[ASTIdentifier] = []
+        seen_parameters: Set[str] = set()
+        for block in blocks:
+            for statement in block.statements:
+                if isinstance(statement, ASTFunctionPrologue):
+                    slot_name = statement.var.render()
+                    if slot_name not in slot_map:
+                        slot_map[slot_name] = self._make_frame_slot(slot_name, statement)
+                    parameter = self._parameter_from_expr(statement.expr)
+                    if parameter and parameter.name not in seen_parameters:
+                        parameters.append(parameter)
+                        seen_parameters.add(parameter.name)
+        frame = ASTStackFrame(slots=tuple(slot_map.values()))
+        return tuple(parameters), frame
+
+    @staticmethod
+    def _parameter_from_expr(expr: ASTExpression) -> Optional[ASTIdentifier]:
+        if isinstance(expr, ASTIdentifier):
+            return expr
+        return None
+
+    @staticmethod
+    def _make_frame_slot(name: str, statement: ASTFunctionPrologue) -> ASTFrameSlot:
+        index = ASTBuilder._slot_index(statement.var)
+        return ASTFrameSlot(name=name, index=index, value=statement.expr)
+
+    @staticmethod
+    def _slot_index(expr: ASTExpression) -> Optional[int]:
+        if isinstance(expr, ASTSlotRef):
+            return expr.slot.index
+        if isinstance(expr, ASTIdentifier) and expr.name.lower().startswith("slot_"):
+            try:
+                return int(expr.name[5:], 16)
+            except ValueError:
+                return None
+        return None
+
+    def _collect_return_mask(self, blocks: Sequence[ASTBlock]) -> Optional[int]:
+        mask: Optional[int] = None
+        for block in blocks:
+            for statement in block.statements:
+                value: Optional[int] = None
+                if isinstance(statement, ASTReturn):
+                    value = statement.mask
+                elif isinstance(statement, ASTTailCall):
+                    value = statement.mask
+                if value is None:
+                    continue
+                mask = value if mask is None else mask | value
+        return mask
+
+    @staticmethod
+    def _narrow_return_mask(
+        mask: Optional[int], values: Sequence[ASTExpression], varargs: bool
+    ) -> Optional[int]:
+        if mask is None or varargs:
+            return mask
+        live_values = [value for value in values if not isinstance(value, ASTUnknown)]
+        if not live_values:
+            return None
+        bits = [index for index in range(16) if mask & (1 << index)]
+        if len(bits) <= len(live_values):
+            return mask
+        narrowed = 0
+        for bit in bits[: len(live_values)]:
+            narrowed |= 1 << bit
+        return narrowed
 
     def _collect_entry_blocks(
         self,
@@ -835,10 +914,12 @@ class ASTBuilder:
                 len(call_expr.args),
             )
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            return [ASTTailCall(call=call_expr, returns=resolved_returns)], []
+            mask = self._narrow_return_mask(node.cleanup_mask, resolved_returns, node.varargs)
+            return [ASTTailCall(call=call_expr, returns=resolved_returns, mask=mask)], []
         if isinstance(node, IRReturn):
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            return [ASTReturn(values=values, varargs=node.varargs)], []
+            mask = self._narrow_return_mask(node.mask, values, node.varargs)
+            return [ASTReturn(values=values, varargs=node.varargs, mask=mask)], []
         if isinstance(node, IRCallCleanup):
             return [], []
         if isinstance(node, IRTerminator):
