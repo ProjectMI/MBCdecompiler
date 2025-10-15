@@ -369,6 +369,19 @@ class IRLiteralChunk(IRNode):
 
 
 @dataclass(frozen=True)
+class IRDataMarker(IRNode):
+    """Structural marker emitted inside literal / data streams."""
+
+    mnemonic: str
+    operand: int = 0
+
+    def describe(self) -> str:
+        if self.operand:
+            return f"marker {self.mnemonic}(operand=0x{self.operand:04X})"
+        return f"marker {self.mnemonic}"
+
+
+@dataclass(frozen=True)
 class IRStringConstant(IRNode):
     """Entry in the global ASCII constant pool."""
 
@@ -1208,6 +1221,7 @@ __all__ = [
     "IRConditionMask",
     "IRLiteral",
     "IRLiteralChunk",
+    "IRDataMarker",
     "IRStringConstant",
     "IRAsciiPreamble",
     "IRCallPreparation",

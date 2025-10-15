@@ -44,6 +44,7 @@ from .model import (
     IRLiteral,
     IRLiteralBlock,
     IRLiteralChunk,
+    IRDataMarker,
     IRPageRegister,
     IRLoad,
     IRNode,
@@ -82,6 +83,7 @@ from .model import (
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
+DATA_MARKER_MNEMONICS = {"op_DE_00", "op_94_00"}
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
@@ -148,6 +150,29 @@ CALL_CLEANUP_MNEMONICS = {
     "stack_shuffle",
     "op_4B_91",
     "op_E4_01",
+    "op_61_00",
+    "op_E0_88",
+    "op_FC_FF",
+    "op_88_00",
+    "op_37_00",
+    "op_65_00",
+    "op_64_00",
+    "op_6E_00",
+    "op_15_69",
+    "op_85_00",
+    "op_74_00",
+    "op_10_A8",
+    "op_61_10",
+    "op_72_00",
+    "op_10_0C",
+    "op_62_00",
+    "op_DB_0F",
+    "op_D0_17",
+    "op_2D_29",
+    "op_8E_00",
+    "op_61_01",
+    "op_BD_00",
+    "op_B4_00",
 }
 CALL_CLEANUP_PREFIXES = ("stack_teardown_", "op_4A_", "op_95_FE")
 CALL_PREDICATE_SKIP_MNEMONICS = {
@@ -335,6 +360,7 @@ STRUCTURAL_SKIP_NODE_TYPES = (
     IRBuildArray,
     IRBuildMap,
     IRBuildTuple,
+    IRDataMarker,
 )
 
 EPILOGUE_ALLOWED_NODE_TYPES = (
@@ -804,6 +830,7 @@ class IRNormalizer:
         metrics = NormalizerMetrics()
 
         self._pass_literals(items, metrics)
+        self._pass_data_markers(items)
         self._pass_ascii_glue(items, metrics)
         self._pass_ascii_runs(items, metrics)
         self._pass_stack_manipulation(items, metrics)
@@ -816,6 +843,7 @@ class IRNormalizer:
         self._collapse_call_wrapper_sequences(items)
         self._pass_call_preparation(items)
         self._pass_call_cleanup(items)
+        self._pass_orphan_cleanup_sequences(items)
         self._pass_io_operations(items)
         self._pass_io_facade(items)
         self._pass_call_conventions(items)
@@ -867,6 +895,12 @@ class IRNormalizer:
                     nodes.append(drop_node)
                     continue
                 if self._is_singleton_cleanup_instruction(final_wrapper, index):
+                    effect = self._call_cleanup_effect(item)
+                    cleanup = IRCallCleanup(steps=(effect,))
+                    self._transfer_ssa(item, cleanup)
+                    nodes.append(cleanup)
+                    continue
+                if self._is_call_cleanup_candidate(final_wrapper, index) or self._is_neutral_cleanup_step(item):
                     effect = self._call_cleanup_effect(item)
                     cleanup = IRCallCleanup(steps=(effect,))
                     self._transfer_ssa(item, cleanup)
@@ -1064,7 +1098,51 @@ class IRNormalizer:
             return SSAValueKind.IO
         if value <= 0xFF:
             return SSAValueKind.BYTE
-        return SSAValueKind.WORD
+            return SSAValueKind.WORD
+
+    def _pass_data_markers(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction):
+                index += 1
+                continue
+
+            marker_notes = tuple(
+                note for note in item.annotations if note.startswith("literal_marker")
+            )
+            if marker_notes:
+                replacements: List[Union[RawInstruction, IRNode]] = []
+                for note in marker_notes:
+                    operand = 0
+                    for token in note.split():
+                        if token.startswith("0x"):
+                            try:
+                                operand = int(token, 16)
+                            except ValueError:
+                                continue
+                            break
+                    replacements.append(IRDataMarker(mnemonic="literal_marker", operand=operand))
+                remaining = tuple(
+                    note for note in item.annotations if not note.startswith("literal_marker")
+                )
+                if remaining != item.annotations:
+                    item = replace(item, annotations=remaining)
+                replacements.append(item)
+                items.replace_slice(index, index + 1, replacements)
+                index += len(replacements)
+                continue
+
+            mnemonic = item.mnemonic
+            if mnemonic in DATA_MARKER_MNEMONICS or (
+                item.profile.is_literal_marker() and item.operand not in LITERAL_MARKER_HINTS
+            ):
+                marker = IRDataMarker(mnemonic=mnemonic, operand=item.operand)
+                self._transfer_ssa(item, marker)
+                items.replace_slice(index, index + 1, [marker])
+                continue
+
+            index += 1
 
     def _pass_page_registers(self, items: _ItemList) -> None:
         index = 0
@@ -1909,6 +1987,35 @@ class IRNormalizer:
             else:
                 items.replace_slice(start, end, [])
             continue
+
+    def _pass_orphan_cleanup_sequences(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, RawInstruction) or not self._is_call_cleanup_instruction(item):
+                index += 1
+                continue
+
+            start = index
+            sequence: List[RawInstruction] = []
+            while index < len(items):
+                candidate = items[index]
+                if not isinstance(candidate, RawInstruction):
+                    break
+                if not self._is_call_cleanup_instruction(candidate):
+                    break
+                sequence.append(candidate)
+                index += 1
+
+            if not sequence:
+                index += 1
+                continue
+
+            effects = [self._call_cleanup_effect(step) for step in sequence]
+            cleanup = IRCallCleanup(steps=tuple(self._coalesce_epilogue_steps(effects)))
+            self._transfer_ssa(sequence[-1], cleanup)
+            items.replace_slice(start, start + len(sequence), [cleanup])
+            index = start + 1
 
     def _split_preserved_cleanup_nodes(self, items: _ItemList) -> None:
         index = 0
