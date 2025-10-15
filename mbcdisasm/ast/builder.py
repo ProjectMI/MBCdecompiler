@@ -360,12 +360,13 @@ class ASTBuilder:
         blocks: Sequence[_PendingBlock],
     ) -> ASTProcedure:
         realised_blocks = self._realise_blocks(blocks)
-        exit_offsets = self._compute_exit_offsets(blocks)
+        simplified_blocks = self._simplify_blocks(realised_blocks, entry_offset)
+        exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
-            blocks=realised_blocks,
+            blocks=simplified_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
         )
 
@@ -490,6 +491,266 @@ class ASTBuilder:
             if immediate == exit_node or (immediate is None and exit_node in candidates):
                 exit_offsets.add(offset)
         return tuple(sorted(exit_offsets))
+
+    def _simplify_blocks(
+        self, blocks: Tuple[ASTBlock, ...], entry_offset: int
+    ) -> Tuple[ASTBlock, ...]:
+        if not blocks:
+            return tuple()
+
+        block_order: List[ASTBlock] = list(blocks)
+        entry_block = next(
+            (block for block in block_order if block.start_offset == entry_offset),
+            block_order[0],
+        )
+
+        id_map: Dict[int, ASTBlock] = {id(block): block for block in block_order}
+
+        for block in block_order:
+            self._simplify_stack_branches(block)
+
+        for block in block_order:
+            filtered = tuple(
+                statement
+                for statement in block.statements
+                if not self._is_noise_statement(statement)
+            )
+            if filtered != block.statements:
+                block.statements = filtered
+
+        predecessors: Dict[int, Set[int]] = {block_id: set() for block_id in id_map}
+        for block in block_order:
+            deduped: List[ASTBlock] = []
+            seen_ids: Set[int] = set()
+            for successor in block.successors:
+                succ_id = id(successor)
+                if succ_id not in predecessors:
+                    continue
+                if succ_id not in seen_ids:
+                    deduped.append(successor)
+                    seen_ids.add(succ_id)
+                predecessors[succ_id].add(id(block))
+            block.successors = tuple(deduped)
+
+        changed = True
+        while changed:
+            changed = False
+            for block in list(block_order):
+                if block is entry_block:
+                    continue
+                if block.statements:
+                    continue
+                if len(block.successors) != 1:
+                    continue
+                successor = block.successors[0]
+                succ_id = id(successor)
+                block_id = id(block)
+                if succ_id not in predecessors:
+                    continue
+                for pred_id in list(predecessors.get(block_id, set())):
+                    pred = id_map.get(pred_id)
+                    if pred is None:
+                        continue
+                    self._replace_successor(pred, block, successor)
+                    predecessors[succ_id].add(pred_id)
+                predecessors[succ_id].discard(block_id)
+                block_order.remove(block)
+                predecessors.pop(block_id, None)
+                id_map.pop(block_id, None)
+                changed = True
+                break
+
+        merged = True
+        while merged:
+            merged = False
+            for block in list(block_order):
+                if len(block.successors) != 1:
+                    continue
+                successor = block.successors[0]
+                if successor is block:
+                    continue
+                block_id = id(block)
+                succ_id = id(successor)
+                if succ_id not in predecessors:
+                    continue
+                if len(predecessors[succ_id]) != 1:
+                    continue
+                if block.statements and isinstance(block.statements[-1], BranchStatement):
+                    continue
+                if successor in successor.successors:
+                    continue
+                block.statements = tuple(block.statements + successor.statements)
+                block.successors = successor.successors
+                for succ in successor.successors:
+                    succ_key = id(succ)
+                    pred_set = predecessors.setdefault(succ_key, set())
+                    pred_set.discard(succ_id)
+                    pred_set.add(block_id)
+                block_order.remove(successor)
+                predecessors.pop(succ_id, None)
+                id_map.pop(succ_id, None)
+                merged = True
+                break
+
+        removed = True
+        while removed:
+            removed = False
+            for block in list(block_order):
+                if block is entry_block:
+                    continue
+                block_id = id(block)
+                if predecessors.get(block_id):
+                    continue
+                for succ in block.successors:
+                    predecessors.setdefault(id(succ), set()).discard(block_id)
+                block_order.remove(block)
+                predecessors.pop(block_id, None)
+                id_map.pop(block_id, None)
+                removed = True
+                break
+
+        return tuple(block_order)
+
+    def _simplify_stack_branches(self, block: ASTBlock) -> None:
+        stack: List[Tuple[str, int | None]] = []
+        for statement in list(block.statements):
+            if isinstance(statement, ASTComment):
+                effect = self._stack_effect_from_comment(statement.text)
+                kind = effect[0]
+                if kind == "literal":
+                    stack.append(effect)
+                elif kind == "marker":
+                    stack.append(effect)
+                else:
+                    stack.clear()
+                continue
+            if isinstance(statement, ASTReturn):
+                stack.clear()
+                continue
+            if isinstance(statement, ASTBranch):
+                if self._is_stack_top_expr(statement.condition) and stack:
+                    kind, value = stack[-1]
+                    if kind == "literal" and value is not None:
+                        target = statement.then_branch if value else statement.else_branch
+                        if target is not None:
+                            block.statements = tuple(
+                                stmt for stmt in block.statements if stmt is not statement
+                            )
+                            block.successors = (target,)
+                            return
+                stack.clear()
+                continue
+            stack.clear()
+
+    @staticmethod
+    def _is_stack_top_expr(expr: ASTExpression) -> bool:
+        return isinstance(expr, ASTIdentifier) and expr.name == "stack_top"
+
+    @staticmethod
+    def _stack_effect_from_comment(text: str) -> Tuple[str, int | None]:
+        body = text.strip()
+        if body.startswith("lit(") and body.endswith(")"):
+            literal = body[4:-1]
+            try:
+                value = int(literal, 16)
+            except ValueError:
+                return ("invalidate", None)
+            return ("literal", value)
+        if body.startswith("marker "):
+            return ("marker", None)
+        return ("invalidate", None)
+
+    @staticmethod
+    def _is_noise_statement(statement: ASTStatement) -> bool:
+        if isinstance(statement, ASTComment):
+            body = statement.text.strip()
+            prefixes = ("lit(", "marker ", "literal_block", "ascii(")
+            return body.startswith(prefixes)
+        return False
+
+    def _replace_successor(self, block: ASTBlock, old: ASTBlock, new: ASTBlock) -> None:
+        block.successors = tuple(new if succ is old else succ for succ in block.successors)
+        for statement in block.statements:
+            if isinstance(statement, BranchStatement):
+                if statement.then_branch is old:
+                    statement.then_branch = new
+                    statement.then_hint = None
+                if statement.else_branch is old:
+                    statement.else_branch = new
+                    statement.else_hint = None
+
+    def _compute_exit_offsets_from_ast(self, blocks: Sequence[ASTBlock]) -> Tuple[int, ...]:
+        if not blocks:
+            return tuple()
+
+        exit_node = "__exit__"
+        offsets = {block.start_offset for block in blocks}
+        nodes: Set[int | str] = set(offsets)
+        nodes.add(exit_node)
+
+        postdom: Dict[int | str, Set[int | str]] = {
+            offset: set(nodes) for offset in offsets
+        }
+        postdom[exit_node] = {exit_node}
+
+        successors: Dict[int, Set[int | str]] = {}
+        for block in blocks:
+            succ: Set[int | str] = set()
+            if not block.successors:
+                succ.add(exit_node)
+            for candidate in block.successors:
+                if candidate.start_offset in offsets:
+                    succ.add(candidate.start_offset)
+            if self._block_has_exit(block):
+                succ.add(exit_node)
+            if not succ:
+                succ.add(exit_node)
+            successors[block.start_offset] = succ
+
+        changed = True
+        while changed:
+            changed = False
+            for offset in offsets:
+                succ = successors.get(offset, {exit_node})
+                if not succ:
+                    succ = {exit_node}
+                intersection = set(nodes)
+                for candidate in succ:
+                    intersection &= postdom.get(candidate, {exit_node})
+                updated = {offset} | intersection
+                if updated != postdom[offset]:
+                    postdom[offset] = updated
+                    changed = True
+
+        exit_offsets: Set[int] = set()
+        for offset in offsets:
+            if exit_node not in successors.get(offset, {exit_node}):
+                continue
+            candidates = postdom[offset] - {offset}
+            if not candidates:
+                continue
+            immediate: Optional[int | str] = None
+            for candidate in candidates:
+                dominated = False
+                for other in candidates:
+                    if other == candidate:
+                        continue
+                    if candidate in postdom.get(other, set()):
+                        dominated = True
+                        break
+                if not dominated:
+                    immediate = candidate
+                    break
+            if immediate == exit_node or (immediate is None and exit_node in candidates):
+                exit_offsets.add(offset)
+        return tuple(sorted(exit_offsets))
+
+    @staticmethod
+    def _block_has_exit(block: ASTBlock) -> bool:
+        for statement in block.statements:
+            if isinstance(statement, (ASTReturn, ASTTailCall)):
+                return True
+        return False
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
