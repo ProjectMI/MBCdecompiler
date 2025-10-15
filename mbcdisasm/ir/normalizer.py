@@ -60,6 +60,7 @@ from .model import (
     IRStackDuplicate,
     IRStackDrop,
     IRStringConstant,
+    IRFormatter,
     IRTablePatch,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
@@ -659,6 +660,8 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._formatter_pool: Dict[str, IRFormatter] = {}
+        self._formatter_pool_order: List[IRFormatter] = []
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -682,6 +685,8 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._formatter_pool.clear()
+        self._formatter_pool_order.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -694,6 +699,7 @@ class IRNormalizer:
             segments=tuple(segments),
             metrics=aggregate_metrics,
             string_pool=tuple(self._string_pool_order),
+            formatter_pool=tuple(self._formatter_pool_order),
         )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
@@ -1237,6 +1243,17 @@ class IRNormalizer:
         self._string_pool[data] = constant
         self._string_pool_order.append(constant)
         return constant
+
+    def _intern_formatter(self, summary: str) -> IRFormatter:
+        formatter = self._formatter_pool.get(summary)
+        if formatter is not None:
+            return formatter
+
+        name = f"fmt_{len(self._formatter_pool_order):04d}"
+        formatter = IRFormatter(name=name, summary=summary)
+        self._formatter_pool[summary] = formatter
+        self._formatter_pool_order.append(formatter)
+        return formatter
 
     def _make_literal_chunk(
         self, data: bytes, source: str, annotations: Sequence[str]
@@ -3675,7 +3692,8 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            finalize = IRAsciiFinalize(helper=helper_operand, summary=summary or "ascii")
+            formatter = self._intern_formatter(summary or "ascii")
+            finalize = IRAsciiFinalize(helper=helper_operand, formatter=formatter.name)
             self._transfer_ssa(item, finalize)
 
             if isinstance(item, IRCallCleanup):

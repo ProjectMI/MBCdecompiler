@@ -859,6 +859,34 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert "lit(0x6704)" in descriptions
 
 
+def test_normalizer_pools_ascii_formatters() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    first_chunk = normalizer._make_literal_chunk(b"DATA", "ascii_run", [])
+    second_chunk = normalizer._make_literal_chunk(b"DATA", "ascii_run", [])
+    effect = IRStackEffect(mnemonic="call_helpers", operand=0x3D30)
+
+    items = _ItemList(
+        [
+            first_chunk,
+            IRCallCleanup(steps=(effect,)),
+            second_chunk,
+            IRCallCleanup(steps=(effect,)),
+        ]
+    )
+
+    normalizer._pass_ascii_finalize(items)
+
+    ascii_finalize = [
+        node for node in items if isinstance(node, IRAsciiFinalize)
+    ]
+
+    assert len(ascii_finalize) == 2
+    assert len(normalizer._formatter_pool_order) == 1
+    pooled_name = normalizer._formatter_pool_order[0].name
+    assert {node.formatter for node in ascii_finalize} == {pooled_name}
+
+
 def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

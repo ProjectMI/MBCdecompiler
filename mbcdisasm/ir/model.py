@@ -401,6 +401,17 @@ class IRStringConstant(IRNode):
 
 
 @dataclass(frozen=True)
+class IRFormatter(IRNode):
+    """Entry in the global formatter pool."""
+
+    name: str
+    summary: str
+
+    def describe(self) -> str:
+        return f"formatter {self.name} = {self.summary}"
+
+
+@dataclass(frozen=True)
 class IRBuildArray(IRNode):
     """Aggregate literal values into a positional container."""
 
@@ -888,10 +899,10 @@ class IRAsciiFinalize(IRNode):
     """Normalises helper invocations that terminate ASCII aggregation blocks."""
 
     helper: int
-    summary: str
+    formatter: str
 
     def describe(self) -> str:
-        return f"ascii_finalize helper=0x{self.helper:04X} source={self.summary}"
+        return f"ascii_finalize helper=0x{self.helper:04X} formatter={self.formatter}"
 
 
 @dataclass(frozen=True)
@@ -1129,6 +1140,7 @@ class IRProgram:
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
     string_pool: Tuple[IRStringConstant, ...] = tuple()
+    formatter_pool: Tuple[IRFormatter, ...] = tuple()
 
 
 @dataclass
@@ -1223,6 +1235,7 @@ __all__ = [
     "IRLiteralChunk",
     "IRDataMarker",
     "IRStringConstant",
+    "IRFormatter",
     "IRAsciiPreamble",
     "IRCallPreparation",
     "IRTailcallFrame",
