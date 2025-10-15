@@ -1563,23 +1563,25 @@ class IRNormalizer:
 
         if mode in RETURN_NIBBLE_MODES:
             if nibble:
-                return nibble, False
+                decoded = self._decode_width_byte(nibble)
+                if decoded is not None:
+                    return decoded, False
             hint = self._stack_teardown_hint(items, index)
             if hint is not None:
                 return hint, False
-            base = hi & 0x1F
-            if base:
+            base = self._decode_width_byte(hi & 0x1F)
+            if base is not None:
                 return base, False
             return 0, True
 
         if lo:
-            if lo > 0x3F:
-                narrowed = lo & 0x0F
-                if narrowed:
-                    return narrowed, False
-            return lo, False
+            decoded_lo = self._decode_width_byte(lo)
+            if decoded_lo is not None:
+                return decoded_lo, False
         if hi:
-            return hi, False
+            decoded_hi = self._decode_width_byte(hi)
+            if decoded_hi is not None:
+                return decoded_hi, False
 
         hint = self._stack_teardown_hint(items, index)
         if hint is not None:
@@ -4861,6 +4863,35 @@ class IRNormalizer:
                 )
                 index += 2
                 continue
+            if step.mnemonic == "stack_teardown" and step.pops > 0:
+                pops = step.pops
+                operand = step.operand
+                operand_role = step.operand_role
+                operand_alias = step.operand_alias
+                lookahead = index + 1
+                while lookahead < len(steps):
+                    candidate = steps[lookahead]
+                    if (
+                        candidate.mnemonic != "stack_teardown"
+                        or candidate.pops <= 0
+                        or candidate.operand != operand
+                        or candidate.operand_role != operand_role
+                        or candidate.operand_alias != operand_alias
+                    ):
+                        break
+                    pops += candidate.pops
+                    lookahead += 1
+                combined.append(
+                    IRStackEffect(
+                        mnemonic="stack_teardown",
+                        operand=operand,
+                        pops=pops,
+                        operand_role=operand_role,
+                        operand_alias=operand_alias,
+                    )
+                )
+                index = lookahead
+                continue
             combined.append(step)
             index += 1
         return combined
@@ -4916,17 +4947,30 @@ class IRNormalizer:
         return step.operand
 
     @staticmethod
-    def _decode_call_arity(value: int) -> Optional[int]:
+    def _decode_width_byte(value: int) -> Optional[int]:
+        if value <= 0:
+            return None
+        if value <= 0x1F:
+            return value
+        bit_count = value.bit_count()
+        if bit_count and bit_count <= 8:
+            return bit_count
+        if value <= 0x3F:
+            return value
+        return None
+
+    @classmethod
+    def _decode_call_arity(cls, value: int) -> Optional[int]:
         if value <= 0:
             return None
         high = (value >> 8) & 0xFF
         low = value & 0xFF
-        if high and low == 0:
-            return high
-        if high:
-            return high
-        if value <= 0x3F:
-            return value
+        decoded_low = cls._decode_width_byte(low)
+        if decoded_low is not None:
+            return decoded_low
+        decoded_high = cls._decode_width_byte(high)
+        if decoded_high is not None:
+            return decoded_high
         return None
 
     @staticmethod
