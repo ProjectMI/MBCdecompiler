@@ -172,6 +172,64 @@ class ASTBankedLoadExpr(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTStackEffect(ASTExpression):
+    """Human readable view of a stack effect."""
+
+    mnemonic: str
+    operand: int = 0
+    pops: int = 0
+    operand_role: str | None = None
+    operand_alias: str | None = None
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.pops:
+            details.append(f"pop={self.pops}")
+        include_operand = bool(self.operand_role or self.operand_alias)
+        if not include_operand:
+            include_operand = bool(self.operand)
+        if include_operand:
+            operand = f"0x{self.operand:04X}"
+            if self.operand_alias:
+                alias = self.operand_alias
+                operand = alias if alias == operand else f"{alias}({operand})"
+            if self.operand_role:
+                details.append(f"{self.operand_role}={operand}")
+            else:
+                details.append(f"operand={operand}")
+        if not details:
+            return self.mnemonic
+        rendered = ", ".join(details)
+        return f"{self.mnemonic}({rendered})"
+
+
+@dataclass(frozen=True)
+class ASTCallFrame:
+    """Representation of the ABI scaffolding around a call."""
+
+    parameters: Tuple[str, ...] = field(default_factory=tuple)
+    convention: ASTStackEffect | None = None
+    cleanup: Tuple[ASTStackEffect, ...] = field(default_factory=tuple)
+    return_mask: int | None = None
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.parameters:
+            params = ", ".join(self.parameters)
+            parts.append(f"params=[{params}]")
+        if self.convention is not None:
+            parts.append(f"shuffle={self.convention.render()}")
+        if self.cleanup:
+            rendered = ", ".join(effect.render() for effect in self.cleanup)
+            parts.append(f"cleanup=[{rendered}]")
+        if self.return_mask is not None:
+            parts.append(f"mask=0x{self.return_mask:04X}")
+        if not parts:
+            return "frame()"
+        return "frame(" + " ".join(parts) + ")"
+
+
+@dataclass(frozen=True)
 class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
@@ -180,6 +238,7 @@ class ASTCallExpr(ASTExpression):
     symbol: str | None = None
     tail: bool = False
     varargs: bool = False
+    frame: ASTCallFrame | None = None
 
     def render(self) -> str:
         rendered_args = ", ".join(arg.render() for arg in self.args)
@@ -188,7 +247,8 @@ class ASTCallExpr(ASTExpression):
             target_repr = f"{self.symbol}({target_repr})"
         prefix = "tail " if self.tail else ""
         suffix = ", ..." if self.varargs else ""
-        return f"{prefix}call {target_repr}({rendered_args}{suffix})"
+        frame_note = f" {self.frame.render()}" if self.frame is not None else ""
+        return f"{prefix}call {target_repr}({rendered_args}{suffix}){frame_note}"
 
 
 @dataclass(frozen=True)
@@ -295,6 +355,7 @@ class ASTReturn(ASTStatement):
 
     values: Tuple[ASTExpression, ...]
     varargs: bool = False
+    mask: int | None = None
 
     def render(self) -> str:
         if self.varargs:
@@ -303,7 +364,10 @@ class ASTReturn(ASTStatement):
         else:
             rendered = ", ".join(expr.render() for expr in self.values)
             payload = f"[{rendered}]"
-        return f"return {payload}"
+        mask_note = ""
+        if self.mask is not None:
+            mask_note = f" mask=0x{self.mask:04X}"
+        return f"return {payload}{mask_note}"
 
 
 @dataclass
@@ -469,6 +533,38 @@ class ASTBlock:
 
 
 @dataclass(frozen=True)
+class ASTFrameSlot:
+    """Summary of how a stack frame slot is used."""
+
+    index: int
+    reads: int = 0
+    writes: int = 0
+
+    def render(self) -> str:
+        return f"slot_0x{self.index:04X}(r={self.reads},w={self.writes})"
+
+
+@dataclass(frozen=True)
+class ASTFrameParameter:
+    """Formal parameter reconstructed from frame traffic."""
+
+    slot: int
+    identifier: ASTIdentifier
+
+    def render(self) -> str:
+        return f"{self.identifier.render()}@slot_0x{self.slot:04X}"
+
+
+@dataclass(frozen=True)
+class ASTFrameModel:
+    """Lightweight view of the reconstructed stack frame."""
+
+    size: int
+    slots: Tuple[ASTFrameSlot, ...] = field(default_factory=tuple)
+    parameters: Tuple[ASTFrameParameter, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class ASTProcedure:
     """Group of blocks that form a reconstructed procedure."""
 
@@ -477,6 +573,7 @@ class ASTProcedure:
     entry_reasons: Tuple[str, ...]
     blocks: Tuple[ASTBlock, ...]
     exit_offsets: Tuple[int, ...]
+    frame: ASTFrameModel
 
 
 @dataclass(frozen=True)

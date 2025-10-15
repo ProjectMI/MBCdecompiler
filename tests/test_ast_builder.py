@@ -3,16 +3,20 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.ast import ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
 from mbcdisasm.ir.model import (
+    IRAbiEffect,
     IRBlock,
     IRCall,
+    IRCallReturn,
     IRDispatchCase,
     IRIf,
     IRLoad,
     IRProgram,
     IRReturn,
+    IRStackEffect,
     IRSegment,
     IRSwitchDispatch,
     IRSlot,
+    IRStore,
     MemSpace,
     NormalizerMetrics,
 )
@@ -38,6 +42,8 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     procedure = segment.procedures[0]
     assert procedure.entry_reasons
     assert procedure.blocks
+    assert procedure.frame.size >= 0
+    assert isinstance(procedure.frame.parameters, tuple)
 
     block = procedure.blocks[0]
     assert block.successors is not None
@@ -188,3 +194,87 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].helper == 0x5555
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
+
+
+def test_ast_builder_records_frame_and_return_mask() -> None:
+    block = IRBlock(
+        label="entry",
+        start_offset=0x1000,
+        nodes=(
+            IRLoad(slot=IRSlot(MemSpace.FRAME, 0x0000), target="arg0"),
+            IRStore(slot=IRSlot(MemSpace.FRAME, 0x0001), value="word1"),
+            IRReturn(
+                values=("arg0",),
+                varargs=False,
+                abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0003),),
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+
+    assert procedure.frame.slots[0].index == 0x0000
+    assert procedure.frame.slots[0].reads == 1
+    assert procedure.frame.parameters[0].identifier.render() == "arg0"
+
+    return_stmt = next(
+        stmt for stmt in procedure.blocks[0].statements if isinstance(stmt, ASTReturn)
+    )
+    assert return_stmt.mask == 0x0001
+
+
+def test_ast_builder_attaches_call_frame_details() -> None:
+    call = IRCallReturn(
+        target=0x1234,
+        args=("arg_a", "arg_b"),
+        tail=False,
+        returns=("ret0",),
+        cleanup=(IRStackEffect(mnemonic="stack_teardown", pops=1),),
+        arity=2,
+        convention=IRStackEffect(
+            mnemonic="stack_shuffle",
+            operand=0x4B08,
+            operand_alias="CALL_SHUFFLE_STD",
+        ),
+        symbol="helper",  # pragma: no mutate
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0003),),
+    )
+    block = IRBlock(
+        label="entry",
+        start_offset=0x2000,
+        nodes=(
+            call,
+            IRReturn(values=("ret0",), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    call_stmt = next(stmt for stmt in statements if hasattr(stmt, "call"))
+    frame = call_stmt.call.frame
+    assert frame is not None
+    assert frame.parameters == ("arg0", "arg1")
+    assert frame.convention is not None
+    assert frame.convention.render() == "stack_shuffle(operand=CALL_SHUFFLE_STD(0x4B08))"
+    assert frame.cleanup and frame.cleanup[0].render() == "stack_teardown(pop=1)"
+    assert frame.return_mask == 0x0001

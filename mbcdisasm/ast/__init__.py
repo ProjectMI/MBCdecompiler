@@ -5,6 +5,7 @@ from .model import (
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTCallFrame,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
@@ -17,6 +18,9 @@ from .model import (
     ASTIOWrite,
     ASTIdentifier,
     ASTIndirectLoadExpr,
+    ASTFrameModel,
+    ASTFrameParameter,
+    ASTFrameSlot,
     ASTSwitch,
     ASTSwitchCase,
     ASTBankedRefExpr,
@@ -33,6 +37,7 @@ from .model import (
     ASTTailCall,
     ASTTestSet,
     ASTUnknown,
+    ASTStackEffect,
 )
 from .printer import ASTTextRenderer
 
@@ -68,6 +73,11 @@ __all__ = [
     "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
+    "ASTCallFrame",
     "ASTUnknown",
     "ASTMetrics",
+    "ASTStackEffect",
+    "ASTFrameModel",
+    "ASTFrameParameter",
+    "ASTFrameSlot",
 ]

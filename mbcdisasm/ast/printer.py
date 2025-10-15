@@ -44,6 +44,12 @@ class ASTTextRenderer:
             f"procedure {procedure.name} entry=0x{procedure.entry_offset:04X} "
             f"reasons={reasons} exits=[{exits}]"
         )
+        frame = procedure.frame
+        slot_text = ", ".join(slot.render() for slot in frame.slots)
+        param_text = ", ".join(param.render() for param in frame.parameters)
+        yield (
+            f"    frame size={frame.size} slots=[{slot_text}] params=[{param_text}]"
+        )
         for block in procedure.blocks:
             yield from self._render_block(block)
         yield ""

@@ -11,6 +11,7 @@ from ..ir.model import (
     IRCall,
     IRCallCleanup,
     IRCallReturn,
+    IRAbiEffect,
     IRFunctionPrologue,
     IRIORead,
     IRIOWrite,
@@ -24,6 +25,7 @@ from ..ir.model import (
     IRLoad,
     IRProgram,
     IRReturn,
+    IRStackEffect,
     IRSegment,
     IRStore,
     IRSwitchDispatch,
@@ -31,12 +33,14 @@ from ..ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRTerminator,
+    MemSpace,
     SSAValueKind,
 )
 from .model import (
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTCallFrame,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
@@ -49,6 +53,9 @@ from .model import (
     ASTIOWrite,
     ASTIdentifier,
     ASTIndirectLoadExpr,
+    ASTFrameModel,
+    ASTFrameParameter,
+    ASTFrameSlot,
     ASTBankedLoadExpr,
     ASTBankedRefExpr,
     ASTLiteral,
@@ -65,6 +72,7 @@ from .model import (
     ASTTailCall,
     ASTTestSet,
     ASTUnknown,
+    ASTStackEffect,
 )
 
 
@@ -103,15 +111,6 @@ class _PendingBlock:
 
 
 @dataclass
-class _ProcedureAccumulator:
-    """Partial reconstruction state for a single procedure."""
-
-    entry_offset: int
-    entry_reasons: Set[str] = field(default_factory=set)
-    blocks: Dict[int, _PendingBlock] = field(default_factory=dict)
-
-
-@dataclass
 class _PendingDispatchCall:
     """Call statement awaiting an accompanying dispatch table."""
 
@@ -126,6 +125,54 @@ class _PendingDispatchTable:
 
     dispatch: IRSwitchDispatch
     index: int
+
+
+@dataclass
+class _FrameSlotUsage:
+    """Track read/write statistics for a frame slot."""
+
+    reads: int = 0
+    writes: int = 0
+    first_read_order: Optional[int] = None
+    first_write_order: Optional[int] = None
+    first_read_target: Optional[str] = None
+
+
+class _FrameModelBuilder:
+    """Collect usage information for stack frame slots."""
+
+    def __init__(self) -> None:
+        self._slots: Dict[int, _FrameSlotUsage] = {}
+        self._order: int = 0
+
+    def record_read(self, slot: int, target: Optional[str]) -> None:
+        usage = self._slots.setdefault(slot, _FrameSlotUsage())
+        if usage.first_read_order is None:
+            usage.first_read_order = self._order
+            usage.first_read_target = target
+        usage.reads += 1
+        self._order += 1
+
+    def record_write(self, slot: int) -> None:
+        usage = self._slots.setdefault(slot, _FrameSlotUsage())
+        if usage.first_write_order is None:
+            usage.first_write_order = self._order
+        usage.writes += 1
+        self._order += 1
+
+    @property
+    def slots(self) -> Mapping[int, _FrameSlotUsage]:
+        return self._slots
+
+
+@dataclass
+class _ProcedureAccumulator:
+    """Partial reconstruction state for a single procedure."""
+
+    entry_offset: int
+    entry_reasons: Set[str] = field(default_factory=set)
+    blocks: Dict[int, _PendingBlock] = field(default_factory=dict)
+    frame_builder: _FrameModelBuilder = field(default_factory=_FrameModelBuilder)
 
 
 class ASTBuilder:
@@ -319,7 +366,9 @@ class ASTBuilder:
                 assigned[offset] = entry
                 analysis = analyses[offset]
                 accumulator.entry_reasons.update(entry_reasons.get(offset, ()))
-                accumulator.blocks[offset] = self._convert_block(analysis, state, metrics)
+                accumulator.blocks[offset] = self._convert_block(
+                    analysis, state, metrics, accumulator.frame_builder
+                )
             accumulators[entry] = accumulator
 
         for offset in sorted(analyses):
@@ -335,7 +384,9 @@ class ASTBuilder:
                 assigned[node] = offset
                 analysis = analyses[node]
                 accumulator.entry_reasons.update(entry_reasons.get(node, ()))
-                accumulator.blocks[node] = self._convert_block(analysis, state, metrics)
+                accumulator.blocks[node] = self._convert_block(
+                    analysis, state, metrics, accumulator.frame_builder
+                )
             accumulators[offset] = accumulator
 
         procedures: List[ASTProcedure] = []
@@ -348,6 +399,7 @@ class ASTBuilder:
                 entry_offset=accumulator.entry_offset,
                 entry_reasons=tuple(sorted(accumulator.entry_reasons)),
                 blocks=pending_blocks,
+                frame_builder=accumulator.frame_builder,
             )
             procedures.append(procedure)
         return procedures
@@ -358,15 +410,18 @@ class ASTBuilder:
         entry_offset: int,
         entry_reasons: Tuple[str, ...],
         blocks: Sequence[_PendingBlock],
+        frame_builder: _FrameModelBuilder,
     ) -> ASTProcedure:
         realised_blocks = self._realise_blocks(blocks)
         exit_offsets = self._compute_exit_offsets(blocks)
+        frame = self._build_frame_model(frame_builder)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=realised_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
+            frame=frame,
         )
 
     def _collect_entry_blocks(
@@ -531,6 +586,7 @@ class ASTBuilder:
         analysis: _BlockAnalysis,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
+        frame_builder: _FrameModelBuilder,
     ) -> _PendingBlock:
         block = analysis.block
         statements: List[ASTStatement] = []
@@ -561,6 +617,7 @@ class ASTBuilder:
                 block.start_offset,
                 value_state,
                 metrics,
+                frame_builder,
             )
             statements.extend(node_statements)
             branch_links.extend(node_links)
@@ -588,6 +645,11 @@ class ASTBuilder:
             node.tail,
             node.varargs if hasattr(node, "varargs") else False,
             value_state,
+            arity=node.arity,
+            convention=node.convention,
+            cleanup=node.cleanup,
+            cleanup_mask=node.cleanup_mask,
+            return_count=0,
         )
         metrics.call_sites += 1
         metrics.observe_call_args(
@@ -701,8 +763,11 @@ class ASTBuilder:
         origin_offset: int,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
+        frame_builder: _FrameModelBuilder,
     ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
         if isinstance(node, IRLoad):
+            if node.slot.space is MemSpace.FRAME:
+                frame_builder.record_read(node.slot.index, node.target)
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             expr = ASTSlotRef(node.slot)
             value_state[node.target] = expr
@@ -710,6 +775,8 @@ class ASTBuilder:
             metrics.observe_load(True)
             return [ASTAssign(target=target, value=expr)], []
         if isinstance(node, IRStore):
+            if node.slot.space is MemSpace.FRAME:
+                frame_builder.record_write(node.slot.index)
             target_expr = ASTSlotRef(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(not isinstance(value_expr, ASTUnknown))
@@ -768,6 +835,8 @@ class ASTBuilder:
             )
             return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRIndirectLoad):
+            if node.base_slot is not None and node.base_slot.space is MemSpace.FRAME:
+                frame_builder.record_read(node.base_slot.index, None)
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
                 self._resolve_expr(node.offset_source, value_state)
@@ -785,6 +854,8 @@ class ASTBuilder:
                 )
             ], []
         if isinstance(node, IRIndirectStore):
+            if node.base_slot is not None and node.base_slot.space is MemSpace.FRAME:
+                frame_builder.record_read(node.base_slot.index, None)
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
                 self._resolve_expr(node.offset_source, value_state)
@@ -798,13 +869,18 @@ class ASTBuilder:
             target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
             return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRCallReturn):
-            call_expr, returns = self._convert_call(
+            call_expr, _ = self._convert_call(
                 node.target,
                 node.args,
                 node.symbol,
                 node.tail,
                 node.varargs,
                 value_state,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup=node.cleanup,
+                cleanup_mask=node.cleanup_mask,
+                return_count=len(node.returns),
             )
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
@@ -821,13 +897,19 @@ class ASTBuilder:
             statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
             return statements, []
         if isinstance(node, IRTailCall):
-            call_expr, returns = self._convert_call(
+            combined_cleanup = node.call.cleanup + node.cleanup
+            call_expr, _ = self._convert_call(
                 node.call.target,
                 node.call.args,
                 node.call.symbol,
                 True,
                 node.varargs,
                 value_state,
+                arity=node.call.arity,
+                convention=node.call.convention,
+                cleanup=combined_cleanup,
+                cleanup_mask=node.cleanup_mask,
+                return_count=len(node.returns),
             )
             metrics.call_sites += 1
             metrics.observe_call_args(
@@ -838,7 +920,8 @@ class ASTBuilder:
             return [ASTTailCall(call=call_expr, returns=resolved_returns)], []
         if isinstance(node, IRReturn):
             values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            return [ASTReturn(values=values, varargs=node.varargs)], []
+            mask = self._active_mask(node.mask, len(values), node.varargs)
+            return [ASTReturn(values=values, varargs=node.varargs, mask=mask)], []
         if isinstance(node, IRCallCleanup):
             return [], []
         if isinstance(node, IRTerminator):
@@ -898,10 +981,65 @@ class ASTBuilder:
         tail: bool,
         varargs: bool,
         value_state: Mapping[str, ASTExpression],
+        *,
+        arity: Optional[int],
+        convention: Optional[IRStackEffect],
+        cleanup: Sequence[IRStackEffect],
+        cleanup_mask: Optional[int],
+        return_count: int,
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
         arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
+        frame = self._build_call_frame(
+            arity=arity,
+            convention=convention,
+            cleanup=cleanup,
+            cleanup_mask=cleanup_mask,
+            return_count=return_count,
+            varargs=varargs,
+        )
+        call_expr = ASTCallExpr(
+            target=target,
+            args=arg_exprs,
+            symbol=symbol,
+            tail=tail,
+            varargs=varargs,
+            frame=frame,
+        )
         return call_expr, arg_exprs
+
+    def _convert_stack_effect(self, effect: IRStackEffect) -> ASTStackEffect:
+        return ASTStackEffect(
+            mnemonic=effect.mnemonic,
+            operand=effect.operand,
+            pops=effect.pops,
+            operand_role=effect.operand_role,
+            operand_alias=effect.operand_alias,
+        )
+
+    def _build_call_frame(
+        self,
+        *,
+        arity: Optional[int],
+        convention: Optional[IRStackEffect],
+        cleanup: Sequence[IRStackEffect],
+        cleanup_mask: Optional[int],
+        return_count: int,
+        varargs: bool,
+    ) -> Optional[ASTCallFrame]:
+        parameters = tuple(f"arg{index}" for index in range(arity or 0)) if arity is not None else tuple()
+        convention_model = (
+            self._convert_stack_effect(convention) if convention is not None else None
+        )
+        cleanup_model = tuple(self._convert_stack_effect(step) for step in cleanup)
+        mask = self._active_mask(cleanup_mask, return_count, varargs)
+        if not parameters and convention_model is None and not cleanup_model and mask is None:
+            return None
+        return ASTCallFrame(
+            parameters=parameters,
+            convention=convention_model,
+            cleanup=cleanup_model,
+            return_mask=mask,
+        )
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
@@ -940,6 +1078,41 @@ class ASTBuilder:
         if lowered.startswith("id"):
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
+
+    @staticmethod
+    def _active_mask(
+        mask: Optional[int], count: int, varargs: bool = False
+    ) -> Optional[int]:
+        if mask is None:
+            return None
+        if varargs:
+            return mask
+        if count <= 0:
+            narrowed = mask & 0
+        else:
+            narrowed = mask & ((1 << count) - 1)
+        return narrowed
+
+    def _build_frame_model(self, builder: _FrameModelBuilder) -> ASTFrameModel:
+        slots: List[ASTFrameSlot] = []
+        parameters: List[ASTFrameParameter] = []
+        size = 0
+        for index, usage in sorted(builder.slots.items()):
+            slots.append(ASTFrameSlot(index=index, reads=usage.reads, writes=usage.writes))
+            size = max(size, index + 1)
+            if usage.first_read_order is None:
+                continue
+            if usage.first_write_order is not None and usage.first_write_order <= usage.first_read_order:
+                continue
+            if usage.first_read_target:
+                identifier = ASTIdentifier(
+                    usage.first_read_target,
+                    self._infer_kind(usage.first_read_target),
+                )
+            else:
+                identifier = ASTIdentifier(f"slot_{index:04X}", SSAValueKind.POINTER)
+            parameters.append(ASTFrameParameter(slot=index, identifier=identifier))
+        return ASTFrameModel(size=size, slots=tuple(slots), parameters=tuple(parameters))
 
     def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:
         if target_offset in self._current_block_labels:
