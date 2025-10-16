@@ -9,6 +9,7 @@ from mbcdisasm.ast import (
     ASTDispatchTable,
     ASTReturn,
     ASTSwitch,
+    ASTTailCall,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -21,6 +22,7 @@ from mbcdisasm.ir.model import (
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTailCall,
     IRSlot,
     MemSpace,
     NormalizerMetrics,
@@ -159,12 +161,14 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     ast_program = builder.build(program)
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
-    assert isinstance(statements[0], ASTDispatchTable)
-    assert isinstance(statements[1], ASTSwitch)
-    assert statements[1].helper == 0x1111
-    assert statements[1].cases[0].key == 0x01
-    assert statements[1].cases[0].target == 0x2222
-    assert isinstance(statements[2], ASTReturn)
+    assert not any(isinstance(stmt, ASTDispatchTable) for stmt in statements)
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.inline_table
+    assert switch_stmt.helper == 0x1111
+    assert switch_stmt.cases[0].key == 0x01
+    assert switch_stmt.cases[0].target == 0x2222
+    assert isinstance(statements[1], ASTReturn)
 
 
 def test_ast_builder_converts_dispatch_with_leading_call() -> None:
@@ -192,11 +196,76 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     ast_program = builder.build(program)
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
-    assert isinstance(statements[0], ASTDispatchTable)
-    assert isinstance(statements[1], ASTSwitch)
-    assert statements[1].helper == 0x5555
-    assert statements[1].cases[0].key == 0x02
-    assert statements[1].cases[0].target == 0x4444
+    assert not any(isinstance(stmt, ASTDispatchTable) for stmt in statements)
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.inline_table
+    assert switch_stmt.helper == 0x5555
+    assert switch_stmt.cases[0].key == 0x02
+    assert switch_stmt.cases[0].target == 0x4444
+
+
+def test_ast_switch_marks_io_dispatch() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x10, target=0x2000, symbol=None),),
+        helper=0x00F0,
+        helper_symbol="io.flush_tail",
+        default=0x1234,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0250,
+        nodes=(dispatch, IRCall(target=0x00F0, args=(), symbol="io.flush_tail"), IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0250,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.kind == "io"
+
+
+def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x05, target=0x3000, symbol=None),),
+        helper=0x7777,
+        helper_symbol=None,
+    )
+    helper_call = IRCall(target=0x7777, args=())
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0300,
+        nodes=(
+            dispatch,
+            helper_call,
+            IRTailCall(call=IRCall(target=0x7777, args=()), returns=()),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert any(isinstance(stmt, ASTSwitch) for stmt in statements)
+    assert not any(isinstance(stmt, ASTTailCall) for stmt in statements)
 
 
 def test_ast_builder_prunes_redundant_branch_blocks() -> None:
