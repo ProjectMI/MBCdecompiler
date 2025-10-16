@@ -1,7 +1,13 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.ast import ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
+from mbcdisasm.ast import (
+    ASTBranch,
+    ASTBuilder,
+    ASTDispatchTable,
+    ASTReturn,
+    ASTSwitch,
+)
 from mbcdisasm.ir.model import (
     IRBlock,
     IRCall,
@@ -189,6 +195,64 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].helper == 0x5555
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
+
+
+def test_ast_builder_prunes_redundant_branch_blocks() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x20,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0400,
+                nodes=(IRIf(condition="stack_top", then_target=0x0410, else_target=0x0410),),
+            ),
+            IRBlock(
+                label="block_return",
+                start_offset=0x0410,
+                nodes=(IRReturn(values=("ret0",), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    segment_ast = ast_program.segments[0]
+    assert len(segment_ast.procedures) == 1
+    procedure = segment_ast.procedures[0]
+    assert {block.start_offset for block in procedure.blocks} == {0x0410}
+    assert all(
+        not isinstance(statement, ASTBranch)
+        for block in procedure.blocks
+        for statement in block.statements
+    )
+
+
+def test_ast_builder_drops_empty_procedures() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x10,
+        blocks=(
+            IRBlock(
+                label="block_empty",
+                start_offset=0x0500,
+                nodes=tuple(),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    assert not ast_program.segments[0].procedures
+    assert ast_program.metrics.procedure_count == 0
 
 
 def test_ast_switch_renders_index_note() -> None:

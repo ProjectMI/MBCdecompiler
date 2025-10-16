@@ -315,6 +315,8 @@ class ASTBranch(ASTStatement):
     else_branch: "ASTBlock | None" = None
     then_hint: str | None = None
     else_hint: str | None = None
+    then_offset: int | None = None
+    else_offset: int | None = None
 
     def render(self) -> str:
         condition = self.condition.render()
@@ -333,6 +335,8 @@ class ASTTestSet(ASTStatement):
     else_branch: "ASTBlock | None" = None
     then_hint: str | None = None
     else_hint: str | None = None
+    then_offset: int | None = None
+    else_offset: int | None = None
 
     def render(self) -> str:
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
@@ -352,6 +356,8 @@ class ASTFlagCheck(ASTStatement):
     else_branch: "ASTBlock | None" = None
     then_hint: str | None = None
     else_hint: str | None = None
+    then_offset: int | None = None
+    else_offset: int | None = None
 
     def render(self) -> str:
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
@@ -369,6 +375,8 @@ class ASTFunctionPrologue(ASTStatement):
     else_branch: "ASTBlock | None" = None
     then_hint: str | None = None
     else_hint: str | None = None
+    then_offset: int | None = None
+    else_offset: int | None = None
 
     def render(self) -> str:
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
