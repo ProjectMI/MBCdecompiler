@@ -335,6 +335,8 @@ class ASTTestSet(ASTStatement):
     else_hint: str | None = None
 
     def render(self) -> str:
+        if not any((self.then_branch, self.else_branch, self.then_hint, self.else_hint)):
+            return f"testset {self.var.render()} = {self.expr.render()}"
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (
@@ -371,6 +373,8 @@ class ASTFunctionPrologue(ASTStatement):
     else_hint: str | None = None
 
     def render(self) -> str:
+        if not any((self.then_branch, self.else_branch, self.then_hint, self.else_hint)):
+            return f"prologue {self.var.render()} = {self.expr.render()}"
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (

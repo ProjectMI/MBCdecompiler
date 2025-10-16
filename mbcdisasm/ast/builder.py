@@ -349,7 +349,8 @@ class ASTBuilder:
                 entry_reasons=tuple(sorted(accumulator.entry_reasons)),
                 blocks=pending_blocks,
             )
-            procedures.append(procedure)
+            if not self._procedure_is_empty(procedure):
+                procedures.append(procedure)
         return procedures
 
     def _finalise_procedure(
@@ -517,6 +518,7 @@ class ASTBuilder:
             )
             if filtered != block.statements:
                 block.statements = filtered
+            self._simplify_branch_statements(block)
 
         predecessors: Dict[int, Set[int]] = {block_id: set() for block_id in id_map}
         for block in block_order:
@@ -664,9 +666,31 @@ class ASTBuilder:
     def _is_noise_statement(statement: ASTStatement) -> bool:
         if isinstance(statement, ASTComment):
             body = statement.text.strip()
-            prefixes = ("lit(", "marker ", "literal_block", "ascii(")
+            prefixes = ("lit(", "marker ", "literal_block", "ascii(", "drop ")
             return body.startswith(prefixes)
         return False
+
+    def _simplify_branch_statements(self, block: ASTBlock) -> None:
+        cleaned: List[ASTStatement] = []
+        for statement in block.statements:
+            if isinstance(statement, ASTBranch):
+                targets = {id(branch) for branch in (statement.then_branch, statement.else_branch) if branch is not None}
+                if targets and len(targets) == 1:
+                    continue
+            elif isinstance(statement, ASTFlagCheck):
+                targets = {id(branch) for branch in (statement.then_branch, statement.else_branch) if branch is not None}
+                if targets and len(targets) == 1:
+                    continue
+            elif isinstance(statement, (ASTTestSet, ASTFunctionPrologue)):
+                targets = {id(branch) for branch in (statement.then_branch, statement.else_branch) if branch is not None}
+                if targets and len(targets) == 1:
+                    statement.then_branch = None
+                    statement.else_branch = None
+                    statement.then_hint = None
+                    statement.else_hint = None
+            cleaned.append(statement)
+        if tuple(cleaned) != block.statements:
+            block.statements = tuple(cleaned)
 
     def _replace_successor(self, block: ASTBlock, old: ASTBlock, new: ASTBlock) -> None:
         block.successors = tuple(new if succ is old else succ for succ in block.successors)
@@ -832,6 +856,13 @@ class ASTBuilder:
             successors=analysis.successors,
             branch_links=branch_links,
         )
+
+    @staticmethod
+    def _procedure_is_empty(procedure: ASTProcedure) -> bool:
+        for block in procedure.blocks:
+            if block.statements or block.successors:
+                return False
+        return True
 
     def _handle_dispatch_call(
         self,

@@ -7,12 +7,14 @@ from mbcdisasm.ir.model import (
     IRCall,
     IRDispatchCase,
     IRDispatchIndex,
+    IRFunctionPrologue,
     IRIf,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTestSetBranch,
     IRSlot,
     MemSpace,
     NormalizerMetrics,
@@ -190,6 +192,94 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
 
+
+def test_ast_builder_drops_empty_procedures() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(IRBlock(label="empty", start_offset=0x0100, nodes=()),),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    assert not ast_program.segments[0].procedures
+
+
+def test_ast_builder_collapses_stack_top_gate() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x20,
+        blocks=(
+            IRBlock(
+                label="gate",
+                start_offset=0x0200,
+                nodes=(IRIf(condition="stack_top", then_target=0x0100, else_target=0x0210),),
+            ),
+            IRBlock(
+                label="body",
+                start_offset=0x0210,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedures = ast_program.segments[0].procedures
+    assert len(procedures) == 1
+    procedure = procedures[0]
+    assert len(procedure.blocks) == 1
+    assert any(isinstance(stmt, ASTReturn) for stmt in procedure.blocks[0].statements)
+
+
+def test_ast_builder_flattens_prologue_and_testset_branches() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x30,
+        blocks=(
+            IRBlock(
+                label="prologue",
+                start_offset=0x0300,
+                nodes=(
+                    IRFunctionPrologue(
+                        var="slot(0x0001)",
+                        expr="stack_top",
+                        then_target=0x0400,
+                        else_target=0x0310,
+                    ),
+                    IRTestSetBranch(
+                        var="slot(0x0002)",
+                        expr="bool0",
+                        then_target=0x0400,
+                        else_target=0x0310,
+                    ),
+                ),
+            ),
+            IRBlock(
+                label="body",
+                start_offset=0x0310,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    block = procedure.blocks[0]
+    rendered = [statement.render() for statement in block.statements]
+    assert "then" not in rendered[0]
+    assert "then" not in rendered[1]
 
 def test_ast_switch_renders_index_note() -> None:
     dispatch = IRSwitchDispatch(
