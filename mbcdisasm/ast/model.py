@@ -3,9 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
+from ..constants import OPERAND_ALIASES
 from ..ir.model import IRSlot, MemRef, SSAValueKind
+
+
+def _format_operand(value: int, alias: Optional[str] = None) -> str:
+    """Format ``value`` using the shared operand alias table."""
+
+    hex_value = f"0x{value:04X}"
+    alias_text = alias or OPERAND_ALIASES.get(value)
+    if alias_text:
+        upper = alias_text.upper()
+        if upper.startswith("0X"):
+            alias_text = upper
+        if alias_text == hex_value:
+            return alias_text
+        return f"{alias_text}({hex_value})"
+    return hex_value
 
 
 # ---------------------------------------------------------------------------
@@ -202,9 +218,86 @@ class ASTCallResult(ASTExpression):
         return f"{self.call.render()}[{self.index}]"
 
 
+@dataclass(frozen=True)
+class ASTTupleExpr(ASTExpression):
+    """Tuple literal composed of concrete AST expressions."""
+
+    items: Tuple[ASTExpression, ...]
+
+    def render(self) -> str:
+        inner = ", ".join(item.render() for item in self.items)
+        return f"({inner})"
+
+
 # ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ASTFrameEffect:
+    """Side effect applied while constructing a call frame."""
+
+    kind: str
+    operand: Optional[int] = None
+    alias: Optional[str] = None
+    pops: int = 0
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.pops:
+            details.append(f"pop={self.pops}")
+        if self.operand is not None:
+            details.append(f"value={_format_operand(self.operand, self.alias)}")
+        if not details:
+            return self.kind
+        inner = ", ".join(details)
+        return f"{self.kind}({inner})"
+
+
+@dataclass(frozen=True)
+class ASTCallFrameSlot:
+    """Assignment of a value to a frame slot prior to a helper call."""
+
+    index: int
+    value: ASTExpression
+
+    def render(self) -> str:
+        return f"slot[{self.index}]={self.value.render()}"
+
+
+@dataclass(frozen=True)
+class ASTFinallyStep:
+    """Single action performed by a structured epilogue."""
+
+    kind: str
+    operand: Optional[int] = None
+    alias: Optional[str] = None
+    pops: int = 0
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.pops:
+            details.append(f"pop={self.pops}")
+        if self.operand is not None:
+            details.append(f"value={_format_operand(self.operand, self.alias)}")
+        if not details:
+            return self.kind
+        inner = ", ".join(details)
+        return f"{self.kind}({inner})"
+
+
+@dataclass(frozen=True)
+class ASTFinally:
+    """Structured epilogue attached to a return statement."""
+
+    steps: Tuple[ASTFinallyStep, ...]
+
+    def render(self) -> str:
+        if not self.steps:
+            return "[]"
+        rendered = ", ".join(step.render() for step in self.steps)
+        return f"[{rendered}]"
 
 
 @dataclass
@@ -252,6 +345,28 @@ class ASTCallStatement(ASTStatement):
 
 
 @dataclass
+class ASTCallFrame(ASTStatement):
+    """Explicit description of the call frame layout for helper invocations."""
+
+    slots: Tuple[ASTCallFrameSlot, ...] = field(default_factory=tuple)
+    effects: Tuple[ASTFrameEffect, ...] = field(default_factory=tuple)
+    live_mask: Optional[int] = None
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.slots:
+            rendered_slots = ", ".join(slot.render() for slot in self.slots)
+            parts.append(f"slots=[{rendered_slots}]")
+        if self.effects:
+            rendered_effects = ", ".join(effect.render() for effect in self.effects)
+            parts.append(f"effects=[{rendered_effects}]")
+        if self.live_mask is not None:
+            parts.append(f"live={_format_operand(self.live_mask)}")
+        suffix = " " + " ".join(parts) if parts else ""
+        return f"call_frame{suffix}"
+
+
+@dataclass
 class ASTIORead(ASTStatement):
     """I/O read effect emitted by helper façades."""
 
@@ -293,17 +408,27 @@ class ASTTailCall(ASTStatement):
 class ASTReturn(ASTStatement):
     """Return from the current procedure."""
 
-    values: Tuple[ASTExpression, ...]
+    value: Optional[ASTExpression]
     varargs: bool = False
+    finally_branch: Optional[ASTFinally] = None
 
     def render(self) -> str:
         if self.varargs:
-            rendered = ", ".join(expr.render() for expr in self.values)
-            payload = f"varargs({rendered})" if rendered else "varargs"
+            if self.value is None:
+                payload = "varargs"
+            elif isinstance(self.value, ASTTupleExpr):
+                payload = f"varargs{self.value.render()}"
+            else:
+                payload = f"varargs({self.value.render()})"
         else:
-            rendered = ", ".join(expr.render() for expr in self.values)
-            payload = f"[{rendered}]"
-        return f"return {payload}"
+            if self.value is None:
+                payload = "()"
+            else:
+                payload = self.value.render()
+        suffix = ""
+        if self.finally_branch is not None:
+            suffix = f" finally {self.finally_branch.render()}"
+        return f"return {payload}{suffix}"
 
 
 @dataclass
@@ -588,14 +713,20 @@ __all__ = [
     "ASTBankedLoadExpr",
     "ASTCallExpr",
     "ASTCallResult",
+    "ASTTupleExpr",
     "ASTStatement",
     "ASTAssign",
     "ASTStore",
+    "ASTFrameEffect",
+    "ASTCallFrameSlot",
     "ASTCallStatement",
+    "ASTCallFrame",
     "ASTIORead",
     "ASTIOWrite",
     "ASTTailCall",
     "ASTReturn",
+    "ASTFinallyStep",
+    "ASTFinally",
     "ASTBranch",
     "ASTTestSet",
     "ASTFlagCheck",
