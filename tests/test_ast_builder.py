@@ -1,12 +1,13 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.constants import RET_MASK
+from mbcdisasm.constants import IO_PORT_NAME, RET_MASK
 from mbcdisasm.ast import (
     ASTBranch,
     ASTBuilder,
     ASTCallFrame,
     ASTCallStatement,
+    ASTIOWrite,
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
@@ -17,6 +18,7 @@ from mbcdisasm.ir.model import (
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
+    IRIOWrite,
     IRLoad,
     IRProgram,
     IRReturn,
@@ -391,6 +393,88 @@ def test_ast_switch_carries_index_metadata() -> None:
     rendered = switch_stmt.render()
     assert "index=word0 & 0x0007" in rendered
     assert "base=0x0001" in rendered
+
+
+def test_ast_switch_resolves_io_helper_index() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x02, target=0x6671, symbol=None),),
+        helper=0x6671,
+        helper_symbol=None,
+        default=None,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0310,
+        nodes=(
+            IRIOWrite(port=IO_PORT_NAME, mask=0x000C),
+            dispatch,
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0310,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert isinstance(statements[0], ASTIOWrite)
+    switch_stmt = statements[1]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.helper is None
+    assert switch_stmt.helper_symbol is None
+    assert switch_stmt.kind == "io"
+    assert switch_stmt.index_mask is None
+    assert switch_stmt.index_expr is not None
+    assert switch_stmt.index_expr.render() == "ChatOutMask::MASK_000C"
+    assert switch_stmt.cases[0].symbol == "ChatOutMask::MASK_0002"
+
+
+def test_ast_switch_resolves_masked_io_helper_index() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x03, target=0x664F, symbol=None),),
+        helper=0x664F,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(mask=0x1000),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0320,
+        nodes=(
+            IRIOWrite(port=IO_PORT_NAME, mask=0x1000),
+            dispatch,
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0320,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert isinstance(statements[0], ASTIOWrite)
+    switch_stmt = statements[1]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.helper is None
+    assert switch_stmt.index_mask is None
+    assert switch_stmt.index_expr is not None
+    assert switch_stmt.index_expr.render() == "ChatOutMask::MASK_1000"
+    assert switch_stmt.cases[0].symbol == "ChatOutMask::MASK_0003"
+    assert switch_stmt.kind == "io"
 
 
 def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:

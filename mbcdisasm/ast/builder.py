@@ -36,6 +36,7 @@ from ..ir.model import (
     IRStackEffect,
     SSAValueKind,
 )
+from ..constants import IO_PORT_NAME
 from .model import (
     ASTAssign,
     ASTBlock,
@@ -932,6 +933,7 @@ class ASTBuilder:
             statements.extend(node_statements)
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
+        self._resolve_switch_indices_in_block(statements)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
@@ -1531,6 +1533,60 @@ class ASTBuilder:
                 return ASTUnknown(token)
             return ASTIdentifier(f"slot_{index:04X}", SSAValueKind.POINTER)
         return ASTIdentifier(token, self._infer_kind(token))
+
+    def _resolve_switch_indices_in_block(self, statements: List[ASTStatement]) -> None:
+        """Enrich switch statements with contextual dispatch metadata."""
+
+        for index, statement in enumerate(statements):
+            if not isinstance(statement, ASTSwitch):
+                continue
+            io_write = self._find_preceding_io_write(statements, index)
+            if io_write is None:
+                continue
+            self._rewrite_io_dispatch(statement, io_write)
+
+    def _find_preceding_io_write(
+        self, statements: Sequence[ASTStatement], index: int
+    ) -> ASTIOWrite | None:
+        """Return the nearest IO write immediately preceding ``index``."""
+
+        for offset in range(index - 1, -1, -1):
+            candidate = statements[offset]
+            if isinstance(candidate, ASTComment):
+                continue
+            if isinstance(candidate, ASTIOWrite):
+                return candidate
+            break
+        return None
+
+    _IO_DISPATCH_HELPERS = {0x664F, 0x6671}
+
+    def _rewrite_io_dispatch(
+        self, statement: ASTSwitch, io_write: ASTIOWrite | None
+    ) -> None:
+        helper = statement.helper
+        if helper is None or helper not in self._IO_DISPATCH_HELPERS:
+            return
+        if io_write is None or io_write.port != IO_PORT_NAME:
+            return
+        mask_value = io_write.mask
+        if mask_value is None:
+            return
+
+        statement.helper = None
+        statement.helper_symbol = None
+        statement.index_mask = None
+        statement.index_expr = ASTIdentifier(
+            self._format_io_mask_name(mask_value), SSAValueKind.IDENTIFIER
+        )
+        if statement.kind is None:
+            statement.kind = "io"
+        for case in statement.cases:
+            case.symbol = self._format_io_mask_name(case.key)
+
+    @staticmethod
+    def _format_io_mask_name(mask: int) -> str:
+        return f"ChatOutMask::MASK_{mask:04X}"
 
     def _infer_kind(self, name: str) -> SSAValueKind:
         lowered = name.lower()
