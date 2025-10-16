@@ -98,6 +98,7 @@ __all__ = [
     "IRTableBuilderEmit",
     "IRTableBuilderCommit",
     "IRDispatchCase",
+    "IRDispatchIndex",
     "IRSwitchDispatch",
     "IRSlot",
     "IRRaw",

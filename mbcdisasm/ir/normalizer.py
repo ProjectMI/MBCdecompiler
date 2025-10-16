@@ -65,6 +65,7 @@ from .model import (
     IRTableBuilderEmit,
     IRTableBuilderCommit,
     IRDispatchCase,
+    IRDispatchIndex,
     IRSwitchDispatch,
     IRTailcallFrame,
     IRTestSetBranch,
@@ -645,6 +646,12 @@ class IRNormalizer:
         SSAValueKind.PAGE_REGISTER: 5,
         SSAValueKind.BOOLEAN: 6,
     }
+    _AUTO_HELPER_ALIASES = {
+        0x02F0: "fmt.flush",
+        0x03F0: "fmt.commit",
+        0x05F0: "fmt.reset",
+    }
+    _INDEX_MASK_MAX_BITS = 4
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
@@ -664,6 +671,8 @@ class IRNormalizer:
         alias = TAIL_HELPER_ALIASES.get(helper)
         if alias is None:
             alias = CALL_HELPER_ALIASES.get(helper)
+        if alias is None:
+            alias = self._AUTO_HELPER_ALIASES.get(helper & 0xFFFF)
         if alias is not None:
             return alias
         return self.knowledge.lookup_address(helper)
@@ -2785,11 +2794,13 @@ class IRNormalizer:
             helper_target, helper_symbol = self._resolve_dispatch_helper(
                 items, index, cases, default
             )
+            index_info = self._infer_dispatch_index(items, index)
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
+                index=index_info,
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
@@ -3116,20 +3127,86 @@ class IRNormalizer:
     ) -> Tuple[List[IRDispatchCase], Optional[int]]:
         cases: List[IRDispatchCase] = []
         default_target: Optional[int] = None
+        ordinal = 0
         for mnemonic, operand in operations:
             if mnemonic.startswith("op_2C_"):
                 suffix = mnemonic.split("_")[-1]
                 try:
                     key = int(suffix, 16)
                 except ValueError:
-                    continue
+                    key = ordinal
                 target = operand & 0xFFFF
                 symbol = self.knowledge.lookup_address(target)
                 cases.append(IRDispatchCase(key=key, target=target, symbol=symbol))
+                ordinal += 1
                 continue
             if mnemonic == "fanout":
                 default_target = operand & 0xFFFF
         return cases, default_target
+
+    def _looks_like_index_mask(self, value: int) -> bool:
+        masked = value & 0xFFFF
+        if masked == 0 or masked == 0xFFFF:
+            return False
+        return masked.bit_count() <= self._INDEX_MASK_MAX_BITS
+
+    def _infer_dispatch_index(
+        self, items: _ItemList, index: int
+    ) -> Optional[IRDispatchIndex]:
+        mask: Optional[int] = None
+        base_literal: Optional[int] = None
+        source_name: Optional[str] = None
+        scan = index - 1
+        steps = 0
+        while scan >= 0 and steps < 12:
+            node = items[scan]
+            if isinstance(node, IRLiteral):
+                value = node.value & 0xFFFF
+                if mask is None and self._looks_like_index_mask(value):
+                    mask = value
+                    scan -= 1
+                    steps += 1
+                    continue
+                if base_literal is None and value not in {0, 0xFFFF}:
+                    base_literal = value
+                    scan -= 1
+                    steps += 1
+                    continue
+            elif isinstance(node, IRLoad):
+                if source_name is None:
+                    alias = self._ssa_value(node)
+                    source_name = alias or node.target
+                    scan -= 1
+                    steps += 1
+                    continue
+                break
+            elif isinstance(node, IRCallCleanup):
+                scan -= 1
+                steps += 1
+                continue
+            elif isinstance(node, IRIOWrite):
+                scan -= 1
+                steps += 1
+                continue
+            elif isinstance(node, IRStackEffect):
+                scan -= 1
+                steps += 1
+                continue
+            elif isinstance(node, IRRaw):
+                if source_name is None:
+                    source_name = self._describe_value(node)
+                    scan -= 1
+                    steps += 1
+                    continue
+                break
+            else:
+                break
+            scan -= 1
+            steps += 1
+
+        if mask is None and base_literal is None and source_name is None:
+            return None
+        return IRDispatchIndex(source=source_name, mask=mask, base=base_literal)
 
     def _resolve_dispatch_helper(
         self,
