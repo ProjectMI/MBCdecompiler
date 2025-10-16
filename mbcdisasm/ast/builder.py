@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
+from enum import Enum, auto
 from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
@@ -349,6 +350,8 @@ class ASTBuilder:
                 entry_reasons=tuple(sorted(accumulator.entry_reasons)),
                 blocks=pending_blocks,
             )
+            if not any(block.statements or block.successors for block in procedure.blocks):
+                continue
             procedures.append(procedure)
         return procedures
 
@@ -509,6 +512,8 @@ class ASTBuilder:
         for block in block_order:
             self._simplify_stack_branches(block)
 
+        self._propagate_branch_invariants(block_order, entry_block)
+
         for block in block_order:
             filtered = tuple(
                 statement
@@ -610,6 +615,253 @@ class ASTBuilder:
                 break
 
         return tuple(block_order)
+
+    # ------------------------------------------------------------------
+    # branch simplification helpers
+    # ------------------------------------------------------------------
+
+    class _BooleanValue(Enum):
+        UNKNOWN = auto()
+        TRUE = auto()
+        FALSE = auto()
+
+        @classmethod
+        def from_bool(cls, value: bool) -> "ASTBuilder._BooleanValue":
+            return cls.TRUE if value else cls.FALSE
+
+        def as_python(self) -> Optional[bool]:
+            if self is ASTBuilder._BooleanValue.TRUE:
+                return True
+            if self is ASTBuilder._BooleanValue.FALSE:
+                return False
+            return None
+
+    _BooleanState = Dict[str, "ASTBuilder._BooleanValue"]
+
+    def _propagate_branch_invariants(
+        self, blocks: Sequence[ASTBlock], entry_block: ASTBlock
+    ) -> None:
+        if not blocks:
+            return
+
+        state_in: Dict[int, ASTBuilder._BooleanState] = {}
+        worklist: deque[ASTBlock] = deque([entry_block])
+        decisions: Dict[int, Tuple[Optional[ASTBlock], bool]] = {}
+        successor_overrides: Dict[int, Tuple[ASTBlock, ...]] = {}
+
+        while worklist:
+            block = worklist.popleft()
+            block_id = id(block)
+            inbound = state_in.get(block_id, {})
+            outbound, decision, succ_override = self._evaluate_block_invariants(
+                block, inbound
+            )
+            if decision:
+                decisions.update(decision)
+            if succ_override is not None:
+                successor_overrides[block_id] = succ_override
+                successors: Tuple[ASTBlock, ...] = succ_override
+            else:
+                successors = block.successors
+
+            for successor in successors:
+                successor_id = id(successor)
+                merged = self._merge_boolean_states(
+                    state_in.get(successor_id), outbound
+                )
+                if merged is not None:
+                    state_in[successor_id] = merged
+                    worklist.append(successor)
+
+        if not decisions and not successor_overrides:
+            return
+
+        for block in blocks:
+            block_id = id(block)
+            if block_id in successor_overrides:
+                block.successors = successor_overrides[block_id]
+            updated_statements: List[ASTStatement] = []
+            for statement in block.statements:
+                decision = decisions.get(id(statement))
+                if decision is None:
+                    updated_statements.append(statement)
+                    continue
+                target, value = decision
+                if isinstance(statement, ASTBranch):
+                    continue
+                if isinstance(statement, (ASTTestSet, ASTFunctionPrologue)):
+                    replacement = self._materialise_boolean_store(statement.var, value)
+                    if replacement is not None:
+                        updated_statements.append(replacement)
+                    continue
+                updated_statements.append(statement)
+            block.statements = tuple(updated_statements)
+
+    def _materialise_boolean_store(
+        self, target_expr: ASTExpression, value: bool
+    ) -> Optional[ASTStatement]:
+        literal = ASTLiteral(1 if value else 0)
+        if isinstance(target_expr, ASTIdentifier):
+            return ASTAssign(target=target_expr, value=literal)
+        if isinstance(target_expr, ASTExpression):
+            return ASTStore(target=target_expr, value=literal)
+        return None
+
+    def _evaluate_block_invariants(
+        self,
+        block: ASTBlock,
+        inbound: _BooleanState,
+    ) -> Tuple[_BooleanState, Dict[int, Tuple[Optional[ASTBlock], bool]], Optional[Tuple[ASTBlock, ...]]]:
+        state = dict(inbound)
+        decisions: Dict[int, Tuple[Optional[ASTBlock], bool]] = {}
+        override: Optional[Tuple[ASTBlock, ...]] = None
+
+        for statement in block.statements:
+            if isinstance(statement, ASTComment):
+                self._update_state_from_comment(state, statement.text)
+                continue
+            if isinstance(statement, ASTAssign):
+                self._update_assignment_state(state, statement.target, statement.value)
+                continue
+            if isinstance(statement, ASTStore):
+                self._update_store_state(state, statement.target, statement.value)
+                continue
+            if isinstance(statement, ASTTestSet):
+                decision = self._evaluate_boolean_branch(
+                    state, statement.expr, statement.then_branch, statement.else_branch
+                )
+                if decision is not None:
+                    chosen, value = decision
+                    decisions[id(statement)] = (chosen, value)
+                    self._update_store_state(
+                        state, statement.var, ASTLiteral(1 if value else 0)
+                    )
+                    override = () if chosen is None else (chosen,)
+                break
+            if isinstance(statement, ASTFunctionPrologue):
+                decision = self._evaluate_boolean_branch(
+                    state, statement.expr, statement.then_branch, statement.else_branch
+                )
+                if decision is not None:
+                    chosen, value = decision
+                    decisions[id(statement)] = (chosen, value)
+                    self._update_store_state(
+                        state, statement.var, ASTLiteral(1 if value else 0)
+                    )
+                    override = () if chosen is None else (chosen,)
+                break
+            if isinstance(statement, ASTBranch):
+                decision = self._evaluate_boolean_branch(
+                    state,
+                    statement.condition,
+                    statement.then_branch,
+                    statement.else_branch,
+                )
+                if decision is not None:
+                    chosen, value = decision
+                    decisions[id(statement)] = (chosen, value)
+                    override = () if chosen is None else (chosen,)
+                break
+
+        return state, decisions, override
+
+    def _evaluate_boolean_branch(
+        self,
+        state: _BooleanState,
+        expr: ASTExpression,
+        then_branch: Optional[ASTBlock],
+        else_branch: Optional[ASTBlock],
+    ) -> Optional[Tuple[Optional[ASTBlock], bool]]:
+        value = self._evaluate_expression_bool(state, expr)
+        if value is None:
+            return None
+        target = then_branch if value else else_branch
+        return (target, value)
+
+    def _evaluate_expression_bool(
+        self, state: _BooleanState, expr: ASTExpression
+    ) -> Optional[bool]:
+        if isinstance(expr, ASTLiteral):
+            return bool(expr.value)
+        if isinstance(expr, ASTIdentifier):
+            name = expr.name
+            if name == "stack_top":
+                stored = state.get(name)
+                return stored.as_python() if stored else None
+            if name in state:
+                return state[name].as_python()
+            lowered = name.lower()
+            if lowered.startswith("bool"):
+                stored = state.get(name)
+                return stored.as_python() if stored else None
+        return None
+
+    def _update_state_from_comment(
+        self, state: _BooleanState, text: str
+    ) -> None:
+        body = text.strip()
+        if body.startswith("lit(") and body.endswith(")"):
+            try:
+                literal = int(body[4:-1], 16)
+            except ValueError:
+                state.pop("stack_top", None)
+                return
+            state["stack_top"] = self._BooleanValue.from_bool(bool(literal))
+            return
+        if body.startswith("drop"):
+            state.pop("stack_top", None)
+            return
+        if "stack_teardown" in body:
+            state["stack_top"] = self._BooleanValue.FALSE
+            return
+        if "stack_setup" in body:
+            state.pop("stack_top", None)
+
+    def _update_assignment_state(
+        self, state: _BooleanState, target: ASTIdentifier, value: ASTExpression
+    ) -> None:
+        name = target.name
+        if not name.lower().startswith("bool"):
+            return
+        resolved = self._evaluate_expression_bool(state, value)
+        if resolved is None:
+            state.pop(name, None)
+            return
+        state[name] = self._BooleanValue.from_bool(resolved)
+
+    def _update_store_state(
+        self, state: _BooleanState, target: ASTExpression, value: ASTExpression
+    ) -> None:
+        if isinstance(target, ASTIdentifier):
+            self._update_assignment_state(state, target, value)
+
+    def _merge_boolean_states(
+        self,
+        existing: Optional[_BooleanState],
+        incoming: _BooleanState,
+    ) -> Optional[_BooleanState]:
+        if existing is None:
+            return dict(incoming)
+        updated: Dict[str, ASTBuilder._BooleanValue] = dict(existing)
+        changed = False
+        keys = set(existing) | set(incoming)
+        for key in keys:
+            left = existing.get(key, self._BooleanValue.UNKNOWN)
+            right = incoming.get(key, self._BooleanValue.UNKNOWN)
+            if left == right:
+                continue
+            if left is self._BooleanValue.UNKNOWN:
+                if right is not self._BooleanValue.UNKNOWN:
+                    updated[key] = right
+                    changed = True
+                continue
+            if right is self._BooleanValue.UNKNOWN:
+                continue
+            if left != right:
+                if updated.get(key) != self._BooleanValue.UNKNOWN:
+                    updated[key] = self._BooleanValue.UNKNOWN
+                    changed = True
+        return updated if changed else None
 
     def _simplify_stack_branches(self, block: ASTBlock) -> None:
         stack: List[Tuple[str, int | None]] = []

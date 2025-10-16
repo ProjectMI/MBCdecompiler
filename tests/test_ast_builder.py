@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.ast import ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
+from mbcdisasm.ast import ASTAssign, ASTBuilder, ASTDispatchTable, ASTReturn, ASTSwitch
 from mbcdisasm.ir.model import (
     IRBlock,
     IRCall,
@@ -9,11 +9,13 @@ from mbcdisasm.ir.model import (
     IRDispatchIndex,
     IRIf,
     IRLoad,
+    IRFunctionPrologue,
     IRProgram,
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
     IRSlot,
+    IRTestSetBranch,
     MemSpace,
     NormalizerMetrics,
 )
@@ -221,3 +223,110 @@ def test_ast_switch_renders_index_note() -> None:
     rendered = switch_stmt.render()
     assert "index=word0 & 0x0007" in rendered
     assert "base=0x0001" in rendered
+
+
+def test_ast_builder_drops_empty_procedures() -> None:
+    empty_block = IRBlock(label="empty", start_offset=0x0100, nodes=tuple())
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(empty_block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    assert not ast_program.segments[0].procedures
+
+
+def test_ast_builder_folds_constant_testset_branch() -> None:
+    entry = IRBlock(
+        label="entry",
+        start_offset=0x0100,
+        nodes=(
+            IRTestSetBranch(
+                var="bool0",
+                expr="lit(0x0000)",
+                then_target=0x0110,
+                else_target=0x0120,
+            ),
+        ),
+    )
+    then_block = IRBlock(
+        label="then",
+        start_offset=0x0110,
+        nodes=(IRReturn(values=("ret0",), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="else",
+        start_offset=0x0120,
+        nodes=(IRReturn(values=("ret1",), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x40,
+        blocks=(entry, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = next(block for block in procedure.blocks if block.start_offset == 0x0100)
+    assert len(entry_block.statements) == 2
+    assignment = entry_block.statements[0]
+    assert isinstance(assignment, ASTAssign)
+    assert assignment.target.name == "bool0"
+    return_stmt = entry_block.statements[1]
+    assert isinstance(return_stmt, ASTReturn)
+
+
+def test_ast_builder_folds_constant_prologue_branch() -> None:
+    entry = IRBlock(
+        label="entry",
+        start_offset=0x0200,
+        nodes=(
+            IRFunctionPrologue(
+                var="slot(0x0100)",
+                expr="lit(0x0001)",
+                then_target=0x0210,
+                else_target=0x0220,
+            ),
+        ),
+    )
+    then_block = IRBlock(
+        label="then",
+        start_offset=0x0210,
+        nodes=(IRReturn(values=("ret0",), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="else",
+        start_offset=0x0220,
+        nodes=(IRReturn(values=("ret1",), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x40,
+        blocks=(entry, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = next(block for block in procedure.blocks if block.start_offset == 0x0200)
+    assert len(entry_block.statements) == 2
+    assignment = entry_block.statements[0]
+    assert isinstance(assignment, ASTAssign)
+    assert assignment.target.name == "slot_0100"
+    return_stmt = entry_block.statements[1]
+    assert isinstance(return_stmt, ASTReturn)
