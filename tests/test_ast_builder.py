@@ -384,7 +384,8 @@ def test_ast_switch_carries_index_metadata() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
-    assert switch_stmt.index_source == "word0"
+    assert switch_stmt.index_expr is not None
+    assert switch_stmt.index_expr.render() == "word0"
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
     rendered = switch_stmt.render()

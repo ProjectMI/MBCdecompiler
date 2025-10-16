@@ -126,6 +126,7 @@ class _PendingDispatchCall:
     helper: int
     index: int
     call: ASTCallExpr
+    args: Tuple[ASTExpression, ...]
 
 
 @dataclass
@@ -134,6 +135,7 @@ class _PendingDispatchTable:
 
     dispatch: IRSwitchDispatch
     index: int
+    index_expr: ASTExpression | None
 
 
 class ASTBuilder:
@@ -917,6 +919,7 @@ class ASTBuilder:
             if isinstance(node, IRSwitchDispatch):
                 self._handle_dispatch_table(
                     node,
+                    value_state,
                     statements,
                     pending_calls,
                     pending_tables,
@@ -975,7 +978,10 @@ class ASTBuilder:
             else:
                 target_index = pending_table.index
             statements[target_index] = self._build_dispatch_switch(
-                call_expr, pending_table.dispatch
+                call_expr,
+                pending_table.dispatch,
+                index_expr=pending_table.index_expr,
+                call_args=arg_exprs,
             )
             return
         if frame is not None:
@@ -983,25 +989,43 @@ class ASTBuilder:
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(
+                helper=node.target,
+                index=index,
+                call=call_expr,
+                args=arg_exprs,
+            )
         )
 
     def _handle_dispatch_table(
         self,
         dispatch: IRSwitchDispatch,
+        value_state: MutableMapping[str, ASTExpression],
         statements: List[ASTStatement],
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
     ) -> None:
+        index_expr = self._resolve_dispatch_index_source(dispatch, value_state)
         call_info = self._pop_dispatch_call(dispatch, pending_calls)
         if call_info is not None:
-            switch_statement = self._build_dispatch_switch(call_info.call, dispatch)
+            switch_statement = self._build_dispatch_switch(
+                call_info.call,
+                dispatch,
+                index_expr=index_expr,
+                call_args=call_info.args,
+            )
             statements[call_info.index] = switch_statement
             return
         index = len(statements)
-        switch_statement = self._build_dispatch_switch(None, dispatch)
+        switch_statement = self._build_dispatch_switch(
+            None,
+            dispatch,
+            index_expr=index_expr,
+        )
         statements.append(switch_statement)
-        pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
+        pending_tables.append(
+            _PendingDispatchTable(dispatch=dispatch, index=index, index_expr=index_expr)
+        )
 
     def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
         if dispatch.helper is not None:
@@ -1117,16 +1141,23 @@ class ASTBuilder:
         )
 
     def _build_dispatch_switch(
-        self, call_expr: ASTCallExpr | None, dispatch: IRSwitchDispatch
+        self,
+        call_expr: ASTCallExpr | None,
+        dispatch: IRSwitchDispatch,
+        *,
+        index_expr: ASTExpression | None = None,
+        call_args: Sequence[ASTExpression] = (),
     ) -> ASTSwitch:
         cases = self._build_dispatch_cases(dispatch.cases)
-        index_source = None
         index_mask = None
         index_base = None
         if dispatch.index is not None:
-            index_source = dispatch.index.source
             index_mask = dispatch.index.mask
             index_base = dispatch.index.base
+            if index_expr is None and dispatch.index.source:
+                index_expr = self._resolve_expr(dispatch.index.source, {})
+        if index_expr is None and call_args:
+            index_expr = call_args[0]
         kind = self._classify_dispatch_kind(dispatch)
         return ASTSwitch(
             call=call_expr,
@@ -1134,11 +1165,24 @@ class ASTBuilder:
             helper=dispatch.helper,
             helper_symbol=dispatch.helper_symbol,
             default=dispatch.default,
-            index_source=index_source,
+            index_expr=index_expr,
             index_mask=index_mask,
             index_base=index_base,
             kind=kind,
         )
+
+    def _resolve_dispatch_index_source(
+        self,
+        dispatch: IRSwitchDispatch,
+        value_state: Mapping[str, ASTExpression],
+    ) -> ASTExpression | None:
+        index_info = dispatch.index
+        if index_info is None:
+            return None
+        source = index_info.source
+        if not source:
+            return None
+        return self._resolve_expr(source, value_state)
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
         helper = dispatch.helper

@@ -546,7 +546,7 @@ class ASTSwitch(ASTStatement):
     helper: int | None = None
     helper_symbol: str | None = None
     default: int | None = None
-    index_source: str | None = None
+    index_expr: ASTExpression | None = None
     index_mask: int | None = None
     index_base: int | None = None
     kind: str | None = None
@@ -561,8 +561,8 @@ class ASTSwitch(ASTStatement):
 
     def _render_index(self) -> str:
         expr = None
-        if self.index_source:
-            expr = self.index_source
+        if self.index_expr is not None:
+            expr = self.index_expr.render()
         elif self.call is not None:
             expr = self.call.render()
         if self.index_mask is not None:
