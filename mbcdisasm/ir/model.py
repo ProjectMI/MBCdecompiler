@@ -291,8 +291,16 @@ class IRAbiEffect(IRNode):
         parts: List[str] = []
         if self.operand is not None:
             value = _format_operand(self.operand)
-            if self.alias and self.alias != value:
-                parts.append(f"value={self.alias}({value})")
+            if self.alias:
+                alias_text = str(self.alias)
+                upper = alias_text.upper()
+                if upper.startswith("0X"):
+                    alias_text = upper
+                # Avoid double-wrapping values such as RET_MASK(RET_MASK(0x2910)).
+                if value == alias_text or value.startswith(f"{alias_text}("):
+                    parts.append(f"value={value}")
+                else:
+                    parts.append(f"value={alias_text}({value})")
             else:
                 parts.append(f"value={value}")
         elif self.alias is not None:

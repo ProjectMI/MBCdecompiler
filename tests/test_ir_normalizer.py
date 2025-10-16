@@ -13,6 +13,7 @@ from mbcdisasm.ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRAbiEffect,
     IRAsciiFinalize,
     IRAsciiHeader,
     IRLiteralChunk,
@@ -1388,6 +1389,32 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x4A, 0x05, 0x0052),  # call helper wrapper
+        build_word(4, 0x28, 0x00, 0x1234),  # call_dispatch
+        build_word(8, 0x10, 0xE8, 0x0001),  # call_helpers cleanup
+        build_word(12, 0x32, 0x29, 0x1000),  # tail mask setup
+        build_word(16, 0x29, 0x10, 0x2910),  # RET_MASK literal
+        build_word(20, 0x01, 0xF0, 0x0000),  # stack teardown
+        build_word(24, 0x30, 0x00, 0x0003),  # return_values (wide hint)
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.returns == ("ret0",)
+
+
 def test_normalizer_absorbs_zero_stack_call_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1856,6 +1883,11 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.call.symbol == "test_helper_1234"
     assert tail_call.call.args == ()
     assert tail_call.returns == ("ret0",)
+
+
+def test_abi_effect_rendering_avoids_nested_aliases() -> None:
+    effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
+    assert effect.describe() == "abi.return_mask value=RET_MASK(0x2910)"
 
 
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:
