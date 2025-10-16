@@ -529,12 +529,16 @@ class ASTSwitchCase:
     key: int
     target: int
     symbol: str | None = None
+    key_symbol: str | None = None
 
     def render(self) -> str:
+        key_repr = f"0x{self.key:04X}"
+        if self.key_symbol:
+            key_repr = f"{self.key_symbol}({key_repr})"
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
-        return f"0x{self.key:04X}->{target_repr}"
+        return f"{key_repr}->{target_repr}"
 
 
 @dataclass

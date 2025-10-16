@@ -7,6 +7,7 @@ from mbcdisasm.ast import (
     ASTBuilder,
     ASTCallFrame,
     ASTCallStatement,
+    ASTIdentifier,
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
@@ -17,6 +18,7 @@ from mbcdisasm.ir.model import (
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
+    IRIOWrite,
     IRLoad,
     IRProgram,
     IRReturn,
@@ -261,6 +263,48 @@ def test_ast_switch_marks_io_dispatch() -> None:
     switch_stmt = statements[0]
     assert isinstance(switch_stmt, ASTSwitch)
     assert switch_stmt.kind == "io"
+
+
+def test_ast_builder_resolves_io_switch_index() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x02, target=0x6671, symbol=None),),
+        helper=0x6671,
+        helper_symbol=None,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0400,
+        nodes=(
+            IRIOWrite(port="ChatOut", mask=0x000C),
+            dispatch,
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    assert isinstance(statements[1], ASTSwitch)
+    switch_stmt = statements[1]
+    assert switch_stmt.helper is None
+    assert switch_stmt.helper_symbol is None
+    assert switch_stmt.kind == "io"
+    assert isinstance(switch_stmt.index_expr, ASTIdentifier)
+    assert switch_stmt.index_expr.render() == "ChatOutMask_000C"
+    assert switch_stmt.cases[0].key_symbol == "ChatOutCase_0002"
+    rendered = switch_stmt.render()
+    assert "helper=" not in rendered
+    assert "ChatOutMask_000C" in rendered
+    assert "ChatOutCase_0002" in rendered
 
 
 def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:

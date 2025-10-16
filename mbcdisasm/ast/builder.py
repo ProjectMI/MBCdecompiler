@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+from ..constants import OPERAND_ALIASES
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -147,6 +148,9 @@ class ASTBuilder:
         self._current_redirects: Mapping[int, int] = {}
         self._pending_call_frame: List[IRStackEffect] = []
         self._pending_epilogue: List[IRStackEffect] = []
+
+        self._io_mask_prefix = {"ChatOut": "ChatOutMask"}
+        self._io_case_prefix = {"ChatOut": "ChatOutCase"}
 
     # ------------------------------------------------------------------
     # public API
@@ -932,6 +936,7 @@ class ASTBuilder:
             statements.extend(node_statements)
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
+        statements = self._resolve_switch_indices(statements)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
@@ -1578,6 +1583,67 @@ class ASTBuilder:
             seen.add(target)
             target = redirects[target]
         return target
+
+    def _resolve_switch_indices(
+        self, statements: List[ASTStatement]
+    ) -> List[ASTStatement]:
+        pending_io: ASTIOWrite | None = None
+        for statement in statements:
+            if isinstance(statement, ASTIOWrite):
+                pending_io = statement
+                continue
+            if isinstance(statement, ASTSwitch):
+                if pending_io is not None:
+                    self._rewrite_switch_with_io_context(statement, pending_io)
+                pending_io = None
+                continue
+            if isinstance(statement, ASTComment):
+                continue
+            pending_io = None
+        return statements
+
+    def _rewrite_switch_with_io_context(
+        self, switch: ASTSwitch, io_write: ASTIOWrite
+    ) -> None:
+        if io_write.mask is None:
+            return
+        if switch.index_expr is not None and not isinstance(
+            switch.index_expr, ASTUnknown
+        ):
+            return
+        mask_name = self._format_io_mask_name(io_write.port, io_write.mask)
+        if mask_name is None:
+            return
+        switch.index_expr = ASTIdentifier(mask_name, SSAValueKind.IO)
+        switch.helper = None
+        switch.helper_symbol = None
+        if switch.kind is None:
+            switch.kind = "io"
+        switch.cases = tuple(
+            ASTSwitchCase(
+                key=case.key,
+                target=case.target,
+                symbol=case.symbol,
+                key_symbol=case.key_symbol
+                or self._format_io_case_name(io_write.port, case.key),
+            )
+            for case in switch.cases
+        )
+
+    def _format_io_mask_name(self, port: str, mask: int) -> str | None:
+        alias = OPERAND_ALIASES.get(mask)
+        if alias and alias != port:
+            return self._sanitize_identifier(alias)
+        prefix = self._io_mask_prefix.get(port, f"{port}Mask")
+        return f"{self._sanitize_identifier(prefix)}_{mask:04X}"
+
+    def _format_io_case_name(self, port: str, key: int) -> str:
+        prefix = self._io_case_prefix.get(port, f"{port}Case")
+        return f"{self._sanitize_identifier(prefix)}_{key:04X}"
+
+    @staticmethod
+    def _sanitize_identifier(text: str) -> str:
+        return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in text)
 
     @staticmethod
     def _is_hex_literal(value: str) -> bool:
