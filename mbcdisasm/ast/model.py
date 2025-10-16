@@ -538,56 +538,57 @@ class ASTSwitchCase:
 
 
 @dataclass
-class ASTDispatchTable(ASTStatement):
-    """Address table extracted from a helper-driven dispatch."""
+class ASTSwitch(ASTStatement):
+    """Normalised jump table reconstructed from helper dispatch patterns."""
 
+    call: ASTCallExpr | None
     cases: Tuple[ASTSwitchCase, ...]
     helper: int | None = None
     helper_symbol: str | None = None
     default: int | None = None
+    index_source: str | None = None
+    index_mask: int | None = None
+    index_base: int | None = None
+    kind: str | None = None
+
+    def _render_helper(self) -> str | None:
+        if self.helper is None:
+            return None
+        helper_repr = f"0x{self.helper:04X}"
+        if self.helper_symbol:
+            helper_repr = f"{self.helper_symbol}({helper_repr})"
+        return f"helper={helper_repr}"
+
+    def _render_index(self) -> str:
+        expr = None
+        if self.index_source:
+            expr = self.index_source
+        elif self.call is not None:
+            expr = self.call.render()
+        if self.index_mask is not None:
+            mask_text = f"0x{self.index_mask:04X}"
+            if expr:
+                expr = f"{expr} & {mask_text}"
+            else:
+                expr = f"& {mask_text}"
+        if not expr:
+            expr = "?"
+        return f"index={expr}"
 
     def render(self) -> str:
-        parts: List[str] = []
-        if self.helper is not None:
-            helper_repr = f"0x{self.helper:04X}"
-            if self.helper_symbol:
-                helper_repr = f"{self.helper_symbol}({helper_repr})"
-            parts.append(f"helper={helper_repr}")
+        parts: List[str] = [self._render_index()]
+        rendered_cases = ", ".join(case.render() for case in self.cases)
+        parts.append(f"table=[{rendered_cases}]")
         if self.default is not None:
             parts.append(f"default=0x{self.default:04X}")
-        prefix = "dispatch.data"
-        if parts:
-            prefix += " " + " ".join(parts)
-        rendered_cases = ", ".join(case.render() for case in self.cases)
-        return f"{prefix} cases=[{rendered_cases}]"
-
-
-@dataclass
-class ASTSwitch(ASTStatement):
-    """Explicit switch extracted from a helper dispatch call."""
-
-    selector: ASTExpression
-    cases: Tuple[ASTSwitchCase, ...]
-    helper: int | None = None
-    helper_symbol: str | None = None
-    default: int | None = None
-    index_note: str | None = None
-
-    def render(self) -> str:
-        helper_note = ""
-        if self.helper is not None:
-            helper_repr = f"0x{self.helper:04X}"
-            if self.helper_symbol:
-                helper_repr = f"{self.helper_symbol}({helper_repr})"
-            helper_note = f" helper={helper_repr}"
-        default_note = ""
-        if self.default is not None:
-            default_note = f" default=0x{self.default:04X}"
-        index_note = ""
-        if self.index_note:
-            index_note = f" index={self.index_note}"
-        rendered_cases = ", ".join(case.render() for case in self.cases)
-        return f"switch {self.selector.render()}{index_note} cases=[{rendered_cases}]{default_note}{helper_note}"
+        if self.index_base is not None:
+            parts.append(f"base=0x{self.index_base:04X}")
+        helper_note = self._render_helper()
+        if helper_note:
+            parts.append(helper_note)
+        if self.kind:
+            parts.append(f"kind={self.kind}")
+        return f"Switch{{{', '.join(parts)}}}"
 
 
 # ---------------------------------------------------------------------------
