@@ -131,6 +131,8 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
         helper=0x1111,
         helper_symbol="helper_1111",
         default=0x3333,
+        selector="word0",
+        mask=0x00FF,
     )
     block = IRBlock(
         label="block_dispatch",
@@ -151,10 +153,13 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     assert isinstance(statements[0], ASTDispatchTable)
+    assert statements[0].mask == 0x00FF
     assert isinstance(statements[1], ASTSwitch)
     assert statements[1].helper == 0x1111
+    assert statements[1].mask == 0x00FF
     assert statements[1].cases[0].key == 0x01
     assert statements[1].cases[0].target == 0x2222
+    assert statements[1].selector.render() == "word0"
     assert isinstance(statements[2], ASTReturn)
 
 
@@ -164,6 +169,7 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
         helper=0x5555,
         helper_symbol=None,
         default=None,
+        selector="lit(0x0002)",
     )
     block = IRBlock(
         label="block_dispatch",
@@ -188,3 +194,4 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].helper == 0x5555
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
+    assert statements[1].selector.render() == "0x0002"

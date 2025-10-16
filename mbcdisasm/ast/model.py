@@ -267,10 +267,12 @@ class ASTIOWrite(ASTStatement):
 
     port: str
     mask: int | None = None
+    action: str | None = None
 
     def render(self) -> str:
         mask = "" if self.mask is None else f", mask=0x{self.mask:04X}"
-        return f"io.write({self.port}{mask})"
+        action = f".{self.action}" if self.action else ""
+        return f"io.write{action}({self.port}{mask})"
 
 
 @dataclass
@@ -412,6 +414,7 @@ class ASTDispatchTable(ASTStatement):
     helper: int | None = None
     helper_symbol: str | None = None
     default: int | None = None
+    mask: int | None = None
 
     def render(self) -> str:
         parts: List[str] = []
@@ -422,6 +425,8 @@ class ASTDispatchTable(ASTStatement):
             parts.append(f"helper={helper_repr}")
         if self.default is not None:
             parts.append(f"default=0x{self.default:04X}")
+        if self.mask is not None:
+            parts.append(f"mask=0x{self.mask:04X}")
         prefix = "dispatch.data"
         if parts:
             prefix += " " + " ".join(parts)
@@ -438,6 +443,7 @@ class ASTSwitch(ASTStatement):
     helper: int | None = None
     helper_symbol: str | None = None
     default: int | None = None
+    mask: int | None = None
 
     def render(self) -> str:
         helper_note = ""
@@ -449,8 +455,14 @@ class ASTSwitch(ASTStatement):
         default_note = ""
         if self.default is not None:
             default_note = f" default=0x{self.default:04X}"
+        mask_note = ""
+        if self.mask is not None:
+            mask_note = f" mask=0x{self.mask:04X}"
         rendered_cases = ", ".join(case.render() for case in self.cases)
-        return f"switch {self.selector.render()} cases=[{rendered_cases}]{default_note}{helper_note}"
+        return (
+            f"switch {self.selector.render()} cases=[{rendered_cases}]"
+            f"{default_note}{mask_note}{helper_note}"
+        )
 
 
 # ---------------------------------------------------------------------------

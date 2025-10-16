@@ -684,6 +684,7 @@ class IRIOWrite(IRNode):
 
     mask: Optional[int] = None
     port: str = IO_PORT_NAME
+    action: Optional[str] = None
     pre_helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     post_helpers: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
 
@@ -694,9 +695,12 @@ class IRIOWrite(IRNode):
         helper_note = _render_io_helpers(self.pre_helpers, self.post_helpers)
         if helper_note:
             details.append(helper_note)
+        prefix = "io.write"
+        if self.action:
+            prefix += f".{self.action}"
         if details:
-            return f"io.write({', '.join(details)})"
-        return "io.write()"
+            return f"{prefix}({', '.join(details)})"
+        return f"{prefix}()"
 
 
 def _render_io_helpers(
@@ -820,6 +824,8 @@ class IRSwitchDispatch(IRNode):
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
+    selector: Optional[str] = None
+    mask: Optional[int] = None
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -828,8 +834,13 @@ class IRSwitchDispatch(IRNode):
             if self.helper_symbol:
                 helper_repr = f"{self.helper_symbol}({helper_repr})"
             helper_details = f"helper={helper_repr}"
+        parts = [helper_details]
+        if self.selector:
+            parts.append(f"selector={self.selector}")
+        if self.mask is not None:
+            parts.append(f"mask=0x{self.mask:04X}")
         case_text = ", ".join(case.describe() for case in self.cases)
-        description = f"dispatch {helper_details} cases=[{case_text}]"
+        description = f"dispatch {' '.join(parts)} cases=[{case_text}]"
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"

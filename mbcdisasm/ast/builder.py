@@ -812,6 +812,7 @@ class ASTBuilder:
             if isinstance(node, IRSwitchDispatch):
                 self._handle_dispatch_table(
                     node,
+                    value_state,
                     statements,
                     pending_calls,
                     pending_tables,
@@ -857,7 +858,9 @@ class ASTBuilder:
         )
         dispatch = self._pop_dispatch_table(node.target, pending_tables)
         if dispatch is not None:
-            statements.append(self._build_dispatch_switch(call_expr, dispatch))
+            statements.append(
+                self._build_dispatch_switch(call_expr, dispatch, value_state)
+            )
             return
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
@@ -868,6 +871,7 @@ class ASTBuilder:
     def _handle_dispatch_table(
         self,
         dispatch: IRSwitchDispatch,
+        value_state: MutableMapping[str, ASTExpression],
         statements: List[ASTStatement],
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
@@ -877,7 +881,9 @@ class ASTBuilder:
         if call_info is not None:
             insert_index = call_info.index
             statements.insert(insert_index, table_statement)
-            switch_statement = self._build_dispatch_switch(call_info.call, dispatch)
+            switch_statement = self._build_dispatch_switch(
+                call_info.call, dispatch, value_state
+            )
             statements[insert_index + 1] = switch_statement
             self._adjust_pending_indices(pending_calls, insert_index)
             self._adjust_table_indices(pending_tables, insert_index)
@@ -928,15 +934,24 @@ class ASTBuilder:
                 entry.index += 1
 
     def _build_dispatch_switch(
-        self, call_expr: ASTCallExpr, dispatch: IRSwitchDispatch
+        self,
+        call_expr: ASTCallExpr,
+        dispatch: IRSwitchDispatch,
+        value_state: Mapping[str, ASTExpression],
     ) -> ASTSwitch:
         cases = self._build_dispatch_cases(dispatch.cases)
+        selector_expr: ASTExpression
+        if dispatch.selector:
+            selector_expr = self._resolve_expr(dispatch.selector, value_state)
+        else:
+            selector_expr = call_expr
         return ASTSwitch(
-            selector=call_expr,
+            selector=selector_expr,
             cases=cases,
             helper=dispatch.helper,
             helper_symbol=dispatch.helper_symbol,
             default=dispatch.default,
+            mask=dispatch.mask,
         )
 
     def _build_dispatch_table(self, dispatch: IRSwitchDispatch) -> ASTDispatchTable:
@@ -946,6 +961,7 @@ class ASTBuilder:
             helper=dispatch.helper,
             helper_symbol=dispatch.helper_symbol,
             default=dispatch.default,
+            mask=dispatch.mask,
         )
 
     def _build_dispatch_cases(
@@ -978,7 +994,7 @@ class ASTBuilder:
         if isinstance(node, IRIORead):
             return [ASTIORead(port=node.port)], []
         if isinstance(node, IRIOWrite):
-            return [ASTIOWrite(port=node.port, mask=node.mask)], []
+            return [ASTIOWrite(port=node.port, mask=node.mask, action=node.action)], []
         if isinstance(node, IRBankedLoad):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None

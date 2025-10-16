@@ -763,6 +763,7 @@ def test_normalizer_handles_direct_io_sequences(tmp_path: Path) -> None:
     assert [node.port for node in io_reads] == [IO_PORT_NAME] * len(io_reads)
 
     assert {node.mask for node in io_writes} == {0x2C03, 0x2669}
+    assert {node.action for node in io_writes} == {"reset", "commit"}
     assert len(io_reads) == 1
 
     raw_mnemonics = {
@@ -805,6 +806,7 @@ def test_normalizer_collapses_io_facade_helpers(tmp_path: Path) -> None:
 
     io_write = io_writes[0]
     assert io_write.mask == 0x109C
+    assert io_write.action is None
     assert [step.mnemonic for step in io_write.pre_helpers] == ["call_helpers"]
     assert [step.operand for step in io_write.pre_helpers] == [0x0100]
     assert [step.mnemonic for step in io_write.post_helpers] == ["op_F0_4B", "op_4A_10"]
@@ -1171,7 +1173,7 @@ def test_normalizer_coalesces_io_operations(tmp_path: Path) -> None:
 
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
 
-    assert "io.write(port=ChatOut, mask=0x2910)" in descriptions
+    assert "io.write.flush(port=ChatOut, mask=0x2910)" in descriptions
     assert "io.read()" in descriptions
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_3D_30" for node in block.nodes
@@ -1708,6 +1710,30 @@ def test_normalizer_defaults_dispatch_helper_to_case_target(tmp_path: Path) -> N
     assert dispatch.helper == 0x6615
 
 
+def test_normalizer_attaches_dispatch_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x10, 0x08, RET_MASK),
+        build_word(4, 0x2C, 0x01, 0x6623),
+        build_word(8, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.mask == RET_MASK
+    assert dispatch.selector is None
+    assert not any(isinstance(node, IRConditionMask) for node in block.nodes)
+
+
 def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1935,6 +1961,7 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     io_write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
     assert io_write.mask == 0x00FF
     assert io_write.port == "ChatOut"
+    assert io_write.action is None
 
 
 @pytest.mark.parametrize("operand", sorted(IO_SLOT_ALIASES - {IO_SLOT}))
@@ -1959,6 +1986,7 @@ def test_normalizer_handles_io_slot_aliases(tmp_path: Path, operand: int) -> Non
     assert len(io_writes) == 1
     node = io_writes[0]
     assert node.port == IO_PORT_NAME
+    assert node.action is None
     raw_suffixes = {
         getattr(candidate, "mnemonic", "")
         for candidate in block.nodes

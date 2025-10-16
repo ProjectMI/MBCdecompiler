@@ -400,6 +400,12 @@ STACK_NEUTRAL_CONTROL_KINDS = {
 
 MASK_OPERAND_ALIASES = {"RET_MASK", "ChatOut", "FANOUT_FLAGS"}
 
+IO_WRITE_ACTIONS = {
+    RET_MASK: "flush",
+    0x2C03: "reset",
+    0x2669: "commit",
+}
+
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
     InstructionKind.INDIRECT_STORE,
@@ -905,6 +911,7 @@ class IRNormalizer:
         self._pass_ascii_headers(items)
         self._pass_call_contracts(items)
         self._pass_condition_masks(items)
+        self._pass_dispatch_masks(items)
         self._pass_call_predicates(items)
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
@@ -2345,7 +2352,7 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         if self._is_io_handshake_instruction(instruction, items, index):
             mask = self._io_mask_value(items, index)
-            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            return IRIOWrite(mask=mask, port=IO_PORT_NAME, action=self._io_write_action(mask))
         if mnemonic in IO_READ_MNEMONICS:
             return IRIORead(port=IO_PORT_NAME)
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
@@ -2358,7 +2365,11 @@ class IRNormalizer:
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
-            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            return IRIOWrite(
+                mask=mask,
+                port=IO_PORT_NAME,
+                action=self._io_write_action(mask),
+            )
         return None
 
     @staticmethod
@@ -2404,6 +2415,11 @@ class IRNormalizer:
             scan -= 1
             steps += 1
         return None
+
+    def _io_write_action(self, mask: Optional[int]) -> Optional[str]:
+        if mask is None:
+            return None
+        return IO_WRITE_ACTIONS.get(mask & 0xFFFF)
 
     def _pass_call_conventions(self, items: _ItemList) -> None:
         index = 0
@@ -2785,13 +2801,119 @@ class IRNormalizer:
             helper_target, helper_symbol = self._resolve_dispatch_helper(
                 items, index, cases, default
             )
+            selector, mask, consumed = self._collect_dispatch_selector(items, index)
+            for position in sorted(consumed, reverse=True):
+                removed = items.pop(position)
+                self._ssa_bindings.pop(id(removed), None)
+                if position < index:
+                    index -= 1
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
+                selector=selector,
+                mask=mask,
             )
             items.replace_slice(index, index + 1, [dispatch])
+            index += 1
+
+    def _collect_dispatch_selector(
+        self, items: _ItemList, index: int
+    ) -> Tuple[Optional[str], Optional[int], List[int]]:
+        selector = self._describe_stack_top(items, index)
+        if selector == "stack_top":
+            selector = None
+        mask: Optional[int] = None
+        consumed: List[int] = []
+
+        def scan(direction: int) -> None:
+            nonlocal mask
+            scan_index = index + direction
+            steps = 0
+            while 0 <= scan_index < len(items) and steps < self._DISPATCH_SELECTOR_SCAN:
+                candidate = items[scan_index]
+                if isinstance(candidate, IRConditionMask):
+                    if mask is None:
+                        mask = candidate.mask & 0xFFFF
+                    consumed.append(scan_index)
+                    scan_index += direction
+                    steps += 1
+                    continue
+                if isinstance(candidate, IRCallCleanup):
+                    scan_index += direction
+                    steps += 1
+                    continue
+                if isinstance(candidate, RawInstruction):
+                    if self._has_mask_operand(candidate) or candidate.mnemonic == "fanout":
+                        if mask is None:
+                            mask = candidate.operand & 0xFFFF
+                        consumed.append(scan_index)
+                        scan_index += direction
+                        steps += 1
+                        continue
+                    event = candidate.event
+                    if (
+                        event.delta != 0
+                        or event.popped_types
+                        or event.pushed_types
+                    ):
+                        break
+                    if candidate.mnemonic.startswith("op_2C_"):
+                        break
+                elif isinstance(candidate, (IRSwitchDispatch, IRTablePatch)):
+                    break
+                else:
+                    break
+                scan_index += direction
+                steps += 1
+
+        scan(-1)
+        if mask is None:
+            scan(1)
+
+        consumed = sorted(set(consumed))
+        return selector, mask, consumed
+
+    def _pass_dispatch_masks(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, IRSwitchDispatch):
+                index += 1
+                continue
+
+            mask = node.mask
+            selector = node.selector
+            changed = False
+
+            while index > 0 and isinstance(items[index - 1], IRConditionMask):
+                mask_node = cast(IRConditionMask, items[index - 1])
+                mask = mask or (mask_node.mask & 0xFFFF)
+                self._ssa_bindings.pop(id(mask_node), None)
+                items.pop(index - 1)
+                index -= 1
+                changed = True
+
+            while index + 1 < len(items) and isinstance(items[index + 1], IRConditionMask):
+                mask_node = cast(IRConditionMask, items[index + 1])
+                mask = mask or (mask_node.mask & 0xFFFF)
+                self._ssa_bindings.pop(id(mask_node), None)
+                items.pop(index + 1)
+                changed = True
+
+            updated_selector = selector
+            if selector and selector.startswith("cleanup_call"):
+                updated_selector = None
+                changed = True
+
+            if changed:
+                replacement = replace(node, mask=mask, selector=updated_selector)
+                items.replace_slice(index, index + 1, [replacement])
+            else:
+                index += 1
+                continue
+
             index += 1
 
     def _pass_dispatch_wrappers(self, items: _ItemList) -> None:
@@ -2999,6 +3121,7 @@ class IRNormalizer:
 
     _TABLE_BUILDER_LOOKAHEAD = 24
     _DISPATCH_HELPER_LOOKAHEAD = 8
+    _DISPATCH_SELECTOR_SCAN = 8
     _DISPATCH_HELPER_SKIP_TYPES = STRUCTURAL_SKIP_NODE_TYPES + (
         IRCallCleanup,
         IRCallPreparation,
@@ -3616,7 +3739,11 @@ class IRNormalizer:
         if helper == 0x00F0:
             io_node: IRNode = IRIORead(port=IO_PORT_NAME)
         else:
-            io_node = IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            io_node = IRIOWrite(
+                mask=mask,
+                port=IO_PORT_NAME,
+                action=self._io_write_action(mask),
+            )
         port_node = items[handshake_index]
         self._transfer_ssa(port_node, io_node)
         self._transfer_ssa(node, io_node)
