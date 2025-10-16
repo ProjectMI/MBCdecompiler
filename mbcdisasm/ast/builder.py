@@ -47,7 +47,6 @@ from .model import (
     ASTCallFrameSlot,
     ASTComment,
     ASTExpression,
-    ASTDispatchTable,
     ASTFrameEffect,
     ASTFlagCheck,
     ASTFunctionPrologue,
@@ -918,6 +917,7 @@ class ASTBuilder:
             if isinstance(node, IRSwitchDispatch):
                 self._handle_dispatch_table(
                     node,
+                    value_state,
                     statements,
                     pending_calls,
                     pending_tables,
@@ -931,6 +931,7 @@ class ASTBuilder:
             )
             statements.extend(node_statements)
             branch_links.extend(node_links)
+        statements = self._collapse_dispatch_sequences(statements)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
@@ -962,14 +963,24 @@ class ASTBuilder:
             len(call_expr.args),
         )
         frame = self._build_call_frame(node, arg_exprs)
-        if frame is not None:
-            statements.append(frame)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        dispatch = self._pop_dispatch_table(node.target, pending_tables)
-        if dispatch is not None:
-            statements.append(self._build_dispatch_switch(call_expr, dispatch))
+        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        if pending_table is not None:
+            if frame is not None:
+                insert_index = pending_table.index
+                statements.insert(insert_index, frame)
+                self._adjust_pending_indices(pending_calls, insert_index)
+                self._adjust_table_indices(pending_tables, insert_index)
+                target_index = insert_index + 1
+            else:
+                target_index = pending_table.index
+            statements[target_index] = self._build_dispatch_switch(
+                call_expr, pending_table.dispatch, value_state
+            )
             return
+        if frame is not None:
+            statements.append(frame)
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
@@ -979,22 +990,23 @@ class ASTBuilder:
     def _handle_dispatch_table(
         self,
         dispatch: IRSwitchDispatch,
+        value_state: MutableMapping[str, ASTExpression],
         statements: List[ASTStatement],
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
     ) -> None:
-        table_statement = self._build_dispatch_table(dispatch)
         call_info = self._pop_dispatch_call(dispatch, pending_calls)
         if call_info is not None:
-            insert_index = call_info.index
-            statements.insert(insert_index, table_statement)
-            switch_statement = self._build_dispatch_switch(call_info.call, dispatch)
-            statements[insert_index + 1] = switch_statement
-            self._adjust_pending_indices(pending_calls, insert_index)
-            self._adjust_table_indices(pending_tables, insert_index)
+            switch_statement = self._build_dispatch_switch(
+                call_info.call, dispatch, value_state
+            )
+            statements[call_info.index] = switch_statement
             return
         index = len(statements)
-        statements.append(table_statement)
+        switch_statement = self._build_dispatch_switch(
+            None, dispatch, value_state
+        )
+        statements.append(switch_statement)
         pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
 
     def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
@@ -1004,12 +1016,12 @@ class ASTBuilder:
 
     def _pop_dispatch_table(
         self, helper: int, pending_tables: List[_PendingDispatchTable]
-    ) -> Optional[IRSwitchDispatch]:
+    ) -> Optional[_PendingDispatchTable]:
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
             if self._dispatch_helper_matches(helper, entry.dispatch):
                 pending_tables.pop(index)
-                return entry.dispatch
+                return entry
         return None
 
     def _pop_dispatch_call(
@@ -1038,41 +1050,126 @@ class ASTBuilder:
             if entry.index >= insert_index:
                 entry.index += 1
 
-    def _build_dispatch_switch(
-        self, call_expr: ASTCallExpr, dispatch: IRSwitchDispatch
-    ) -> ASTSwitch:
-        cases = self._build_dispatch_cases(dispatch.cases)
-        index_note = None
-        if dispatch.index is not None:
-            parts: List[str] = []
-            expr = dispatch.index.source or ""
-            if dispatch.index.mask is not None:
-                mask_text = f"0x{dispatch.index.mask:04X}"
-                expr = f"{expr} & {mask_text}" if expr else f"& {mask_text}"
-            expr = expr.strip()
-            if expr:
-                parts.append(expr)
-            if dispatch.index.base is not None:
-                parts.append(f"base=0x{dispatch.index.base:04X}")
-            if parts:
-                index_note = " ".join(parts)
-        return ASTSwitch(
-            selector=call_expr,
-            cases=cases,
-            helper=dispatch.helper,
-            helper_symbol=dispatch.helper_symbol,
-            default=dispatch.default,
-            index_note=index_note,
+    def _collapse_dispatch_sequences(
+        self, statements: List[ASTStatement]
+    ) -> List[ASTStatement]:
+        collapsed: List[ASTStatement] = []
+        index = 0
+        while index < len(statements):
+            current = statements[index]
+            replacements = self._simplify_dispatch_statement(current)
+            for replacement in replacements:
+                collapsed.append(replacement)
+            if (
+                replacements
+                and isinstance(replacements[-1], (ASTSwitch, ASTCallStatement))
+                and index + 1 < len(statements)
+                and self._is_redundant_dispatch_followup(
+                    replacements[-1], statements[index + 1]
+                )
+            ):
+                index += 1
+            index += 1
+        return collapsed
+
+    def _simplify_dispatch_statement(
+        self, statement: ASTStatement
+    ) -> List[ASTStatement]:
+        if not isinstance(statement, ASTSwitch):
+            return [statement]
+        if len(statement.cases) != 1:
+            return [statement]
+        if statement.call is None:
+            return [statement]
+        if statement.default is not None:
+            return [statement]
+        if statement.call.tail:
+            return [ASTTailCall(call=statement.call, returns=tuple())]
+        return [ASTCallStatement(call=statement.call)]
+
+    def _is_redundant_dispatch_followup(
+        self, primary: ASTStatement, statement: ASTStatement
+    ) -> bool:
+        call_expr = self._extract_dispatch_call(primary)
+        if call_expr is None:
+            return False
+        if isinstance(statement, ASTTailCall):
+            if statement.returns:
+                return False
+            return self._calls_match(statement.call, call_expr)
+        if isinstance(statement, ASTCallStatement):
+            if statement.returns:
+                return False
+            return self._calls_match(statement.call, call_expr)
+        return False
+
+    @staticmethod
+    def _extract_dispatch_call(statement: ASTStatement) -> ASTCallExpr | None:
+        if isinstance(statement, ASTSwitch):
+            return statement.call
+        if isinstance(statement, ASTCallStatement):
+            return statement.call
+        if isinstance(statement, ASTTailCall):
+            return statement.call
+        return None
+
+    @staticmethod
+    def _calls_match(lhs: ASTCallExpr, rhs: ASTCallExpr) -> bool:
+        return (
+            lhs.target == rhs.target
+            and lhs.symbol == rhs.symbol
+            and lhs.args == rhs.args
+            and lhs.varargs == rhs.varargs
         )
 
-    def _build_dispatch_table(self, dispatch: IRSwitchDispatch) -> ASTDispatchTable:
+    def _build_dispatch_switch(
+        self,
+        call_expr: ASTCallExpr | None,
+        dispatch: IRSwitchDispatch,
+        value_state: Mapping[str, ASTExpression],
+    ) -> ASTSwitch:
         cases = self._build_dispatch_cases(dispatch.cases)
-        return ASTDispatchTable(
+        index_expr, index_mask, index_base = self._resolve_dispatch_index(
+            dispatch, value_state
+        )
+        kind = self._classify_dispatch_kind(dispatch)
+        return ASTSwitch(
+            call=call_expr,
             cases=cases,
             helper=dispatch.helper,
             helper_symbol=dispatch.helper_symbol,
             default=dispatch.default,
+            index_expr=index_expr,
+            index_mask=index_mask,
+            index_base=index_base,
+            kind=kind,
         )
+
+    def _resolve_dispatch_index(
+        self,
+        dispatch: IRSwitchDispatch,
+        value_state: Mapping[str, ASTExpression],
+    ) -> Tuple[ASTExpression | None, int | None, int | None]:
+        index_info = dispatch.index
+        if index_info is None:
+            return None, None, None
+        index_expr: ASTExpression | None = None
+        if index_info.source:
+            index_expr = self._resolve_expr(index_info.source, value_state)
+        return index_expr, index_info.mask, index_info.base
+
+    def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
+        helper = dispatch.helper
+        symbol = dispatch.helper_symbol or ""
+        if helper is None and not symbol:
+            return None
+        io_helper_addresses = {0x00F0, 0x0029, 0x002C, 0x0041, 0x0069}
+        if helper in io_helper_addresses:
+            return "io"
+        lowered = symbol.lower()
+        if lowered.startswith("io.") or lowered.startswith("scheduler.mask_"):
+            return "io"
+        return None
 
     def _build_dispatch_cases(
         self, cases: Sequence[IRDispatchCase]
