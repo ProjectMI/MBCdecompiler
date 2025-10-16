@@ -1,9 +1,11 @@
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
+from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTBranch,
     ASTBuilder,
+    ASTCallFrame,
     ASTDispatchTable,
     ASTReturn,
     ASTSwitch,
@@ -285,3 +287,22 @@ def test_ast_switch_renders_index_note() -> None:
     rendered = switch_stmt.render()
     assert "index=word0 & 0x0007" in rendered
     assert "base=0x0001" in rendered
+
+
+def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
+    container, knowledge = build_container(tmp_path)
+    program = IRNormalizer(knowledge).normalise_container(container)
+    ast_program = ASTBuilder().build(program)
+
+    segment = ast_program.segments[0]
+    procedure = segment.procedures[0]
+    block = procedure.blocks[0]
+
+    frame = next(statement for statement in block.statements if isinstance(statement, ASTCallFrame))
+    assert frame.live_mask == RET_MASK
+    assert len(frame.slots) == 2
+
+    return_stmt = next(statement for statement in block.statements if isinstance(statement, ASTReturn))
+    assert return_stmt.finally_branch is not None
+    kinds = [step.kind for step in return_stmt.finally_branch.steps]
+    assert "stack_teardown" in kinds

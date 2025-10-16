@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
     IRBlock,
     IRCall,
     IRCallCleanup,
+    IRCallPreparation,
     IRCallReturn,
     IRFunctionPrologue,
     IRIORead,
@@ -31,6 +32,8 @@ from ..ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRTerminator,
+    IRAbiEffect,
+    IRStackEffect,
     SSAValueKind,
 )
 from .model import (
@@ -40,9 +43,12 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTCallFrame,
+    ASTCallFrameSlot,
     ASTComment,
     ASTExpression,
     ASTDispatchTable,
+    ASTFrameEffect,
     ASTFlagCheck,
     ASTFunctionPrologue,
     ASTIORead,
@@ -60,10 +66,13 @@ from .model import (
     ASTSlotRef,
     ASTStatement,
     ASTStore,
+    ASTFinally,
+    ASTFinallyStep,
     ASTSwitch,
     ASTSwitchCase,
     ASTTailCall,
     ASTTestSet,
+    ASTTupleExpr,
     ASTUnknown,
 )
 
@@ -137,6 +146,8 @@ class ASTBuilder:
         self._current_block_labels: Mapping[int, str] = {}
         self._current_exit_hints: Mapping[int, str] = {}
         self._current_redirects: Mapping[int, int] = {}
+        self._pending_call_frame: List[IRStackEffect] = []
+        self._pending_epilogue: List[IRStackEffect] = []
 
     # ------------------------------------------------------------------
     # public API
@@ -891,6 +902,8 @@ class ASTBuilder:
         branch_links: List[_BranchLink] = []
         pending_calls: List[_PendingDispatchCall] = []
         pending_tables: List[_PendingDispatchTable] = []
+        self._pending_call_frame.clear()
+        self._pending_epilogue.clear()
         for node in block.nodes:
             if isinstance(node, IRCall):
                 self._handle_dispatch_call(
@@ -935,7 +948,7 @@ class ASTBuilder:
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
     ) -> None:
-        call_expr, _ = self._convert_call(
+        call_expr, arg_exprs = self._convert_call(
             node.target,
             node.args,
             node.symbol,
@@ -948,6 +961,11 @@ class ASTBuilder:
             sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
             len(call_expr.args),
         )
+        frame = self._build_call_frame(node, arg_exprs)
+        if frame is not None:
+            statements.append(frame)
+        if getattr(node, "cleanup", tuple()):
+            self._pending_epilogue.extend(node.cleanup)
         dispatch = self._pop_dispatch_table(node.target, pending_tables)
         if dispatch is not None:
             statements.append(self._build_dispatch_switch(call_expr, dispatch))
@@ -1071,6 +1089,10 @@ class ASTBuilder:
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
     ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
+        if isinstance(node, IRCallPreparation):
+            for mnemonic, operand in node.steps:
+                self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
+            return [], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             expr = ASTSlotRef(node.slot)
@@ -1167,7 +1189,7 @@ class ASTBuilder:
             target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
             return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRCallReturn):
-            call_expr, returns = self._convert_call(
+            call_expr, arg_exprs = self._convert_call(
                 node.target,
                 node.args,
                 node.symbol,
@@ -1181,6 +1203,11 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
+            frame = self._build_call_frame(node, arg_exprs)
+            if frame is not None:
+                statements.append(frame)
+            if node.cleanup:
+                self._pending_epilogue.extend(node.cleanup)
             return_identifiers = []
             for index, name in enumerate(node.returns):
                 identifier = ASTIdentifier(name, self._infer_kind(name))
@@ -1190,7 +1217,7 @@ class ASTBuilder:
             statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
             return statements, []
         if isinstance(node, IRTailCall):
-            call_expr, returns = self._convert_call(
+            call_expr, arg_exprs = self._convert_call(
                 node.call.target,
                 node.call.args,
                 node.call.symbol,
@@ -1198,17 +1225,29 @@ class ASTBuilder:
                 node.varargs,
                 value_state,
             )
+            statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
+            frame = self._build_call_frame(node, arg_exprs)
+            if frame is not None:
+                statements.append(frame)
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            return [ASTTailCall(call=call_expr, returns=resolved_returns)], []
+            statements.append(ASTTailCall(call=call_expr, returns=resolved_returns))
+            self._pending_epilogue.clear()
+            return statements, []
         if isinstance(node, IRReturn):
-            values = tuple(self._resolve_expr(name, value_state) for name in node.values)
-            return [ASTReturn(values=values, varargs=node.varargs)], []
+            value = self._build_return_value(node, value_state)
+            finally_branch = self._build_finally(node.cleanup, node.abi_effects)
+            self._pending_epilogue.clear()
+            return [ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)], []
         if isinstance(node, IRCallCleanup):
+            if any(step.mnemonic == "stack_shuffle" for step in node.steps):
+                self._pending_call_frame.extend(node.steps)
+            else:
+                self._pending_epilogue.extend(node.steps)
             return [], []
         if isinstance(node, IRTerminator):
             return [], []
@@ -1284,6 +1323,84 @@ class ASTBuilder:
                 )
             ]
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+
+    @staticmethod
+    def _stack_effect_operand(step: IRStackEffect) -> Optional[int]:
+        include_operand = bool(step.operand_role or step.operand_alias)
+        if not include_operand:
+            include_operand = bool(step.operand) or step.mnemonic not in {"stack_teardown"}
+        return step.operand if include_operand else None
+
+    def _convert_frame_effect(self, step: IRStackEffect) -> ASTFrameEffect:
+        operand = self._stack_effect_operand(step)
+        alias = str(step.operand_alias) if step.operand_alias is not None else None
+        return ASTFrameEffect(kind=step.mnemonic, operand=operand, alias=alias, pops=step.pops)
+
+    def _convert_epilogue_step(self, step: IRStackEffect) -> ASTFinallyStep:
+        operand = self._stack_effect_operand(step)
+        alias = str(step.operand_alias) if step.operand_alias is not None else None
+        return ASTFinallyStep(kind=step.mnemonic, operand=operand, alias=alias, pops=step.pops)
+
+    @staticmethod
+    def _convert_abi_effect(effect: IRAbiEffect) -> ASTFinallyStep:
+        operand = effect.operand
+        alias = str(effect.alias) if effect.alias is not None else None
+        return ASTFinallyStep(kind=f"abi.{effect.kind}", operand=operand, alias=alias)
+
+    def _build_call_frame(
+        self,
+        node: Any,
+        arg_exprs: Sequence[ASTExpression],
+    ) -> Optional[ASTCallFrame]:
+        steps = list(self._pending_call_frame)
+        self._pending_call_frame.clear()
+        effects = [
+            self._convert_frame_effect(step)
+            for step in steps
+            if step.mnemonic != "stack_shuffle"
+        ]
+        arity = getattr(node, "arity", None)
+        slot_count = arity or len(arg_exprs)
+        slots: List[ASTCallFrameSlot] = []
+        if slot_count:
+            values = list(arg_exprs)
+            if len(values) < slot_count:
+                deficit = slot_count - len(values)
+                values.extend(ASTUnknown(f"slot_{index}") for index in range(len(values), len(values) + deficit))
+            for index in range(slot_count):
+                slots.append(ASTCallFrameSlot(index=index, value=values[index]))
+        live_mask = getattr(node, "cleanup_mask", None)
+        if not slots and not effects and live_mask is None:
+            return None
+        return ASTCallFrame(slots=tuple(slots), effects=tuple(effects), live_mask=live_mask)
+
+    def _build_return_value(
+        self,
+        node: IRReturn,
+        value_state: Mapping[str, ASTExpression],
+    ) -> Optional[ASTExpression]:
+        values = [self._resolve_expr(name, value_state) for name in node.values]
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        return ASTTupleExpr(tuple(values))
+
+    def _build_finally(
+        self,
+        cleanup_steps: Sequence[IRStackEffect],
+        abi_effects: Sequence[IRAbiEffect],
+    ) -> Optional[ASTFinally]:
+        steps: List[ASTFinallyStep] = []
+        if self._pending_epilogue:
+            steps.extend(self._convert_epilogue_step(step) for step in self._pending_epilogue)
+        if cleanup_steps:
+            steps.extend(self._convert_epilogue_step(step) for step in cleanup_steps)
+        if abi_effects:
+            steps.extend(self._convert_abi_effect(effect) for effect in abi_effects)
+        if not steps:
+            return None
+        return ASTFinally(steps=tuple(steps))
 
     def _convert_call(
         self,
@@ -1381,6 +1498,8 @@ class ASTBuilder:
         self._current_block_labels = {}
         self._current_exit_hints = {}
         self._current_redirects = {}
+        self._pending_call_frame = []
+        self._pending_epilogue = []
 
 
 __all__ = ["ASTBuilder"]
