@@ -136,6 +136,7 @@ class ASTBuilder:
         self._current_entry_reasons: Mapping[int, Tuple[str, ...]] = {}
         self._current_block_labels: Mapping[int, str] = {}
         self._current_exit_hints: Mapping[int, str] = {}
+        self._current_redirects: Mapping[int, int] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -158,7 +159,7 @@ class ASTBuilder:
         block_map: Dict[int, IRBlock] = {block.start_offset: block for block in segment.blocks}
         analyses = self._build_cfg(segment, block_map)
         entry_reasons = self._detect_entries(segment, block_map, analyses)
-        analyses, entry_reasons = self._compact_cfg(analyses, entry_reasons)
+        analyses, entry_reasons, redirects = self._compact_cfg(analyses, entry_reasons)
         self._current_analyses = analyses
         self._current_entry_reasons = entry_reasons
         self._current_block_labels = {offset: analysis.block.label for offset, analysis in analyses.items()}
@@ -167,6 +168,7 @@ class ASTBuilder:
             for offset, analysis in analyses.items()
             if analysis.exit_reasons
         }
+        self._current_redirects = redirects
         procedures = self._group_procedures(segment, analyses, entry_reasons, metrics)
         result = ASTSegment(
             index=segment.index,
@@ -240,7 +242,11 @@ class ASTBuilder:
         self,
         analyses: Mapping[int, _BlockAnalysis],
         entry_reasons: Mapping[int, Tuple[str, ...]],
-    ) -> Tuple[Mapping[int, _BlockAnalysis], Mapping[int, Tuple[str, ...]]]:
+    ) -> Tuple[
+        Mapping[int, _BlockAnalysis],
+        Mapping[int, Tuple[str, ...]],
+        Mapping[int, int],
+    ]:
         """Collapse trivial cleanup/terminator blocks into their successors."""
 
         trivial_targets: Dict[int, int] = {}
@@ -259,7 +265,7 @@ class ASTBuilder:
                 trivial_targets[offset] = analysis.successors[0]
 
         if not trivial_targets:
-            return analyses, entry_reasons
+            return analyses, entry_reasons, {}
 
         def resolve(target: int) -> int:
             seen: Set[int] = set()
@@ -267,6 +273,8 @@ class ASTBuilder:
                 seen.add(target)
                 target = trivial_targets[target]
             return target
+
+        redirects = {offset: resolve(target) for offset, target in trivial_targets.items()}
 
         compacted: Dict[int, _BlockAnalysis] = {}
         for offset, analysis in analyses.items():
@@ -292,7 +300,7 @@ class ASTBuilder:
             if offset in compacted
         }
 
-        return compacted, updated_entries
+        return compacted, updated_entries, redirects
 
     def _group_procedures(
         self,
@@ -349,6 +357,8 @@ class ASTBuilder:
                 entry_reasons=tuple(sorted(accumulator.entry_reasons)),
                 blocks=pending_blocks,
             )
+            if procedure is None:
+                continue
             procedures.append(procedure)
         return procedures
 
@@ -358,9 +368,14 @@ class ASTBuilder:
         entry_offset: int,
         entry_reasons: Tuple[str, ...],
         blocks: Sequence[_PendingBlock],
-    ) -> ASTProcedure:
+    ) -> Optional[ASTProcedure]:
         realised_blocks = self._realise_blocks(blocks)
         simplified_blocks = self._simplify_blocks(realised_blocks, entry_offset)
+        simplified_blocks = tuple(
+            block for block in simplified_blocks if block.statements or block.successors
+        )
+        if not simplified_blocks:
+            return None
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
         return ASTProcedure(
             name=name,
@@ -506,7 +521,8 @@ class ASTBuilder:
 
         id_map: Dict[int, ASTBlock] = {id(block): block for block in block_order}
 
-        for block in block_order:
+        for block in list(block_order):
+            self._simplify_branch_targets(block, block_order)
             self._simplify_stack_branches(block)
 
         for block in block_order:
@@ -536,17 +552,19 @@ class ASTBuilder:
         while changed:
             changed = False
             for block in list(block_order):
-                if block is entry_block:
-                    continue
                 if block.statements:
                     continue
                 if len(block.successors) != 1:
                     continue
                 successor = block.successors[0]
+                if successor is block:
+                    continue
                 succ_id = id(successor)
                 block_id = id(block)
                 if succ_id not in predecessors:
                     continue
+                if block is entry_block:
+                    entry_block = successor
                 for pred_id in list(predecessors.get(block_id, set())):
                     pred = id_map.get(pred_id)
                     if pred is None:
@@ -645,6 +663,81 @@ class ASTBuilder:
     @staticmethod
     def _is_stack_top_expr(expr: ASTExpression) -> bool:
         return isinstance(expr, ASTIdentifier) and expr.name == "stack_top"
+
+    def _simplify_branch_targets(
+        self, block: ASTBlock, block_order: Sequence[ASTBlock]
+    ) -> None:
+        analysis = self._current_analyses.get(block.start_offset)
+        fallthrough = analysis.fallthrough if analysis else None
+        simplified: List[ASTStatement] = []
+        for statement in block.statements:
+            if isinstance(statement, BranchStatement):
+                updated = self._simplify_branch_statement(
+                    statement, block_order, fallthrough
+                )
+                if updated is None:
+                    continue
+                statement = updated
+            simplified.append(statement)
+        block.statements = tuple(simplified)
+
+    def _simplify_branch_statement(
+        self,
+        statement: BranchStatement,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> Optional[BranchStatement]:
+        then_target = self._ensure_branch_target(
+            statement, "then", block_order, fallthrough
+        )
+        else_target = self._ensure_branch_target(
+            statement, "else", block_order, fallthrough
+        )
+        if (
+            then_target is not None
+            and else_target is not None
+            and then_target == else_target
+        ):
+            return None
+        return statement
+
+    def _ensure_branch_target(
+        self,
+        statement: BranchStatement,
+        prefix: str,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> Optional[int]:
+        branch_attr = f"{prefix}_branch"
+        hint_attr = f"{prefix}_hint"
+        offset_attr = f"{prefix}_offset"
+        branch = getattr(statement, branch_attr)
+        offset = getattr(statement, offset_attr)
+        if branch is not None:
+            offset = branch.start_offset
+        elif offset is None:
+            hint = getattr(statement, hint_attr)
+            if hint == "fallthrough":
+                offset = fallthrough
+        target_block = self._find_block_by_offset(block_order, offset)
+        if target_block is not None:
+            setattr(statement, branch_attr, target_block)
+            setattr(statement, hint_attr, None)
+            setattr(statement, offset_attr, target_block.start_offset)
+            return target_block.start_offset
+        setattr(statement, offset_attr, offset)
+        return offset
+
+    @staticmethod
+    def _find_block_by_offset(
+        blocks: Sequence[ASTBlock], offset: Optional[int]
+    ) -> Optional[ASTBlock]:
+        if offset is None:
+            return None
+        for candidate in blocks:
+            if candidate.start_offset == offset:
+                return candidate
+        return None
 
     @staticmethod
     def _stack_effect_from_comment(text: str) -> Tuple[str, int | None]:
@@ -1121,46 +1214,72 @@ class ASTBuilder:
             return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
-            branch = ASTBranch(condition=condition)
+            then_target = self._resolve_target(node.then_target)
+            else_target = self._resolve_target(node.else_target)
+            branch = ASTBranch(
+                condition=condition,
+                then_offset=then_target,
+                else_offset=else_target,
+            )
             return [branch], [
                 _BranchLink(
                     statement=branch,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+                    then_target=then_target,
+                    else_target=else_target,
                     origin_offset=origin_offset,
                 )
             ]
         if isinstance(node, IRTestSetBranch):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
-            statement = ASTTestSet(var=var_expr, expr=expr)
+            then_target = self._resolve_target(node.then_target)
+            else_target = self._resolve_target(node.else_target)
+            statement = ASTTestSet(
+                var=var_expr,
+                expr=expr,
+                then_offset=then_target,
+                else_offset=else_target,
+            )
             return [statement], [
                 _BranchLink(
                     statement=statement,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+                    then_target=then_target,
+                    else_target=else_target,
                     origin_offset=origin_offset,
                 )
             ]
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
-            statement = ASTFunctionPrologue(var=var_expr, expr=expr)
+            then_target = self._resolve_target(node.then_target)
+            else_target = self._resolve_target(node.else_target)
+            statement = ASTFunctionPrologue(
+                var=var_expr,
+                expr=expr,
+                then_offset=then_target,
+                else_offset=else_target,
+            )
             return [statement], [
                 _BranchLink(
                     statement=statement,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+                    then_target=then_target,
+                    else_target=else_target,
                     origin_offset=origin_offset,
                 )
             ]
         if isinstance(node, IRFlagCheck):
-            statement = ASTFlagCheck(flag=node.flag)
+            then_target = self._resolve_target(node.then_target)
+            else_target = self._resolve_target(node.else_target)
+            statement = ASTFlagCheck(
+                flag=node.flag,
+                then_offset=then_target,
+                else_offset=else_target,
+            )
             return [statement], [
                 _BranchLink(
                     statement=statement,
-                    then_target=node.then_target,
-                    else_target=node.else_target,
+                    then_target=then_target,
+                    else_target=else_target,
                     origin_offset=origin_offset,
                 )
             ]
@@ -1238,6 +1357,14 @@ class ASTBuilder:
         mapping = {"return": "return", "tail_call": "tail_call"}
         return "|".join(mapping.get(reason, reason) for reason in exit_reasons)
 
+    def _resolve_target(self, target: int) -> int:
+        redirects = self._current_redirects
+        seen: Set[int] = set()
+        while target in redirects and target not in seen:
+            seen.add(target)
+            target = redirects[target]
+        return target
+
     @staticmethod
     def _is_hex_literal(value: str) -> bool:
         try:
@@ -1253,6 +1380,7 @@ class ASTBuilder:
         self._current_entry_reasons = {}
         self._current_block_labels = {}
         self._current_exit_hints = {}
+        self._current_redirects = {}
 
 
 __all__ = ["ASTBuilder"]
