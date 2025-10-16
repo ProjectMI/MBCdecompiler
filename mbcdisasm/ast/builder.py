@@ -931,12 +931,27 @@ class ASTBuilder:
         self, call_expr: ASTCallExpr, dispatch: IRSwitchDispatch
     ) -> ASTSwitch:
         cases = self._build_dispatch_cases(dispatch.cases)
+        index_note = None
+        if dispatch.index is not None:
+            parts: List[str] = []
+            expr = dispatch.index.source or ""
+            if dispatch.index.mask is not None:
+                mask_text = f"0x{dispatch.index.mask:04X}"
+                expr = f"{expr} & {mask_text}" if expr else f"& {mask_text}"
+            expr = expr.strip()
+            if expr:
+                parts.append(expr)
+            if dispatch.index.base is not None:
+                parts.append(f"base=0x{dispatch.index.base:04X}")
+            if parts:
+                index_note = " ".join(parts)
         return ASTSwitch(
             selector=call_expr,
             cases=cases,
             helper=dispatch.helper,
             helper_symbol=dispatch.helper_symbol,
             default=dispatch.default,
+            index_note=index_note,
         )
 
     def _build_dispatch_table(self, dispatch: IRSwitchDispatch) -> ASTDispatchTable:

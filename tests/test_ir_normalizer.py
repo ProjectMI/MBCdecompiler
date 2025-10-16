@@ -1708,6 +1708,58 @@ def test_normalizer_defaults_dispatch_helper_to_case_target(tmp_path: Path) -> N
     assert dispatch.helper == 0x6615
 
 
+def test_normalizer_records_dispatch_index(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x03, 0x66, 0x0001),  # load frame slot
+        build_word(4, 0x00, 0x00, 0x0007),  # mask literal
+        build_word(8, 0x2C, 0x01, 0x6623),
+        build_word(12, 0x2C, 0x02, 0x6624),
+        build_word(16, 0x28, 0x00, 0x6623),
+        build_word(20, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.index is not None
+    assert dispatch.index.mask == 0x0007
+    assert dispatch.index.base == 0x0001
+
+
+def test_auto_helper_symbolization(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x02, 0x6600),
+        build_word(4, 0x2B, 0x00, 0x02F0),
+        build_word(8, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.helper == 0x02F0
+    assert dispatch.helper_symbol == "fmt.flush"
+
+
 def test_normalizer_cleans_dispatch_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

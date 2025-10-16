@@ -438,6 +438,7 @@ class ASTSwitch(ASTStatement):
     helper: int | None = None
     helper_symbol: str | None = None
     default: int | None = None
+    index_note: str | None = None
 
     def render(self) -> str:
         helper_note = ""
@@ -449,8 +450,11 @@ class ASTSwitch(ASTStatement):
         default_note = ""
         if self.default is not None:
             default_note = f" default=0x{self.default:04X}"
+        index_note = ""
+        if self.index_note:
+            index_note = f" index={self.index_note}"
         rendered_cases = ", ".join(case.render() for case in self.cases)
-        return f"switch {self.selector.render()} cases=[{rendered_cases}]{default_note}{helper_note}"
+        return f"switch {self.selector.render()}{index_note} cases=[{rendered_cases}]{default_note}{helper_note}"
 
 
 # ---------------------------------------------------------------------------

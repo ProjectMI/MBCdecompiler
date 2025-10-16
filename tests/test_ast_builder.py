@@ -6,6 +6,7 @@ from mbcdisasm.ir.model import (
     IRBlock,
     IRCall,
     IRDispatchCase,
+    IRDispatchIndex,
     IRIf,
     IRLoad,
     IRProgram,
@@ -188,3 +189,35 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert statements[1].helper == 0x5555
     assert statements[1].cases[0].key == 0x02
     assert statements[1].cases[0].target == 0x4444
+
+
+def test_ast_switch_renders_index_note() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x03, target=0x8888, symbol=None),),
+        helper=0x7777,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source="word0", mask=0x0007, base=0x0001),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0300,
+        nodes=(dispatch, IRCall(target=0x7777, args=()), IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+    rendered = switch_stmt.render()
+    assert "index=word0 & 0x0007" in rendered
+    assert "base=0x0001" in rendered

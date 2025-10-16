@@ -813,6 +813,28 @@ class IRDispatchCase:
 
 
 @dataclass(frozen=True)
+class IRDispatchIndex:
+    """Best-effort reconstruction of the dispatch index expression."""
+
+    source: Optional[str] = None
+    mask: Optional[int] = None
+    base: Optional[int] = None
+
+    def describe(self) -> str:
+        parts: List[str] = []
+        expr = self.source or ""
+        if self.mask is not None:
+            mask_text = f"0x{self.mask:04X}"
+            expr = f"{expr} & {mask_text}" if expr else f"& {mask_text}"
+        expr = expr.strip()
+        if expr:
+            parts.append(expr)
+        if self.base is not None:
+            parts.append(f"base=0x{self.base:04X}")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
 class IRSwitchDispatch(IRNode):
     """High level representation of dispatch helper tables."""
 
@@ -820,6 +842,7 @@ class IRSwitchDispatch(IRNode):
     helper: Optional[int] = None
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
+    index: Optional[IRDispatchIndex] = None
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -833,6 +856,10 @@ class IRSwitchDispatch(IRNode):
         if self.default is not None:
             default_repr = f"0x{self.default:04X}"
             description += f" default={default_repr}"
+        if self.index is not None:
+            rendered = self.index.describe()
+            if rendered:
+                description += f" index={rendered}"
         return description
 
 
