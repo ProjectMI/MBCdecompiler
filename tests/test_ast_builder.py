@@ -6,9 +6,10 @@ from mbcdisasm.ast import (
     ASTBranch,
     ASTBuilder,
     ASTCallFrame,
-    ASTDispatchTable,
+    ASTCallStatement,
     ASTReturn,
     ASTSwitch,
+    ASTTailCall,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -21,6 +22,7 @@ from mbcdisasm.ir.model import (
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTailCall,
     IRSlot,
     MemSpace,
     NormalizerMetrics,
@@ -159,12 +161,13 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     ast_program = builder.build(program)
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
-    assert isinstance(statements[0], ASTDispatchTable)
-    assert isinstance(statements[1], ASTSwitch)
-    assert statements[1].helper == 0x1111
-    assert statements[1].cases[0].key == 0x01
-    assert statements[1].cases[0].target == 0x2222
-    assert isinstance(statements[2], ASTReturn)
+    assert all("dispatch.data" not in stmt.render() for stmt in statements)
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.helper == 0x1111
+    assert switch_stmt.cases[0].key == 0x01
+    assert switch_stmt.cases[0].target == 0x2222
+    assert isinstance(statements[1], ASTReturn)
 
 
 def test_ast_builder_converts_dispatch_with_leading_call() -> None:
@@ -192,11 +195,105 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     ast_program = builder.build(program)
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
-    assert isinstance(statements[0], ASTDispatchTable)
-    assert isinstance(statements[1], ASTSwitch)
-    assert statements[1].helper == 0x5555
-    assert statements[1].cases[0].key == 0x02
-    assert statements[1].cases[0].target == 0x4444
+    assert all("dispatch.data" not in stmt.render() for stmt in statements)
+    call_stmt = statements[0]
+    assert isinstance(call_stmt, ASTCallStatement)
+    assert call_stmt.call.target == 0x5555
+    assert call_stmt.call.symbol is None
+
+
+def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x07, target=0xAAAA, symbol=None),),
+        helper=0x6060,
+        helper_symbol="helper_6060",
+        default=None,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0220,
+        nodes=(dispatch, IRCall(target=0x6060, args=(), symbol="helper_6060")),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0220,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert all("dispatch.data" not in stmt.render() for stmt in statements)
+    assert isinstance(statements[0], ASTCallStatement)
+    assert statements[0].call.target == 0x6060
+    assert statements[0].call.symbol == "helper_6060"
+
+
+def test_ast_switch_marks_io_dispatch() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x10, target=0x2000, symbol=None),),
+        helper=0x00F0,
+        helper_symbol="io.flush_tail",
+        default=0x1234,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0250,
+        nodes=(dispatch, IRCall(target=0x00F0, args=(), symbol="io.flush_tail"), IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0250,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.kind == "io"
+
+
+def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x05, target=0x3000, symbol=None),),
+        helper=0x7777,
+        helper_symbol=None,
+    )
+    helper_call = IRCall(target=0x7777, args=())
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0300,
+        nodes=(
+            dispatch,
+            helper_call,
+            IRTailCall(call=IRCall(target=0x7777, args=()), returns=()),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert any(isinstance(stmt, ASTCallStatement) for stmt in statements)
+    assert not any(isinstance(stmt, ASTTailCall) for stmt in statements)
 
 
 def test_ast_builder_prunes_redundant_branch_blocks() -> None:
@@ -257,9 +354,12 @@ def test_ast_builder_drops_empty_procedures() -> None:
     assert ast_program.metrics.procedure_count == 0
 
 
-def test_ast_switch_renders_index_note() -> None:
+def test_ast_switch_carries_index_metadata() -> None:
     dispatch = IRSwitchDispatch(
-        cases=(IRDispatchCase(key=0x03, target=0x8888, symbol=None),),
+        cases=(
+            IRDispatchCase(key=0x03, target=0x8888, symbol=None),
+            IRDispatchCase(key=0x04, target=0x9999, symbol=None),
+        ),
         helper=0x7777,
         helper_symbol=None,
         default=None,
@@ -284,9 +384,97 @@ def test_ast_switch_renders_index_note() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+    assert switch_stmt.index_source == "word0"
+    assert switch_stmt.index_mask == 0x0007
+    assert switch_stmt.index_base == 0x0001
     rendered = switch_stmt.render()
     assert "index=word0 & 0x0007" in rendered
     assert "base=0x0001" in rendered
+
+
+def test_ast_switch_infers_index_from_call_arguments() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x10, target=0x1000, symbol=None),
+            IRDispatchCase(key=0x11, target=0x1100, symbol=None),
+            IRDispatchCase(key=0x12, target=0x1200, symbol=None),
+        ),
+        helper=0x660A,
+        helper_symbol="helper_660A",
+        default=None,
+        index=None,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0310,
+        nodes=(
+            IRCall(target=0x660A, args=("word0",), symbol="helper_660A"),
+            dispatch,
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0310,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+    assert switch_stmt.index_source == "word0"
+    assert switch_stmt.index_mask == 0x0003
+    assert switch_stmt.index_base == 0x0010
+    rendered = switch_stmt.render()
+    assert "index=word0 & 0x0003" in rendered
+    assert "base=0x0010" in rendered
+
+
+def test_ast_switch_fills_missing_index_source_from_call() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x05, target=0x2000, symbol=None),
+            IRDispatchCase(key=0x06, target=0x2100, symbol=None),
+        ),
+        helper=0x6610,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source=None, mask=0x0003, base=0x0005),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0320,
+        nodes=(
+            IRCall(target=0x6610, args=("word1",), symbol=None),
+            dispatch,
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0320,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+    assert switch_stmt.index_source == "word1"
+    assert switch_stmt.index_mask == 0x0003
+    assert switch_stmt.index_base == 0x0005
+    rendered = switch_stmt.render()
+    assert "index=word1 & 0x0003" in rendered
+    assert "base=0x0005" in rendered
 
 
 def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
