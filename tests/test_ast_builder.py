@@ -3,14 +3,17 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTBlock,
     ASTBranch,
     ASTBuilder,
     ASTCallFrame,
     ASTCallStatement,
+    ASTIdentifier,
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
 )
+from mbcdisasm.ast.builder import _BlockAnalysis
 from mbcdisasm.ir.model import (
     IRBlock,
     IRCall,
@@ -560,3 +563,39 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert return_stmt.finally_branch is not None
     kinds = [step.kind for step in return_stmt.finally_branch.steps]
     assert "stack_teardown" in kinds
+
+
+def test_ast_builder_resolves_fallthrough_hints() -> None:
+    builder = ASTBuilder()
+    origin_ir = IRBlock(label="origin", start_offset=0x0100, nodes=())
+    analysis = _BlockAnalysis(
+        block=origin_ir,
+        successors=(0x0110,),
+        exit_reasons=(),
+        fallthrough=0x0110,
+    )
+    fallthrough_block = ASTBlock(
+        label="fallthrough",
+        start_offset=0x0110,
+        statements=tuple(),
+        successors=tuple(),
+    )
+    branch = ASTBranch(
+        condition=ASTIdentifier("cond"),
+        then_branch=None,
+        else_branch=None,
+        then_hint="fallthrough",
+    )
+    block = ASTBlock(
+        label="origin",
+        start_offset=0x0100,
+        statements=(branch,),
+        successors=(fallthrough_block,),
+    )
+    builder._current_analyses = {block.start_offset: analysis}
+
+    builder._resolve_fallthrough_hints(block)
+
+    assert branch.then_branch is fallthrough_block
+    assert branch.then_hint is None
+    assert branch.then_offset == fallthrough_block.start_offset

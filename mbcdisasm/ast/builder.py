@@ -563,6 +563,7 @@ class ASTBuilder:
         for block in list(block_order):
             self._simplify_branch_targets(block, block_order)
             self._simplify_stack_branches(block)
+            self._resolve_fallthrough_hints(block)
 
         for block in block_order:
             filtered = tuple(
@@ -739,6 +740,36 @@ class ASTBuilder:
         ):
             return None
         return statement
+
+    def _resolve_fallthrough_hints(self, block: ASTBlock) -> None:
+        analysis = self._current_analyses.get(block.start_offset)
+        if analysis is None or analysis.fallthrough is None:
+            return
+        fallthrough_target = analysis.fallthrough
+        successor = next(
+            (
+                candidate
+                for candidate in block.successors
+                if candidate.start_offset == fallthrough_target
+            ),
+            None,
+        )
+        if successor is None:
+            return
+        for statement in block.statements:
+            if not isinstance(statement, BranchStatement):
+                continue
+            for prefix in ("then", "else"):
+                branch_attr = f"{prefix}_branch"
+                hint_attr = f"{prefix}_hint"
+                offset_attr = f"{prefix}_offset"
+                if getattr(statement, branch_attr) is not None:
+                    continue
+                if getattr(statement, hint_attr) != "fallthrough":
+                    continue
+                setattr(statement, branch_attr, successor)
+                setattr(statement, hint_attr, None)
+                setattr(statement, offset_attr, successor.start_offset)
 
     def _ensure_branch_target(
         self,
