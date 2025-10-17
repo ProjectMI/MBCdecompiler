@@ -7,7 +7,9 @@ from mbcdisasm.ast import (
     ASTBuilder,
     ASTCallFrame,
     ASTCallStatement,
+    ASTLiteral,
     ASTReturn,
+    ASTSlotRef,
     ASTSwitch,
     ASTTailCall,
 )
@@ -399,6 +401,24 @@ def test_ast_switch_carries_index_metadata() -> None:
     assert switch_stmt.index_expr.render() == "word0"
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
+
+
+def test_ast_builder_resolves_slot_reference() -> None:
+    builder = ASTBuilder()
+    expr = builder._resolve_expr("slot(0x0004)", {})
+    assert isinstance(expr, ASTSlotRef)
+    assert expr.slot.space is MemSpace.FRAME
+    assert expr.slot.index == 0x0004
+
+
+def test_ast_builder_reuses_call_frame_argument() -> None:
+    builder = ASTBuilder()
+    literal = ASTLiteral(0x1234)
+    call = IRCall(target=0x1000, args=())
+    frame = builder._build_call_frame(call, (literal,))
+    assert frame is not None
+    resolved = builder._resolve_expr("slot_0", {})
+    assert resolved == literal
 
 
 def test_ast_builder_merges_enum_members_across_switches() -> None:

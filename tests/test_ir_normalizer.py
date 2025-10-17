@@ -16,7 +16,9 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
+    IRLoad,
     IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
@@ -38,6 +40,8 @@ from mbcdisasm.ir.model import (
     IRTableBuilderBegin,
     IRTableBuilderEmit,
     IRTableBuilderCommit,
+    MemSpace,
+    IRSlot,
     NormalizerMetrics,
     IRIORead,
 )
@@ -1733,6 +1737,22 @@ def test_normalizer_records_dispatch_index(tmp_path: Path) -> None:
     assert dispatch.index is not None
     assert dispatch.index.mask == 0x0007
     assert dispatch.index.base == 0x0001
+
+
+def test_normalizer_dispatch_index_traces_source(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    load = IRLoad(slot=IRSlot(MemSpace.FRAME, 0x0020), target="word0")
+    mask_literal = IRLiteral(value=0x0007, mode=0, source="mask")
+    table = IRTablePatch(operations=(("op_2C_01", 0x6623),))
+    items = _ItemList([load, mask_literal, table])
+
+    index_info = normalizer._infer_dispatch_index(items, 2)
+    assert index_info is not None
+    assert index_info.source == "word0"
+    assert index_info.mask == 0x0007
+    assert index_info.base is None
 
 
 def test_auto_helper_symbolization(tmp_path: Path) -> None:

@@ -3158,17 +3158,20 @@ class IRNormalizer:
         source_name: Optional[str] = None
         scan = index - 1
         steps = 0
+        skip_nodes: Set[int] = set()
         while scan >= 0 and steps < 12:
             node = items[scan]
             if isinstance(node, IRLiteral):
                 value = node.value & 0xFFFF
                 if mask is None and self._looks_like_index_mask(value):
                     mask = value
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
                 if base_literal is None and value not in {0, 0xFFFF}:
                     base_literal = value
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
@@ -3176,6 +3179,7 @@ class IRNormalizer:
                 if source_name is None:
                     alias = self._ssa_value(node)
                     source_name = alias or node.target
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
@@ -3195,6 +3199,7 @@ class IRNormalizer:
             elif isinstance(node, IRRaw):
                 if source_name is None:
                     source_name = self._describe_value(node)
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
@@ -3204,9 +3209,56 @@ class IRNormalizer:
             scan -= 1
             steps += 1
 
+        if source_name is None:
+            source_name = self._find_dispatch_source(items, index, skip_nodes)
+
         if mask is None and base_literal is None and source_name is None:
             return None
         return IRDispatchIndex(source=source_name, mask=mask, base=base_literal)
+
+    def _find_dispatch_source(
+        self, items: _ItemList, index: int, skip_nodes: Set[int]
+    ) -> Optional[str]:
+        scan = index - 1
+        while scan >= 0:
+            node = items[scan]
+            if id(node) in skip_nodes:
+                scan -= 1
+                continue
+            if isinstance(node, (IRCallCleanup, IRIOWrite, IRStackEffect, IRConditionMask)):
+                scan -= 1
+                continue
+            if isinstance(node, IRLiteral):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                return node.describe()
+            if isinstance(node, IRLiteralChunk):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                return node.describe()
+            if isinstance(node, IRStackDuplicate):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                return node.value
+            if isinstance(node, RawInstruction):
+                if node.pushes_value():
+                    mapped = self._ssa_value(node)
+                    if mapped is not None:
+                        return mapped
+                    return self._describe_value(node)
+                break
+            if isinstance(node, IRNode):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                describe = getattr(node, "describe", None)
+                if callable(describe):
+                    return describe()
+            scan -= 1
+        return None
 
     def _resolve_dispatch_helper(
         self,
