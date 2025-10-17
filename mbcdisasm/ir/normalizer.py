@@ -924,6 +924,8 @@ class IRNormalizer:
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
 
+        self._pass_refresh_dispatch_indices(items)
+
         final_items = list(items)
         final_wrapper = _ItemList(final_items)
         nodes: List[IRNode] = []
@@ -2931,6 +2933,39 @@ class IRNormalizer:
 
             index = follow
 
+    def _pass_refresh_dispatch_indices(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if not isinstance(node, IRSwitchDispatch):
+                index += 1
+                continue
+
+            fresh = self._infer_dispatch_index(items, index)
+            existing = node.index
+            if fresh is None:
+                fresh = IRDispatchIndex()
+
+            if existing is None:
+                combined = fresh
+            else:
+                combined = IRDispatchIndex(
+                    source=fresh.source or existing.source,
+                    mask=fresh.mask if fresh.mask is not None else existing.mask,
+                    base=fresh.base if fresh.base is not None else existing.base,
+                )
+
+            if existing != combined:
+                updated = IRSwitchDispatch(
+                    cases=node.cases,
+                    helper=node.helper,
+                    helper_symbol=node.helper_symbol,
+                    default=node.default,
+                    index=combined,
+                )
+                items.replace_slice(index, index + 1, [updated])
+            index += 1
+
     def _pass_table_builders(self, items: _ItemList) -> None:
         state: Optional[_TableBuilderState] = None
         index = 0
@@ -3158,37 +3193,47 @@ class IRNormalizer:
         source_name: Optional[str] = None
         scan = index - 1
         steps = 0
-        while scan >= 0 and steps < 12:
+        while scan >= 0 and steps < 24:
             node = items[scan]
             if isinstance(node, IRLiteral):
                 value = node.value & 0xFFFF
-                if mask is None and self._looks_like_index_mask(value):
-                    mask = value
+                if self._looks_like_index_mask(value):
+                    mask = value if mask is None else mask
                     scan -= 1
                     steps += 1
                     continue
-                if base_literal is None and value not in {0, 0xFFFF}:
-                    base_literal = value
+                if value not in {0, 0xFFFF}:
+                    base_literal = value if base_literal is None else base_literal
                     scan -= 1
                     steps += 1
                     continue
-            elif isinstance(node, IRLoad):
+            elif isinstance(node, (IRLoad, IRIndirectLoad, IRBankedLoad)):
                 if source_name is None:
                     alias = self._ssa_value(node)
-                    source_name = alias or node.target
+                    source_name = alias or getattr(node, "target", None)
                     scan -= 1
                     steps += 1
                     continue
                 break
-            elif isinstance(node, IRCallCleanup):
-                scan -= 1
-                steps += 1
-                continue
-            elif isinstance(node, IRIOWrite):
-                scan -= 1
-                steps += 1
-                continue
-            elif isinstance(node, IRStackEffect):
+            elif isinstance(node, IRStackDuplicate):
+                if source_name is None:
+                    source_name = node.value
+                    scan -= 1
+                    steps += 1
+                    continue
+                break
+            elif isinstance(
+                node,
+                (
+                    IRCallCleanup,
+                    IRCallPreparation,
+                    IRIOWrite,
+                    IRStackEffect,
+                    IRLiteralChunk,
+                    IRPageRegister,
+                    IRDataMarker,
+                ),
+            ):
                 scan -= 1
                 steps += 1
                 continue
@@ -3205,7 +3250,7 @@ class IRNormalizer:
             steps += 1
 
         if mask is None and base_literal is None and source_name is None:
-            return None
+            return IRDispatchIndex()
         return IRDispatchIndex(source=source_name, mask=mask, base=base_literal)
 
     def _resolve_dispatch_helper(

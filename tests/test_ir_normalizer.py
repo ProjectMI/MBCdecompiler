@@ -16,7 +16,9 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
+    IRDispatchCase,
     IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
@@ -1733,6 +1735,38 @@ def test_normalizer_records_dispatch_index(tmp_path: Path) -> None:
     assert dispatch.index is not None
     assert dispatch.index.mask == 0x0007
     assert dispatch.index.base == 0x0001
+
+
+def test_infer_dispatch_index_traces_indirect_load(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    load = IRIndirectLoad(base="ptr0", offset=0x8C03, target="word0")
+    filler_cleanup = IRCallCleanup(steps=(IRStackEffect(mnemonic="noop"),))
+    filler_chunk = IRLiteralChunk(data=b"test", source="chunk")
+    intermediate_literal = IRLiteral(value=0x7223, mode=0, source="filler")
+    base_literal = IRLiteral(value=0x20B8, mode=0, source="base")
+    mask_literal = IRLiteral(value=0x0026, mode=0, source="mask")
+    dispatch = IRSwitchDispatch(cases=(IRDispatchCase(key=0x05, target=0x6667, symbol=None),))
+
+    items = _ItemList(
+        [
+            load,
+            filler_cleanup,
+            filler_chunk,
+            IRCallCleanup(steps=tuple()),
+            intermediate_literal,
+            base_literal,
+            mask_literal,
+            dispatch,
+        ]
+    )
+
+    info = normalizer._infer_dispatch_index(items, len(items) - 1)
+
+    assert info.source == "word0"
+    assert info.mask == 0x0026
+    assert info.base == 0x20B8
 
 
 def test_auto_helper_symbolization(tmp_path: Path) -> None:

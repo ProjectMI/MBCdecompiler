@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
@@ -7,9 +8,11 @@ from mbcdisasm.ast import (
     ASTBuilder,
     ASTCallFrame,
     ASTCallStatement,
+    ASTLiteral,
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTSlotRef,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -399,6 +402,24 @@ def test_ast_switch_carries_index_metadata() -> None:
     assert switch_stmt.index_expr.render() == "word0"
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
+
+
+def test_resolve_expr_returns_slot_reference() -> None:
+    builder = ASTBuilder()
+    expr = builder._resolve_expr("slot(0x0002)", {})
+    assert isinstance(expr, ASTSlotRef)
+    assert expr.slot.index == 0x0002
+    assert expr.slot.space is MemSpace.FRAME
+
+
+def test_resolve_expr_uses_call_frame_values() -> None:
+    builder = ASTBuilder()
+    node = SimpleNamespace(arity=1, cleanup_mask=None)
+    frame = builder._build_call_frame(node, (ASTLiteral(0x1234),))
+    assert frame is not None
+    expr = builder._resolve_expr("slot_0000", {})
+    assert isinstance(expr, ASTLiteral)
+    assert expr.value == 0x1234
 
 
 def test_ast_builder_merges_enum_members_across_switches() -> None:

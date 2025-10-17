@@ -26,6 +26,7 @@ from ..ir.model import (
     IRProgram,
     IRReturn,
     IRSegment,
+    IRSlot,
     IRStore,
     IRSwitchDispatch,
     IRTestSetBranch,
@@ -34,6 +35,7 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    MemSpace,
     SSAValueKind,
 )
 from .model import (
@@ -165,6 +167,7 @@ class ASTBuilder:
         self._segment_declared_enum_keys: List[str] = []
         self._segment_declared_enum_set: Set[str] = set()
         self._current_segment_index: int = -1
+        self._call_frame_values: Dict[str, ASTExpression] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -932,6 +935,7 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
+        self._call_frame_values.clear()
         for node in block.nodes:
             if isinstance(node, IRCall):
                 self._handle_dispatch_call(
@@ -1674,6 +1678,7 @@ class ASTBuilder:
         node: Any,
         arg_exprs: Sequence[ASTExpression],
     ) -> Optional[ASTCallFrame]:
+        self._call_frame_values.clear()
         steps = list(self._pending_call_frame)
         self._pending_call_frame.clear()
         effects = [
@@ -1694,7 +1699,14 @@ class ASTBuilder:
         live_mask = getattr(node, "cleanup_mask", None)
         if not slots and not effects and live_mask is None:
             return None
-        return ASTCallFrame(slots=tuple(slots), effects=tuple(effects), live_mask=live_mask)
+        frame = ASTCallFrame(slots=tuple(slots), effects=tuple(effects), live_mask=live_mask)
+        if frame.slots:
+            mapping: Dict[str, ASTExpression] = {}
+            for slot in frame.slots:
+                mapping[f"slot_{slot.index:04X}"] = slot.value
+                mapping[f"slot_{slot.index}"] = slot.value
+            self._call_frame_values = mapping
+        return frame
 
     def _build_return_value(
         self,
@@ -1742,6 +1754,8 @@ class ASTBuilder:
             return ASTUnknown("")
         if token in value_state:
             return value_state[token]
+        if token in self._call_frame_values:
+            return self._call_frame_values[token]
         if token.startswith("lit(") and token.endswith(")"):
             literal = token[4:-1]
             try:
@@ -1754,8 +1768,17 @@ class ASTBuilder:
                 index = int(token[5:-1], 16)
             except ValueError:
                 return ASTUnknown(token)
-            return ASTIdentifier(f"slot_{index:04X}", SSAValueKind.POINTER)
+            slot = IRSlot(space=self._slot_space(index), index=index)
+            return ASTSlotRef(slot)
         return ASTIdentifier(token, self._infer_kind(token))
+
+    @staticmethod
+    def _slot_space(index: int) -> MemSpace:
+        if index < 0x1000:
+            return MemSpace.FRAME
+        if index < 0x8000:
+            return MemSpace.GLOBAL
+        return MemSpace.CONST
 
     def _infer_kind(self, name: str) -> SSAValueKind:
         lowered = name.lower()
