@@ -12,6 +12,7 @@ from mbcdisasm.ast import (
     ASTTailCall,
 )
 from mbcdisasm.ir.model import (
+    DispatchKind,
     IRBlock,
     IRCall,
     IRDispatchCase,
@@ -233,12 +234,13 @@ def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:
     assert statements[0].call.symbol == "helper_6060"
 
 
-def test_ast_switch_marks_io_dispatch() -> None:
+def test_ast_switch_preserves_dispatch_kind() -> None:
     dispatch = IRSwitchDispatch(
         cases=(IRDispatchCase(key=0x10, target=0x2000, symbol=None),),
         helper=0x00F0,
         helper_symbol="io.flush_tail",
         default=0x1234,
+        kind=DispatchKind.IO,
     )
     block = IRBlock(
         label="block_dispatch",
@@ -260,7 +262,37 @@ def test_ast_switch_marks_io_dispatch() -> None:
 
     switch_stmt = statements[0]
     assert isinstance(switch_stmt, ASTSwitch)
-    assert switch_stmt.kind == "io"
+    assert switch_stmt.kind is DispatchKind.IO
+    assert "kind=IO" in switch_stmt.render()
+
+
+def test_ast_switch_renders_unknown_kind() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x10, target=0x2000, symbol=None),),
+        kind=DispatchKind.UNKNOWN,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0260,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0260,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.kind is DispatchKind.UNKNOWN
+    assert "kind=UNKNOWN" in switch_stmt.render()
 
 
 def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:

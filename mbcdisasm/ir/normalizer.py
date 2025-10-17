@@ -64,6 +64,7 @@ from .model import (
     IRTableBuilderBegin,
     IRTableBuilderEmit,
     IRTableBuilderCommit,
+    DispatchKind,
     IRDispatchCase,
     IRDispatchIndex,
     IRSwitchDispatch,
@@ -242,6 +243,37 @@ LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0400: "literal_hint",
     0x0110: "literal_hint",
 }
+
+
+def _dispatch_kind_from_symbol(symbol: str) -> Optional[DispatchKind]:
+    lowered = symbol.lower()
+    if lowered.startswith("io."):
+        return DispatchKind.IO
+    if lowered.startswith("scheduler.mask_"):
+        return DispatchKind.MASK
+    return None
+
+
+def _build_dispatch_kind_table() -> Dict[int, DispatchKind]:
+    mapping: Dict[int, DispatchKind] = {}
+    for table in (CALL_HELPER_ALIASES, TAIL_HELPER_ALIASES):
+        for helper, alias in table.items():
+            kind = _dispatch_kind_from_symbol(alias)
+            if kind is not None:
+                mapping[helper] = kind
+    manual_overrides = {
+        0x00F0: DispatchKind.IO,
+        0x0029: DispatchKind.MASK,
+        0x002C: DispatchKind.MASK,
+        0x0041: DispatchKind.MASK,
+        0x0069: DispatchKind.MASK,
+    }
+    for helper, kind in manual_overrides.items():
+        mapping.setdefault(helper, kind)
+    return mapping
+
+
+DISPATCH_HELPER_KINDS = _build_dispatch_kind_table()
 
 
 def _io_slot_bytes() -> Set[int]:
@@ -2791,16 +2823,20 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            helper_target, helper_symbol = self._resolve_dispatch_helper(
+            helper_target, helper_symbol, derived_helper = self._resolve_dispatch_helper(
                 items, index, cases, default
             )
             index_info = self._infer_dispatch_index(items, index)
+            dispatch_kind = self._dispatch_kind_for_helper(
+                helper_target, helper_symbol, derived_helper
+            )
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
                 index=index_info,
+                kind=dispatch_kind,
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
@@ -3208,33 +3244,51 @@ class IRNormalizer:
             return None
         return IRDispatchIndex(source=source_name, mask=mask, base=base_literal)
 
+    def _dispatch_kind_for_helper(
+        self,
+        helper: Optional[int],
+        helper_symbol: Optional[str],
+        derived: bool,
+    ) -> Optional[DispatchKind]:
+        if helper is not None:
+            kind = DISPATCH_HELPER_KINDS.get(helper)
+            if kind is not None:
+                return kind
+        if helper_symbol:
+            symbol_kind = _dispatch_kind_from_symbol(helper_symbol)
+            if symbol_kind is not None:
+                return symbol_kind
+        if derived and (helper is not None or helper_symbol):
+            return DispatchKind.UNKNOWN
+        return None
+
     def _resolve_dispatch_helper(
         self,
         items: _ItemList,
         index: int,
         cases: Sequence[IRDispatchCase],
         default: Optional[int],
-    ) -> Tuple[Optional[int], Optional[str]]:
+    ) -> Tuple[Optional[int], Optional[str], bool]:
         for direction in (1, -1):
             call = self._find_dispatch_calllike(items, index, direction)
             if call is not None:
                 target = getattr(call, "target", None)
                 if isinstance(target, int):
-                    return target, self._helper_symbol(target)
+                    return target, self._helper_symbol(target), False
 
         unique_targets = {case.target for case in cases}
         if len(unique_targets) == 1:
             helper = next(iter(unique_targets))
-            return helper, self._helper_symbol(helper)
+            return helper, self._helper_symbol(helper), True
 
         if default is not None:
-            return default, self._helper_symbol(default)
+            return default, self._helper_symbol(default), True
 
         if cases:
             helper = cases[0].target
-            return helper, self._helper_symbol(helper)
+            return helper, self._helper_symbol(helper), True
 
-        return None, None
+        return None, None, True
 
     def _find_dispatch_calllike(
         self, items: _ItemList, index: int, direction: int

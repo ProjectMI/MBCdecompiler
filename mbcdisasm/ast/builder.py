@@ -1132,7 +1132,6 @@ class ASTBuilder:
         index_expr, index_mask, index_base = self._resolve_dispatch_index(
             dispatch, value_state
         )
-        kind = self._classify_dispatch_kind(dispatch)
         return ASTSwitch(
             call=call_expr,
             cases=cases,
@@ -1142,7 +1141,7 @@ class ASTBuilder:
             index_expr=index_expr,
             index_mask=index_mask,
             index_base=index_base,
-            kind=kind,
+            kind=dispatch.kind,
         )
 
     def _resolve_dispatch_index(
@@ -1157,19 +1156,6 @@ class ASTBuilder:
         if index_info.source:
             index_expr = self._resolve_expr(index_info.source, value_state)
         return index_expr, index_info.mask, index_info.base
-
-    def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
-        helper = dispatch.helper
-        symbol = dispatch.helper_symbol or ""
-        if helper is None and not symbol:
-            return None
-        io_helper_addresses = {0x00F0, 0x0029, 0x002C, 0x0041, 0x0069}
-        if helper in io_helper_addresses:
-            return "io"
-        lowered = symbol.lower()
-        if lowered.startswith("io.") or lowered.startswith("scheduler.mask_"):
-            return "io"
-        return None
 
     def _build_dispatch_cases(
         self, cases: Sequence[IRDispatchCase]

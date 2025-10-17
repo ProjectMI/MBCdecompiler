@@ -30,6 +30,14 @@ class SSAValueKind(Enum):
     IDENTIFIER = auto()
 
 
+class DispatchKind(Enum):
+    """Classification of helper dispatch tables."""
+
+    UNKNOWN = auto()
+    IO = auto()
+    MASK = auto()
+
+
 @dataclass(frozen=True)
 class IRSlot:
     """Address of a VM slot used by :class:`IRLoad` and :class:`IRStore`."""
@@ -843,6 +851,7 @@ class IRSwitchDispatch(IRNode):
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
     index: Optional[IRDispatchIndex] = None
+    kind: Optional[DispatchKind] = None
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -860,6 +869,8 @@ class IRSwitchDispatch(IRNode):
             rendered = self.index.describe()
             if rendered:
                 description += f" index={rendered}"
+        if self.kind is not None:
+            description += f" kind={self.kind.name}"
         return description
 
 
@@ -1263,6 +1274,7 @@ __all__ = [
     "IRTailcallFrame",
     "IRTablePatch",
     "IRDispatchCase",
+    "DispatchKind",
     "IRSwitchDispatch",
     "IRAsciiFinalize",
     "IRSlot",
