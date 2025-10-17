@@ -530,7 +530,7 @@ class ASTEnumMember:
     value: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class ASTEnumDecl:
     """Named enumeration reconstructed from dispatch helpers."""
 
