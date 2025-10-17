@@ -44,6 +44,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     MemSpace,
     IRSlot,
+    SSAValueKind,
     NormalizerMetrics,
     IRIORead,
 )
@@ -1817,6 +1818,40 @@ def test_normalizer_dispatch_index_uses_recorded_hint(tmp_path: Path) -> None:
     assert updated.index.source == "slot(0x0400)"
     assert updated.index.mask == 0x2910
     assert updated.index.base == 0x9000
+
+
+def test_normalizer_dispatch_index_skips_neutral_raw(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    load = IRLoad(slot=IRSlot(MemSpace.FRAME, 0x0020), target="word0")
+    normalizer._record_ssa(load, ("word0",), kinds=(SSAValueKind.WORD,))
+    neutral = make_stack_neutral_instruction(4, "op_3C_00")
+    mask_literal = IRLiteral(value=0x0007, mode=0, source="mask")
+    table = IRTablePatch(operations=(("op_2C_01", 0x6623),))
+    items = _ItemList([load, neutral, mask_literal, table])
+
+    index_info = normalizer._infer_dispatch_index(items, 3)
+    assert index_info is not None
+    assert index_info.source == "word0"
+    assert index_info.mask == 0x0007
+
+
+def test_normalizer_dispatch_index_defaults_to_stack_top(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    table = IRTablePatch(operations=(("op_2C_04", 0x6633),))
+    items = _ItemList([table])
+
+    normalizer._pass_table_dispatch(items)
+    normalizer._current_block_offset = 0x2000
+    normalizer._pass_resolve_dispatch_indices(items)
+
+    dispatch = items[0]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.index is not None
+    assert dispatch.index.source == "stack_top"
 
 
 def test_auto_helper_symbolization(tmp_path: Path) -> None:

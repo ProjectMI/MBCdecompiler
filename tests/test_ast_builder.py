@@ -3,10 +3,12 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTBinaryExpr,
     ASTBranch,
     ASTBuilder,
     ASTCallFrame,
     ASTCallStatement,
+    ASTIdentifier,
     ASTLiteral,
     ASTReturn,
     ASTSlotRef,
@@ -409,6 +411,23 @@ def test_ast_builder_resolves_slot_reference() -> None:
     assert isinstance(expr, ASTSlotRef)
     assert expr.slot.space is MemSpace.FRAME
     assert expr.slot.index == 0x0004
+
+
+def test_ast_builder_resolves_hex_literal_token() -> None:
+    builder = ASTBuilder()
+    expr = builder._resolve_expr("0x00FF", {})
+    assert isinstance(expr, ASTLiteral)
+    assert expr.value == 0x00FF
+
+
+def test_ast_builder_parses_bitwise_and_expression() -> None:
+    builder = ASTBuilder()
+    expr = builder._resolve_expr("word0 & 0x0007", {})
+    assert isinstance(expr, ASTBinaryExpr)
+    assert isinstance(expr.left, ASTIdentifier)
+    assert expr.left.render() == "word0"
+    assert isinstance(expr.right, ASTLiteral)
+    assert expr.right.value == 0x0007
 
 
 def test_ast_builder_reuses_call_frame_argument() -> None:

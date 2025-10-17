@@ -2800,6 +2800,8 @@ class IRNormalizer:
                 items, index, cases, default
             )
             index_info = self._infer_dispatch_index(items, index)
+            if index_info is None:
+                index_info = IRDispatchIndex()
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
@@ -3240,6 +3242,28 @@ class IRNormalizer:
                     steps += 1
                     continue
                 break
+            elif isinstance(node, RawInstruction):
+                if node.pushes_value():
+                    if source_name is None:
+                        mapped = self._ssa_value(node)
+                        if mapped is not None:
+                            source_name = mapped
+                            skip_nodes.add(id(node))
+                            scan -= 1
+                            steps += 1
+                            continue
+                        source_name = self._describe_value(node)
+                        skip_nodes.add(id(node))
+                        scan -= 1
+                        steps += 1
+                        continue
+                    break
+                event = getattr(node, "event", None)
+                if event is not None and not event.popped_types and not event.pushed_types:
+                    scan -= 1
+                    steps += 1
+                    continue
+                break
             else:
                 break
             scan -= 1
@@ -3247,6 +3271,23 @@ class IRNormalizer:
 
         if source_name is None:
             source_name = self._find_dispatch_source(items, index, skip_nodes)
+
+        tracked_values: Set[int] = set()
+        if mask is not None:
+            tracked_values.add(mask & 0xFFFF)
+        if base_literal is not None:
+            tracked_values.add(base_literal & 0xFFFF)
+
+        if source_name is None:
+            for name, origin in self._stack_sources(items, index, 3):
+                if isinstance(origin, IRLiteral):
+                    value = origin.value & 0xFFFF
+                    if value in tracked_values:
+                        continue
+                if isinstance(origin, IRLiteralChunk):
+                    continue
+                source_name = self._render_ssa(name)
+                break
 
         if mask is None and base_literal is None and source_name is None:
             return None
@@ -3287,6 +3328,10 @@ class IRNormalizer:
                     if mapped is not None:
                         return mapped
                     return self._describe_value(node)
+                event = getattr(node, "event", None)
+                if event is not None and not event.popped_types and not event.pushed_types:
+                    scan -= 1
+                    continue
                 break
             if isinstance(node, IRNode):
                 mapped = self._ssa_value(node)
@@ -3304,16 +3349,25 @@ class IRNormalizer:
             if not isinstance(item, IRSwitchDispatch):
                 continue
             existing = item.index
-            if existing is not None and existing.source:
+            if existing is not None and existing.source and existing.source != "stack_top":
                 continue
 
             prefix = _ItemList(snapshot[: idx + 1])
             index_info = self._infer_dispatch_index(prefix, len(prefix) - 1)
             if index_info is None:
                 hints = self._dispatch_index_hints.get(self._current_block_offset)
-                if not hints:
+                if hints:
+                    index_info = hints[-1]
+                elif existing is None:
+                    index_info = IRDispatchIndex(source="stack_top")
+                elif not existing.source:
+                    index_info = IRDispatchIndex(
+                        source="stack_top",
+                        mask=existing.mask,
+                        base=existing.base,
+                    )
+                else:
                     continue
-                index_info = hints[-1]
 
             if existing is None:
                 updated = replace(item, index=index_info)

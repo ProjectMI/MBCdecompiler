@@ -42,6 +42,7 @@ from .model import (
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTBinaryExpr,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
@@ -1751,14 +1752,27 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        token = token.strip()
         if token in value_state:
             return value_state[token]
         if token in self._call_arg_values:
             return self._call_arg_values[token]
+        if "&" in token:
+            parts = [part.strip() for part in token.split("&", 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                left_expr = self._resolve_expr(parts[0], value_state)
+                right_expr = self._resolve_expr(parts[1], value_state)
+                return ASTBinaryExpr("&", left_expr, right_expr)
         if token.startswith("lit(") and token.endswith(")"):
             literal = token[4:-1]
             try:
                 value = int(literal, 16)
+            except ValueError:
+                return ASTUnknown(token)
+            return ASTLiteral(value)
+        if token.startswith("0x"):
+            try:
+                value = int(token, 16)
             except ValueError:
                 return ASTUnknown(token)
             return ASTLiteral(value)

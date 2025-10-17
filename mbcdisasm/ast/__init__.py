@@ -3,6 +3,7 @@
 from .builder import ASTBuilder
 from .model import (
     ASTAssign,
+    ASTBinaryExpr,
     ASTBlock,
     ASTBranch,
     ASTCallExpr,
@@ -74,6 +75,7 @@ __all__ = [
     "ASTExpression",
     "ASTLiteral",
     "ASTIdentifier",
+    "ASTBinaryExpr",
     "ASTSlotRef",
     "ASTIndirectLoadExpr",
     "ASTBankedRefExpr",

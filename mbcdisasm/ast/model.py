@@ -99,6 +99,29 @@ class ASTSlotRef(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTBinaryExpr(ASTExpression):
+    """Binary operation composed of two expressions."""
+
+    operator: str
+    left: ASTExpression
+    right: ASTExpression
+
+    def render(self) -> str:
+        return f"{self.left.render()} {self.operator} {self.right.render()}"
+
+    def kind(self) -> SSAValueKind:
+        left_kind = self.left.kind()
+        right_kind = self.right.kind()
+        if left_kind is right_kind:
+            return left_kind
+        if left_kind is SSAValueKind.UNKNOWN:
+            return right_kind
+        if right_kind is SSAValueKind.UNKNOWN:
+            return left_kind
+        return SSAValueKind.UNKNOWN
+
+
+@dataclass(frozen=True)
 class ASTMemRefExpr(ASTExpression):
     """Reference to a symbolic memory location."""
 
@@ -733,6 +756,7 @@ __all__ = [
     "ASTLiteral",
     "ASTIdentifier",
     "ASTSlotRef",
+    "ASTBinaryExpr",
     "ASTMemRefExpr",
     "ASTIndirectLoadExpr",
     "ASTBankedRefExpr",
