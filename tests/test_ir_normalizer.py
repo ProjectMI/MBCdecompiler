@@ -40,6 +40,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderCommit,
     NormalizerMetrics,
     IRIORead,
+    DispatchKind,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -1663,6 +1664,32 @@ def test_normalizer_assigns_dispatch_helper_from_trailing_call(tmp_path: Path) -
 
     dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
     assert dispatch.helper == 0x00F0
+    assert dispatch.kind is DispatchKind.IO
+
+
+def test_normalizer_assigns_dispatch_kind_for_scheduler_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x2C, 0x02, 0x6625),
+        build_word(4, 0x28, 0x00, 0x0029),
+        build_word(8, 0xF0, 0x4B, CALL_SHUFFLE_STANDARD),
+        build_word(12, 0x29, 0x10, RET_MASK),
+        build_word(16, 0x30, 0x00, 0x0000),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
+    assert dispatch.helper == 0x0029
+    assert dispatch.kind is DispatchKind.BUS_MASK
 
 
 def test_normalizer_assigns_dispatch_helper_from_leading_call(tmp_path: Path) -> None:
@@ -1706,6 +1733,7 @@ def test_normalizer_defaults_dispatch_helper_to_case_target(tmp_path: Path) -> N
 
     dispatch = next(node for node in block.nodes if isinstance(node, IRSwitchDispatch))
     assert dispatch.helper == 0x6615
+    assert dispatch.kind is DispatchKind.UNKNOWN
 
 
 def test_normalizer_records_dispatch_index(tmp_path: Path) -> None:

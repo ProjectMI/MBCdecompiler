@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from ..constants import OPERAND_ALIASES
-from ..ir.model import IRSlot, MemRef, SSAValueKind
+from ..ir.model import DispatchKind, IRSlot, MemRef, SSAValueKind
 
 
 def _format_operand(value: int, alias: Optional[str] = None) -> str:
@@ -549,7 +549,7 @@ class ASTSwitch(ASTStatement):
     index_expr: ASTExpression | None = None
     index_mask: int | None = None
     index_base: int | None = None
-    kind: str | None = None
+    kind: DispatchKind | None = None
 
     def _render_helper(self) -> str | None:
         if self.helper is None:
@@ -586,8 +586,8 @@ class ASTSwitch(ASTStatement):
         helper_note = self._render_helper()
         if helper_note:
             parts.append(helper_note)
-        if self.kind:
-            parts.append(f"kind={self.kind}")
+        if self.kind is not None:
+            parts.append(f"kind={self.kind.name}")
         return f"Switch{{{', '.join(parts)}}}"
 
 

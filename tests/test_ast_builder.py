@@ -26,6 +26,7 @@ from mbcdisasm.ir.model import (
     IRSlot,
     MemSpace,
     NormalizerMetrics,
+    DispatchKind,
 )
 
 from tests.test_ir_normalizer import build_container
@@ -142,6 +143,7 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
         helper=0x1111,
         helper_symbol="helper_1111",
         default=0x3333,
+        kind=DispatchKind.IO,
     )
     block = IRBlock(
         label="block_dispatch",
@@ -167,6 +169,8 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert switch_stmt.helper == 0x1111
     assert switch_stmt.cases[0].key == 0x01
     assert switch_stmt.cases[0].target == 0x2222
+    assert switch_stmt.kind is DispatchKind.IO
+    assert "kind=IO" in switch_stmt.render()
     assert isinstance(statements[1], ASTReturn)
 
 
@@ -176,6 +180,7 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
         helper=0x5555,
         helper_symbol=None,
         default=None,
+        kind=None,
     )
     block = IRBlock(
         label="block_dispatch",
@@ -239,6 +244,7 @@ def test_ast_switch_marks_io_dispatch() -> None:
         helper=0x00F0,
         helper_symbol="io.flush_tail",
         default=0x1234,
+        kind=DispatchKind.IO,
     )
     block = IRBlock(
         label="block_dispatch",
@@ -260,7 +266,7 @@ def test_ast_switch_marks_io_dispatch() -> None:
 
     switch_stmt = statements[0]
     assert isinstance(switch_stmt, ASTSwitch)
-    assert switch_stmt.kind == "io"
+    assert switch_stmt.kind is DispatchKind.IO
 
 
 def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:

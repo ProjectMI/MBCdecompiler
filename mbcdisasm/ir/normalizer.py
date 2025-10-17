@@ -67,6 +67,7 @@ from .model import (
     IRDispatchCase,
     IRDispatchIndex,
     IRSwitchDispatch,
+    DispatchKind,
     IRTailcallFrame,
     IRTestSetBranch,
     IRIf,
@@ -234,6 +235,30 @@ TAIL_HELPER_ALIASES = {
     0x0FF0: "io.flush_frame",
     0x16F0: "io.flush_deferred",
 }
+
+
+def _dispatch_kind_from_symbol(symbol: Optional[str]) -> Optional[DispatchKind]:
+    if symbol is None:
+        return None
+    lowered = symbol.lower()
+    if lowered.startswith("io."):
+        return DispatchKind.IO
+    if lowered.startswith("scheduler.mask_"):
+        return DispatchKind.BUS_MASK
+    return None
+
+
+def _build_dispatch_helper_kind_map() -> Dict[int, DispatchKind]:
+    mapping: Dict[int, DispatchKind] = {}
+    for aliases in (CALL_HELPER_ALIASES, TAIL_HELPER_ALIASES):
+        for helper, symbol in aliases.items():
+            kind = _dispatch_kind_from_symbol(symbol)
+            if kind is not None:
+                mapping[helper] = kind
+    return mapping
+
+
+_DISPATCH_HELPER_KINDS = _build_dispatch_helper_kind_map()
 
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
@@ -2795,12 +2820,14 @@ class IRNormalizer:
                 items, index, cases, default
             )
             index_info = self._infer_dispatch_index(items, index)
+            kind = self._dispatch_kind(helper_target, helper_symbol)
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
                 helper_symbol=helper_symbol,
                 default=default,
                 index=index_info,
+                kind=kind,
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
@@ -3235,6 +3262,20 @@ class IRNormalizer:
             return helper, self._helper_symbol(helper)
 
         return None, None
+
+    def _dispatch_kind(
+        self, helper: Optional[int], helper_symbol: Optional[str]
+    ) -> Optional[DispatchKind]:
+        if helper is not None:
+            kind = _DISPATCH_HELPER_KINDS.get(helper)
+            if kind is not None:
+                return kind
+        symbol_kind = _dispatch_kind_from_symbol(helper_symbol)
+        if symbol_kind is not None:
+            return symbol_kind
+        if helper is not None and helper_symbol is None:
+            return DispatchKind.UNKNOWN
+        return None
 
     def _find_dispatch_calllike(
         self, items: _ItemList, index: int, direction: int
