@@ -712,7 +712,7 @@ class ASTBuilder:
         for statement in block.statements:
             if isinstance(statement, BranchStatement):
                 updated = self._simplify_branch_statement(
-                    statement, block_order, fallthrough
+                    block, statement, block_order, fallthrough
                 )
                 if updated is None:
                     continue
@@ -722,15 +722,16 @@ class ASTBuilder:
 
     def _simplify_branch_statement(
         self,
+        block: ASTBlock,
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
     ) -> Optional[BranchStatement]:
         then_target = self._ensure_branch_target(
-            statement, "then", block_order, fallthrough
+            block, statement, "then", block_order, fallthrough
         )
         else_target = self._ensure_branch_target(
-            statement, "else", block_order, fallthrough
+            block, statement, "else", block_order, fallthrough
         )
         if (
             then_target is not None
@@ -742,6 +743,7 @@ class ASTBuilder:
 
     def _ensure_branch_target(
         self,
+        block: ASTBlock,
         statement: BranchStatement,
         prefix: str,
         block_order: Sequence[ASTBlock],
@@ -752,18 +754,24 @@ class ASTBuilder:
         offset_attr = f"{prefix}_offset"
         branch = getattr(statement, branch_attr)
         offset = getattr(statement, offset_attr)
+        hint = getattr(statement, hint_attr)
         if branch is not None:
             offset = branch.start_offset
-        elif offset is None:
-            hint = getattr(statement, hint_attr)
-            if hint == "fallthrough":
-                offset = fallthrough
+        elif offset is None and hint == "fallthrough":
+            offset = fallthrough
         target_block = self._find_block_by_offset(block_order, offset)
         if target_block is not None:
             setattr(statement, branch_attr, target_block)
             setattr(statement, hint_attr, None)
             setattr(statement, offset_attr, target_block.start_offset)
             return target_block.start_offset
+        if branch is None and hint == "fallthrough":
+            successor = self._find_fallthrough_successor(block, fallthrough)
+            if successor is not None:
+                setattr(statement, branch_attr, successor)
+                setattr(statement, hint_attr, None)
+                setattr(statement, offset_attr, successor.start_offset)
+                return successor.start_offset
         setattr(statement, offset_attr, offset)
         return offset
 
@@ -776,6 +784,18 @@ class ASTBuilder:
         for candidate in blocks:
             if candidate.start_offset == offset:
                 return candidate
+        return None
+
+    @staticmethod
+    def _find_fallthrough_successor(
+        block: ASTBlock, fallthrough_offset: Optional[int]
+    ) -> Optional[ASTBlock]:
+        if fallthrough_offset is not None:
+            for successor in block.successors:
+                if successor.start_offset == fallthrough_offset:
+                    return successor
+        if len(block.successors) == 1:
+            return block.successors[0]
         return None
 
     @staticmethod
