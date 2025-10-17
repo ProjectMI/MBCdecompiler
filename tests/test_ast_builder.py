@@ -5,9 +5,12 @@ from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTBranch,
     ASTBuilder,
+    ASTCallExpr,
     ASTCallFrame,
     ASTCallStatement,
+    ASTLiteral,
     ASTReturn,
+    ASTSlotRef,
     ASTSwitch,
     ASTTailCall,
 )
@@ -399,6 +402,60 @@ def test_ast_switch_carries_index_metadata() -> None:
     assert switch_stmt.index_expr.render() == "word0"
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
+
+
+def test_ast_builder_resolves_slot_reference() -> None:
+    builder = ASTBuilder()
+    expr = builder._resolve_expr("slot(0x0004)", {})
+    assert isinstance(expr, ASTSlotRef)
+    assert expr.slot.space is MemSpace.FRAME
+    assert expr.slot.index == 0x0004
+
+
+def test_ast_builder_reconstructs_dispatch_call_index() -> None:
+    call = IRCall(target=0x4444, args=("word0",), symbol="helper_4444")
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x01, target=0x9999, symbol=None),
+            IRDispatchCase(key=0x02, target=0xAAAA, symbol=None),
+        ),
+        helper=0x4444,
+        helper_symbol="helper_4444",
+        default=None,
+        index=IRDispatchIndex(source=call.describe(), mask=0x000F, base=None),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0100,
+        nodes=(call, dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+
+    assert isinstance(switch_stmt.call, ASTCallExpr)
+    assert switch_stmt.index_expr is switch_stmt.call
+    assert switch_stmt.index_mask == 0x000F
+
+
+def test_ast_builder_reuses_call_frame_argument() -> None:
+    builder = ASTBuilder()
+    literal = ASTLiteral(0x1234)
+    call = IRCall(target=0x1000, args=())
+    frame = builder._build_call_frame(call, (literal,))
+    assert frame is not None
+    resolved = builder._resolve_expr("slot_0", {})
+    assert resolved == literal
 
 
 def test_ast_builder_merges_enum_members_across_switches() -> None:

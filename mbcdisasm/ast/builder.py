@@ -23,6 +23,7 @@ from ..ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRLoad,
+    IRSlot,
     IRProgram,
     IRReturn,
     IRSegment,
@@ -34,6 +35,7 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    MemSpace,
     SSAValueKind,
 )
 from .model import (
@@ -165,6 +167,8 @@ class ASTBuilder:
         self._segment_declared_enum_keys: List[str] = []
         self._segment_declared_enum_set: Set[str] = set()
         self._current_segment_index: int = -1
+        self._call_arg_values: Dict[str, ASTExpression] = {}
+        self._expression_lookup: Dict[str, ASTExpression] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -173,6 +177,8 @@ class ASTBuilder:
         self._enum_infos = {}
         self._enum_order = []
         self._enum_name_usage = {}
+        self._call_arg_values = {}
+        self._expression_lookup = {}
         segments: List[ASTSegment] = []
         metrics = ASTMetrics()
         for segment in program.segments:
@@ -986,6 +992,7 @@ class ASTBuilder:
             node.varargs if hasattr(node, "varargs") else False,
             value_state,
         )
+        self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
             sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
@@ -1150,6 +1157,11 @@ class ASTBuilder:
             and lhs.args == rhs.args
             and lhs.varargs == rhs.varargs
         )
+
+    def _register_expression(self, token: Optional[str], expr: ASTExpression) -> None:
+        if not token:
+            return
+        self._expression_lookup[token] = expr
 
     def _build_dispatch_switch(
         self,
@@ -1519,6 +1531,7 @@ class ASTBuilder:
                 node.varargs,
                 value_state,
             )
+            self._register_expression(node.describe(), call_expr)
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
@@ -1547,6 +1560,8 @@ class ASTBuilder:
                 node.varargs,
                 value_state,
             )
+            self._register_expression(node.call.describe(), call_expr)
+            self._register_expression(node.describe(), call_expr)
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
@@ -1691,6 +1706,10 @@ class ASTBuilder:
                 values.extend(ASTUnknown(f"slot_{index}") for index in range(len(values), len(values) + deficit))
             for index in range(slot_count):
                 slots.append(ASTCallFrameSlot(index=index, value=values[index]))
+                token = f"slot_{index}"
+                value = values[index]
+                if not isinstance(value, ASTUnknown):
+                    self._call_arg_values[token] = value
         live_mask = getattr(node, "cleanup_mask", None)
         if not slots and not effects and live_mask is None:
             return None
@@ -1735,6 +1754,9 @@ class ASTBuilder:
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
         arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
         call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
+        for token, expr in zip(args, arg_exprs):
+            if token and not isinstance(expr, ASTUnknown):
+                self._call_arg_values[token] = expr
         return call_expr, arg_exprs
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
@@ -1742,6 +1764,14 @@ class ASTBuilder:
             return ASTUnknown("")
         if token in value_state:
             return value_state[token]
+        if token in self._call_arg_values:
+            return self._call_arg_values[token]
+        if token in self._expression_lookup:
+            return self._expression_lookup[token]
+        if " & " in token:
+            head, mask = token.rsplit(" & ", 1)
+            if self._is_hex_literal(mask.strip()):
+                return self._resolve_expr(head.strip(), value_state)
         if token.startswith("lit(") and token.endswith(")"):
             literal = token[4:-1]
             try:
@@ -1754,8 +1784,18 @@ class ASTBuilder:
                 index = int(token[5:-1], 16)
             except ValueError:
                 return ASTUnknown(token)
-            return ASTIdentifier(f"slot_{index:04X}", SSAValueKind.POINTER)
+            return ASTSlotRef(self._build_slot(index))
         return ASTIdentifier(token, self._infer_kind(token))
+
+    @staticmethod
+    def _build_slot(index: int) -> IRSlot:
+        if index < 0x1000:
+            space = MemSpace.FRAME
+        elif index < 0x8000:
+            space = MemSpace.GLOBAL
+        else:
+            space = MemSpace.CONST
+        return IRSlot(space=space, index=index)
 
     def _infer_kind(self, name: str) -> SSAValueKind:
         lowered = name.lower()
@@ -1825,6 +1865,8 @@ class ASTBuilder:
         self._segment_declared_enum_keys = []
         self._segment_declared_enum_set = set()
         self._current_segment_index = -1
+        self._call_arg_values = {}
+        self._expression_lookup = {}
 
 
 __all__ = ["ASTBuilder"]

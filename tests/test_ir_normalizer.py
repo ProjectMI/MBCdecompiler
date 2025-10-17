@@ -16,7 +16,9 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRLiteral,
     IRLiteralChunk,
+    IRLoad,
     IRPageRegister,
     IRTailCall,
     IRTailcallReturn,
@@ -34,10 +36,14 @@ from mbcdisasm.ir.model import (
     IRBuildTuple,
     IRBuildArray,
     IRSwitchDispatch,
+    IRDispatchCase,
+    IRDispatchIndex,
     IRTablePatch,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
     IRTableBuilderCommit,
+    MemSpace,
+    IRSlot,
     NormalizerMetrics,
     IRIORead,
 )
@@ -1733,6 +1739,108 @@ def test_normalizer_records_dispatch_index(tmp_path: Path) -> None:
     assert dispatch.index is not None
     assert dispatch.index.mask == 0x0007
     assert dispatch.index.base == 0x0001
+
+
+def test_normalizer_dispatch_index_traces_source(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    load = IRLoad(slot=IRSlot(MemSpace.FRAME, 0x0020), target="word0")
+    mask_literal = IRLiteral(value=0x0007, mode=0, source="mask")
+    table = IRTablePatch(operations=(("op_2C_01", 0x6623),))
+    items = _ItemList([load, mask_literal, table])
+
+    index_info = normalizer._infer_dispatch_index(items, 2)
+    assert index_info is not None
+    assert index_info.source == "word0"
+    assert index_info.mask == 0x0007
+    assert index_info.base is None
+
+
+def test_normalizer_dispatch_index_traces_indirect_load_with_noise(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    load = IRIndirectLoad(base="ptr0", offset=0x8400, target="word0")
+    literal_chunk = IRLiteralChunk(data=b"test", source="inline", annotations=(), symbol=None)
+    cleanup = IRCallCleanup(steps=(IRStackEffect(mnemonic="op_10_0E", operand=0),))
+    mask_literal = IRLiteral(value=0x0026, mode=0, source="mask")
+    base_literal = IRLiteral(value=0x10CC, mode=0, source="base")
+    table = IRTablePatch(operations=(("op_2C_03", 0x6675),))
+    items = _ItemList([load, literal_chunk, cleanup, mask_literal, base_literal, table])
+
+    index_info = normalizer._infer_dispatch_index(items, 5)
+    assert index_info is not None
+    assert index_info.source == "word0"
+    assert index_info.mask == 0x0026
+    assert index_info.base == 0x10CC
+
+
+def test_normalizer_dispatch_index_uses_testset_slot_source(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    base_literal = IRLiteral(value=0x10CC, mode=0, source="base")
+    mask_literal = IRLiteral(value=0x0026, mode=0, source="mask")
+    branch = IRTestSetBranch(var="slot(0x0400)", expr="bool0", then_target=0x0400, else_target=0x06B8)
+    table = IRTablePatch(operations=(("op_2C_03", 0x6675),))
+    items = _ItemList([base_literal, mask_literal, branch, table])
+
+    index_info = normalizer._infer_dispatch_index(items, 3)
+    assert index_info is not None
+    assert index_info.source == "slot(0x0400)"
+    assert index_info.mask == 0x0026
+    assert index_info.base == 0x10CC
+
+
+def test_normalizer_dispatch_index_uses_recorded_hint(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=3, target=0x6675),),
+        helper=0x6675,
+        helper_symbol=None,
+        default=None,
+        index=None,
+    )
+    items = _ItemList([dispatch])
+    hint = IRDispatchIndex(source="slot(0x0400)", mask=0x2910, base=0x9000)
+    normalizer._current_block_offset = 0x06B8
+    normalizer._dispatch_index_hints[0x06B8].append(hint)
+
+    normalizer._pass_resolve_dispatch_indices(items)
+
+    updated = items[0]
+    assert isinstance(updated, IRSwitchDispatch)
+    assert updated.index is not None
+    assert updated.index.source == "slot(0x0400)"
+    assert updated.index.mask == 0x2910
+    assert updated.index.base == 0x9000
+
+
+def test_normalizer_dispatch_index_defaults_to_stack_top(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=1, target=0x6675),),
+        helper=0x6675,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source=None, mask=0x2000, base=0x0042),
+    )
+    items = _ItemList([dispatch])
+    normalizer._current_block_offset = 0x2000
+
+    normalizer._pass_resolve_dispatch_indices(items)
+
+    updated = items[0]
+    assert isinstance(updated, IRSwitchDispatch)
+    assert updated.index is not None
+    assert updated.index.source == "stack_top"
+    assert updated.index.mask == 0x2000
+    assert updated.index.base == 0x0042
 
 
 def test_auto_helper_symbolization(tmp_path: Path) -> None:

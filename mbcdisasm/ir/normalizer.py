@@ -666,6 +666,8 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._dispatch_index_hints: Dict[int, List[IRDispatchIndex]] = defaultdict(list)
+        self._current_block_offset: int = -1
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -717,6 +719,7 @@ class IRNormalizer:
         blocks: List[IRBlock] = []
         metrics = NormalizerMetrics()
         self._pending_tail_targets.clear()
+        self._dispatch_index_hints.clear()
 
         for block in raw_blocks:
             ir_block, block_metrics = self._normalise_block(block)
@@ -876,6 +879,7 @@ class IRNormalizer:
         self._ssa_types.clear()
         self._ssa_aliases.clear()
         self._ssa_counters.clear()
+        self._current_block_offset = block.start_offset
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
 
@@ -923,6 +927,7 @@ class IRNormalizer:
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
+        self._pass_resolve_dispatch_indices(items)
 
         final_items = list(items)
         final_wrapper = _ItemList(final_items)
@@ -3158,28 +3163,47 @@ class IRNormalizer:
         source_name: Optional[str] = None
         scan = index - 1
         steps = 0
+        skip_nodes: Set[int] = set()
         while scan >= 0 and steps < 12:
             node = items[scan]
             if isinstance(node, IRLiteral):
                 value = node.value & 0xFFFF
                 if mask is None and self._looks_like_index_mask(value):
                     mask = value
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
                 if base_literal is None and value not in {0, 0xFFFF}:
                     base_literal = value
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
-            elif isinstance(node, IRLoad):
+            elif isinstance(node, (IRLoad, IRIndirectLoad, IRBankedLoad)):
                 if source_name is None:
                     alias = self._ssa_value(node)
-                    source_name = alias or node.target
+                    target = getattr(node, "target", None)
+                    if target is None and isinstance(node, IRBankedLoad):
+                        target = node.target
+                    source_name = alias or target or self._describe_value(node)
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
                 break
+            elif isinstance(node, IRTestSetBranch):
+                if source_name is None:
+                    source_name = node.var
+                    skip_nodes.add(id(node))
+                    scan -= 1
+                    steps += 1
+                    continue
+                break
+            elif isinstance(node, IRLiteralChunk):
+                scan -= 1
+                steps += 1
+                continue
             elif isinstance(node, IRCallCleanup):
                 scan -= 1
                 steps += 1
@@ -3192,9 +3216,26 @@ class IRNormalizer:
                 scan -= 1
                 steps += 1
                 continue
+            elif isinstance(node, IRStackDrop):
+                scan -= 1
+                steps += 1
+                continue
+            elif isinstance(node, IRCall):
+                if source_name is None:
+                    alias = self._ssa_value(node)
+                    if alias is not None:
+                        source_name = alias
+                        skip_nodes.add(id(node))
+                        scan -= 1
+                        steps += 1
+                        continue
+                scan -= 1
+                steps += 1
+                continue
             elif isinstance(node, IRRaw):
                 if source_name is None:
                     source_name = self._describe_value(node)
+                    skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1
                     continue
@@ -3204,9 +3245,163 @@ class IRNormalizer:
             scan -= 1
             steps += 1
 
+        if source_name is None:
+            source_name = self._find_dispatch_source(items, index, skip_nodes)
+
         if mask is None and base_literal is None and source_name is None:
             return None
         return IRDispatchIndex(source=source_name, mask=mask, base=base_literal)
+
+    def _find_dispatch_source(
+        self, items: _ItemList, index: int, skip_nodes: Set[int]
+    ) -> Optional[str]:
+        scan = index - 1
+        while scan >= 0:
+            node = items[scan]
+            if id(node) in skip_nodes:
+                scan -= 1
+                continue
+            if isinstance(node, (IRCallCleanup, IRIOWrite, IRStackEffect, IRConditionMask)):
+                scan -= 1
+                continue
+            if isinstance(node, IRLiteral):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                return node.describe()
+            if isinstance(node, IRLiteralChunk):
+                if "literal_marker" in node.annotations:
+                    scan -= 1
+                    continue
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                return node.describe()
+            if isinstance(node, IRDataMarker):
+                scan -= 1
+                continue
+            if isinstance(node, IRTestSetBranch):
+                return node.var
+            if isinstance(node, IRStackDuplicate):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                return node.value
+            if isinstance(node, RawInstruction):
+                if node.pushes_value():
+                    mapped = self._ssa_value(node)
+                    if mapped is not None:
+                        return mapped
+                    return self._describe_value(node)
+                break
+            if isinstance(node, IRNode):
+                mapped = self._ssa_value(node)
+                if mapped is not None:
+                    return mapped
+                describe = getattr(node, "describe", None)
+                if callable(describe):
+                    return describe()
+            scan -= 1
+        return None
+
+    def _pass_resolve_dispatch_indices(self, items: _ItemList) -> None:
+        snapshot: List[Union[RawInstruction, IRNode]] = list(items)
+        for idx, item in enumerate(snapshot):
+            if not isinstance(item, IRSwitchDispatch):
+                continue
+            existing = item.index
+            if existing is not None and existing.source:
+                continue
+
+            prefix = _ItemList(snapshot[: idx + 1])
+            index_info = self._infer_dispatch_index(prefix, len(prefix) - 1)
+            if index_info is None:
+                hints = self._dispatch_index_hints.get(self._current_block_offset)
+                if hints:
+                    index_info = hints[-1]
+                else:
+                    fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
+                    if fallback_source is None:
+                        fallback_source = "stack_top"
+                    fallback_mask = existing.mask if existing else None
+                    fallback_base = existing.base if existing else None
+                    index_info = IRDispatchIndex(
+                        source=fallback_source,
+                        mask=fallback_mask,
+                        base=fallback_base,
+                    )
+            if index_info.source is None and (existing is None or not existing.source):
+                fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
+                if fallback_source is None:
+                    fallback_source = "stack_top"
+                mask = index_info.mask
+                base = index_info.base
+                if existing is not None:
+                    if mask is None:
+                        mask = existing.mask
+                    if base is None:
+                        base = existing.base
+                index_info = IRDispatchIndex(source=fallback_source, mask=mask, base=base)
+            elif existing is not None:
+                mask = existing.mask if existing.mask is not None else index_info.mask
+                base = existing.base if existing.base is not None else index_info.base
+                index_info = IRDispatchIndex(
+                    source=index_info.source,
+                    mask=mask,
+                    base=base,
+                )
+
+            if existing is None:
+                updated = replace(item, index=index_info)
+            else:
+                merged = IRDispatchIndex(
+                    source=index_info.source or existing.source,
+                    mask=existing.mask if existing.mask is not None else index_info.mask,
+                    base=existing.base if existing.base is not None else index_info.base,
+                )
+                updated = replace(item, index=merged)
+
+            items.replace_slice(idx, idx + 1, [updated])
+            snapshot[idx] = updated
+
+    def _record_dispatch_hint(
+        self, items: _ItemList, index: int, branch: IRTestSetBranch
+    ) -> None:
+        mask: Optional[int] = None
+        base: Optional[int] = None
+        scan = index - 1
+        steps = 0
+        while scan >= 0 and steps < 12:
+            candidate = items[scan]
+            if isinstance(candidate, IRLiteral):
+                value = candidate.value & 0xFFFF
+                if mask is None and self._looks_like_index_mask(value):
+                    mask = value
+                    scan -= 1
+                    steps += 1
+                    continue
+                if base is None and value not in {0, 0xFFFF}:
+                    base = value
+                    scan -= 1
+                    steps += 1
+                    continue
+            if isinstance(
+                candidate,
+                (
+                    IRCallCleanup,
+                    IRLiteralChunk,
+                    IRStackEffect,
+                    IRStackDrop,
+                    IRCall,
+                ),
+            ):
+                scan -= 1
+                steps += 1
+                continue
+            break
+
+        hint = IRDispatchIndex(source=branch.var, mask=mask, base=base)
+        self._dispatch_index_hints[branch.else_target].append(hint)
 
     def _resolve_dispatch_helper(
         self,
@@ -5346,6 +5541,7 @@ class IRNormalizer:
                     replacement.append(branch)
                     metrics.if_branches += 1
                 items.replace_slice(index, index + 1, replacement)
+                self._record_dispatch_hint(items, index, node)
                 metrics.testset_branches += 1
                 continue
 
