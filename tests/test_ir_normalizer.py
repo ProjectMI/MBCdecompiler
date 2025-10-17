@@ -1687,6 +1687,22 @@ def test_normalizer_assigns_dispatch_helper_from_leading_call(tmp_path: Path) ->
     assert dispatch.helper == 0x01F1
 
 
+def test_normalizer_dispatch_helper_skips_stack_effect_wrappers(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    normalizer = IRNormalizer(knowledge)
+    call = IRCall(target=0x0123, args=tuple())
+    wrapper = IRStackEffect(mnemonic="op_10_50", operand=0x1B00)
+    table = IRTablePatch(operations=(("op_2C_01", 0x661D),))
+    items = _ItemList([call, wrapper, table])
+
+    normalizer._pass_table_dispatch(items)
+
+    dispatch = items[-1]
+    assert isinstance(dispatch, IRSwitchDispatch)
+    assert dispatch.helper == call.target
+
+
 def test_normalizer_defaults_dispatch_helper_to_case_target(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

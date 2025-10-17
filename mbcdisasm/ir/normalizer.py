@@ -3015,6 +3015,9 @@ class IRNormalizer:
         IRCallPreparation,
         IRPageRegister,
         IRConditionMask,
+        IRStackEffect,
+        IRStackDrop,
+        IRStackDuplicate,
     )
 
     def _match_table_builder_prologue(self, items: _ItemList, index: int) -> int:
