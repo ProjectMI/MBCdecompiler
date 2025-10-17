@@ -1132,6 +1132,15 @@ class ASTBuilder:
         index_expr, index_mask, index_base = self._resolve_dispatch_index(
             dispatch, value_state
         )
+        if index_expr is None:
+            fallback_expr, fallback_mask, fallback_base = self._fallback_dispatch_index(
+                dispatch
+            )
+            if fallback_expr is not None:
+                index_expr = fallback_expr
+                index_mask = fallback_mask
+                if fallback_base is not None:
+                    index_base = fallback_base
         kind = self._classify_dispatch_kind(dispatch)
         return ASTSwitch(
             call=call_expr,
@@ -1157,6 +1166,22 @@ class ASTBuilder:
         if index_info.source:
             index_expr = self._resolve_expr(index_info.source, value_state)
         return index_expr, index_info.mask, index_info.base
+
+    def _fallback_dispatch_index(
+        self, dispatch: IRSwitchDispatch
+    ) -> Tuple[ASTExpression | None, int | None, int | None]:
+        if not dispatch.cases:
+            return None, None, None
+        if len(dispatch.cases) > 1:
+            return None, None, None
+        index_info = dispatch.index
+        if index_info is not None and index_info.source is None:
+            if index_info.mask is not None:
+                return ASTLiteral(index_info.mask), None, index_info.base
+            if index_info.base is not None:
+                return ASTLiteral(index_info.base), None, None
+        case = dispatch.cases[0]
+        return ASTLiteral(case.key), None, None
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
         helper = dispatch.helper

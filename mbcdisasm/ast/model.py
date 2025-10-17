@@ -565,14 +565,20 @@ class ASTSwitch(ASTStatement):
             expr = self.index_expr.render()
         elif self.call is not None:
             expr = self.call.render()
+        if expr is None and self.cases:
+            if len(self.cases) == 1:
+                expr = f"0x{self.cases[0].key:04X}"
+            else:
+                keys = ", ".join(f"0x{case.key:04X}" for case in self.cases)
+                expr = f"keys[{keys}]"
         if self.index_mask is not None:
             mask_text = f"0x{self.index_mask:04X}"
-            if expr:
+            if expr is not None:
                 expr = f"{expr} & {mask_text}"
             else:
-                expr = f"& {mask_text}"
-        if not expr:
-            expr = "?"
+                expr = mask_text
+        if expr is None:
+            expr = "unknown"
         return f"index={expr}"
 
     def render(self) -> str:
