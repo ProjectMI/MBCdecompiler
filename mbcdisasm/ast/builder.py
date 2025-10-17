@@ -59,6 +59,7 @@ from .model import (
     ASTBankedLoadExpr,
     ASTBankedRefExpr,
     ASTLiteral,
+    ASTBinaryExpr,
     ASTMetrics,
     ASTProcedure,
     ASTProgram,
@@ -165,6 +166,7 @@ class ASTBuilder:
         self._segment_declared_enum_keys: List[str] = []
         self._segment_declared_enum_set: Set[str] = set()
         self._current_segment_index: int = -1
+        self._frame_slot_aliases: Dict[str, ASTExpression] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -932,6 +934,7 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
+        self._frame_slot_aliases.clear()
         for node in block.nodes:
             if isinstance(node, IRCall):
                 self._handle_dispatch_call(
@@ -1211,7 +1214,16 @@ class ASTBuilder:
         index_expr: ASTExpression | None = None
         if index_info.source:
             index_expr = self._resolve_expr(index_info.source, value_state)
-        return index_expr, index_info.mask, index_info.base
+        mask = index_info.mask
+        if (
+            mask is not None
+            and isinstance(index_expr, ASTBinaryExpr)
+            and index_expr.operator == "&"
+            and isinstance(index_expr.rhs, ASTLiteral)
+            and index_expr.rhs.value == mask
+        ):
+            mask = None
+        return index_expr, mask, index_info.base
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
         helper = dispatch.helper
@@ -1674,6 +1686,7 @@ class ASTBuilder:
         node: Any,
         arg_exprs: Sequence[ASTExpression],
     ) -> Optional[ASTCallFrame]:
+        self._frame_slot_aliases = {}
         steps = list(self._pending_call_frame)
         self._pending_call_frame.clear()
         effects = [
@@ -1691,6 +1704,16 @@ class ASTBuilder:
                 values.extend(ASTUnknown(f"slot_{index}") for index in range(len(values), len(values) + deficit))
             for index in range(slot_count):
                 slots.append(ASTCallFrameSlot(index=index, value=values[index]))
+        if slots:
+            alias_map: Dict[str, ASTExpression] = {}
+            for slot in slots:
+                value = slot.value
+                hex_index = f"0x{slot.index:04X}"
+                alias_map[f"slot({hex_index})"] = value
+                alias_map[f"slot_{slot.index:04X}"] = value
+                alias_map[f"arg{slot.index}"] = value
+                alias_map[f"arg({hex_index})"] = value
+            self._frame_slot_aliases = alias_map
         live_mask = getattr(node, "cleanup_mask", None)
         if not slots and not effects and live_mask is None:
             return None
@@ -1738,10 +1761,28 @@ class ASTBuilder:
         return call_expr, arg_exprs
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
+        if token is None:
+            return ASTUnknown("")
+        token = token.strip()
         if not token:
             return ASTUnknown("")
         if token in value_state:
             return value_state[token]
+        alias_expr = self._frame_slot_aliases.get(token)
+        if alias_expr is not None:
+            return alias_expr
+        if "&" in token:
+            lhs_token, rhs_token = (part.strip() for part in token.split("&", 1))
+            lhs_expr = self._resolve_expr(lhs_token, value_state)
+            rhs_expr: ASTExpression
+            if rhs_token.upper().startswith("0X"):
+                try:
+                    rhs_expr = ASTLiteral(int(rhs_token, 16))
+                except ValueError:
+                    rhs_expr = ASTUnknown(rhs_token)
+            else:
+                rhs_expr = self._resolve_expr(rhs_token, value_state)
+            return ASTBinaryExpr("&", lhs_expr, rhs_expr)
         if token.startswith("lit(") and token.endswith(")"):
             literal = token[4:-1]
             try:
@@ -1750,11 +1791,17 @@ class ASTBuilder:
                 return ASTUnknown(token)
             return ASTLiteral(value)
         if token.startswith("slot(") and token.endswith(")"):
+            alias_expr = self._frame_slot_aliases.get(token)
+            if alias_expr is not None:
+                return alias_expr
             try:
                 index = int(token[5:-1], 16)
             except ValueError:
                 return ASTUnknown(token)
             return ASTIdentifier(f"slot_{index:04X}", SSAValueKind.POINTER)
+        alias_expr = self._frame_slot_aliases.get(token)
+        if alias_expr is not None:
+            return alias_expr
         return ASTIdentifier(token, self._infer_kind(token))
 
     def _infer_kind(self, name: str) -> SSAValueKind:

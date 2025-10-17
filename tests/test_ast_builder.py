@@ -14,6 +14,7 @@ from mbcdisasm.ast import (
 from mbcdisasm.ir.model import (
     IRBlock,
     IRCall,
+    IRCallReturn,
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
@@ -399,6 +400,75 @@ def test_ast_switch_carries_index_metadata() -> None:
     assert switch_stmt.index_expr.render() == "word0"
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
+
+
+def test_ast_switch_uses_call_frame_arguments_for_index() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x00, target=0x4000, symbol=None),
+            IRDispatchCase(key=0x01, target=0x4010, symbol=None),
+        ),
+        helper=0x1234,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source="slot(0x0000)", mask=0x0003, base=None),
+    )
+    call = IRCall(target=0x1234, args=("word0",), arity=1)
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0400,
+        nodes=(call, dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+
+    assert switch_stmt.index_expr is not None
+    assert switch_stmt.index_expr.render() == "word0"
+    assert switch_stmt.index_mask == 0x0003
+
+
+def test_ast_switch_masks_call_results_in_index_expression() -> None:
+    call = IRCallReturn(target=0x2000, args=tuple(), tail=False, returns=("ret0",))
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x01, target=0x6000, symbol=None),),
+        helper=None,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source="ret0 & 0x0007", mask=0x0007, base=None),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0500,
+        nodes=(call, dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+
+    assert switch_stmt.index_expr is not None
+    assert switch_stmt.index_expr.render() == "call 0x2000()[0] & 0x0007"
+    assert switch_stmt.index_mask is None
 
 
 def test_ast_builder_merges_enum_members_across_switches() -> None:

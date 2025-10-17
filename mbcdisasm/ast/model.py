@@ -136,6 +136,24 @@ class ASTIndirectLoadExpr(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTBinaryExpr(ASTExpression):
+    """Generic binary expression used for lightweight arithmetic."""
+
+    operator: str
+    lhs: ASTExpression
+    rhs: ASTExpression
+
+    def render(self) -> str:
+        return f"{self.lhs.render()} {self.operator} {self.rhs.render()}"
+
+    def kind(self) -> SSAValueKind:
+        lhs_kind = self.lhs.kind()
+        if lhs_kind is not SSAValueKind.UNKNOWN:
+            return lhs_kind
+        return self.rhs.kind()
+
+
+@dataclass(frozen=True)
 class ASTBankedRefExpr(ASTExpression):
     """Reference to a banked memory location."""
 

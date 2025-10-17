@@ -2795,6 +2795,8 @@ class IRNormalizer:
                 items, index, cases, default
             )
             index_info = self._infer_dispatch_index(items, index)
+            if index_info is None:
+                index_info = IRDispatchIndex()
             dispatch = IRSwitchDispatch(
                 cases=tuple(sorted(cases, key=lambda entry: entry.key)),
                 helper=helper_target,
