@@ -46,6 +46,8 @@ from .model import (
     ASTCallFrame,
     ASTCallFrameSlot,
     ASTComment,
+    ASTEnumDecl,
+    ASTEnumMember,
     ASTExpression,
     ASTFrameEffect,
     ASTFlagCheck,
@@ -147,6 +149,10 @@ class ASTBuilder:
         self._current_redirects: Mapping[int, int] = {}
         self._pending_call_frame: List[IRStackEffect] = []
         self._pending_epilogue: List[IRStackEffect] = []
+        self._segment_enums: Dict[str, ASTEnumDecl] = {}
+        self._segment_enum_order: List[str] = []
+        self._segment_enum_names: Dict[str, str] = {}
+        self._segment_enum_name_usage: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -154,18 +160,32 @@ class ASTBuilder:
     def build(self, program: IRProgram) -> ASTProgram:
         segments: List[ASTSegment] = []
         metrics = ASTMetrics()
+        program_enums: Dict[str, ASTEnumDecl] = {}
+        enum_order: List[str] = []
         for segment in program.segments:
             segment_result = self._build_segment(segment, metrics)
             segments.append(segment_result)
+            for enum in segment_result.enums:
+                if enum.name not in program_enums:
+                    program_enums[enum.name] = enum
+                    enum_order.append(enum.name)
         metrics.procedure_count = sum(len(seg.procedures) for seg in segments)
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
-        return ASTProgram(segments=tuple(segments), metrics=metrics)
+        return ASTProgram(
+            segments=tuple(segments),
+            metrics=metrics,
+            enums=tuple(program_enums[name] for name in enum_order),
+        )
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
     def _build_segment(self, segment: IRSegment, metrics: ASTMetrics) -> ASTSegment:
+        self._segment_enums = {}
+        self._segment_enum_order = []
+        self._segment_enum_names = {}
+        self._segment_enum_name_usage = {}
         block_map: Dict[int, IRBlock] = {block.start_offset: block for block in segment.blocks}
         analyses = self._build_cfg(segment, block_map)
         entry_reasons = self._detect_entries(segment, block_map, analyses)
@@ -185,6 +205,7 @@ class ASTBuilder:
             start=segment.start,
             length=segment.length,
             procedures=tuple(procedures),
+            enums=tuple(self._segment_enums[key] for key in self._segment_enum_order),
         )
         self._clear_context()
         return result
@@ -1128,7 +1149,9 @@ class ASTBuilder:
         dispatch: IRSwitchDispatch,
         value_state: Mapping[str, ASTExpression],
     ) -> ASTSwitch:
-        cases = self._build_dispatch_cases(dispatch.cases)
+        enum_decl, alias_lookup = self._ensure_dispatch_enum(dispatch)
+        enum_name = enum_decl.name if enum_decl else None
+        cases = self._build_dispatch_cases(dispatch.cases, enum_name, alias_lookup)
         index_expr, index_mask, index_base = self._resolve_dispatch_index(
             dispatch, value_state
         )
@@ -1143,6 +1166,7 @@ class ASTBuilder:
             index_mask=index_mask,
             index_base=index_base,
             kind=kind,
+            enum_name=enum_name,
         )
 
     def _resolve_dispatch_index(
@@ -1172,12 +1196,154 @@ class ASTBuilder:
         return None
 
     def _build_dispatch_cases(
-        self, cases: Sequence[IRDispatchCase]
+        self,
+        cases: Sequence[IRDispatchCase],
+        enum_name: str | None,
+        alias_lookup: Mapping[int, str],
     ) -> Tuple[ASTSwitchCase, ...]:
         return tuple(
-            ASTSwitchCase(key=case.key, target=case.target, symbol=case.symbol)
+            ASTSwitchCase(
+                key=case.key,
+                target=case.target,
+                symbol=case.symbol,
+                key_alias=(
+                    f"{enum_name}.{alias_lookup[case.key]}"
+                    if enum_name and case.key in alias_lookup
+                    else None
+                ),
+            )
             for case in cases
         )
+
+    def _ensure_dispatch_enum(
+        self, dispatch: IRSwitchDispatch
+    ) -> Tuple[ASTEnumDecl | None, Mapping[int, str]]:
+        key = self._dispatch_helper_key(dispatch)
+        if key is None:
+            return None, {}
+        enum_decl = self._segment_enums.get(key)
+        if enum_decl is None:
+            name = self._segment_enum_names.get(key)
+            if name is None:
+                name = self._allocate_enum_name(dispatch, key)
+                self._segment_enum_names[key] = name
+            members = self._build_enum_members(dispatch)
+            enum_decl = ASTEnumDecl(name=name, members=members)
+            self._segment_enums[key] = enum_decl
+            self._segment_enum_order.append(key)
+        lookup = {member.value: member.name for member in enum_decl.members}
+        return enum_decl, lookup
+
+    def _dispatch_helper_key(self, dispatch: IRSwitchDispatch) -> str | None:
+        symbol = dispatch.helper_symbol
+        if symbol:
+            return f"symbol:{symbol}"
+        helper = dispatch.helper
+        if helper is not None:
+            return f"helper:0x{helper:04X}"
+        return None
+
+    def _allocate_enum_name(self, dispatch: IRSwitchDispatch, key: str) -> str:
+        base = self._normalise_enum_name(dispatch.helper_symbol, dispatch.helper)
+        name = base
+        existing = self._segment_enum_name_usage.get(name)
+        if existing is not None and existing != key:
+            helper = dispatch.helper
+            if helper is not None:
+                name = f"{base}_{helper:04X}"
+            else:
+                suffix = 2
+                candidate = f"{base}_{suffix}"
+                while candidate in self._segment_enum_name_usage:
+                    suffix += 1
+                    candidate = f"{base}_{suffix}"
+                name = candidate
+        self._segment_enum_name_usage[name] = key
+        return name
+
+    def _normalise_enum_name(
+        self, symbol: str | None, helper: int | None
+    ) -> str:
+        if symbol:
+            lowered = symbol.lower()
+            if lowered.startswith("scheduler.mask_"):
+                base = "SchedulerMask"
+            elif lowered.startswith("io.") and lowered.endswith("write"):
+                parts = [
+                    piece.capitalize()
+                    for part in symbol.split(".")
+                    for piece in part.split("_")
+                    if piece
+                ]
+                base = "".join(parts) or "Dispatch"
+                if not base.endswith("Dispatch"):
+                    base += "Dispatch"
+            else:
+                parts = [
+                    piece.capitalize()
+                    for part in symbol.replace("/", ".").split(".")
+                    for piece in part.split("_")
+                    if piece
+                ]
+                base = "".join(parts) or "Dispatch"
+            return base
+        if helper is not None:
+            return f"Dispatch_0x{helper:04X}"
+        return "Dispatch"
+
+    def _build_enum_members(
+        self, dispatch: IRSwitchDispatch
+    ) -> Tuple[ASTEnumMember, ...]:
+        aliases = self._resolve_enum_aliases(dispatch)
+        members: List[ASTEnumMember] = []
+        used: Set[str] = set()
+        for case in sorted(dispatch.cases, key=lambda item: item.key):
+            name = aliases.get(case.key)
+            if not name:
+                name = self._format_enum_member_name(case.key)
+            name = self._ensure_unique_member_name(name, used)
+            used.add(name)
+            members.append(ASTEnumMember(name=name, value=case.key))
+        return tuple(members)
+
+    def _resolve_enum_aliases(
+        self, dispatch: IRSwitchDispatch
+    ) -> Mapping[int, str]:
+        symbol = (dispatch.helper_symbol or "").lower()
+        if "mask" in symbol:
+            return self._build_mask_aliases(dispatch.cases)
+        return {}
+
+    def _build_mask_aliases(
+        self, cases: Sequence[IRDispatchCase]
+    ) -> Mapping[int, str]:
+        aliases: Dict[int, str] = {}
+        for case in cases:
+            value = case.key
+            if value == 0:
+                aliases[value] = "MaskClear"
+                continue
+            if value & (value - 1) == 0:
+                bit_index = value.bit_length() - 1
+                aliases[value] = f"MaskBit{bit_index:02d}"
+            else:
+                aliases[value] = f"MaskValue_{value:04X}"
+        return aliases
+
+    @staticmethod
+    def _format_enum_member_name(value: int) -> str:
+        return f"K_{value:04X}"
+
+    @staticmethod
+    def _ensure_unique_member_name(name: str, used: Set[str]) -> str:
+        if name not in used:
+            return name
+        index = 2
+        while True:
+            candidate = f"{name}_{index}"
+            if candidate not in used:
+                return candidate
+            index += 1
 
     def _convert_node(
         self,
@@ -1597,6 +1763,10 @@ class ASTBuilder:
         self._current_redirects = {}
         self._pending_call_frame = []
         self._pending_epilogue = []
+        self._segment_enums = {}
+        self._segment_enum_order = []
+        self._segment_enum_names = {}
+        self._segment_enum_name_usage = {}
 
 
 __all__ = ["ASTBuilder"]

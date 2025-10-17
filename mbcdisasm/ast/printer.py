@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from .model import ASTBlock, ASTProcedure, ASTProgram, ASTSegment
+from .model import ASTBlock, ASTEnumDecl, ASTProcedure, ASTProgram, ASTSegment
 
 
 class ASTTextRenderer:
@@ -29,6 +29,10 @@ class ASTTextRenderer:
             f"; segment {segment.index} offset=0x{segment.start:06X} length={segment.length}"
         )
         yield header
+        if segment.enums:
+            for enum in segment.enums:
+                yield from self._render_enum(enum)
+            yield ""
         if not segment.procedures:
             yield ";   no procedures reconstructed"
             yield ""
@@ -36,6 +40,12 @@ class ASTTextRenderer:
         for procedure in segment.procedures:
             yield from self._render_procedure(procedure)
         yield ""
+
+    def _render_enum(self, enum: ASTEnumDecl) -> Iterable[str]:
+        yield f"enum {enum.name} {{"
+        for member in enum.members:
+            yield f"  {member.name} = 0x{member.value:04X}"
+        yield "}"
 
     def _render_procedure(self, procedure: ASTProcedure) -> Iterable[str]:
         reasons = ",".join(procedure.entry_reasons) or "unspecified"

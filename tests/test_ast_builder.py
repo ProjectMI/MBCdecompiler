@@ -167,6 +167,12 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert switch_stmt.helper == 0x1111
     assert switch_stmt.cases[0].key == 0x01
     assert switch_stmt.cases[0].target == 0x2222
+    assert switch_stmt.enum_name == "Helper1111"
+    assert switch_stmt.cases[0].key_alias == "Helper1111.K_0001"
+    segment = ast_program.segments[0]
+    assert segment.enums and segment.enums[0].name == "Helper1111"
+    assert segment.enums[0].members[0].name == "K_0001"
+    assert ast_program.enums and ast_program.enums[0].name == "Helper1111"
     assert isinstance(statements[1], ASTReturn)
 
 
@@ -200,6 +206,8 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     assert isinstance(call_stmt, ASTCallStatement)
     assert call_stmt.call.target == 0x5555
     assert call_stmt.call.symbol is None
+    enums = ast_program.segments[0].enums
+    assert enums and enums[0].name == "Dispatch_0x5555"
 
 
 def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:
@@ -261,6 +269,8 @@ def test_ast_switch_marks_io_dispatch() -> None:
     switch_stmt = statements[0]
     assert isinstance(switch_stmt, ASTSwitch)
     assert switch_stmt.kind == "io"
+    assert switch_stmt.enum_name == "IoFlushTail"
+    assert switch_stmt.cases[0].key_alias == "IoFlushTail.K_0010"
 
 
 def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
@@ -388,6 +398,11 @@ def test_ast_switch_carries_index_metadata() -> None:
     assert switch_stmt.index_expr.render() == "word0"
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
+    assert switch_stmt.enum_name == "Dispatch_0x7777"
+    assert {case.key_alias for case in switch_stmt.cases} == {
+        "Dispatch_0x7777.K_0003",
+        "Dispatch_0x7777.K_0004",
+    }
     rendered = switch_stmt.render()
     assert "index=word0 & 0x0007" in rendered
     assert "base=0x0001" in rendered

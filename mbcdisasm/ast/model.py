@@ -522,6 +522,22 @@ class ASTComment(ASTStatement):
         return f"; {self.text}"
 
 
+@dataclass(frozen=True)
+class ASTEnumMember:
+    """Single member of an enum declaration."""
+
+    name: str
+    value: int
+
+
+@dataclass(frozen=True)
+class ASTEnumDecl:
+    """Named enumeration reconstructed from dispatch helpers."""
+
+    name: str
+    members: Tuple[ASTEnumMember, ...]
+
+
 @dataclass
 class ASTSwitchCase:
     """Single case handled by a helper dispatch."""
@@ -529,12 +545,16 @@ class ASTSwitchCase:
     key: int
     target: int
     symbol: str | None = None
+    key_alias: str | None = None
 
     def render(self) -> str:
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
-        return f"0x{self.key:04X}->{target_repr}"
+        key_repr = f"0x{self.key:04X}"
+        if self.key_alias:
+            key_repr = f"{self.key_alias}(0x{self.key:04X})"
+        return f"{key_repr}->{target_repr}"
 
 
 @dataclass
@@ -550,6 +570,7 @@ class ASTSwitch(ASTStatement):
     index_mask: int | None = None
     index_base: int | None = None
     kind: str | None = None
+    enum_name: str | None = None
 
     def _render_helper(self) -> str | None:
         if self.helper is None:
@@ -577,6 +598,8 @@ class ASTSwitch(ASTStatement):
 
     def render(self) -> str:
         parts: List[str] = [self._render_index()]
+        if self.enum_name:
+            parts.append(f"enum={self.enum_name}")
         rendered_cases = ", ".join(case.render() for case in self.cases)
         parts.append(f"table=[{rendered_cases}]")
         if self.default is not None:
@@ -625,6 +648,7 @@ class ASTSegment:
     start: int
     length: int
     procedures: Tuple[ASTProcedure, ...]
+    enums: Tuple[ASTEnumDecl, ...] = ()
 
 
 @dataclass
@@ -700,6 +724,7 @@ class ASTProgram:
 
     segments: Tuple[ASTSegment, ...]
     metrics: ASTMetrics
+    enums: Tuple[ASTEnumDecl, ...] = ()
 
 
 __all__ = [
@@ -733,6 +758,8 @@ __all__ = [
     "ASTFlagCheck",
     "ASTFunctionPrologue",
     "ASTComment",
+    "ASTEnumDecl",
+    "ASTEnumMember",
     "ASTBlock",
     "ASTProcedure",
     "ASTSegment",
