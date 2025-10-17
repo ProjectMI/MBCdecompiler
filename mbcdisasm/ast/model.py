@@ -559,30 +559,46 @@ class ASTSwitch(ASTStatement):
             helper_repr = f"{self.helper_symbol}({helper_repr})"
         return f"helper={helper_repr}"
 
-    def _render_index(self) -> str:
-        expr = None
+    def _render_index(self) -> str | None:
+        expr_text: str | None = None
         if self.index_expr is not None:
-            expr = self.index_expr.render()
+            expr_text = self.index_expr.render()
         elif self.call is not None:
-            expr = self.call.render()
-        if self.index_mask is not None:
+            expr_text = self.call.render()
+
+        details: List[Tuple[str, str]] = []
+
+        if expr_text:
+            if self.index_mask is not None:
+                mask_text = f"0x{self.index_mask:04X}"
+                expr_text = f"{expr_text} & {mask_text}"
+            details.append(("expr", expr_text))
+        elif self.index_mask is not None:
             mask_text = f"0x{self.index_mask:04X}"
-            if expr:
-                expr = f"{expr} & {mask_text}"
-            else:
-                expr = f"& {mask_text}"
-        if not expr:
-            expr = "?"
-        return f"index={expr}"
+            details.append(("mask", mask_text))
+
+        if self.index_base is not None:
+            base_text = f"0x{self.index_base:04X}"
+            details.append(("base", base_text))
+
+        if not details:
+            return None
+
+        if len(details) == 1 and details[0][0] == "expr":
+            return f"index={details[0][1]}"
+
+        inner = ", ".join(f"{label}={value}" for label, value in details)
+        return f"index{{{inner}}}"
 
     def render(self) -> str:
-        parts: List[str] = [self._render_index()]
+        parts: List[str] = []
+        index_text = self._render_index()
+        if index_text:
+            parts.append(index_text)
         rendered_cases = ", ".join(case.render() for case in self.cases)
         parts.append(f"table=[{rendered_cases}]")
         if self.default is not None:
             parts.append(f"default=0x{self.default:04X}")
-        if self.index_base is not None:
-            parts.append(f"base=0x{self.index_base:04X}")
         helper_note = self._render_helper()
         if helper_note:
             parts.append(helper_note)

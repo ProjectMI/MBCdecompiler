@@ -389,8 +389,76 @@ def test_ast_switch_carries_index_metadata() -> None:
     assert switch_stmt.index_mask == 0x0007
     assert switch_stmt.index_base == 0x0001
     rendered = switch_stmt.render()
-    assert "index=word0 & 0x0007" in rendered
-    assert "base=0x0001" in rendered
+    assert "index{expr=word0 & 0x0007, base=0x0001}" in rendered
+
+
+def test_ast_switch_renders_mask_only_index() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x01, target=0x1111, symbol=None),
+            IRDispatchCase(key=0x02, target=0x2222, symbol=None),
+        ),
+        helper=None,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(mask=0x0003),
+    )
+    block = IRBlock(
+        label="block_mask",
+        start_offset=0x0500,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+    rendered = switch_stmt.render()
+    assert "index{mask=0x0003}" in rendered
+
+
+def test_ast_switch_omits_missing_index_metadata() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x05, target=0x3333, symbol=None),
+            IRDispatchCase(key=0x06, target=0x4444, symbol=None),
+        ),
+        helper=None,
+        helper_symbol=None,
+        default=None,
+        index=None,
+    )
+    block = IRBlock(
+        label="block_plain",
+        start_offset=0x0600,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0600,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+    rendered = switch_stmt.render()
+    assert "index{" not in rendered
+    assert "index=" not in rendered
 
 
 def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
