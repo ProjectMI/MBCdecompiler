@@ -8,6 +8,7 @@ from mbcdisasm.ast import (
     ASTCallExpr,
     ASTCallFrame,
     ASTCallStatement,
+    ASTFrameProtocol,
     ASTLiteral,
     ASTReturn,
     ASTSlotRef,
@@ -613,7 +614,14 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert frame.live_mask == RET_MASK
     assert len(frame.slots) == 2
 
+    protocol = next(statement for statement in block.statements if isinstance(statement, ASTFrameProtocol))
+    assert protocol.teardown == 1
+    mask_values = [value for value, _ in protocol.masks]
+    assert RET_MASK in mask_values
+
     return_stmt = next(statement for statement in block.statements if isinstance(statement, ASTReturn))
     assert return_stmt.finally_branch is not None
     kinds = [step.kind for step in return_stmt.finally_branch.steps]
-    assert "stack_teardown" in kinds
+    assert "frame.page_select" in kinds
+    assert "io.bridge" in kinds
+    assert "frame.teardown" not in kinds

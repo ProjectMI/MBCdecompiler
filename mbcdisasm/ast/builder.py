@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -38,6 +39,131 @@ from ..ir.model import (
     MemSpace,
     SSAValueKind,
 )
+
+
+_DIRECT_EPILOGUE_KIND_MAP = {
+    "call_helpers": "helpers.invoke",
+    "fanout": "helpers.fanout",
+    "page_register": "frame.page_select",
+    "stack_teardown": "frame.teardown",
+    "op_6C_01": "frame.page_select",
+    "op_08_00": "helpers.dispatch",
+    "op_72_23": "helpers.wrapper",
+    "op_52_06": "io.handshake",
+    "op_0B_00": "io.handshake",
+    "op_0B_E1": "io.handshake",
+    "op_76_41": "io.bridge",
+    "op_04_EC": "io.bridge",
+    "op_2D_01": "frame.cleanup",
+    "reduce_passthrough": "helpers.reduce",
+}
+
+_MASK_STEP_MNEMONICS = {
+    "epilogue",
+    "op_29_10",
+    "op_31_52",
+    "op_32_29",
+    "op_4B_0B",
+    "op_4B_45",
+    "op_4B_CC",
+    "op_4F_01",
+    "op_4F_02",
+    "op_4F_03",
+    "op_52_05",
+    "op_5E_29",
+    "op_70_29",
+    "op_72_4A",
+}
+
+_MASK_OPERANDS = {RET_MASK, FANOUT_FLAGS_A, FANOUT_FLAGS_B}
+_MASK_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
+
+_FRAME_DROP_MNEMONICS = {
+    "op_01_0C",
+    "op_01_30",
+    "op_01_78",
+    "op_01_C0",
+    "op_2D_01",
+}
+
+_IO_BRIDGE_MNEMONICS = {
+    "op_3A_01",
+    "op_3E_4B",
+    "op_E1_4D",
+    "op_E8_4B",
+    "op_ED_4B",
+    "op_F0_4B",
+}
+
+_IO_STEP_MNEMONICS = {
+    "op_10_08",
+    "op_10_0A",
+    "op_10_0E",
+    "op_10_18",
+    "op_10_3C",
+    "op_10_69",
+    "op_10_C5",
+    "op_10_CC",
+    "op_10_CD",
+    "op_10_E3",
+    "op_10_E5",
+    "op_15_4A",
+    "op_18_2A",
+    "op_20_8C",
+    "op_21_94",
+    "op_21_AC",
+    "op_28_6C",
+    "op_52_06",
+    "op_78_00",
+    "op_89_01",
+    "op_A0_03",
+    "op_C0_00",
+    "op_C3_01",
+}
+
+_IO_OPCODE_FALLBACK = {
+    0x10,
+    0x11,
+    0x14,
+    0x15,
+    0x18,
+    0x1C,
+    0x1D,
+    0x20,
+    0x21,
+    0x28,
+    0x52,
+    0x78,
+    0x89,
+    0xA0,
+    0xA2,
+    0xC0,
+    0xC3,
+}
+_MASK_OPCODE_FALLBACK = {0x29, 0x31, 0x32, 0x4B, 0x4F, 0x52, 0x5E, 0x70, 0x72}
+_DROP_OPCODE_FALLBACK = {0x01, 0x2D}
+_BRIDGE_OPCODE_FALLBACK = {0x3A, 0x3E, 0x04, 0x4A, 0x4B, 0x76, 0xE1, 0xE8, 0xED, 0xF0}
+
+_FRAME_CLEAR_ALIASES = {"fmt.buffer_reset"}
+_FORMAT_PREFIXES = ("fmt.", "text.")
+_FRAME_OPERAND_KIND_OVERRIDES = {
+    0x0000: "frame.reset",
+    0x0020: "helpers.format",
+    0x0029: "frame.scheduler",
+    0x002C: "frame.scheduler",
+    0x0041: "frame.scheduler",
+    0x0069: "frame.scheduler",
+    0x006C: "frame.page_select",
+    0x10E1: "io.bridge",
+    0x2C04: "helpers.format",
+    0x2DF0: "io.step",
+    0x2EF0: "io.step",
+    0x3100: "helpers.format",
+    0x3E4B: "helpers.format",
+    0x5B01: "helpers.format",
+    0xED4D: "frame.page_select",
+    0xF0EB: "io.step",
+}
 from .model import (
     ASTAssign,
     ASTBlock,
@@ -52,6 +178,7 @@ from .model import (
     ASTEnumMember,
     ASTExpression,
     ASTFrameEffect,
+    ASTFrameProtocol,
     ASTFlagCheck,
     ASTFunctionPrologue,
     ASTIORead,
@@ -112,6 +239,32 @@ class _PendingBlock:
     statements: List[ASTStatement]
     successors: Tuple[int, ...]
     branch_links: List[_BranchLink]
+
+
+@dataclass
+class _FramePolicySummary:
+    """Aggregated frame policy derived from cleanup sequences."""
+
+    teardown: int = 0
+    drops: int = 0
+    masks: List[Tuple[int, Optional[str]]] = field(default_factory=list)
+
+    def add_mask(self, value: Optional[int], alias: Optional[str]) -> None:
+        if value is None:
+            return
+        entry = (value, alias)
+        if entry not in self.masks:
+            self.masks.append(entry)
+
+    def merge(self, other: "_FramePolicySummary") -> None:
+        self.teardown += other.teardown
+        self.drops += other.drops
+        for mask in other.masks:
+            if mask not in self.masks:
+                self.masks.append(mask)
+
+    def has_effects(self) -> bool:
+        return bool(self.teardown or self.drops or self.masks)
 
 
 @dataclass
@@ -1577,9 +1730,14 @@ class ASTBuilder:
             return statements, []
         if isinstance(node, IRReturn):
             value = self._build_return_value(node, value_state)
-            finally_branch = self._build_finally(node.cleanup, node.abi_effects)
-            self._pending_epilogue.clear()
-            return [ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)], []
+            protocol_stmt, finally_branch = self._build_finally(node.cleanup, node.abi_effects)
+            statements: List[ASTStatement] = []
+            if protocol_stmt is not None:
+                statements.append(protocol_stmt)
+            statements.append(
+                ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)
+            )
+            return statements, []
         if isinstance(node, IRCallCleanup):
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
@@ -1668,6 +1826,90 @@ class ASTBuilder:
             include_operand = bool(step.operand) or step.mnemonic not in {"stack_teardown"}
         return step.operand if include_operand else None
 
+    @staticmethod
+    def _mnemonic_opcode(mnemonic: str) -> Optional[int]:
+        if not mnemonic.startswith("op_"):
+            return None
+        try:
+            return int(mnemonic[3:5], 16)
+        except (ValueError, IndexError):
+            return None
+
+    def _epilogue_step_kind(self, step: IRStackEffect) -> str:
+        mnemonic = step.mnemonic
+        alias = step.operand_alias
+        operand = step.operand
+
+        direct = _DIRECT_EPILOGUE_KIND_MAP.get(mnemonic)
+        if direct is not None:
+            return direct
+
+        alias_text = str(alias) if alias is not None else None
+        if (
+            mnemonic in _MASK_STEP_MNEMONICS
+            or operand in _MASK_OPERANDS
+            or (alias_text is not None and alias_text in _MASK_ALIASES)
+        ):
+            return "frame.return_mask"
+
+        opcode = self._mnemonic_opcode(mnemonic)
+        if opcode in _MASK_OPCODE_FALLBACK:
+            return "frame.return_mask"
+
+        if mnemonic in _FRAME_DROP_MNEMONICS or opcode in _DROP_OPCODE_FALLBACK:
+            if step.pops:
+                return "frame.drop"
+
+        if mnemonic in _IO_BRIDGE_MNEMONICS or opcode in _BRIDGE_OPCODE_FALLBACK:
+            return "io.bridge"
+
+        if (
+            mnemonic in _IO_STEP_MNEMONICS
+            or opcode in _IO_OPCODE_FALLBACK
+            or (alias_text is not None and alias_text == "ChatOut")
+        ):
+            return "io.step"
+
+        if step.pops and step.mnemonic != "stack_teardown":
+            return "frame.drop"
+
+        return "frame.effect"
+
+    def _classify_frame_effect_kind(
+        self,
+        step: IRStackEffect,
+        operand: Optional[int],
+        alias: Optional[str],
+    ) -> str:
+        alias_text = alias.lower() if alias else ""
+        opcode = self._mnemonic_opcode(step.mnemonic)
+
+        if alias_text:
+            if alias_text in _FRAME_CLEAR_ALIASES or alias_text.endswith(".reset"):
+                return "frame.reset"
+            if any(alias_text.startswith(prefix) for prefix in _FORMAT_PREFIXES):
+                return "helpers.format"
+            if alias_text.startswith("scheduler."):
+                return "frame.scheduler"
+            if alias_text.startswith("page."):
+                return "frame.page_select"
+            if alias_text.startswith("io."):
+                return "io.step"
+
+        if operand in _FRAME_OPERAND_KIND_OVERRIDES:
+            return _FRAME_OPERAND_KIND_OVERRIDES[operand]
+
+        if operand is None:
+            return "frame.write"
+
+        if operand == 0:
+            return "frame.reset"
+
+        if opcode in _BRIDGE_OPCODE_FALLBACK:
+            return "io.bridge"
+
+        return "frame.write"
+
     def _convert_frame_effect(self, step: IRStackEffect) -> ASTFrameEffect:
         operand = self._stack_effect_operand(step)
         alias = str(step.operand_alias) if step.operand_alias is not None else None
@@ -1676,12 +1918,14 @@ class ASTBuilder:
     def _convert_epilogue_step(self, step: IRStackEffect) -> ASTFinallyStep:
         operand = self._stack_effect_operand(step)
         alias = str(step.operand_alias) if step.operand_alias is not None else None
-        return ASTFinallyStep(kind=step.mnemonic, operand=operand, alias=alias, pops=step.pops)
+        kind = self._epilogue_step_kind(step)
+        return ASTFinallyStep(kind=kind, operand=operand, alias=alias, pops=step.pops)
 
-    @staticmethod
-    def _convert_abi_effect(effect: IRAbiEffect) -> ASTFinallyStep:
+    def _convert_abi_effect(self, effect: IRAbiEffect) -> ASTFinallyStep:
         operand = effect.operand
         alias = str(effect.alias) if effect.alias is not None else None
+        if effect.kind == "return_mask":
+            return ASTFinallyStep(kind="frame.return_mask", operand=operand, alias=alias)
         return ASTFinallyStep(kind=f"abi.{effect.kind}", operand=operand, alias=alias)
 
     def _build_call_frame(
@@ -1727,21 +1971,76 @@ class ASTBuilder:
             return values[0]
         return ASTTupleExpr(tuple(values))
 
+    @staticmethod
+    def _aggregate_finally_steps(steps: Sequence[ASTFinallyStep]) -> List[ASTFinallyStep]:
+        if not steps:
+            return []
+        aggregated: List[ASTFinallyStep] = []
+        index_map: Dict[Tuple[str, Optional[int], Optional[str]], int] = {}
+        for step in steps:
+            key = (step.kind, step.operand, step.alias)
+            if key in index_map:
+                idx = index_map[key]
+                existing = aggregated[idx]
+                aggregated[idx] = ASTFinallyStep(
+                    kind=existing.kind,
+                    operand=existing.operand,
+                    alias=existing.alias,
+                    pops=existing.pops + step.pops,
+                )
+            else:
+                index_map[key] = len(aggregated)
+                aggregated.append(step)
+        return aggregated
+
+    @staticmethod
+    def _build_frame_protocol(policy: _FramePolicySummary) -> ASTFrameProtocol:
+        return ASTFrameProtocol(
+            masks=tuple(policy.masks),
+            teardown=policy.teardown,
+            drops=policy.drops,
+        )
+
     def _build_finally(
         self,
         cleanup_steps: Sequence[IRStackEffect],
         abi_effects: Sequence[IRAbiEffect],
-    ) -> Optional[ASTFinally]:
-        steps: List[ASTFinallyStep] = []
-        if self._pending_epilogue:
-            steps.extend(self._convert_epilogue_step(step) for step in self._pending_epilogue)
-        if cleanup_steps:
-            steps.extend(self._convert_epilogue_step(step) for step in cleanup_steps)
-        if abi_effects:
-            steps.extend(self._convert_abi_effect(effect) for effect in abi_effects)
-        if not steps:
-            return None
-        return ASTFinally(steps=tuple(steps))
+    ) -> Tuple[Optional[ASTFrameProtocol], Optional[ASTFinally]]:
+        combined = list(self._pending_epilogue)
+        combined.extend(cleanup_steps)
+        self._pending_epilogue = []
+
+        policy = _FramePolicySummary()
+        effect_steps: List[ASTFinallyStep] = []
+
+        for step in combined:
+            kind = self._epilogue_step_kind(step)
+            operand = self._stack_effect_operand(step)
+            alias = str(step.operand_alias) if step.operand_alias is not None else None
+            if kind == "frame.teardown":
+                policy.teardown += step.pops
+                continue
+            if kind == "frame.drop":
+                policy.drops += step.pops or 1
+                continue
+            if kind == "frame.return_mask":
+                policy.add_mask(operand, alias)
+                continue
+            if kind == "frame.effect":
+                kind = self._classify_frame_effect_kind(step, operand, alias)
+            effect_steps.append(ASTFinallyStep(kind=kind, operand=operand, alias=alias, pops=step.pops))
+
+        for effect in abi_effects:
+            if effect.kind == "return_mask":
+                alias = str(effect.alias) if effect.alias is not None else None
+                policy.add_mask(effect.operand, alias)
+                continue
+            effect_steps.append(self._convert_abi_effect(effect))
+
+        aggregated_steps = self._aggregate_finally_steps(effect_steps)
+        protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
+        finally_stmt = ASTFinally(steps=tuple(aggregated_steps)) if aggregated_steps else None
+        return protocol_stmt, finally_stmt
 
     def _convert_call(
         self,
