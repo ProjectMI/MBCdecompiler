@@ -138,6 +138,7 @@ from .model import (
     ASTEnumMember,
     ASTExpression,
     ASTFrameEffect,
+    ASTFrameProtocol,
     ASTFlagCheck,
     ASTFunctionPrologue,
     ASTIORead,
@@ -198,6 +199,32 @@ class _PendingBlock:
     statements: List[ASTStatement]
     successors: Tuple[int, ...]
     branch_links: List[_BranchLink]
+
+
+@dataclass
+class _FramePolicySummary:
+    """Aggregated frame policy derived from cleanup sequences."""
+
+    teardown: int = 0
+    drops: int = 0
+    masks: List[Tuple[int, Optional[str]]] = field(default_factory=list)
+
+    def add_mask(self, value: Optional[int], alias: Optional[str]) -> None:
+        if value is None:
+            return
+        entry = (value, alias)
+        if entry not in self.masks:
+            self.masks.append(entry)
+
+    def merge(self, other: "_FramePolicySummary") -> None:
+        self.teardown += other.teardown
+        self.drops += other.drops
+        for mask in other.masks:
+            if mask not in self.masks:
+                self.masks.append(mask)
+
+    def has_effects(self) -> bool:
+        return bool(self.teardown or self.drops or self.masks)
 
 
 @dataclass
@@ -1663,9 +1690,14 @@ class ASTBuilder:
             return statements, []
         if isinstance(node, IRReturn):
             value = self._build_return_value(node, value_state)
-            finally_branch = self._build_finally(node.cleanup, node.abi_effects)
-            self._pending_epilogue.clear()
-            return [ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)], []
+            protocol_stmt, finally_branch = self._build_finally(node.cleanup, node.abi_effects)
+            statements: List[ASTStatement] = []
+            if protocol_stmt is not None:
+                statements.append(protocol_stmt)
+            statements.append(
+                ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)
+            )
+            return statements, []
         if isinstance(node, IRCallCleanup):
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
@@ -1801,7 +1833,7 @@ class ASTBuilder:
         if step.pops and step.mnemonic != "stack_teardown":
             return "frame.drop"
 
-        return "effect.cleanup"
+        return "frame.effect"
 
     def _convert_frame_effect(self, step: IRStackEffect) -> ASTFrameEffect:
         operand = self._stack_effect_operand(step)
@@ -1864,21 +1896,74 @@ class ASTBuilder:
             return values[0]
         return ASTTupleExpr(tuple(values))
 
+    @staticmethod
+    def _aggregate_finally_steps(steps: Sequence[ASTFinallyStep]) -> List[ASTFinallyStep]:
+        if not steps:
+            return []
+        aggregated: List[ASTFinallyStep] = []
+        index_map: Dict[Tuple[str, Optional[int], Optional[str]], int] = {}
+        for step in steps:
+            key = (step.kind, step.operand, step.alias)
+            if key in index_map:
+                idx = index_map[key]
+                existing = aggregated[idx]
+                aggregated[idx] = ASTFinallyStep(
+                    kind=existing.kind,
+                    operand=existing.operand,
+                    alias=existing.alias,
+                    pops=existing.pops + step.pops,
+                )
+            else:
+                index_map[key] = len(aggregated)
+                aggregated.append(step)
+        return aggregated
+
+    @staticmethod
+    def _build_frame_protocol(policy: _FramePolicySummary) -> ASTFrameProtocol:
+        return ASTFrameProtocol(
+            masks=tuple(policy.masks),
+            teardown=policy.teardown,
+            drops=policy.drops,
+        )
+
     def _build_finally(
         self,
         cleanup_steps: Sequence[IRStackEffect],
         abi_effects: Sequence[IRAbiEffect],
-    ) -> Optional[ASTFinally]:
-        steps: List[ASTFinallyStep] = []
-        if self._pending_epilogue:
-            steps.extend(self._convert_epilogue_step(step) for step in self._pending_epilogue)
-        if cleanup_steps:
-            steps.extend(self._convert_epilogue_step(step) for step in cleanup_steps)
-        if abi_effects:
-            steps.extend(self._convert_abi_effect(effect) for effect in abi_effects)
-        if not steps:
-            return None
-        return ASTFinally(steps=tuple(steps))
+    ) -> Tuple[Optional[ASTFrameProtocol], Optional[ASTFinally]]:
+        combined = list(self._pending_epilogue)
+        combined.extend(cleanup_steps)
+        self._pending_epilogue = []
+
+        policy = _FramePolicySummary()
+        effect_steps: List[ASTFinallyStep] = []
+
+        for step in combined:
+            kind = self._epilogue_step_kind(step)
+            operand = self._stack_effect_operand(step)
+            alias = str(step.operand_alias) if step.operand_alias is not None else None
+            if kind == "frame.teardown":
+                policy.teardown += step.pops
+                continue
+            if kind == "frame.drop":
+                policy.drops += step.pops or 1
+                continue
+            if kind == "frame.return_mask":
+                policy.add_mask(operand, alias)
+                continue
+            effect_steps.append(ASTFinallyStep(kind=kind, operand=operand, alias=alias, pops=step.pops))
+
+        for effect in abi_effects:
+            if effect.kind == "return_mask":
+                alias = str(effect.alias) if effect.alias is not None else None
+                policy.add_mask(effect.operand, alias)
+                continue
+            effect_steps.append(self._convert_abi_effect(effect))
+
+        aggregated_steps = self._aggregate_finally_steps(effect_steps)
+        protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
+        finally_stmt = ASTFinally(steps=tuple(aggregated_steps)) if aggregated_steps else None
+        return protocol_stmt, finally_stmt
 
     def _convert_call(
         self,
