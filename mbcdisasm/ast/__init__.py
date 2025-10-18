@@ -18,6 +18,7 @@ from .model import (
     ASTFinally,
     ASTFinallyStep,
     ASTFrameEffect,
+    ASTFrameProtocol,
     ASTFunctionPrologue,
     ASTIORead,
     ASTIOWrite,
@@ -84,4 +85,5 @@ __all__ = [
     "ASTUnknown",
     "ASTMetrics",
     "ASTFrameEffect",
+    "ASTFrameProtocol",
 ]

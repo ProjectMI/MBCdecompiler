@@ -367,6 +367,30 @@ class ASTCallFrame(ASTStatement):
 
 
 @dataclass
+class ASTFrameProtocol(ASTStatement):
+    """Aggregated description of the frame policy prior to returning."""
+
+    masks: Tuple[Tuple[int, Optional[str]], ...] = field(default_factory=tuple)
+    teardown: int = 0
+    drops: int = 0
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.masks:
+            rendered_masks = ", ".join(
+                _format_operand(value, alias)
+                for value, alias in self.masks
+            )
+            parts.append(f"masks=[{rendered_masks}]")
+        if self.teardown:
+            parts.append(f"teardown={self.teardown}")
+        if self.drops:
+            parts.append(f"drops={self.drops}")
+        suffix = " " + " ".join(parts) if parts else ""
+        return f"frame_protocol{suffix}"
+
+
+@dataclass
 class ASTIORead(ASTStatement):
     """I/O read effect emitted by helper façades."""
 
