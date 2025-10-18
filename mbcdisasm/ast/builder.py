@@ -283,6 +283,8 @@ class _PendingDispatchCall:
     helper: int
     index: int
     call: ASTCallExpr
+    symbol: str | None
+    arg_tokens: Tuple[str, ...]
 
 
 @dataclass
@@ -1154,7 +1156,10 @@ class ASTBuilder:
         frame = self._build_call_frame(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        call_tokens = self._collect_call_dispatch_tokens(node)
+        pending_table = self._pop_dispatch_table(
+            call_expr, call_tokens, node.symbol, pending_tables
+        )
         if pending_table is not None:
             if frame is not None:
                 insert_index = pending_table.index
@@ -1173,7 +1178,13 @@ class ASTBuilder:
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(
+                helper=node.target,
+                index=index,
+                call=call_expr,
+                symbol=node.symbol,
+                arg_tokens=call_tokens,
+            )
         )
 
     def _handle_dispatch_table(
@@ -1198,20 +1209,77 @@ class ASTBuilder:
         statements.append(switch_statement)
         pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
 
+    def _collect_call_dispatch_tokens(self, call: IRCall) -> Tuple[str, ...]:
+        raw_tokens: List[str] = [arg for arg in call.args if arg]
+        raw_tokens.append(call.describe())
+        if call.symbol:
+            raw_tokens.append(call.symbol)
+        seen: Set[str] = set()
+        tokens: List[str] = []
+        for raw in raw_tokens:
+            normalised = self._normalise_dispatch_token(raw)
+            if normalised and normalised not in seen:
+                seen.add(normalised)
+                tokens.append(normalised)
+        return tuple(tokens)
+
+    @staticmethod
+    def _normalise_dispatch_token(token: Optional[str]) -> str | None:
+        if token is None:
+            return None
+        stripped = "".join(ch for ch in token if not ch.isspace())
+        if not stripped:
+            return None
+        return stripped.lower()
+
     def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
         if dispatch.helper is not None:
             return dispatch.helper == helper
         return False
 
+    @staticmethod
+    def _dispatch_symbols_match(
+        call_symbol: str | None, helper_symbol: str | None
+    ) -> bool:
+        if call_symbol and helper_symbol:
+            return call_symbol == helper_symbol
+        return True
+
+    def _dispatch_args_match(
+        self, arg_tokens: Tuple[str, ...], dispatch: IRSwitchDispatch
+    ) -> bool:
+        index_info = dispatch.index
+        if index_info is None or not index_info.source:
+            return False
+        source_token = self._normalise_dispatch_token(index_info.source)
+        if not source_token:
+            return False
+        return source_token in arg_tokens
+
     def _pop_dispatch_table(
-        self, helper: int, pending_tables: List[_PendingDispatchTable]
+        self,
+        call_expr: ASTCallExpr,
+        arg_tokens: Tuple[str, ...],
+        call_symbol: str | None,
+        pending_tables: List[_PendingDispatchTable],
     ) -> Optional[_PendingDispatchTable]:
+        best_index: int | None = None
+        fallback_index: int | None = None
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
-            if self._dispatch_helper_matches(helper, entry.dispatch):
-                pending_tables.pop(index)
-                return entry
-        return None
+            if not self._dispatch_helper_matches(call_expr.target, entry.dispatch):
+                continue
+            if not self._dispatch_symbols_match(call_symbol, entry.dispatch.helper_symbol):
+                continue
+            if self._dispatch_args_match(arg_tokens, entry.dispatch):
+                best_index = index
+                break
+            if fallback_index is None:
+                fallback_index = index
+        chosen = best_index if best_index is not None else fallback_index
+        if chosen is None:
+            return None
+        return pending_tables.pop(chosen)
 
     def _pop_dispatch_call(
         self, dispatch: IRSwitchDispatch, pending_calls: List[_PendingDispatchCall]
@@ -1219,11 +1287,23 @@ class ASTBuilder:
         helper = dispatch.helper
         if helper is None:
             return None
+        best_index: int | None = None
+        fallback_index: int | None = None
         for index in range(len(pending_calls) - 1, -1, -1):
             entry = pending_calls[index]
-            if entry.helper == helper:
-                return pending_calls.pop(index)
-        return None
+            if not self._dispatch_helper_matches(entry.helper, dispatch):
+                continue
+            if not self._dispatch_symbols_match(entry.symbol, dispatch.helper_symbol):
+                continue
+            if self._dispatch_args_match(entry.arg_tokens, dispatch):
+                best_index = index
+                break
+            if fallback_index is None:
+                fallback_index = index
+        chosen = best_index if best_index is not None else fallback_index
+        if chosen is None:
+            return None
+        return pending_calls.pop(chosen)
 
     def _adjust_pending_indices(
         self, pending_calls: List[_PendingDispatchCall], insert_index: int

@@ -603,6 +603,98 @@ def test_ast_builder_uses_call_symbol_for_enum_naming() -> None:
     assert segment_enum.name == "SchedulerMask"
 
 
+def test_ast_builder_matches_dispatch_by_arguments() -> None:
+    call_a = IRCall(target=0x660A, args=("slot_0",), symbol=None)
+    call_b = IRCall(target=0x660A, args=("slot_1",), symbol=None)
+    dispatch_a = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x00, target=0x1000, symbol=None),
+            IRDispatchCase(key=0x01, target=0x1002, symbol=None),
+        ),
+        helper=0x660A,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source="slot_0", mask=None, base=None),
+    )
+    dispatch_b = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x00, target=0x2000, symbol=None),
+            IRDispatchCase(key=0x01, target=0x2002, symbol=None),
+        ),
+        helper=0x660A,
+        helper_symbol=None,
+        default=None,
+        index=IRDispatchIndex(source="slot_1", mask=None, base=None),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0500,
+        nodes=(call_a, call_b, dispatch_a, dispatch_b, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switches = [stmt for stmt in statements if isinstance(stmt, ASTSwitch)]
+    assert [switch.cases[0].target for switch in switches] == [0x1000, 0x2000]
+    assert not any(isinstance(stmt, ASTCallStatement) for stmt in statements)
+
+
+def test_ast_builder_matches_dispatch_by_symbol_with_pending_tables() -> None:
+    dispatch_a = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x10, target=0x3000, symbol=None),
+            IRDispatchCase(key=0x11, target=0x3002, symbol=None),
+        ),
+        helper=0x6610,
+        helper_symbol="helper_a",
+        default=None,
+        index=IRDispatchIndex(source="slot_0", mask=None, base=None),
+    )
+    dispatch_b = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x20, target=0x4000, symbol=None),
+            IRDispatchCase(key=0x21, target=0x4002, symbol=None),
+        ),
+        helper=0x6610,
+        helper_symbol="helper_b",
+        default=None,
+        index=IRDispatchIndex(source="slot_0", mask=None, base=None),
+    )
+    call_a = IRCall(target=0x6610, args=("slot_0",), symbol="helper_a")
+    call_b = IRCall(target=0x6610, args=("slot_0",), symbol="helper_b")
+    block = IRBlock(
+        label="block_dispatch_tables",
+        start_offset=0x0600,
+        nodes=(dispatch_a, dispatch_b, call_a, call_b, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0600,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switches = [stmt for stmt in statements if isinstance(stmt, ASTSwitch)]
+    assert [switch.cases[0].target for switch in switches] == [0x3000, 0x4000]
+    assert not any(isinstance(stmt, ASTCallStatement) for stmt in statements)
+
+
 def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     program = IRNormalizer(knowledge).normalise_container(container)
