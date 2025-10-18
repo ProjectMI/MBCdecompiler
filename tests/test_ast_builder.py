@@ -17,6 +17,7 @@ from mbcdisasm.ast import (
 )
 from mbcdisasm.ir.model import (
     IRBlock,
+    IRAbiEffect,
     IRCall,
     IRDispatchCase,
     IRDispatchIndex,
@@ -27,6 +28,7 @@ from mbcdisasm.ir.model import (
     IRSegment,
     IRSwitchDispatch,
     IRTailCall,
+    IRStackEffect,
     IRSlot,
     MemSpace,
     NormalizerMetrics,
@@ -624,4 +626,96 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     kinds = [step.kind for step in return_stmt.finally_branch.steps]
     assert "frame.page_select" in kinds
     assert "io.bridge" in kinds
-    assert "frame.teardown" not in kinds
+    assert "frame.teardown" in kinds
+    mask_steps = [step for step in return_stmt.finally_branch.steps if step.kind == "frame.return_mask"]
+    assert any(step.operand == RET_MASK for step in mask_steps)
+    assert any(step.operand == 0x0001 for step in mask_steps)
+
+
+def test_ast_tailcall_emits_protocol_and_finally() -> None:
+    tail_call = IRTailCall(
+        call=IRCall(target=0x1234, args=(), symbol="tail_helper"),
+        returns=tuple(),
+        cleanup=(
+            IRStackEffect(mnemonic="stack_teardown", pops=2),
+            IRStackEffect(mnemonic="op_01_0C", pops=1),
+        ),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=RET_MASK),),
+    )
+    block = IRBlock(label="tail_block", start_offset=0x1000, nodes=(tail_call,))
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    protocol = next(statement for statement in statements if isinstance(statement, ASTFrameProtocol))
+    assert protocol.teardown == 2
+    assert protocol.drops == 1
+    mask_values = {value for value, _ in protocol.masks}
+    assert RET_MASK in mask_values
+
+    tail_stmt = next(statement for statement in statements if isinstance(statement, ASTTailCall))
+    assert tail_stmt.finally_branch is not None
+    final_steps = tail_stmt.finally_branch.steps
+    final_kinds = [step.kind for step in final_steps]
+    assert "frame.return_mask" in final_kinds
+    assert "frame.teardown" in final_kinds
+    assert "frame.drop" in final_kinds
+    mask_pairs = {(step.operand, step.alias) for step in final_steps if step.kind == "frame.return_mask"}
+    assert mask_pairs == {(value, alias) for value, alias in protocol.masks}
+    teardown_steps = [step for step in final_steps if step.kind == "frame.teardown"]
+    assert len(teardown_steps) == 1
+    assert teardown_steps[0].pops == protocol.teardown
+    drop_steps = [step for step in final_steps if step.kind == "frame.drop"]
+    assert len(drop_steps) == 1
+    assert drop_steps[0].pops == protocol.drops
+
+def test_ast_finally_summary_matches_frame_protocol() -> None:
+    return_node = IRReturn(
+        values=(),
+        varargs=False,
+        cleanup=(
+            IRStackEffect(mnemonic="stack_teardown", pops=1),
+            IRStackEffect(mnemonic="stack_teardown", pops=2),
+            IRStackEffect(mnemonic="op_01_0C", pops=1),
+            IRStackEffect(mnemonic="op_01_30", pops=3),
+            IRStackEffect(mnemonic="op_29_10", operand=RET_MASK),
+            IRStackEffect(mnemonic="op_29_10", operand=RET_MASK),
+        ),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0001),),
+    )
+    block = IRBlock(label="summary_block", start_offset=0x2000, nodes=(return_node,))
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    protocol = next(statement for statement in statements if isinstance(statement, ASTFrameProtocol))
+    return_stmt = next(statement for statement in statements if isinstance(statement, ASTReturn))
+    assert return_stmt.finally_branch is not None
+
+    final_steps = return_stmt.finally_branch.steps
+    mask_pairs = {(step.operand, step.alias) for step in final_steps if step.kind == "frame.return_mask"}
+    assert mask_pairs == {(value, alias) for value, alias in protocol.masks}
+
+    teardown_steps = [step for step in final_steps if step.kind == "frame.teardown"]
+    assert len(teardown_steps) == 1
+    assert teardown_steps[0].pops == protocol.teardown
+
+    drop_steps = [step for step in final_steps if step.kind == "frame.drop"]
+    assert len(drop_steps) == 1
+    assert drop_steps[0].pops == protocol.drops

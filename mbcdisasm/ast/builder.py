@@ -1724,9 +1724,19 @@ class ASTBuilder:
             frame = self._build_call_frame(node, arg_exprs)
             if frame is not None:
                 statements.append(frame)
+            protocol_stmt, finally_branch = self._build_finally(
+                node.cleanup, node.abi_effects
+            )
+            if protocol_stmt is not None:
+                statements.append(protocol_stmt)
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            statements.append(ASTTailCall(call=call_expr, returns=resolved_returns))
-            self._pending_epilogue.clear()
+            statements.append(
+                ASTTailCall(
+                    call=call_expr,
+                    returns=resolved_returns,
+                    finally_branch=finally_branch,
+                )
+            )
             return statements, []
         if isinstance(node, IRReturn):
             value = self._build_return_value(node, value_state)
@@ -2037,10 +2047,25 @@ class ASTBuilder:
                 continue
             effect_steps.append(self._convert_abi_effect(effect))
 
+        effect_steps.extend(self._policy_finally_steps(policy))
+
         aggregated_steps = self._aggregate_finally_steps(effect_steps)
         protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
         finally_stmt = ASTFinally(steps=tuple(aggregated_steps)) if aggregated_steps else None
         return protocol_stmt, finally_stmt
+
+    @staticmethod
+    def _policy_finally_steps(policy: _FramePolicySummary) -> List[ASTFinallyStep]:
+        summary: List[ASTFinallyStep] = []
+        for value, alias in policy.masks:
+            summary.append(
+                ASTFinallyStep(kind="frame.return_mask", operand=value, alias=alias)
+            )
+        if policy.teardown:
+            summary.append(ASTFinallyStep(kind="frame.teardown", pops=policy.teardown))
+        if policy.drops:
+            summary.append(ASTFinallyStep(kind="frame.drop", pops=policy.drops))
+        return summary
 
     def _convert_call(
         self,
