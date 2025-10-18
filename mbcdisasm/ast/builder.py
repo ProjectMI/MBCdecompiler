@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -38,6 +39,9 @@ from ..ir.model import (
     MemSpace,
     SSAValueKind,
 )
+
+
+_RAW_DISPATCH_TOKEN = re.compile(r"^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}@0x[0-9A-Fa-f]+$")
 from .model import (
     ASTAssign,
     ASTBlock,
@@ -130,6 +134,7 @@ class _PendingDispatchCall:
     helper: int
     index: int
     call: ASTCallExpr
+    symbol: Optional[str]
 
 
 @dataclass
@@ -1001,7 +1006,9 @@ class ASTBuilder:
         frame = self._build_call_frame(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        pending_table = self._pop_dispatch_table(
+            node.target, node.symbol, pending_tables
+        )
         if pending_table is not None:
             if frame is not None:
                 insert_index = pending_table.index
@@ -1020,7 +1027,12 @@ class ASTBuilder:
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(
+                helper=node.target,
+                index=index,
+                call=call_expr,
+                symbol=node.symbol,
+            )
         )
 
     def _handle_dispatch_table(
@@ -1045,17 +1057,26 @@ class ASTBuilder:
         statements.append(switch_statement)
         pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
 
-    def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
-        if dispatch.helper is not None:
-            return dispatch.helper == helper
+    def _dispatch_helper_matches(
+        self, helper: int | None, symbol: Optional[str], dispatch: IRSwitchDispatch
+    ) -> bool:
+        if dispatch.helper is not None and helper is not None:
+            if dispatch.helper == helper:
+                return True
+        if dispatch.helper_symbol and symbol:
+            if dispatch.helper_symbol == symbol:
+                return True
         return False
 
     def _pop_dispatch_table(
-        self, helper: int, pending_tables: List[_PendingDispatchTable]
+        self,
+        helper: int,
+        symbol: Optional[str],
+        pending_tables: List[_PendingDispatchTable],
     ) -> Optional[_PendingDispatchTable]:
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
-            if self._dispatch_helper_matches(helper, entry.dispatch):
+            if self._dispatch_helper_matches(helper, symbol, entry.dispatch):
                 pending_tables.pop(index)
                 return entry
         return None
@@ -1064,11 +1085,14 @@ class ASTBuilder:
         self, dispatch: IRSwitchDispatch, pending_calls: List[_PendingDispatchCall]
     ) -> Optional[_PendingDispatchCall]:
         helper = dispatch.helper
-        if helper is None:
+        helper_symbol = dispatch.helper_symbol
+        if helper is None and helper_symbol is None:
             return None
         for index in range(len(pending_calls) - 1, -1, -1):
             entry = pending_calls[index]
-            if entry.helper == helper:
+            if helper is not None and entry.helper == helper:
+                return pending_calls.pop(index)
+            if helper_symbol and entry.symbol == helper_symbol:
                 return pending_calls.pop(index)
         return None
 
@@ -1220,10 +1244,54 @@ class ASTBuilder:
         index_info = dispatch.index
         if index_info is None:
             return None, None, None
+        mask = index_info.mask
+        source_token = index_info.source.strip() if index_info.source else None
+        parsed_mask: Optional[int] = None
+        if source_token:
+            source_token, parsed_mask = self._split_dispatch_source(source_token)
+        if mask is None and parsed_mask is not None:
+            mask = parsed_mask
         index_expr: ASTExpression | None = None
-        if index_info.source:
-            index_expr = self._resolve_expr(index_info.source, value_state)
-        return index_expr, index_info.mask, index_info.base
+        if source_token:
+            candidate = self._resolve_expr(source_token, value_state)
+            if not self._is_unhelpful_dispatch_expr(candidate):
+                index_expr = candidate
+        return index_expr, mask, index_info.base
+
+    def _split_dispatch_source(self, token: str) -> Tuple[str | None, int | None]:
+        text = token.strip()
+        if not text:
+            return None, None
+        if text.startswith("(") and text.endswith(")"):
+            text = text[1:-1].strip()
+        if "&" not in text:
+            return text or None, None
+        head, tail = text.rsplit("&", 1)
+        mask_text = tail.strip()
+        if mask_text.startswith("(") and mask_text.endswith(")"):
+            mask_text = mask_text[1:-1].strip()
+        if self._is_hex_literal(mask_text):
+            expr_text = head.strip()
+            if expr_text.startswith("(") and expr_text.endswith(")"):
+                expr_text = expr_text[1:-1].strip()
+            try:
+                mask_value = int(mask_text, 16)
+            except ValueError:
+                mask_value = None
+            return expr_text or None, mask_value
+        return text, None
+
+    @staticmethod
+    def _is_unhelpful_dispatch_expr(expr: ASTExpression) -> bool:
+        if isinstance(expr, ASTUnknown):
+            return True
+        if isinstance(expr, ASTIdentifier):
+            name = expr.name
+            if name == "stack_top":
+                return True
+            if _RAW_DISPATCH_TOKEN.match(name):
+                return True
+        return False
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
         helper = dispatch.helper

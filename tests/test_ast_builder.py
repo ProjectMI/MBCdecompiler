@@ -8,6 +8,7 @@ from mbcdisasm.ast import (
     ASTCallExpr,
     ASTCallFrame,
     ASTCallStatement,
+    ASTIdentifier,
     ASTLiteral,
     ASTReturn,
     ASTSlotRef,
@@ -172,6 +173,10 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert switch_stmt.cases[0].target == 0x2222
     assert switch_stmt.enum_name == "Helper1111"
     assert switch_stmt.cases[0].key_alias == "Helper1111.K_0001"
+    rendered = switch_stmt.render()
+    assert rendered.startswith("switch(")
+    assert "helper=" not in rendered
+    assert "Helper1111.K_0001" in rendered
     segment = ast_program.segments[0]
     assert segment.enums and segment.enums[0].name == "Helper1111"
     assert segment.enums[0].members[0].name == "K_0001"
@@ -212,6 +217,40 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     enums = ast_program.segments[0].enums
     assert not enums
     assert not ast_program.enums
+
+
+def test_ast_builder_extracts_mask_from_index_source() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x01, target=0x2222, symbol=None),),
+        helper=0x1111,
+        helper_symbol="helper_1111",
+        default=None,
+        index=IRDispatchIndex(source="word0 & 0x0007", mask=None, base=None),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0150,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0150,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    switch_stmt = statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.index_mask == 0x0007
+    assert isinstance(switch_stmt.index_expr, ASTIdentifier)
+    assert switch_stmt.index_expr.name == "word0"
+    assert "& 0x0007" in switch_stmt.render()
 
 
 def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:

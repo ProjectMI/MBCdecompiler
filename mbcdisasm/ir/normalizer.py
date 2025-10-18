@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace, fields, is_dataclass
+import re
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
@@ -85,6 +86,9 @@ from .model import (
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 DATA_MARKER_MNEMONICS = {"op_DE_00", "op_94_00"}
+
+
+_RAW_DISPATCH_SOURCE = re.compile(r"^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}@0x[0-9A-Fa-f]+$")
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
@@ -3245,8 +3249,14 @@ class IRNormalizer:
             scan -= 1
             steps += 1
 
+        if source_name is not None and self._is_unhelpful_dispatch_source(source_name):
+            source_name = None
+
         if source_name is None:
             source_name = self._find_dispatch_source(items, index, skip_nodes)
+
+        if source_name is not None and self._is_unhelpful_dispatch_source(source_name):
+            source_name = None
 
         if mask is None and base_literal is None and source_name is None:
             return None
@@ -3267,42 +3277,76 @@ class IRNormalizer:
             if isinstance(node, IRLiteral):
                 mapped = self._ssa_value(node)
                 if mapped is not None:
-                    return mapped
-                return node.describe()
+                    if not self._is_unhelpful_dispatch_source(mapped):
+                        return mapped
+                description = node.describe()
+                if not self._is_unhelpful_dispatch_source(description):
+                    return description
+                scan -= 1
+                continue
             if isinstance(node, IRLiteralChunk):
                 if "literal_marker" in node.annotations:
                     scan -= 1
                     continue
                 mapped = self._ssa_value(node)
                 if mapped is not None:
-                    return mapped
-                return node.describe()
+                    if not self._is_unhelpful_dispatch_source(mapped):
+                        return mapped
+                description = node.describe()
+                if not self._is_unhelpful_dispatch_source(description):
+                    return description
+                scan -= 1
+                continue
             if isinstance(node, IRDataMarker):
                 scan -= 1
                 continue
             if isinstance(node, IRTestSetBranch):
-                return node.var
+                if not self._is_unhelpful_dispatch_source(node.var):
+                    return node.var
+                scan -= 1
+                continue
             if isinstance(node, IRStackDuplicate):
                 mapped = self._ssa_value(node)
                 if mapped is not None:
-                    return mapped
-                return node.value
+                    if not self._is_unhelpful_dispatch_source(mapped):
+                        return mapped
+                if not self._is_unhelpful_dispatch_source(node.value):
+                    return node.value
+                scan -= 1
+                continue
             if isinstance(node, RawInstruction):
                 if node.pushes_value():
                     mapped = self._ssa_value(node)
                     if mapped is not None:
-                        return mapped
-                    return self._describe_value(node)
+                        if not self._is_unhelpful_dispatch_source(mapped):
+                            return mapped
+                    description = self._describe_value(node)
+                    if not self._is_unhelpful_dispatch_source(description):
+                        return description
+                    scan -= 1
+                    continue
                 break
             if isinstance(node, IRNode):
                 mapped = self._ssa_value(node)
                 if mapped is not None:
-                    return mapped
+                    if not self._is_unhelpful_dispatch_source(mapped):
+                        return mapped
                 describe = getattr(node, "describe", None)
                 if callable(describe):
-                    return describe()
+                    description = describe()
+                    if not self._is_unhelpful_dispatch_source(description):
+                        return description
             scan -= 1
         return None
+
+    @staticmethod
+    def _is_unhelpful_dispatch_source(name: Optional[str]) -> bool:
+        if not name:
+            return True
+        lowered = name.lower()
+        if lowered == "stack_top":
+            return True
+        return bool(_RAW_DISPATCH_SOURCE.match(name))
 
     def _pass_resolve_dispatch_indices(self, items: _ItemList) -> None:
         snapshot: List[Union[RawInstruction, IRNode]] = list(items)
@@ -3321,19 +3365,21 @@ class IRNormalizer:
                     index_info = hints[-1]
                 else:
                     fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
-                    if fallback_source is None:
-                        fallback_source = "stack_top"
                     fallback_mask = existing.mask if existing else None
                     fallback_base = existing.base if existing else None
                     index_info = IRDispatchIndex(
-                        source=fallback_source,
+                        source=(
+                            None
+                            if self._is_unhelpful_dispatch_source(fallback_source)
+                            else fallback_source
+                        ),
                         mask=fallback_mask,
                         base=fallback_base,
                     )
             if index_info.source is None and (existing is None or not existing.source):
                 fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
-                if fallback_source is None:
-                    fallback_source = "stack_top"
+                if self._is_unhelpful_dispatch_source(fallback_source):
+                    fallback_source = None
                 mask = index_info.mask
                 base = index_info.base
                 if existing is not None:

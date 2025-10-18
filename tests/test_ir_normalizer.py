@@ -1819,7 +1819,7 @@ def test_normalizer_dispatch_index_uses_recorded_hint(tmp_path: Path) -> None:
     assert updated.index.base == 0x9000
 
 
-def test_normalizer_dispatch_index_defaults_to_stack_top(tmp_path: Path) -> None:
+def test_normalizer_dispatch_index_defaults_to_unknown_source(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
     normalizer = IRNormalizer(knowledge)
 
@@ -1838,7 +1838,7 @@ def test_normalizer_dispatch_index_defaults_to_stack_top(tmp_path: Path) -> None
     updated = items[0]
     assert isinstance(updated, IRSwitchDispatch)
     assert updated.index is not None
-    assert updated.index.source == "stack_top"
+    assert updated.index.source is None
     assert updated.index.mask == 0x2000
     assert updated.index.base == 0x0042
 
