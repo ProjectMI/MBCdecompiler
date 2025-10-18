@@ -246,6 +246,8 @@ def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:
     assert isinstance(statements[0], ASTCallStatement)
     assert statements[0].call.target == 0x6060
     assert statements[0].call.symbol == "helper_6060"
+    assert not ast_program.segments[0].enums
+    assert not ast_program.enums
 
 
 def test_ast_switch_marks_io_dispatch() -> None:
