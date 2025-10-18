@@ -291,6 +291,7 @@ class _PendingDispatchTable:
 
     dispatch: IRSwitchDispatch
     index: int
+    enum_key: Optional[str] = None
 
 
 @dataclass
@@ -301,6 +302,7 @@ class _EnumInfo:
     member_names: Dict[int, str]
     owner_segment: int
     order: int
+    uses: int = 0
 
 
 class ASTBuilder:
@@ -340,10 +342,15 @@ class ASTBuilder:
         metrics.procedure_count = sum(len(seg.procedures) for seg in segments)
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
+        active_program_enums = tuple(
+            self._enum_infos[key].decl
+            for key in self._enum_order
+            if self._enum_infos[key].uses > 0
+        )
         return ASTProgram(
             segments=tuple(segments),
             metrics=metrics,
-            enums=tuple(self._enum_infos[key].decl for key in self._enum_order),
+            enums=active_program_enums,
         )
 
     # ------------------------------------------------------------------
@@ -367,12 +374,17 @@ class ASTBuilder:
         }
         self._current_redirects = redirects
         procedures = self._group_procedures(segment, analyses, entry_reasons, metrics)
+        segment_enums = tuple(
+            self._enum_infos[key].decl
+            for key in self._segment_declared_enum_keys
+            if self._enum_infos[key].uses > 0
+        )
         result = ASTSegment(
             index=segment.index,
             start=segment.start,
             length=segment.length,
             procedures=tuple(procedures),
-            enums=tuple(self._enum_infos[key].decl for key in self._segment_declared_enum_keys),
+            enums=segment_enums,
         )
         self._clear_context()
         return result
@@ -1154,7 +1166,7 @@ class ASTBuilder:
         frame = self._build_call_frame(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        pending_table = self._pop_dispatch_table(call_expr, pending_tables)
         if pending_table is not None:
             if frame is not None:
                 insert_index = pending_table.index
@@ -1164,9 +1176,26 @@ class ASTBuilder:
                 target_index = insert_index + 1
             else:
                 target_index = pending_table.index
-            statements[target_index] = self._build_dispatch_switch(
-                call_expr, pending_table.dispatch, value_state
+            switch_statement, enum_key, collapsed = self._build_dispatch_switch(
+                call_expr,
+                pending_table.dispatch,
+                value_state,
+                register_enum_use=False,
             )
+            statements[target_index] = switch_statement
+            previous_key = pending_table.enum_key
+            if collapsed:
+                if previous_key:
+                    self._deactivate_enum_use(previous_key)
+            else:
+                if enum_key != previous_key:
+                    if previous_key:
+                        self._deactivate_enum_use(previous_key)
+                    if enum_key:
+                        info = self._enum_infos.get(enum_key)
+                        if info is not None:
+                            self._activate_enum_use(enum_key, info)
+                pending_table.enum_key = enum_key or previous_key
             return
         if frame is not None:
             statements.append(frame)
@@ -1186,29 +1215,37 @@ class ASTBuilder:
     ) -> None:
         call_info = self._pop_dispatch_call(dispatch, pending_calls)
         if call_info is not None:
-            switch_statement = self._build_dispatch_switch(
+            switch_statement, _, _ = self._build_dispatch_switch(
                 call_info.call, dispatch, value_state
             )
             statements[call_info.index] = switch_statement
             return
         index = len(statements)
-        switch_statement = self._build_dispatch_switch(
+        switch_statement, enum_key, _ = self._build_dispatch_switch(
             None, dispatch, value_state
         )
         statements.append(switch_statement)
-        pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
+        pending_tables.append(
+            _PendingDispatchTable(dispatch=dispatch, index=index, enum_key=enum_key)
+        )
 
-    def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
-        if dispatch.helper is not None:
-            return dispatch.helper == helper
-        return False
+    def _dispatch_table_matches_call(
+        self, call_expr: ASTCallExpr, dispatch: IRSwitchDispatch
+    ) -> bool:
+        helper = dispatch.helper
+        if helper is not None and helper != call_expr.target:
+            return False
+        symbol = dispatch.helper_symbol
+        if symbol and call_expr.symbol and symbol != call_expr.symbol:
+            return False
+        return True
 
     def _pop_dispatch_table(
-        self, helper: int, pending_tables: List[_PendingDispatchTable]
+        self, call_expr: ASTCallExpr, pending_tables: List[_PendingDispatchTable]
     ) -> Optional[_PendingDispatchTable]:
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
-            if self._dispatch_helper_matches(helper, entry.dispatch):
+            if self._dispatch_table_matches_call(call_expr, entry.dispatch):
                 pending_tables.pop(index)
                 return entry
         return None
@@ -1216,14 +1253,22 @@ class ASTBuilder:
     def _pop_dispatch_call(
         self, dispatch: IRSwitchDispatch, pending_calls: List[_PendingDispatchCall]
     ) -> Optional[_PendingDispatchCall]:
-        helper = dispatch.helper
-        if helper is None:
-            return None
         for index in range(len(pending_calls) - 1, -1, -1):
             entry = pending_calls[index]
-            if entry.helper == helper:
+            if self._dispatch_call_matches(entry.call, dispatch):
                 return pending_calls.pop(index)
         return None
+
+    def _dispatch_call_matches(
+        self, call_expr: ASTCallExpr, dispatch: IRSwitchDispatch
+    ) -> bool:
+        helper = dispatch.helper
+        if helper is not None and helper != call_expr.target:
+            return False
+        symbol = dispatch.helper_symbol
+        if symbol and call_expr.symbol and symbol != call_expr.symbol:
+            return False
+        return True
 
     def _adjust_pending_indices(
         self, pending_calls: List[_PendingDispatchCall], insert_index: int
@@ -1321,20 +1366,27 @@ class ASTBuilder:
         call_expr: ASTCallExpr | None,
         dispatch: IRSwitchDispatch,
         value_state: Mapping[str, ASTExpression],
-    ) -> ASTSwitch:
+        *,
+        register_enum_use: bool = True,
+    ) -> Tuple[ASTSwitch, Optional[str], bool]:
         collapse_dispatch = self._should_collapse_dispatch(call_expr, dispatch)
-        enum_decl: ASTEnumDecl | None
-        alias_lookup: Mapping[int, str]
         enum_name: str | None
-        if collapse_dispatch:
-            enum_decl = None
+        alias_lookup: Mapping[int, str]
+        enum_key: Optional[str]
+        should_enumerate = not collapse_dispatch and (
+            len(dispatch.cases) > 1 or dispatch.default is not None
+        )
+        if not should_enumerate:
             alias_lookup = {}
             enum_name = None
+            enum_key = None
         else:
-            enum_decl, alias_lookup = self._ensure_dispatch_enum(
+            info, alias_lookup, enum_key = self._ensure_dispatch_enum(
                 dispatch, call_expr.symbol if call_expr else None
             )
-            enum_name = enum_decl.name if enum_decl else None
+            if info is not None and enum_key is not None and register_enum_use:
+                self._activate_enum_use(enum_key, info)
+            enum_name = info.decl.name if info else None
         cases = self._build_dispatch_cases(dispatch.cases, enum_name, alias_lookup)
         index_expr, index_mask, index_base = self._resolve_dispatch_index(
             dispatch, value_state
@@ -1351,7 +1403,7 @@ class ASTBuilder:
             index_base=index_base,
             kind=kind,
             enum_name=enum_name,
-        )
+        ), enum_key, collapse_dispatch
 
     @staticmethod
     def _should_collapse_dispatch(
@@ -1413,10 +1465,10 @@ class ASTBuilder:
 
     def _ensure_dispatch_enum(
         self, dispatch: IRSwitchDispatch, call_symbol: str | None
-    ) -> Tuple[ASTEnumDecl | None, Mapping[int, str]]:
+    ) -> Tuple[_EnumInfo | None, Mapping[int, str], Optional[str]]:
         key = self._dispatch_helper_key(dispatch, call_symbol)
         if key is None:
-            return None, {}
+            return None, {}, None
         info = self._enum_infos.get(key)
         if info is None:
             name = self._allocate_enum_name(dispatch, key, call_symbol)
@@ -1429,12 +1481,8 @@ class ASTBuilder:
             )
             self._enum_infos[key] = info
             self._enum_order.append(key)
-            self._register_segment_enum(key, info)
-        else:
-            if info.owner_segment == self._current_segment_index:
-                self._register_segment_enum(key, info)
         self._update_enum_members(info, dispatch, call_symbol)
-        return info.decl, info.member_names
+        return info, info.member_names, key
 
     def _register_segment_enum(self, key: str, info: _EnumInfo) -> None:
         if info.owner_segment != self._current_segment_index:
@@ -1443,6 +1491,23 @@ class ASTBuilder:
             return
         self._segment_declared_enum_set.add(key)
         self._segment_declared_enum_keys.append(key)
+
+    def _activate_enum_use(self, key: str, info: _EnumInfo) -> None:
+        if info.uses == 0:
+            self._register_segment_enum(key, info)
+        info.uses += 1
+
+    def _deactivate_enum_use(self, key: str) -> None:
+        info = self._enum_infos.get(key)
+        if info is None or info.uses == 0:
+            return
+        info.uses -= 1
+        if info.uses == 0 and info.owner_segment == self._current_segment_index:
+            if key in self._segment_declared_enum_set:
+                self._segment_declared_enum_set.remove(key)
+                self._segment_declared_enum_keys = [
+                    existing for existing in self._segment_declared_enum_keys if existing != key
+                ]
 
     def _update_enum_members(
         self, info: _EnumInfo, dispatch: IRSwitchDispatch, call_symbol: str | None
@@ -1506,7 +1571,7 @@ class ASTBuilder:
         if symbol:
             lowered = symbol.lower()
             if lowered.startswith("scheduler.mask_"):
-                base = "SchedulerMask"
+                base = "DispatchSchedulerMask"
             elif lowered.startswith("io.") and lowered.endswith("write"):
                 parts = [
                     piece.capitalize()
@@ -1514,7 +1579,7 @@ class ASTBuilder:
                     for piece in part.split("_")
                     if piece
                 ]
-                base = "".join(parts) or "Dispatch"
+                base = "Dispatch" + ("".join(parts) or "Dispatch")
                 if not base.endswith("Dispatch"):
                     base += "Dispatch"
             else:
@@ -1524,10 +1589,11 @@ class ASTBuilder:
                     for piece in part.split("_")
                     if piece
                 ]
-                base = "".join(parts) or "Dispatch"
+                combined = "".join(parts) or "Dispatch"
+                base = combined if combined.startswith("Dispatch") else f"Dispatch{combined}"
             return base
         if helper is not None:
-            return f"Dispatch_0x{helper:04X}"
+            return f"DispatchHelper{helper:04X}"
         return "Dispatch"
 
     def _resolve_enum_aliases(
