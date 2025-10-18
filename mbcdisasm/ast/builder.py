@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -120,6 +121,8 @@ _IO_STEP_MNEMONICS = {
     "op_C0_00",
     "op_C3_01",
 }
+
+_CALL_ARGS_PATTERN = re.compile(r"args=\[(?P<body>.*?)]")
 
 _IO_OPCODE_FALLBACK = {
     0x10,
@@ -280,7 +283,7 @@ class _ProcedureAccumulator:
 class _PendingDispatchCall:
     """Call statement awaiting an accompanying dispatch table."""
 
-    helper: int
+    signature: "_DispatchSignature"
     index: int
     call: ASTCallExpr
 
@@ -291,6 +294,17 @@ class _PendingDispatchTable:
 
     dispatch: IRSwitchDispatch
     index: int
+    signature: "_DispatchSignature"
+
+
+@dataclass(frozen=True)
+class _DispatchSignature:
+    """Signature information used to match calls and dispatch tables."""
+
+    helper: int | None
+    symbol: str | None
+    args: Tuple[str, ...] | None
+    token: str | None
 
 
 @dataclass
@@ -1152,9 +1166,10 @@ class ASTBuilder:
             len(call_expr.args),
         )
         frame = self._build_call_frame(node, arg_exprs)
+        signature = self._call_dispatch_signature(node)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        pending_table = self._pop_dispatch_table(signature, pending_tables)
         if pending_table is not None:
             if frame is not None:
                 insert_index = pending_table.index
@@ -1173,7 +1188,7 @@ class ASTBuilder:
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(signature=signature, index=index, call=call_expr)
         )
 
     def _handle_dispatch_table(
@@ -1184,7 +1199,8 @@ class ASTBuilder:
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
     ) -> None:
-        call_info = self._pop_dispatch_call(dispatch, pending_calls)
+        signature = self._dispatch_table_signature(dispatch)
+        call_info = self._pop_dispatch_call(signature, pending_calls)
         if call_info is not None:
             switch_statement = self._build_dispatch_switch(
                 call_info.call, dispatch, value_state
@@ -1196,32 +1212,28 @@ class ASTBuilder:
             None, dispatch, value_state
         )
         statements.append(switch_statement)
-        pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
-
-    def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
-        if dispatch.helper is not None:
-            return dispatch.helper == helper
-        return False
+        pending_tables.append(
+            _PendingDispatchTable(dispatch=dispatch, index=index, signature=signature)
+        )
 
     def _pop_dispatch_table(
-        self, helper: int, pending_tables: List[_PendingDispatchTable]
+        self, signature: _DispatchSignature, pending_tables: List[_PendingDispatchTable]
     ) -> Optional[_PendingDispatchTable]:
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
-            if self._dispatch_helper_matches(helper, entry.dispatch):
+            if self._signatures_match(signature, entry.signature):
                 pending_tables.pop(index)
                 return entry
         return None
 
     def _pop_dispatch_call(
-        self, dispatch: IRSwitchDispatch, pending_calls: List[_PendingDispatchCall]
+        self,
+        signature: _DispatchSignature,
+        pending_calls: List[_PendingDispatchCall],
     ) -> Optional[_PendingDispatchCall]:
-        helper = dispatch.helper
-        if helper is None:
-            return None
         for index in range(len(pending_calls) - 1, -1, -1):
             entry = pending_calls[index]
-            if entry.helper == helper:
+            if self._signatures_match(entry.signature, signature):
                 return pending_calls.pop(index)
         return None
 
@@ -1260,6 +1272,65 @@ class ASTBuilder:
                 index += 1
             index += 1
         return collapsed
+
+    def _call_dispatch_signature(self, node: IRCall) -> _DispatchSignature:
+        token = node.describe()
+        return _DispatchSignature(
+            helper=node.target,
+            symbol=node.symbol,
+            args=tuple(node.args),
+            token=token.strip() if token else None,
+        )
+
+    def _dispatch_table_signature(self, dispatch: IRSwitchDispatch) -> _DispatchSignature:
+        token = self._extract_dispatch_call_token(dispatch)
+        args = self._parse_call_token_args(token) if token else None
+        return _DispatchSignature(
+            helper=dispatch.helper,
+            symbol=dispatch.helper_symbol,
+            args=args,
+            token=token,
+        )
+
+    @staticmethod
+    def _extract_dispatch_call_token(dispatch: IRSwitchDispatch) -> str | None:
+        index = dispatch.index
+        if index is None or not index.source:
+            return None
+        token = index.source.strip()
+        if token.startswith("call"):
+            return token
+        return None
+
+    @staticmethod
+    def _parse_call_token_args(token: str) -> Tuple[str, ...] | None:
+        match = _CALL_ARGS_PATTERN.search(token)
+        if not match:
+            return None
+        body = match.group("body").strip()
+        if not body:
+            return ()
+        parts = [part.strip() for part in body.split(",")]
+        return tuple(part for part in parts if part)
+
+    def _signatures_match(
+        self, call_signature: _DispatchSignature, dispatch_signature: _DispatchSignature
+    ) -> bool:
+        helper = dispatch_signature.helper
+        if helper is not None and call_signature.helper != helper:
+            return False
+        table_symbol = dispatch_signature.symbol
+        call_symbol = call_signature.symbol
+        if table_symbol and call_symbol and table_symbol != call_symbol:
+            return False
+        if dispatch_signature.args is not None:
+            call_args = call_signature.args or ()
+            if call_args != dispatch_signature.args:
+                return False
+        elif dispatch_signature.token and call_signature.token:
+            if call_signature.token.strip() != dispatch_signature.token.strip():
+                return False
+        return True
 
     def _simplify_dispatch_statement(
         self, statement: ASTStatement
