@@ -172,6 +172,9 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert switch_stmt.cases[0].target == 0x2222
     assert switch_stmt.enum_name == "Helper1111"
     assert switch_stmt.cases[0].key_alias == "Helper1111.K_0001"
+    rendered = switch_stmt.render()
+    assert rendered.startswith("switch(")
+    assert "helper=" not in rendered
     segment = ast_program.segments[0]
     assert segment.enums and segment.enums[0].name == "Helper1111"
     assert segment.enums[0].members[0].name == "K_0001"
@@ -444,7 +447,7 @@ def test_ast_builder_reconstructs_dispatch_call_index() -> None:
     switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
 
     assert isinstance(switch_stmt.call, ASTCallExpr)
-    assert switch_stmt.index_expr is switch_stmt.call
+    assert switch_stmt.index_expr is switch_stmt.call.args[0]
     assert switch_stmt.index_mask == 0x000F
 
 

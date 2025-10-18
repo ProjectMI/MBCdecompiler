@@ -3192,9 +3192,26 @@ class IRNormalizer:
                     steps += 1
                     continue
                 break
+            elif isinstance(node, IRConditionMask):
+                if mask is None:
+                    mask = node.mask & 0xFFFF
+                    skip_nodes.add(id(node))
+                if source_name is None:
+                    source_name = node.source
+                scan -= 1
+                steps += 1
+                continue
             elif isinstance(node, IRTestSetBranch):
                 if source_name is None:
                     source_name = node.var
+                    skip_nodes.add(id(node))
+                    scan -= 1
+                    steps += 1
+                    continue
+                break
+            elif isinstance(node, IRStackDuplicate):
+                if source_name is None:
+                    source_name = node.value
                     skip_nodes.add(id(node))
                     scan -= 1
                     steps += 1

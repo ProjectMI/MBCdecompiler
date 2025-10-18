@@ -1184,7 +1184,7 @@ class ASTBuilder:
             enum_name = enum_decl.name if enum_decl else None
         cases = self._build_dispatch_cases(dispatch.cases, enum_name, alias_lookup)
         index_expr, index_mask, index_base = self._resolve_dispatch_index(
-            dispatch, value_state
+            call_expr, dispatch, value_state
         )
         kind = self._classify_dispatch_kind(dispatch)
         return ASTSwitch(
@@ -1214,16 +1214,58 @@ class ASTBuilder:
 
     def _resolve_dispatch_index(
         self,
+        call_expr: ASTCallExpr | None,
         dispatch: IRSwitchDispatch,
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTExpression | None, int | None, int | None]:
         index_info = dispatch.index
         if index_info is None:
-            return None, None, None
+            return self._extract_call_index_expr(call_expr), None, None
         index_expr: ASTExpression | None = None
         if index_info.source:
             index_expr = self._resolve_expr(index_info.source, value_state)
+            if self._is_placeholder_dispatch_expr(index_expr, call_expr):
+                index_expr = None
+        if index_expr is None:
+            index_expr = self._extract_call_index_expr(call_expr)
+        if index_expr is None and index_info.source:
+            index_expr = ASTIdentifier(index_info.source, SSAValueKind.UNKNOWN)
         return index_expr, index_info.mask, index_info.base
+
+    @staticmethod
+    def _extract_call_index_expr(call_expr: ASTCallExpr | None) -> ASTExpression | None:
+        if call_expr is None:
+            return None
+        if call_expr.args:
+            first = call_expr.args[0]
+            if not isinstance(first, ASTUnknown):
+                return first
+        if not call_expr.args:
+            return call_expr
+        return None
+
+    @staticmethod
+    def _is_placeholder_dispatch_expr(
+        expr: ASTExpression | None, call_expr: ASTCallExpr | None
+    ) -> bool:
+        if expr is None:
+            return False
+        if isinstance(expr, ASTUnknown):
+            return True
+        if isinstance(expr, ASTCallExpr) and call_expr is not None:
+            if (
+                expr.target == call_expr.target
+                and expr.symbol == call_expr.symbol
+                and expr.args == call_expr.args
+            ):
+                return True
+        if isinstance(expr, ASTIdentifier):
+            lowered = expr.name.lower()
+            if lowered == "stack_top":
+                return True
+            if "@" in expr.name:
+                return True
+        return False
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
         helper = dispatch.helper
