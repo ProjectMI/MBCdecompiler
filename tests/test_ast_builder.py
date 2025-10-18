@@ -448,6 +448,45 @@ def test_ast_builder_reconstructs_dispatch_call_index() -> None:
     assert switch_stmt.index_mask == 0x000F
 
 
+def test_ast_switch_render_is_compact() -> None:
+    call = IRCall(target=0x4000, args=(), symbol="helper_4000")
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x01, target=0x2000, symbol=None),),
+        helper=0x4000,
+        helper_symbol="helper_4000",
+        default=0x3000,
+        index=IRDispatchIndex(source="stack_top & 0x000F", mask=None, base=None),
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0400,
+        nodes=(call, dispatch),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
+
+    assert switch_stmt.index_mask == 0x000F
+    assert switch_stmt.index_expr is None
+    rendered = switch_stmt.render()
+    assert rendered.startswith("switch(")
+    assert "Switch{" not in rendered
+    assert "helper=" not in rendered
+    assert "index=" not in rendered
+    assert "stack_top" not in rendered
+    assert "& 0x000F" in rendered
+
+
 def test_ast_builder_reuses_call_frame_argument() -> None:
     builder = ASTBuilder()
     literal = ASTLiteral(0x1234)

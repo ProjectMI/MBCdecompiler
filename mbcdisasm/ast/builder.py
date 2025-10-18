@@ -1220,10 +1220,70 @@ class ASTBuilder:
         index_info = dispatch.index
         if index_info is None:
             return None, None, None
+        source = index_info.source.strip() if index_info.source else None
+        inline_mask: int | None = None
+        if source:
+            source, inline_mask = self._split_dispatch_index_source(source)
         index_expr: ASTExpression | None = None
-        if index_info.source:
-            index_expr = self._resolve_expr(index_info.source, value_state)
-        return index_expr, index_info.mask, index_info.base
+        if source:
+            index_expr = self._resolve_expr(source, value_state)
+            if self._is_placeholder_index_expr(index_expr):
+                index_expr = None
+        mask = self._combine_index_masks(index_info.mask, inline_mask)
+        mask = self._normalise_index_mask(mask)
+        return index_expr, mask, index_info.base
+
+    @staticmethod
+    def _split_dispatch_index_source(
+        token: str,
+    ) -> Tuple[str | None, int | None]:
+        candidate = token.strip()
+        if not candidate:
+            return None, None
+        if "&" not in candidate:
+            return candidate, None
+        head, tail = candidate.rsplit("&", 1)
+        mask_text = tail.strip()
+        if mask_text and ASTBuilder._is_hex_literal(mask_text):
+            try:
+                mask_value = int(mask_text, 16) & 0xFFFF
+            except ValueError:
+                return head.strip() or None, None
+            head_text = head.strip()
+            return (head_text or None), mask_value
+        return candidate, None
+
+    @staticmethod
+    def _combine_index_masks(primary: int | None, secondary: int | None) -> int | None:
+        if primary is None:
+            return secondary
+        if secondary is None:
+            return primary
+        return primary & secondary
+
+    @staticmethod
+    def _normalise_index_mask(mask: int | None) -> int | None:
+        if mask is None:
+            return None
+        masked = mask & 0xFFFF
+        if masked in {0, 0xFFFF}:
+            return None
+        return masked
+
+    @staticmethod
+    def _is_placeholder_index_expr(expr: ASTExpression | None) -> bool:
+        if expr is None:
+            return False
+        if isinstance(expr, ASTUnknown):
+            return True
+        if isinstance(expr, ASTIdentifier):
+            name = expr.name
+            lowered = name.lower()
+            if lowered == "stack_top":
+                return True
+            if "@0x" in name:
+                return True
+        return False
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
         helper = dispatch.helper

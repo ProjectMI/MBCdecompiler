@@ -6,7 +6,7 @@ import pytest
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
-from dataclasses import replace
+from dataclasses import replace, dataclass
 
 from mbcdisasm.ir.model import (
     IRCall,
@@ -42,6 +42,7 @@ from mbcdisasm.ir.model import (
     IRTableBuilderBegin,
     IRTableBuilderEmit,
     IRTableBuilderCommit,
+    IRNode,
     MemSpace,
     IRSlot,
     NormalizerMetrics,
@@ -1755,6 +1756,27 @@ def test_normalizer_dispatch_index_traces_source(tmp_path: Path) -> None:
     assert index_info.source == "word0"
     assert index_info.mask == 0x0007
     assert index_info.base is None
+
+
+def test_normalizer_dispatch_index_splits_inline_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    @dataclass(frozen=True)
+    class DummyIndexSource(IRNode):
+        text: str
+
+        def describe(self) -> str:
+            return self.text
+
+    source = DummyIndexSource(text="word0 & 0x000F")
+    table = IRTablePatch(operations=(("op_2C_01", 0x6623),))
+    items = _ItemList([source, table])
+
+    index_info = normalizer._infer_dispatch_index(items, 1)
+    assert index_info is not None
+    assert index_info.source == "word0"
+    assert index_info.mask == 0x000F
 
 
 def test_normalizer_dispatch_index_traces_indirect_load_with_noise(tmp_path: Path) -> None:

@@ -551,10 +551,8 @@ class ASTSwitchCase:
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
-        key_repr = f"0x{self.key:04X}"
-        if self.key_alias:
-            key_repr = f"{self.key_alias}(0x{self.key:04X})"
-        return f"{key_repr}->{target_repr}"
+        key_repr = self.key_alias or f"0x{self.key:04X}"
+        return f"{key_repr} -> {target_repr}"
 
 
 @dataclass
@@ -572,46 +570,25 @@ class ASTSwitch(ASTStatement):
     kind: str | None = None
     enum_name: str | None = None
 
-    def _render_helper(self) -> str | None:
-        if self.helper is None:
-            return None
-        helper_repr = f"0x{self.helper:04X}"
-        if self.helper_symbol:
-            helper_repr = f"{self.helper_symbol}({helper_repr})"
-        return f"helper={helper_repr}"
+    def render(self) -> str:
+        index_expr = self._render_switch_index()
+        rendered_cases = [case.render() for case in self.cases]
+        if self.default is not None:
+            rendered_cases.append(f"default -> 0x{self.default:04X}")
+        cases_repr = ", ".join(rendered_cases)
+        return f"switch({index_expr}) {{{cases_repr}}}"
 
-    def _render_index(self) -> str:
-        expr = None
+    def _render_switch_index(self) -> str:
         if self.index_expr is not None:
             expr = self.index_expr.render()
         elif self.call is not None:
             expr = self.call.render()
-        if self.index_mask is not None:
-            mask_text = f"0x{self.index_mask:04X}"
-            if expr:
-                expr = f"{expr} & {mask_text}"
-            else:
-                expr = f"& {mask_text}"
-        if not expr:
+        else:
             expr = "?"
-        return f"index={expr}"
-
-    def render(self) -> str:
-        parts: List[str] = [self._render_index()]
-        if self.enum_name:
-            parts.append(f"enum={self.enum_name}")
-        rendered_cases = ", ".join(case.render() for case in self.cases)
-        parts.append(f"table=[{rendered_cases}]")
-        if self.default is not None:
-            parts.append(f"default=0x{self.default:04X}")
-        if self.index_base is not None:
-            parts.append(f"base=0x{self.index_base:04X}")
-        helper_note = self._render_helper()
-        if helper_note:
-            parts.append(helper_note)
-        if self.kind:
-            parts.append(f"kind={self.kind}")
-        return f"Switch{{{', '.join(parts)}}}"
+        mask = self.index_mask
+        if mask is not None and mask not in {0, 0xFFFF}:
+            expr = f"{expr} & 0x{mask:04X}"
+        return expr
 
 
 # ---------------------------------------------------------------------------

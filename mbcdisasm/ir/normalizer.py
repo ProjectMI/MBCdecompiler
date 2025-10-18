@@ -3155,6 +3155,49 @@ class IRNormalizer:
             return False
         return masked.bit_count() <= self._INDEX_MASK_MAX_BITS
 
+    def _split_index_mask(self, token: str) -> Tuple[str | None, int | None]:
+        candidate = token.strip()
+        if not candidate:
+            return None, None
+        if "&" not in candidate:
+            return candidate, None
+        head, tail = candidate.rsplit("&", 1)
+        mask_text = tail.strip()
+        if mask_text.lower().startswith("0x"):
+            try:
+                mask_value = int(mask_text, 16) & 0xFFFF
+            except ValueError:
+                return head.strip() or None, None
+            head_text = head.strip()
+            return (head_text or None), mask_value
+        return candidate, None
+
+    def _normalise_index_mask(self, mask: Optional[int]) -> Optional[int]:
+        if mask is None:
+            return None
+        masked = mask & 0xFFFF
+        if not self._looks_like_index_mask(masked):
+            return None
+        return masked
+
+    def _clean_index_source(
+        self, source: Optional[str], mask: Optional[int]
+    ) -> Tuple[Optional[str], Optional[int]]:
+        if source is None:
+            return None, self._normalise_index_mask(mask)
+        token = source.strip()
+        if not token:
+            return None, self._normalise_index_mask(mask)
+        base, inline_mask = self._split_index_mask(token)
+        if inline_mask is not None:
+            mask = inline_mask if mask is None else mask & inline_mask
+        base_token = base.strip() if isinstance(base, str) else ""
+        if not base_token:
+            base_token = None
+        elif base_token.lower() == "stack_top" or "@0x" in base_token:
+            base_token = None
+        return base_token, self._normalise_index_mask(mask)
+
     def _infer_dispatch_index(
         self, items: _ItemList, index: int
     ) -> Optional[IRDispatchIndex]:
@@ -3247,6 +3290,8 @@ class IRNormalizer:
 
         if source_name is None:
             source_name = self._find_dispatch_source(items, index, skip_nodes)
+
+        source_name, mask = self._clean_index_source(source_name, mask)
 
         if mask is None and base_literal is None and source_name is None:
             return None
