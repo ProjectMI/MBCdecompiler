@@ -418,14 +418,30 @@ class ASTTailCall(ASTStatement):
 
     call: ASTCallExpr
     returns: Tuple[ASTExpression, ...]
+    protocol: Optional[ASTFrameProtocol] = None
+    finally_branch: Optional[ASTFinally] = None
+    varargs: bool = False
 
     def render(self) -> str:
-        rendered = ", ".join(expr.render() for expr in self.returns)
-        suffix = f" returns [{rendered}]" if rendered else ""
         call_repr = self.call.render()
         if self.call.tail and call_repr.startswith("tail "):
             call_repr = call_repr[len("tail ") :]
-        return f"tail {call_repr}{suffix}"
+        base = f"tail {call_repr}"
+        if self.varargs:
+            if not self.returns:
+                base += " returns varargs"
+            else:
+                rendered = ", ".join(expr.render() for expr in self.returns)
+                base += f" returns varargs[{rendered}]"
+        elif self.returns:
+            rendered = ", ".join(expr.render() for expr in self.returns)
+            base += f" returns [{rendered}]"
+        parts = [base]
+        if self.protocol is not None:
+            parts.append(self.protocol.render())
+        if self.finally_branch is not None:
+            parts.append(f"finally {self.finally_branch.render()}")
+        return " ".join(parts)
 
 
 @dataclass

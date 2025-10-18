@@ -58,7 +58,7 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     assert block.successors is not None
     rendered = [statement.render() for statement in block.statements]
     assert any("call" in line for line in rendered)
-    assert any(line.startswith("return") for line in rendered)
+    assert any(line.startswith("return") or line.startswith("tail ") for line in rendered)
     assert procedure.name == f"proc_{procedure.entry_offset:04X}"
 
     summary = ast_program.metrics.describe()
@@ -614,14 +614,15 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert frame.live_mask == RET_MASK
     assert len(frame.slots) == 2
 
-    protocol = next(statement for statement in block.statements if isinstance(statement, ASTFrameProtocol))
+    tail_stmt = next(statement for statement in block.statements if isinstance(statement, ASTTailCall))
+    assert tail_stmt.protocol is not None
+    protocol = tail_stmt.protocol
     assert protocol.teardown == 1
     mask_values = [value for value, _ in protocol.masks]
     assert RET_MASK in mask_values
 
-    return_stmt = next(statement for statement in block.statements if isinstance(statement, ASTReturn))
-    assert return_stmt.finally_branch is not None
-    kinds = [step.kind for step in return_stmt.finally_branch.steps]
+    assert tail_stmt.finally_branch is not None
+    kinds = [step.kind for step in tail_stmt.finally_branch.steps]
     assert "frame.page_select" in kinds
     assert "io.bridge" in kinds
     assert "frame.teardown" not in kinds

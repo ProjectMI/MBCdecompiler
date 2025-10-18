@@ -228,6 +228,15 @@ class _FramePolicySummary:
 
 
 @dataclass
+class _TailCallState:
+    """Tail call awaiting final aggregation into a structured statement."""
+
+    statements: List[ASTStatement]
+    index: int
+    abi_effects: Tuple[IRAbiEffect, ...]
+
+
+@dataclass
 class _ProcedureAccumulator:
     """Partial reconstruction state for a single procedure."""
 
@@ -274,6 +283,7 @@ class ASTBuilder:
         self._current_redirects: Mapping[int, int] = {}
         self._pending_call_frame: List[IRStackEffect] = []
         self._pending_epilogue: List[IRStackEffect] = []
+        self._pending_tail_call: Optional[_TailCallState] = None
         self._enum_infos: Dict[str, _EnumInfo] = {}
         self._enum_order: List[str] = []
         self._enum_name_usage: Dict[str, str] = {}
@@ -1051,6 +1061,7 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
+        self._pending_tail_call = None
         for node in block.nodes:
             if isinstance(node, IRCall):
                 self._handle_dispatch_call(
@@ -1074,6 +1085,7 @@ class ASTBuilder:
             node_statements, node_links = self._convert_node(
                 node,
                 block.start_offset,
+                statements,
                 value_state,
                 metrics,
             )
@@ -1135,6 +1147,12 @@ class ASTBuilder:
         pending_calls.append(
             _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
         )
+        if node.tail:
+            self._pending_tail_call = _TailCallState(
+                statements=statements,
+                index=index,
+                abi_effects=node.abi_effects,
+            )
 
     def _handle_dispatch_table(
         self,
@@ -1533,6 +1551,7 @@ class ASTBuilder:
         self,
         node,
         origin_offset: int,
+        block_statements: List[ASTStatement],
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
     ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
@@ -1689,6 +1708,30 @@ class ASTBuilder:
             self._pending_epilogue.clear()
             return statements, []
         if isinstance(node, IRReturn):
+            tail_state = self._pending_tail_call
+            self._pending_tail_call = None
+            if (
+                tail_state is not None
+                and tail_state.statements is block_statements
+                and 0 <= tail_state.index < len(block_statements)
+            ):
+                existing = block_statements[tail_state.index]
+                if isinstance(existing, ASTCallStatement) and existing.call.tail:
+                    resolved_returns = tuple(
+                        self._resolve_expr(name, value_state) for name in node.values
+                    )
+                    protocol_stmt, finally_branch = self._build_finally(
+                        node.cleanup,
+                        tail_state.abi_effects + node.abi_effects,
+                    )
+                    block_statements[tail_state.index] = ASTTailCall(
+                        call=existing.call,
+                        returns=resolved_returns,
+                        protocol=protocol_stmt,
+                        finally_branch=finally_branch,
+                        varargs=node.varargs,
+                    )
+                    return [], []
             value = self._build_return_value(node, value_state)
             protocol_stmt, finally_branch = self._build_finally(node.cleanup, node.abi_effects)
             statements: List[ASTStatement] = []
