@@ -418,6 +418,7 @@ class ASTTailCall(ASTStatement):
 
     call: ASTCallExpr
     returns: Tuple[ASTExpression, ...]
+    finally_branch: Optional[ASTFinally] = None
 
     def render(self) -> str:
         rendered = ", ".join(expr.render() for expr in self.returns)
@@ -425,7 +426,10 @@ class ASTTailCall(ASTStatement):
         call_repr = self.call.render()
         if self.call.tail and call_repr.startswith("tail "):
             call_repr = call_repr[len("tail ") :]
-        return f"tail {call_repr}{suffix}"
+        finally_suffix = ""
+        if self.finally_branch is not None:
+            finally_suffix = f" finally {self.finally_branch.render()}"
+        return f"tail {call_repr}{suffix}{finally_suffix}"
 
 
 @dataclass
