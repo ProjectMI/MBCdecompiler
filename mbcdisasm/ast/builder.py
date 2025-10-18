@@ -2011,6 +2011,40 @@ class ASTBuilder:
             drops=policy.drops,
         )
 
+    @staticmethod
+    def _ensure_policy_steps(
+        steps: List[ASTFinallyStep], policy: _FramePolicySummary
+    ) -> None:
+        if not policy.has_effects():
+            return
+
+        index_map: Dict[Tuple[str, Optional[int], Optional[str]], int] = {
+            (step.kind, step.operand, step.alias): idx for idx, step in enumerate(steps)
+        }
+
+        def upsert(step: ASTFinallyStep) -> None:
+            key = (step.kind, step.operand, step.alias)
+            existing_index = index_map.get(key)
+            if existing_index is not None:
+                existing = steps[existing_index]
+                if step.pops and step.pops != existing.pops:
+                    steps[existing_index] = ASTFinallyStep(
+                        kind=existing.kind,
+                        operand=existing.operand,
+                        alias=existing.alias,
+                        pops=max(existing.pops, step.pops),
+                    )
+                return
+            index_map[key] = len(steps)
+            steps.append(step)
+
+        for value, alias in policy.masks:
+            upsert(ASTFinallyStep(kind="frame.return_mask", operand=value, alias=alias))
+        if policy.teardown:
+            upsert(ASTFinallyStep(kind="frame.teardown", pops=policy.teardown))
+        if policy.drops:
+            upsert(ASTFinallyStep(kind="frame.drop", pops=policy.drops))
+
     def _build_finally(
         self,
         cleanup_steps: Sequence[IRStackEffect],
@@ -2059,6 +2093,7 @@ class ASTBuilder:
             effect_steps.append(ASTFinallyStep(kind="frame.drop", pops=policy.drops))
 
         aggregated_steps = self._aggregate_finally_steps(effect_steps)
+        self._ensure_policy_steps(aggregated_steps, policy)
         protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
         finally_stmt = ASTFinally(steps=tuple(aggregated_steps)) if aggregated_steps else None
         return protocol_stmt, finally_stmt

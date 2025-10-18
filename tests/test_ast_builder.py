@@ -19,6 +19,7 @@ from mbcdisasm.ir.model import (
     IRBlock,
     IRAbiEffect,
     IRCall,
+    IRCallCleanup,
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
@@ -670,3 +671,53 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert "frame.drop" in final_kinds
     assert any(step.operand == RET_MASK for step in final_steps if step.kind == "frame.return_mask")
     assert any(step.pops == protocol.teardown for step in final_steps if step.kind == "frame.teardown")
+
+
+def test_ast_return_aligns_finally_with_policy_summary() -> None:
+    block = IRBlock(
+        label="ret_block",
+        start_offset=0x2000,
+        nodes=(
+            IRCallCleanup(
+                steps=(
+                    IRStackEffect(mnemonic="stack_teardown", pops=1),
+                    IRStackEffect(mnemonic="op_01_0C", pops=1),
+                )
+            ),
+            IRReturn(
+                values=tuple(),
+                varargs=False,
+                cleanup=(IRStackEffect(mnemonic="op_3A_01", pops=0),),
+                abi_effects=(IRAbiEffect(kind="return_mask", operand=RET_MASK),),
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    protocol = next(statement for statement in statements if isinstance(statement, ASTFrameProtocol))
+    assert protocol.teardown == 1
+    assert protocol.drops == 1
+    mask_values = {value for value, _ in protocol.masks}
+    assert RET_MASK in mask_values
+
+    return_stmt = next(statement for statement in statements if isinstance(statement, ASTReturn))
+    assert return_stmt.finally_branch is not None
+    final_steps = return_stmt.finally_branch.steps
+    summary = {step.kind: step for step in final_steps}
+
+    assert "frame.return_mask" in summary
+    assert summary["frame.return_mask"].operand == RET_MASK
+    assert "frame.teardown" in summary
+    assert summary["frame.teardown"].pops == protocol.teardown
+    assert "frame.drop" in summary
+    assert summary["frame.drop"].pops == protocol.drops
