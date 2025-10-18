@@ -1724,9 +1724,19 @@ class ASTBuilder:
             frame = self._build_call_frame(node, arg_exprs)
             if frame is not None:
                 statements.append(frame)
+            protocol_stmt, finally_branch = self._build_finally(
+                node.cleanup, node.abi_effects
+            )
+            if protocol_stmt is not None:
+                statements.append(protocol_stmt)
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            statements.append(ASTTailCall(call=call_expr, returns=resolved_returns))
-            self._pending_epilogue.clear()
+            statements.append(
+                ASTTailCall(
+                    call=call_expr,
+                    returns=resolved_returns,
+                    finally_branch=finally_branch,
+                )
+            )
             return statements, []
         if isinstance(node, IRReturn):
             value = self._build_return_value(node, value_state)
@@ -2036,6 +2046,17 @@ class ASTBuilder:
                 policy.add_mask(effect.operand, alias)
                 continue
             effect_steps.append(self._convert_abi_effect(effect))
+
+        for value, alias in policy.masks:
+            effect_steps.append(
+                ASTFinallyStep(kind="frame.return_mask", operand=value, alias=alias)
+            )
+        if policy.teardown:
+            effect_steps.append(
+                ASTFinallyStep(kind="frame.teardown", pops=policy.teardown)
+            )
+        if policy.drops:
+            effect_steps.append(ASTFinallyStep(kind="frame.drop", pops=policy.drops))
 
         aggregated_steps = self._aggregate_finally_steps(effect_steps)
         protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
