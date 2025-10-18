@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
+from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -38,6 +39,91 @@ from ..ir.model import (
     MemSpace,
     SSAValueKind,
 )
+
+
+_DIRECT_EPILOGUE_KIND_MAP = {
+    "call_helpers": "helpers.invoke",
+    "fanout": "helpers.fanout",
+    "page_register": "frame.page_select",
+    "stack_teardown": "frame.teardown",
+    "op_6C_01": "frame.page_select",
+    "op_08_00": "helpers.dispatch",
+    "op_72_23": "helpers.wrapper",
+    "op_52_06": "io.handshake",
+    "op_0B_00": "io.handshake",
+    "op_0B_E1": "io.handshake",
+    "op_76_41": "io.bridge",
+    "op_04_EC": "io.bridge",
+    "op_2D_01": "frame.cleanup",
+}
+
+_MASK_STEP_MNEMONICS = {
+    "epilogue",
+    "op_29_10",
+    "op_31_52",
+    "op_32_29",
+    "op_4B_0B",
+    "op_4B_45",
+    "op_4B_CC",
+    "op_4F_01",
+    "op_4F_02",
+    "op_4F_03",
+    "op_52_05",
+    "op_5E_29",
+    "op_70_29",
+    "op_72_4A",
+}
+
+_MASK_OPERANDS = {RET_MASK, FANOUT_FLAGS_A, FANOUT_FLAGS_B}
+_MASK_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
+
+_FRAME_DROP_MNEMONICS = {
+    "op_01_0C",
+    "op_01_30",
+    "op_01_78",
+    "op_01_C0",
+    "op_2D_01",
+}
+
+_IO_BRIDGE_MNEMONICS = {
+    "op_3A_01",
+    "op_3E_4B",
+    "op_E1_4D",
+    "op_E8_4B",
+    "op_ED_4B",
+    "op_F0_4B",
+}
+
+_IO_STEP_MNEMONICS = {
+    "op_10_08",
+    "op_10_0A",
+    "op_10_0E",
+    "op_10_18",
+    "op_10_3C",
+    "op_10_69",
+    "op_10_C5",
+    "op_10_CC",
+    "op_10_CD",
+    "op_10_E3",
+    "op_10_E5",
+    "op_15_4A",
+    "op_18_2A",
+    "op_20_8C",
+    "op_21_94",
+    "op_21_AC",
+    "op_28_6C",
+    "op_52_06",
+    "op_78_00",
+    "op_89_01",
+    "op_A0_03",
+    "op_C0_00",
+    "op_C3_01",
+}
+
+_IO_OPCODE_FALLBACK = {0x10, 0x15, 0x18, 0x20, 0x21, 0x28, 0x52, 0x78, 0x89, 0xA0, 0xC0, 0xC3}
+_MASK_OPCODE_FALLBACK = {0x29, 0x31, 0x32, 0x4B, 0x4F, 0x52, 0x5E, 0x70, 0x72}
+_DROP_OPCODE_FALLBACK = {0x01, 0x2D}
+_BRIDGE_OPCODE_FALLBACK = {0x3A, 0x3E, 0x04, 0x76, 0xE1, 0xE8, 0xED, 0xF0}
 from .model import (
     ASTAssign,
     ASTBlock,
@@ -1668,6 +1754,55 @@ class ASTBuilder:
             include_operand = bool(step.operand) or step.mnemonic not in {"stack_teardown"}
         return step.operand if include_operand else None
 
+    @staticmethod
+    def _mnemonic_opcode(mnemonic: str) -> Optional[int]:
+        if not mnemonic.startswith("op_"):
+            return None
+        try:
+            return int(mnemonic[3:5], 16)
+        except (ValueError, IndexError):
+            return None
+
+    def _epilogue_step_kind(self, step: IRStackEffect) -> str:
+        mnemonic = step.mnemonic
+        alias = step.operand_alias
+        operand = step.operand
+
+        direct = _DIRECT_EPILOGUE_KIND_MAP.get(mnemonic)
+        if direct is not None:
+            return direct
+
+        alias_text = str(alias) if alias is not None else None
+        if (
+            mnemonic in _MASK_STEP_MNEMONICS
+            or operand in _MASK_OPERANDS
+            or (alias_text is not None and alias_text in _MASK_ALIASES)
+        ):
+            return "frame.return_mask"
+
+        opcode = self._mnemonic_opcode(mnemonic)
+        if opcode in _MASK_OPCODE_FALLBACK:
+            return "frame.return_mask"
+
+        if mnemonic in _FRAME_DROP_MNEMONICS or opcode in _DROP_OPCODE_FALLBACK:
+            if step.pops:
+                return "frame.drop"
+
+        if mnemonic in _IO_BRIDGE_MNEMONICS or opcode in _BRIDGE_OPCODE_FALLBACK:
+            return "io.bridge"
+
+        if (
+            mnemonic in _IO_STEP_MNEMONICS
+            or opcode in _IO_OPCODE_FALLBACK
+            or (alias_text is not None and alias_text == "ChatOut")
+        ):
+            return "io.step"
+
+        if step.pops and step.mnemonic != "stack_teardown":
+            return "frame.drop"
+
+        return "effect.cleanup"
+
     def _convert_frame_effect(self, step: IRStackEffect) -> ASTFrameEffect:
         operand = self._stack_effect_operand(step)
         alias = str(step.operand_alias) if step.operand_alias is not None else None
@@ -1676,12 +1811,14 @@ class ASTBuilder:
     def _convert_epilogue_step(self, step: IRStackEffect) -> ASTFinallyStep:
         operand = self._stack_effect_operand(step)
         alias = str(step.operand_alias) if step.operand_alias is not None else None
-        return ASTFinallyStep(kind=step.mnemonic, operand=operand, alias=alias, pops=step.pops)
+        kind = self._epilogue_step_kind(step)
+        return ASTFinallyStep(kind=kind, operand=operand, alias=alias, pops=step.pops)
 
-    @staticmethod
-    def _convert_abi_effect(effect: IRAbiEffect) -> ASTFinallyStep:
+    def _convert_abi_effect(self, effect: IRAbiEffect) -> ASTFinallyStep:
         operand = effect.operand
         alias = str(effect.alias) if effect.alias is not None else None
+        if effect.kind == "return_mask":
+            return ASTFinallyStep(kind="frame.return_mask", operand=operand, alias=alias)
         return ASTFinallyStep(kind=f"abi.{effect.kind}", operand=operand, alias=alias)
 
     def _build_call_frame(

@@ -616,4 +616,4 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     return_stmt = next(statement for statement in block.statements if isinstance(statement, ASTReturn))
     assert return_stmt.finally_branch is not None
     kinds = [step.kind for step in return_stmt.finally_branch.steps]
-    assert "stack_teardown" in kinds
+    assert "frame.teardown" in kinds
