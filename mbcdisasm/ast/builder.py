@@ -283,6 +283,8 @@ class _PendingDispatchCall:
     helper: int
     index: int
     call: ASTCallExpr
+    args: Tuple[str, ...]
+    symbol: Optional[str]
 
 
 @dataclass
@@ -1154,7 +1156,9 @@ class ASTBuilder:
         frame = self._build_call_frame(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        pending_table = self._pop_dispatch_table(
+            node.target, node.symbol, node.args, pending_tables
+        )
         if pending_table is not None:
             if frame is not None:
                 insert_index = pending_table.index
@@ -1173,7 +1177,13 @@ class ASTBuilder:
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(
+                helper=node.target,
+                index=index,
+                call=call_expr,
+                args=node.args,
+                symbol=node.symbol,
+            )
         )
 
     def _handle_dispatch_table(
@@ -1198,17 +1208,16 @@ class ASTBuilder:
         statements.append(switch_statement)
         pending_tables.append(_PendingDispatchTable(dispatch=dispatch, index=index))
 
-    def _dispatch_helper_matches(self, helper: int, dispatch: IRSwitchDispatch) -> bool:
-        if dispatch.helper is not None:
-            return dispatch.helper == helper
-        return False
-
     def _pop_dispatch_table(
-        self, helper: int, pending_tables: List[_PendingDispatchTable]
+        self,
+        helper: int,
+        symbol: Optional[str],
+        args: Tuple[str, ...],
+        pending_tables: List[_PendingDispatchTable],
     ) -> Optional[_PendingDispatchTable]:
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
-            if self._dispatch_helper_matches(helper, entry.dispatch):
+            if self._dispatch_matches_call(helper, symbol, args, entry.dispatch):
                 pending_tables.pop(index)
                 return entry
         return None
@@ -1216,14 +1225,30 @@ class ASTBuilder:
     def _pop_dispatch_call(
         self, dispatch: IRSwitchDispatch, pending_calls: List[_PendingDispatchCall]
     ) -> Optional[_PendingDispatchCall]:
-        helper = dispatch.helper
-        if helper is None:
-            return None
         for index in range(len(pending_calls) - 1, -1, -1):
             entry = pending_calls[index]
-            if entry.helper == helper:
+            if self._dispatch_matches_call(
+                entry.helper, entry.symbol, entry.args, dispatch
+            ):
                 return pending_calls.pop(index)
         return None
+
+    def _dispatch_matches_call(
+        self,
+        helper: int,
+        symbol: Optional[str],
+        args: Tuple[str, ...],
+        dispatch: IRSwitchDispatch,
+    ) -> bool:
+        if dispatch.helper is not None and dispatch.helper != helper:
+            return False
+        dispatch_symbol = dispatch.helper_symbol
+        if dispatch_symbol is not None and dispatch_symbol != symbol:
+            return False
+        expected_args = dispatch.helper_args
+        if expected_args is not None and tuple(args) != tuple(expected_args):
+            return False
+        return True
 
     def _adjust_pending_indices(
         self, pending_calls: List[_PendingDispatchCall], insert_index: int
@@ -1504,31 +1529,33 @@ class ASTBuilder:
         self, symbol: str | None, helper: int | None
     ) -> str:
         if symbol:
-            lowered = symbol.lower()
-            if lowered.startswith("scheduler.mask_"):
-                base = "SchedulerMask"
-            elif lowered.startswith("io.") and lowered.endswith("write"):
-                parts = [
-                    piece.capitalize()
-                    for part in symbol.split(".")
-                    for piece in part.split("_")
-                    if piece
-                ]
-                base = "".join(parts) or "Dispatch"
-                if not base.endswith("Dispatch"):
-                    base += "Dispatch"
-            else:
-                parts = [
-                    piece.capitalize()
-                    for part in symbol.replace("/", ".").split(".")
-                    for piece in part.split("_")
-                    if piece
-                ]
-                base = "".join(parts) or "Dispatch"
-            return base
-        if helper is not None:
-            return f"Dispatch_0x{helper:04X}"
-        return "Dispatch"
+            base = self._format_dispatch_symbol(symbol)
+        elif helper is not None:
+            base = f"0x{helper:04X}"
+        else:
+            base = ""
+        if not base:
+            base = "Dispatch"
+        if not base.startswith("Dispatch"):
+            base = f"Dispatch_{base}"
+        return base
+
+    @staticmethod
+    def _format_dispatch_symbol(symbol: str) -> str:
+        lowered = symbol.lower()
+        if lowered.startswith("scheduler.mask_"):
+            return "SchedulerMask"
+        def _capitalise(piece: str) -> str:
+            if not piece:
+                return ""
+            return piece[0].upper() + piece[1:]
+        parts = [
+            _capitalise(piece)
+            for part in symbol.replace("/", ".").split(".")
+            for piece in part.split("_")
+            if piece
+        ]
+        return "".join(parts)
 
     def _resolve_enum_aliases(
         self, dispatch: IRSwitchDispatch, call_symbol: str | None

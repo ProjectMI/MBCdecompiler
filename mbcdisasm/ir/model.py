@@ -843,6 +843,7 @@ class IRSwitchDispatch(IRNode):
     helper_symbol: Optional[str] = None
     default: Optional[int] = None
     index: Optional[IRDispatchIndex] = None
+    helper_args: Optional[Tuple[str, ...]] = None
 
     def describe(self) -> str:
         helper_details = "helper=?"
@@ -851,6 +852,9 @@ class IRSwitchDispatch(IRNode):
             if self.helper_symbol:
                 helper_repr = f"{self.helper_symbol}({helper_repr})"
             helper_details = f"helper={helper_repr}"
+        if self.helper_args is not None:
+            args_repr = ", ".join(self.helper_args)
+            helper_details += f" args=[{args_repr}]"
         case_text = ", ".join(case.describe() for case in self.cases)
         description = f"dispatch {helper_details} cases=[{case_text}]"
         if self.default is not None:
