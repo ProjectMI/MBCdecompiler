@@ -22,10 +22,12 @@ from mbcdisasm.ir.model import (
     IRDispatchIndex,
     IRIf,
     IRLoad,
+    IRAbiEffect,
     IRProgram,
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRStackEffect,
     IRTailCall,
     IRSlot,
     MemSpace,
@@ -625,3 +627,46 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert "frame.page_select" in kinds
     assert "io.bridge" in kinds
     assert "frame.teardown" not in kinds
+
+
+def test_ast_builder_routes_return_masks_to_frame_protocol() -> None:
+    cleanup_step = IRStackEffect(
+        mnemonic="call_helpers",
+        operand=RET_MASK,
+        operand_alias="RET_MASK",
+    )
+    abi_effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
+    block = IRBlock(
+        label="block_exit",
+        start_offset=0x0400,
+        nodes=(
+            IRReturn(
+                values=tuple(),
+                varargs=False,
+                cleanup=(cleanup_step,),
+                abi_effects=(abi_effect,),
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    ast_block = procedure.blocks[0]
+
+    protocol = next(
+        statement for statement in ast_block.statements if isinstance(statement, ASTFrameProtocol)
+    )
+    assert protocol.masks == ((RET_MASK, "RET_MASK"),)
+
+    return_stmt = next(
+        statement for statement in ast_block.statements if isinstance(statement, ASTReturn)
+    )
+    assert return_stmt.finally_branch is None

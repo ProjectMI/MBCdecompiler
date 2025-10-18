@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
-from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
+from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, OPERAND_ALIASES, RET_MASK
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -76,7 +76,8 @@ _MASK_STEP_MNEMONICS = {
 }
 
 _MASK_OPERANDS = {RET_MASK, FANOUT_FLAGS_A, FANOUT_FLAGS_B}
-_MASK_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
+_MASK_ALIASES = {"RET_MASK", "FANOUT_FLAGS", "ABI.RETURN_MASK"}
+_MASK_OPERAND_ROLES = {"mask", "return_mask"}
 
 _FRAME_DROP_MNEMONICS = {
     "op_01_0C",
@@ -247,24 +248,27 @@ class _FramePolicySummary:
 
     teardown: int = 0
     drops: int = 0
-    masks: List[Tuple[int, Optional[str]]] = field(default_factory=list)
+    masks: Dict[int, Optional[str]] = field(default_factory=dict)
 
     def add_mask(self, value: Optional[int], alias: Optional[str]) -> None:
         if value is None:
             return
-        entry = (value, alias)
-        if entry not in self.masks:
-            self.masks.append(entry)
+        existing = self.masks.get(value)
+        if alias is None:
+            alias = existing or OPERAND_ALIASES.get(value)
+        self.masks[value] = alias
 
     def merge(self, other: "_FramePolicySummary") -> None:
         self.teardown += other.teardown
         self.drops += other.drops
-        for mask in other.masks:
-            if mask not in self.masks:
-                self.masks.append(mask)
+        for value, alias in other.masks.items():
+            self.add_mask(value, alias)
 
     def has_effects(self) -> bool:
         return bool(self.teardown or self.drops or self.masks)
+
+    def iter_masks(self) -> Tuple[Tuple[int, Optional[str]], ...]:
+        return tuple((value, self.masks[value]) for value in sorted(self.masks))
 
 
 @dataclass
@@ -1839,18 +1843,21 @@ class ASTBuilder:
         mnemonic = step.mnemonic
         alias = step.operand_alias
         operand = step.operand
+        alias_text = str(alias) if alias is not None else None
+        alias_key = alias_text.upper() if alias_text is not None else None
+        role_key = step.operand_role.lower() if step.operand_role else None
+
+        if (
+            mnemonic in _MASK_STEP_MNEMONICS
+            or operand in _MASK_OPERANDS
+            or (alias_key is not None and alias_key in _MASK_ALIASES)
+            or (role_key is not None and role_key in _MASK_OPERAND_ROLES)
+        ):
+            return "frame.return_mask"
 
         direct = _DIRECT_EPILOGUE_KIND_MAP.get(mnemonic)
         if direct is not None:
             return direct
-
-        alias_text = str(alias) if alias is not None else None
-        if (
-            mnemonic in _MASK_STEP_MNEMONICS
-            or operand in _MASK_OPERANDS
-            or (alias_text is not None and alias_text in _MASK_ALIASES)
-        ):
-            return "frame.return_mask"
 
         opcode = self._mnemonic_opcode(mnemonic)
         if opcode in _MASK_OPCODE_FALLBACK:
@@ -1866,7 +1873,7 @@ class ASTBuilder:
         if (
             mnemonic in _IO_STEP_MNEMONICS
             or opcode in _IO_OPCODE_FALLBACK
-            or (alias_text is not None and alias_text == "ChatOut")
+            or (alias_key is not None and alias_key == "CHATOUT")
         ):
             return "io.step"
 
@@ -1996,7 +2003,7 @@ class ASTBuilder:
     @staticmethod
     def _build_frame_protocol(policy: _FramePolicySummary) -> ASTFrameProtocol:
         return ASTFrameProtocol(
-            masks=tuple(policy.masks),
+            masks=policy.iter_masks(),
             teardown=policy.teardown,
             drops=policy.drops,
         )
