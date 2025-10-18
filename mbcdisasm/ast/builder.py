@@ -283,6 +283,8 @@ class _PendingDispatchCall:
     helper: int
     index: int
     call: ASTCallExpr
+    token: Optional[str]
+    arg_tokens: Tuple[str, ...]
 
 
 @dataclass
@@ -1137,6 +1139,7 @@ class ASTBuilder:
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
     ) -> None:
+        call_token = node.describe()
         call_expr, arg_exprs = self._convert_call(
             node.target,
             node.args,
@@ -1145,7 +1148,7 @@ class ASTBuilder:
             node.varargs if hasattr(node, "varargs") else False,
             value_state,
         )
-        self._register_expression(node.describe(), call_expr)
+        self._register_expression(call_token, call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
             sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
@@ -1154,7 +1157,13 @@ class ASTBuilder:
         frame = self._build_call_frame(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
-        pending_table = self._pop_dispatch_table(node.target, pending_tables)
+        pending_table = self._pop_dispatch_table(
+            node.target,
+            call_expr.symbol,
+            call_token,
+            node.args,
+            pending_tables,
+        )
         if pending_table is not None:
             if frame is not None:
                 insert_index = pending_table.index
@@ -1173,7 +1182,13 @@ class ASTBuilder:
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(
+                helper=node.target,
+                index=index,
+                call=call_expr,
+                token=call_token,
+                arg_tokens=tuple(node.args),
+            )
         )
 
     def _handle_dispatch_table(
@@ -1203,12 +1218,69 @@ class ASTBuilder:
             return dispatch.helper == helper
         return False
 
+    def _dispatch_matches_call_entry(
+        self, dispatch: IRSwitchDispatch, entry: _PendingDispatchCall
+    ) -> bool:
+        return self._dispatch_matches_call_info(
+            dispatch,
+            entry.helper,
+            entry.call.symbol,
+            entry.token,
+            entry.arg_tokens,
+        )
+
+    def _dispatch_matches_call_info(
+        self,
+        dispatch: IRSwitchDispatch,
+        helper: int,
+        call_symbol: Optional[str],
+        call_token: Optional[str],
+        arg_tokens: Sequence[str],
+    ) -> bool:
+        if not self._dispatch_helper_matches(helper, dispatch):
+            return False
+        if dispatch.helper_symbol is not None:
+            if call_symbol != dispatch.helper_symbol:
+                return False
+        index_info = dispatch.index
+        if index_info is not None and index_info.source:
+            if not self._dispatch_index_matches_tokens(
+                index_info.source, call_token, arg_tokens
+            ):
+                return False
+        return True
+
+    def _dispatch_index_matches_tokens(
+        self, source: str, call_token: Optional[str], arg_tokens: Sequence[str]
+    ) -> bool:
+        candidate = source.strip()
+        if not candidate:
+            return True
+        tokens = {token for token in arg_tokens if token}
+        if call_token:
+            tokens.add(call_token)
+        if candidate in tokens:
+            return True
+        for separator in ("&", "|", "^", "+", "-", ">>", "<<"):
+            if separator in candidate:
+                head = candidate.split(separator, 1)[0].strip()
+                if head and head in tokens:
+                    return True
+        return False
+
     def _pop_dispatch_table(
-        self, helper: int, pending_tables: List[_PendingDispatchTable]
+        self,
+        helper: int,
+        call_symbol: Optional[str],
+        call_token: Optional[str],
+        arg_tokens: Sequence[str],
+        pending_tables: List[_PendingDispatchTable],
     ) -> Optional[_PendingDispatchTable]:
         for index in range(len(pending_tables) - 1, -1, -1):
             entry = pending_tables[index]
-            if self._dispatch_helper_matches(helper, entry.dispatch):
+            if self._dispatch_matches_call_info(
+                entry.dispatch, helper, call_symbol, call_token, arg_tokens
+            ):
                 pending_tables.pop(index)
                 return entry
         return None
@@ -1221,7 +1293,7 @@ class ASTBuilder:
             return None
         for index in range(len(pending_calls) - 1, -1, -1):
             entry = pending_calls[index]
-            if entry.helper == helper:
+            if self._dispatch_matches_call_entry(dispatch, entry):
                 return pending_calls.pop(index)
         return None
 
