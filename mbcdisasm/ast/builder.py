@@ -1369,11 +1369,12 @@ class ASTBuilder:
         *,
         register_enum_use: bool = True,
     ) -> Tuple[ASTSwitch, Optional[str], bool]:
-        collapse_dispatch = self._should_collapse_dispatch(call_expr, dispatch)
+        single_case_dispatch = self._is_single_case_dispatch(dispatch)
+        collapse_dispatch = single_case_dispatch and call_expr is not None
         enum_name: str | None
         alias_lookup: Mapping[int, str]
         enum_key: Optional[str]
-        if collapse_dispatch:
+        if single_case_dispatch:
             alias_lookup = {}
             enum_name = None
             enum_key = None
@@ -1403,11 +1404,7 @@ class ASTBuilder:
         ), enum_key, collapse_dispatch
 
     @staticmethod
-    def _should_collapse_dispatch(
-        call_expr: ASTCallExpr | None, dispatch: IRSwitchDispatch
-    ) -> bool:
-        if call_expr is None:
-            return False
+    def _is_single_case_dispatch(dispatch: IRSwitchDispatch) -> bool:
         if len(dispatch.cases) != 1:
             return False
         if dispatch.default is not None:
@@ -1516,6 +1513,8 @@ class ASTBuilder:
             if case.key in info.member_names:
                 continue
             name = aliases.get(case.key)
+            if not name and case.symbol:
+                name = self._format_enum_member_from_symbol(case.symbol)
             if not name:
                 name = self._format_enum_member_name(case.key)
             name = self._ensure_unique_member_name(name, used_names)
@@ -1543,9 +1542,7 @@ class ASTBuilder:
     def _allocate_enum_name(
         self, dispatch: IRSwitchDispatch, key: str, call_symbol: str | None
     ) -> str:
-        base = self._normalise_enum_name(
-            dispatch.helper_symbol or call_symbol, dispatch.helper
-        )
+        base = self._normalise_enum_name(dispatch, call_symbol)
         name = base
         existing = self._enum_name_usage.get(name)
         if existing is not None and existing != key:
@@ -1563,34 +1560,43 @@ class ASTBuilder:
         return name
 
     def _normalise_enum_name(
-        self, symbol: str | None, helper: int | None
+        self, dispatch: IRSwitchDispatch, call_symbol: str | None
     ) -> str:
-        if symbol:
-            lowered = symbol.lower()
+        helper_symbol = dispatch.helper_symbol or call_symbol
+        if helper_symbol:
+            lowered = helper_symbol.lower()
             if lowered.startswith("scheduler.mask_"):
-                base = "SchedulerMask"
-            elif lowered.startswith("io.") and lowered.endswith("write"):
-                parts = [
-                    piece.capitalize()
-                    for part in symbol.split(".")
-                    for piece in part.split("_")
-                    if piece
-                ]
+                return "SchedulerMask"
+            if lowered.startswith("io.") and lowered.endswith("write"):
+                parts = self._symbol_to_components(helper_symbol)
                 base = "".join(parts) or "Dispatch"
                 if not base.endswith("Dispatch"):
                     base += "Dispatch"
-            else:
-                parts = [
-                    piece.capitalize()
-                    for part in symbol.replace("/", ".").split(".")
-                    for piece in part.split("_")
-                    if piece
-                ]
-                base = "".join(parts) or "Dispatch"
+                return base
+            parts = self._symbol_to_components(helper_symbol)
+            base = "".join(parts) or "Dispatch"
             return base
-        if helper is not None:
-            return f"Dispatch_0x{helper:04X}"
+        case_symbol = next((case.symbol for case in dispatch.cases if case.symbol), None)
+        if case_symbol:
+            parts = self._symbol_to_components(case_symbol)
+            base = "".join(parts) or "Dispatch"
+            if not base.endswith("Dispatch"):
+                base += "Dispatch"
+            return base
+        if dispatch.helper is not None:
+            return f"Dispatch_0x{dispatch.helper:04X}"
+        if dispatch.cases:
+            return f"Dispatch_0x{dispatch.cases[0].target:04X}"
         return "Dispatch"
+
+    @staticmethod
+    def _symbol_to_components(symbol: str) -> List[str]:
+        components: List[str] = []
+        for part in symbol.replace("/", ".").split("."):
+            for piece in part.split("_"):
+                if piece:
+                    components.append(piece.capitalize())
+        return components
 
     def _resolve_enum_aliases(
         self, dispatch: IRSwitchDispatch, call_symbol: str | None
@@ -1619,6 +1625,19 @@ class ASTBuilder:
     @staticmethod
     def _format_enum_member_name(value: int) -> str:
         return f"K_{value:04X}"
+
+    @staticmethod
+    def _format_enum_member_from_symbol(symbol: str) -> str:
+        parts = [
+            piece.capitalize()
+            for part in symbol.replace("/", ".").split(".")
+            for piece in part.split("_")
+            if piece
+        ]
+        base = "".join(parts) or "Case"
+        if not base[0].isalpha():
+            base = f"Case{base}"
+        return base
 
     @staticmethod
     def _ensure_unique_member_name(name: str, used: Set[str]) -> str:
