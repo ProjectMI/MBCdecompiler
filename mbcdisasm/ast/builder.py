@@ -1724,9 +1724,19 @@ class ASTBuilder:
             frame = self._build_call_frame(node, arg_exprs)
             if frame is not None:
                 statements.append(frame)
+            protocol_stmt, finally_branch = self._build_finally(
+                node.cleanup, node.abi_effects
+            )
+            if protocol_stmt is not None:
+                statements.append(protocol_stmt)
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
-            statements.append(ASTTailCall(call=call_expr, returns=resolved_returns))
-            self._pending_epilogue.clear()
+            statements.append(
+                ASTTailCall(
+                    call=call_expr,
+                    returns=resolved_returns,
+                    finally_branch=finally_branch,
+                )
+            )
             return statements, []
         if isinstance(node, IRReturn):
             value = self._build_return_value(node, value_state)
@@ -1823,7 +1833,10 @@ class ASTBuilder:
     def _stack_effect_operand(step: IRStackEffect) -> Optional[int]:
         include_operand = bool(step.operand_role or step.operand_alias)
         if not include_operand:
-            include_operand = bool(step.operand) or step.mnemonic not in {"stack_teardown"}
+            include_operand = (
+                step.operand is not None
+                and (step.operand != 0 or step.mnemonic not in {"stack_teardown"})
+            )
         return step.operand if include_operand else None
 
     @staticmethod
@@ -2037,7 +2050,34 @@ class ASTBuilder:
                 continue
             effect_steps.append(self._convert_abi_effect(effect))
 
+        policy_steps: List[ASTFinallyStep] = []
+        for value, alias in policy.masks:
+            policy_steps.append(
+                ASTFinallyStep(kind="frame.return_mask", operand=value, alias=alias)
+            )
+        if policy.teardown:
+            policy_steps.append(
+                ASTFinallyStep(kind="frame.teardown", pops=policy.teardown)
+            )
+        if policy.drops:
+            policy_steps.append(ASTFinallyStep(kind="frame.drop", pops=policy.drops))
+
+        effect_steps.extend(policy_steps)
+
         aggregated_steps = self._aggregate_finally_steps(effect_steps)
+        if policy.has_effects() and not aggregated_steps:
+            aggregated_steps.extend(policy_steps)
+        elif policy.has_effects():
+            aggregated_keys = {
+                (step.kind, step.operand, step.alias)
+                for step in aggregated_steps
+            }
+            for step in policy_steps:
+                key = (step.kind, step.operand, step.alias)
+                if key not in aggregated_keys:
+                    aggregated_steps.append(step)
+                    aggregated_keys.add(key)
+
         protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
         finally_stmt = ASTFinally(steps=tuple(aggregated_steps)) if aggregated_steps else None
         return protocol_stmt, finally_stmt
