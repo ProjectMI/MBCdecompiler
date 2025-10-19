@@ -57,11 +57,12 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     segment = ast_program.segments[0]
     assert segment.procedures
     procedure = segment.procedures[0]
-    assert procedure.entry_reasons
+    assert procedure.entry.reasons
+    assert all(exit.reasons for exit in procedure.exits)
     assert procedure.blocks
 
     block = procedure.blocks[0]
-    assert block.successors is not None
+    assert isinstance(block.successors, tuple)
     rendered = [statement.render() for statement in block.statements]
     assert any("call" in line for line in rendered)
     assert any(line.startswith("return") for line in rendered)
@@ -107,7 +108,8 @@ def test_ast_builder_splits_after_return_sequences() -> None:
         for procedure in ast_segment.procedures
     )
     first = ast_segment.procedures[0]
-    assert first.exit_offsets == (0x0100,)
+    assert tuple(exit.offset for exit in first.exits) == (0x0100,)
+    assert first.exits[0].reasons and first.exits[0].reasons[0].kind == "return"
     assert len(first.blocks) == 1
 
 
@@ -142,7 +144,7 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     ast_segment = ast_program.segments[0]
     assert len(ast_segment.procedures) == 1
     procedure = ast_segment.procedures[0]
-    assert tuple(sorted(procedure.exit_offsets)) == (0x0210, 0x0220)
+    assert tuple(sorted(exit.offset for exit in procedure.exits)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
 
 
@@ -174,7 +176,9 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert all("dispatch.data" not in stmt.render() for stmt in statements)
     switch_stmt = statements[0]
     assert isinstance(switch_stmt, ASTSwitch)
-    assert switch_stmt.helper == 0x1111
+    assert switch_stmt.helper is not None
+    assert switch_stmt.helper.address == 0x1111
+    assert switch_stmt.helper.symbol == "helper_1111"
     assert switch_stmt.cases[0].key == 0x01
     assert switch_stmt.cases[0].target == 0x2222
     assert switch_stmt.enum_name is None
@@ -404,10 +408,10 @@ def test_ast_switch_carries_index_metadata() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
-    assert switch_stmt.index_expr is not None
-    assert switch_stmt.index_expr.render() == "word0"
-    assert switch_stmt.index_mask == 0x0007
-    assert switch_stmt.index_base == 0x0001
+    assert switch_stmt.index.expression is not None
+    assert switch_stmt.index.expression.render() == "word0"
+    assert switch_stmt.index.mask == 0x0007
+    assert switch_stmt.index.base == 0x0001
 
 
 def test_ast_builder_resolves_slot_reference() -> None:
@@ -451,8 +455,8 @@ def test_ast_builder_reconstructs_dispatch_call_index() -> None:
     switch_stmt = next(statement for statement in statements if isinstance(statement, ASTSwitch))
 
     assert isinstance(switch_stmt.call, ASTCallExpr)
-    assert switch_stmt.index_expr is switch_stmt.call
-    assert switch_stmt.index_mask == 0x000F
+    assert switch_stmt.index.expression is switch_stmt.call
+    assert switch_stmt.index.mask == 0x000F
 
 
 def test_ast_builder_reuses_call_frame_argument() -> None:

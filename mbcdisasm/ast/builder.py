@@ -168,12 +168,16 @@ _FRAME_OPERAND_KIND_OVERRIDES = {
 from .model import (
     ASTAliasInfo,
     ASTAliasKind,
+    ASTAddressDescriptor,
+    ASTAddressSpace,
+    ASTAccessPathElement,
     ASTAssign,
     ASTBitField,
     ASTBlock,
     ASTBranch,
     ASTCallABI,
     ASTCallArgumentSlot,
+    ASTCallReturnSlot,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
@@ -182,6 +186,10 @@ from .model import (
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
+    ASTEntryPoint,
+    ASTEntryReason,
+    ASTExitPoint,
+    ASTExitReason,
     ASTFieldElement,
     ASTFlagCheck,
     ASTFrameEffect,
@@ -203,6 +211,12 @@ from .model import (
     ASTNumericSign,
     ASTProcedure,
     ASTProgram,
+    ASTBaseElement,
+    ASTBankElement,
+    ASTOffsetElement,
+    ASTPageElement,
+    ASTPageRegisterElement,
+    ASTSlotElement,
     ASTReturn,
     ASTReturnPayload,
     ASTSegment,
@@ -212,10 +226,13 @@ from .model import (
     ASTTerminator,
     ASTSwitch,
     ASTSwitchCase,
+    ASTDispatchHelper,
+    ASTDispatchIndex,
     ASTTailCall,
     ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
+    ASTViewElement,
 )
 
 
@@ -590,6 +607,8 @@ class ASTBuilder:
                 analysis = analyses[offset]
                 accumulator.entry_reasons.update(entry_reasons.get(offset, ()))
                 accumulator.blocks[offset] = self._convert_block(analysis, state, metrics)
+            if not accumulator.entry_reasons:
+                accumulator.entry_reasons.add("component")
             accumulators[entry] = accumulator
 
         for offset in sorted(analyses):
@@ -599,6 +618,7 @@ class ASTBuilder:
             if not reachable:
                 continue
             accumulator = _ProcedureAccumulator(entry_offset=offset)
+            accumulator.entry_reasons.add("component")
             order.append(offset)
             state: Dict[str, ASTExpression] = {}
             for node in sorted(reachable):
@@ -616,13 +636,19 @@ class ASTBuilder:
             procedure = self._finalise_procedure(
                 name=name,
                 entry_offset=accumulator.entry_offset,
-                entry_reasons=tuple(sorted(accumulator.entry_reasons)),
+                entry_reasons=self._normalise_entry_reasons(accumulator.entry_reasons),
                 blocks=pending_blocks,
             )
             if procedure is None:
                 continue
             procedures.append(procedure)
         return procedures
+
+    @staticmethod
+    def _normalise_entry_reasons(reasons: Set[str]) -> Tuple[str, ...]:
+        if not reasons:
+            return ("component",)
+        return tuple(sorted(reasons))
 
     def _finalise_procedure(
         self,
@@ -655,28 +681,69 @@ class ASTBuilder:
                 break
         if synthetic_only:
             return None
+        block_lookup = {block.start_offset: block for block in simplified_blocks}
+        entry_block = block_lookup.get(entry_offset, simplified_blocks[0])
+        entry_point = ASTEntryPoint(
+            label=entry_block.label,
+            offset=entry_block.start_offset,
+            reasons=tuple(ASTEntryReason(kind=reason) for reason in entry_reasons),
+        )
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
+        exit_points: List[ASTExitPoint] = []
+        for offset in exit_offsets:
+            block = block_lookup.get(offset)
+            if block is None:
+                continue
+            analysis = self._current_analyses.get(offset)
+            reasons: Tuple[ASTExitReason, ...] = ()
+            if analysis and analysis.exit_reasons:
+                reasons = tuple(
+                    ASTExitReason(kind=reason) for reason in analysis.exit_reasons
+                )
+            else:
+                terminator = block.terminator
+                reason: Optional[str] = None
+                if isinstance(terminator, ASTReturn):
+                    reason = "return"
+                elif isinstance(terminator, ASTTailCall):
+                    reason = "tail_call"
+                elif isinstance(terminator, ASTJump):
+                    reason = "jump"
+                elif isinstance(terminator, ASTSwitch):
+                    reason = "switch"
+                elif isinstance(terminator, ASTBranch):
+                    reason = "branch"
+                elif isinstance(terminator, ASTTestSet):
+                    reason = "testset"
+                elif isinstance(terminator, ASTFlagCheck):
+                    reason = "flag_check"
+                elif isinstance(terminator, ASTFunctionPrologue):
+                    reason = "prologue"
+                if reason:
+                    reasons = (ASTExitReason(kind=reason),)
+            exit_points.append(
+                ASTExitPoint(label=block.label, offset=offset, reasons=reasons)
+            )
         successor_map: Dict[str, Tuple[str, ...]] = {
-            block.label: tuple(successor.label for successor in (block.successors or ()))
+            block.label: tuple(sorted(successor.label for successor in block.successors))
             for block in simplified_blocks
         }
         predecessor_accum: Dict[str, List[str]] = {
             block.label: [] for block in simplified_blocks
         }
         for block in simplified_blocks:
-            for successor in block.successors or ():
+            for successor in block.successors:
                 if successor.label in predecessor_accum:
                     predecessor_accum[successor.label].append(block.label)
         predecessor_map = {
-            label: tuple(values)
+            label: tuple(sorted(values))
             for label, values in predecessor_accum.items()
         }
         return ASTProcedure(
             name=name,
-            entry_offset=entry_offset,
-            entry_reasons=entry_reasons,
             blocks=simplified_blocks,
-            exit_offsets=tuple(sorted(exit_offsets)),
+            entry=entry_point,
+            exits=tuple(exit_points),
             successor_map=successor_map,
             predecessor_map=predecessor_map,
         )
@@ -1498,15 +1565,20 @@ class ASTBuilder:
             dispatch, value_state
         )
         kind = self._classify_dispatch_kind(dispatch)
+        index_info = ASTDispatchIndex(
+            expression=index_expr, mask=index_mask, base=index_base
+        )
+        helper_info = (
+            ASTDispatchHelper(address=dispatch.helper, symbol=dispatch.helper_symbol)
+            if dispatch.helper is not None
+            else None
+        )
         switch = ASTSwitch(
             call=call_expr,
             cases=cases,
-            helper=dispatch.helper,
-            helper_symbol=dispatch.helper_symbol,
+            index=index_info,
+            helper=helper_info,
             default=dispatch.default,
-            index_expr=index_expr,
-            index_mask=index_mask,
-            index_base=index_base,
             kind=kind,
             enum_name=enum_name,
             abi=abi,
@@ -1855,7 +1927,7 @@ class ASTBuilder:
                 self._pending_epilogue.extend(node.cleanup)
             return_identifiers = []
             for index, name in enumerate(node.returns):
-                identifier = ASTIdentifier(name, self._infer_kind(name))
+                identifier = self._build_return_identifier(name, index)
                 value_state[name] = ASTCallResult(call_expr, index)
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
@@ -1886,7 +1958,12 @@ class ASTBuilder:
             )
             abi = self._build_call_abi(node, arg_exprs)
             epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
-            resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
+            resolved_returns = tuple(
+                self._canonicalise_return_expr(
+                    index, self._resolve_expr(name, value_state)
+                )
+                for index, name in enumerate(node.returns)
+            )
             statements.append(
                 ASTTailCall(
                     call=call_expr,
@@ -1982,12 +2059,14 @@ class ASTBuilder:
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
-    def _slot_components(slot: IRSlot) -> Tuple[str, str]:
+    def _slot_descriptor(slot: IRSlot) -> ASTAddressDescriptor:
         if slot.space is MemSpace.FRAME:
-            return "frame", "slots"
-        if slot.space is MemSpace.GLOBAL:
-            return "global", "cells"
-        return "const", "cells"
+            space = ASTAddressSpace.FRAME
+        elif slot.space is MemSpace.GLOBAL:
+            space = ASTAddressSpace.GLOBAL
+        else:
+            space = ASTAddressSpace.CONST
+        return ASTAddressDescriptor(space=space, region=space.value)
 
     @staticmethod
     def _slot_alias(slot: IRSlot) -> ASTAliasInfo:
@@ -1997,14 +2076,18 @@ class ASTBuilder:
         return ASTAliasInfo(ASTAliasKind.REGION, f"{region}_{slot.index:04X}")
 
     def _build_slot_location(self, slot: IRSlot) -> ASTMemoryLocation:
-        base, element = self._slot_components(slot)
+        descriptor = self._slot_descriptor(slot)
         index_literal = ASTIntegerLiteral(
             value=slot.index,
             bits=16,
             sign=ASTNumericSign.UNSIGNED,
         )
-        path = (ASTFieldElement(element), ASTIndexElement(index_literal))
-        return ASTMemoryLocation(base=base, path=path, alias=self._slot_alias(slot))
+        slot_element = ASTSlotElement(space=descriptor.space.value, index=index_literal)
+        return ASTMemoryLocation(
+            base=descriptor,
+            path=(slot_element,),
+            alias=self._slot_alias(slot),
+        )
 
     @staticmethod
     def _build_offset_literal(value: int) -> ASTIntegerLiteral:
@@ -2025,14 +2108,23 @@ class ASTBuilder:
         return SSAValueKind.WORD
 
     @staticmethod
-    def _memref_base_name(ref: Optional[MemRef]) -> str:
+    def _memref_descriptor(ref: Optional[MemRef]) -> ASTAddressDescriptor:
         if ref is None:
-            return "mem"
-        if ref.symbol:
-            return ref.symbol
-        if ref.region:
-            return ref.region
-        return "mem"
+            return ASTAddressDescriptor(space=ASTAddressSpace.MEMORY, region="mem")
+        region = ref.region or "mem"
+        symbol = ref.symbol
+        lowered = region.lower()
+        if lowered == "frame":
+            space = ASTAddressSpace.FRAME
+        elif lowered == "global":
+            space = ASTAddressSpace.GLOBAL
+        elif lowered == "const":
+            space = ASTAddressSpace.CONST
+        elif lowered.startswith("io"):
+            space = ASTAddressSpace.IO
+        else:
+            space = ASTAddressSpace.MEMORY
+        return ASTAddressDescriptor(space=space, region=region, symbol=symbol)
 
     @staticmethod
     def _memref_alias(ref: Optional[MemRef]) -> ASTAliasInfo:
@@ -2044,23 +2136,20 @@ class ASTBuilder:
         return ASTAliasInfo(ASTAliasKind.REGION, region)
 
     @staticmethod
-    def _memref_prefix_elements(ref: Optional[MemRef]) -> List[ASTFieldElement]:
+    def _memref_prefix_elements(ref: Optional[MemRef]) -> List[ASTAccessPathElement]:
         if ref is None:
             return []
-        elements: List[ASTFieldElement] = []
+        elements: List[ASTAccessPathElement] = []
         if ref.bank is not None:
-            elements.append(ASTFieldElement(f"bank_{ref.bank:04X}"))
+            elements.append(ASTBankElement(ref.bank))
         if ref.page_alias:
-            elements.append(ASTFieldElement(f"page_{ref.page_alias}"))
+            page_value = ref.page if ref.page is not None else 0
+            elements.append(ASTPageElement(page_value, alias=ref.page_alias))
         elif ref.page is not None:
-            elements.append(ASTFieldElement(f"page_{ref.page:02X}"))
+            elements.append(ASTPageElement(ref.page))
         if ref.base is not None:
-            elements.append(ASTFieldElement(f"base_{ref.base:04X}"))
+            elements.append(ASTBaseElement(ref.base))
         return elements
-
-    @staticmethod
-    def _format_field_name(offset: int) -> str:
-        return f"offset_{offset:04X}"
 
     def _build_banked_location(
         self,
@@ -2068,20 +2157,27 @@ class ASTBuilder:
         pointer: Optional[ASTExpression],
         offset: Optional[ASTExpression],
     ) -> ASTMemoryLocation:
-        base: str | ASTExpression = self._memref_base_name(node.ref)
+        descriptor = self._memref_descriptor(node.ref)
         alias = self._memref_alias(node.ref)
         elements = self._memref_prefix_elements(node.ref)
         if pointer is not None and not isinstance(pointer, ASTUnknown):
-            elements.append(ASTFieldElement("view"))
-            elements.append(ASTIndexElement(pointer))
+            elements.append(ASTViewElement(kind="pointer", index=pointer))
         if node.register_value is not None:
-            elements.append(ASTFieldElement(f"page_{node.register_value:04X}"))
+            elements.append(ASTPageElement(node.register_value))
         else:
-            elements.append(ASTFieldElement(f"page_reg_{node.register:04X}"))
+            elements.append(ASTPageRegisterElement(node.register))
         if offset is not None and not isinstance(offset, ASTUnknown):
-            elements.append(ASTIndexElement(offset))
+            if isinstance(offset, ASTIntegerLiteral):
+                elements.append(ASTOffsetElement(offset.value))
+            else:
+                elements.append(ASTIndexElement(offset))
         elif node.ref is not None and node.ref.offset is not None:
-            elements.append(ASTFieldElement(self._format_field_name(node.ref.offset)))
+            elements.append(ASTOffsetElement(node.ref.offset))
+        base: ASTAddressDescriptor | ASTExpression
+        if node.ref is None and pointer is not None:
+            base = pointer
+        else:
+            base = descriptor
         return ASTMemoryLocation(base=base, path=tuple(elements), alias=alias)
 
     def _build_indirect_location(
@@ -2090,16 +2186,16 @@ class ASTBuilder:
         pointer: ASTExpression,
         offset: ASTExpression,
     ) -> ASTMemoryLocation:
-        base: str | ASTExpression = self._memref_base_name(node.ref)
+        descriptor = self._memref_descriptor(node.ref)
         alias = self._memref_alias(node.ref)
         elements = self._memref_prefix_elements(node.ref)
         if not isinstance(pointer, ASTUnknown):
-            elements.append(ASTFieldElement("view"))
-            elements.append(ASTIndexElement(pointer))
+            elements.append(ASTViewElement(kind="pointer", index=pointer))
         if isinstance(offset, ASTIntegerLiteral) and not isinstance(offset, ASTUnknown):
-            elements.append(ASTFieldElement(self._format_field_name(offset.value)))
+            elements.append(ASTOffsetElement(offset.value))
         else:
             elements.append(ASTIndexElement(offset))
+        base: ASTAddressDescriptor | ASTExpression = descriptor
         if node.ref is None:
             base = pointer
         return ASTMemoryLocation(base=base, path=tuple(elements), alias=alias)
@@ -2339,24 +2435,62 @@ class ASTBuilder:
         mask_field = None
         if live_mask is not None:
             mask_field = self._bitfield(live_mask, None)
-        return_count = len(getattr(node, "returns", ())) or None
-        tail_allowed = isinstance(node, IRTailCall)
-        if not slots and not effects and mask_field is None and return_count is None and not tail_allowed:
+        return_tokens = getattr(node, "returns", ())
+        return_slots: List[ASTCallReturnSlot] = []
+        for index, token in enumerate(return_tokens):
+            kind = self._infer_kind(token)
+            name = self._canonical_placeholder_name(token, index, kind)
+            return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
+        tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
+        if (
+            not slots
+            and not effects
+            and mask_field is None
+            and not return_slots
+            and not tail_allowed
+        ):
             return None
         return ASTCallABI(
             slots=tuple(slots),
+            returns=tuple(return_slots),
             effects=tuple(effects),
             live_mask=mask_field,
-            return_count=return_count,
-            tail_effects=tail_allowed,
+            tail=tail_allowed,
         )
+
+    def _build_return_identifier(self, name: str, index: int) -> ASTIdentifier:
+        kind = self._infer_kind(name)
+        canonical = self._canonical_placeholder_name(name, index, kind)
+        return ASTIdentifier(canonical, kind)
+
+    def _canonicalise_return_expr(
+        self, index: int, expr: ASTExpression
+    ) -> ASTExpression:
+        if isinstance(expr, ASTIdentifier):
+            kind = expr.kind()
+            canonical = self._canonical_placeholder_name(expr.name, index, kind)
+            if canonical != expr.name:
+                return ASTIdentifier(canonical, kind)
+        if isinstance(expr, ASTUnknown):
+            token = expr.token
+            if token and token.startswith("ret"):
+                canonical = self._canonical_placeholder_name(
+                    token, index, SSAValueKind.UNKNOWN
+                )
+                return ASTIdentifier(canonical, SSAValueKind.UNKNOWN)
+        return expr
 
     def _build_return_payload(
         self,
         node: IRReturn,
         value_state: Mapping[str, ASTExpression],
     ) -> ASTReturnPayload:
-        values = tuple(self._resolve_expr(name, value_state) for name in node.values)
+        values = tuple(
+            self._canonicalise_return_expr(
+                index, self._resolve_expr(name, value_state)
+            )
+            for index, name in enumerate(node.values)
+        )
         return ASTReturnPayload(values=values, varargs=node.varargs)
 
     def _policy_effects(self, policy: _FramePolicySummary) -> List[ASTEffect]:
@@ -2513,6 +2647,27 @@ class ASTBuilder:
         if lowered.startswith("id"):
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
+
+    @staticmethod
+    def _ret_prefix(kind: SSAValueKind) -> str:
+        mapping = {
+            SSAValueKind.BOOLEAN: "flag",
+            SSAValueKind.BYTE: "byte",
+            SSAValueKind.WORD: "word",
+            SSAValueKind.POINTER: "ptr",
+            SSAValueKind.IO: "io",
+            SSAValueKind.PAGE_REGISTER: "page",
+            SSAValueKind.IDENTIFIER: "id",
+        }
+        return mapping.get(kind, "value")
+
+    def _canonical_placeholder_name(
+        self, token: str, index: int, kind: SSAValueKind
+    ) -> str:
+        if token.startswith("ret"):
+            prefix = self._ret_prefix(kind)
+            return f"{prefix}{index}"
+        return token
 
     def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:
         if target_offset in self._current_block_labels:
