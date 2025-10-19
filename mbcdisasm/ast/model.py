@@ -3,25 +3,50 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import List, Optional, Tuple
 
 from ..constants import OPERAND_ALIASES
-from ..ir.model import IRSlot, MemRef, SSAValueKind
+from ..ir.model import SSAValueKind
 
 
-def _format_operand(value: int, alias: Optional[str] = None) -> str:
+def _format_signed_hex(value: int, bits: int, force_sign: bool = True) -> str:
+    """Render ``value`` as a signed hexadecimal literal with a stable width."""
+
+    if bits <= 0:
+        raise ValueError("bit width must be positive")
+    digits = max(1, (bits + 3) // 4)
+    magnitude = abs(value)
+    rendered = f"0x{magnitude:0{digits}X}"
+    if force_sign or value < 0:
+        sign = "+" if value >= 0 else "-"
+        return f"{sign}{rendered}"
+    return rendered
+
+
+def _format_operand(value: int, alias: Optional[str] = None, bits: int = 16) -> str:
     """Format ``value`` using the shared operand alias table."""
 
-    hex_value = f"0x{value:04X}"
+    canonical = _format_signed_hex(value, bits)
     alias_text = alias or OPERAND_ALIASES.get(value)
     if alias_text:
         upper = alias_text.upper()
         if upper.startswith("0X"):
             alias_text = upper
-        if alias_text == hex_value:
+        if alias_text == canonical:
             return alias_text
-        return f"{alias_text}({hex_value})"
-    return hex_value
+        return f"{alias_text}({canonical})"
+    return canonical
+
+
+class ASTEffectCategory(Enum):
+    """Side-effect classification for AST nodes."""
+
+    PURE = "pure"
+    READ_ONLY = "read_only"
+    MUTABLE = "mutable"
+    IO = "io"
+    UNKNOWN = "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +66,11 @@ class ASTExpression:
 
         return SSAValueKind.UNKNOWN
 
+    def effect(self) -> ASTEffectCategory:
+        """Return the side-effect classification for the expression."""
+
+        return ASTEffectCategory.PURE
+
 
 @dataclass(frozen=True)
 class ASTUnknown(ASTExpression):
@@ -49,24 +79,102 @@ class ASTUnknown(ASTExpression):
     token: str
 
     def render(self) -> str:
-        return f"?({self.token})"
+        return f"?({self.token})" if self.token else "?"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.UNKNOWN
 
 
 @dataclass(frozen=True)
-class ASTLiteral(ASTExpression):
-    """Literal constant extracted from stack traffic."""
+class ASTIntegerLiteral(ASTExpression):
+    """Integer literal with explicit width and sign."""
 
     value: int
-    width: int = 16
+    bits: int = 16
+    signed: bool = True
 
     def render(self) -> str:
-        digits = max(1, self.width // 4)
-        return f"0x{self.value:0{digits}X}"
+        return _format_signed_hex(self.value, self.bits)
 
     def kind(self) -> SSAValueKind:
-        if self.width <= 8:
+        if self.bits <= 8:
             return SSAValueKind.BYTE
         return SSAValueKind.WORD
+
+
+@dataclass(frozen=True)
+class ASTFloatLiteral(ASTExpression):
+    """Floating point literal with canonical formatting."""
+
+    value: float
+    precision: int = 6
+
+    def render(self) -> str:
+        magnitude = abs(self.value)
+        formatted = f"{magnitude:.{self.precision}g}"
+        sign = "+" if self.value >= 0 else "-"
+        return f"{sign}{formatted}"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.WORD
+
+
+@dataclass(frozen=True)
+class ASTBooleanLiteral(ASTExpression):
+    """Boolean literal rendered in canonical form."""
+
+    value: bool
+
+    def render(self) -> str:
+        return "true" if self.value else "false"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.BOOLEAN
+
+
+def _escape_string(value: str) -> str:
+    escaped: List[str] = []
+    for char in value:
+        code = ord(char)
+        if char == "\\":
+            escaped.append("\\\\")
+        elif char == '"':
+            escaped.append("\\\"")
+        elif char == "\n":
+            escaped.append("\\n")
+        elif char == "\r":
+            escaped.append("\\r")
+        elif char == "\t":
+            escaped.append("\\t")
+        elif 0x20 <= code <= 0x7E:
+            escaped.append(char)
+        else:
+            escaped.append(f"\\x{code:02X}")
+    return "".join(escaped)
+
+
+@dataclass(frozen=True)
+class ASTStringLiteral(ASTExpression):
+    """Text literal with explicit encoding information."""
+
+    value: str
+    encoding: str
+
+    def render(self) -> str:
+        body = _escape_string(self.value)
+        return f"string[{self.encoding}](\"{body}\")"
+
+
+@dataclass(frozen=True)
+class ASTBytesLiteral(ASTExpression):
+    """Opaque byte sequence literal with encoding metadata."""
+
+    data: bytes
+    encoding: str
+
+    def render(self) -> str:
+        payload = self.data.hex()
+        return f"bytes[{self.encoding}]({payload})"
 
 
 @dataclass(frozen=True)
@@ -84,107 +192,103 @@ class ASTIdentifier(ASTExpression):
 
 
 @dataclass(frozen=True)
-class ASTSlotRef(ASTExpression):
-    """Reference to a VM slot."""
+class ASTRegionRef(ASTExpression):
+    """Root reference to a memory region with aliasing metadata."""
 
-    slot: IRSlot
+    name: str
+    region: str | None = None
+    noalias: bool = False
 
     def render(self) -> str:
-        space = self.slot.space.name.lower()
-        index = f"0x{self.slot.index:04X}"
-        return f"{space}[{index}]"
+        parts: List[str] = []
+        if self.region and self.region != self.name:
+            parts.append(self.region)
+        parts.append(self.name)
+        rendered = ".".join(parts)
+        if self.noalias:
+            rendered += "(noalias)"
+        return rendered
 
     def kind(self) -> SSAValueKind:
         return SSAValueKind.POINTER
 
 
 @dataclass(frozen=True)
-class ASTMemRefExpr(ASTExpression):
-    """Reference to a symbolic memory location."""
+class ASTFieldComponent:
+    """Field access on a structured value."""
 
-    ref: MemRef
+    name: str
 
     def render(self) -> str:
-        return self.ref.describe()
-
-    def kind(self) -> SSAValueKind:
-        return SSAValueKind.POINTER
+        return f".{self.name}"
 
 
 @dataclass(frozen=True)
-class ASTIndirectLoadExpr(ASTExpression):
-    """Load through an indirect pointer."""
+class ASTIndexComponent:
+    """Index lookup inside an aggregate."""
 
-    pointer: ASTExpression
-    offset: ASTExpression
-    ref: MemRef | None = None
+    index: ASTExpression
 
     def render(self) -> str:
-        base = self.pointer.render()
-        displacement = self.offset.render()
-        if self.ref is not None:
-            return f"load {self.ref.describe()}[{base} + {displacement}]"
-        return f"load {base} + {displacement}"
-
-    def kind(self) -> SSAValueKind:
-        pointer_kind = self.pointer.kind()
-        if pointer_kind is SSAValueKind.BYTE:
-            return SSAValueKind.BYTE
-        if pointer_kind is SSAValueKind.BOOLEAN:
-            return SSAValueKind.BOOLEAN
-        return SSAValueKind.WORD
+        return f"[{self.index.render()}]"
 
 
 @dataclass(frozen=True)
-class ASTBankedRefExpr(ASTExpression):
-    """Reference to a banked memory location."""
+class ASTNamedIndexComponent:
+    """Named view on an aggregate element."""
 
-    ref: MemRef
-    register: int
-    register_value: int | None = None
-    pointer: ASTExpression | None = None
-    offset: ASTExpression | None = None
+    name: str
+    index: ASTExpression
 
     def render(self) -> str:
-        parts = [self.ref.describe()]
-        if self.pointer is not None:
-            parts.append(f"ptr={self.pointer.render()}")
-        if self.offset is not None:
-            parts.append(f"offset={self.offset.render()}")
-        if self.register_value is not None:
-            parts.append(f"page=0x{self.register_value:04X}")
-        else:
-            parts.append(f"page_reg=0x{self.register:04X}")
-        return "banked_ref " + " ".join(parts)
-
-    def kind(self) -> SSAValueKind:
-        return SSAValueKind.POINTER
+        return f".{self.name}[{self.index.render()}]"
 
 
 @dataclass(frozen=True)
-class ASTBankedLoadExpr(ASTExpression):
-    """Load a value from banked memory."""
+class ASTSliceComponent:
+    """Slice of an aggregate using offset and optional size."""
 
-    ref: MemRef
-    register: int
-    register_value: int | None = None
-    pointer: ASTExpression | None = None
-    offset: ASTExpression | None = None
+    start: ASTExpression
+    size: ASTExpression | None = None
 
     def render(self) -> str:
-        parts = [self.ref.describe()]
-        if self.pointer is not None:
-            parts.append(f"ptr={self.pointer.render()}")
-        if self.offset is not None:
-            parts.append(f"offset={self.offset.render()}")
-        if self.register_value is not None:
-            parts.append(f"page=0x{self.register_value:04X}")
-        else:
-            parts.append(f"page_reg=0x{self.register:04X}")
-        return "banked_load " + " ".join(parts)
+        if self.size is None:
+            return f"[{self.start.render()}:]"
+        return f"[{self.start.render()}:{self.size.render()}]"
+
+
+@dataclass(frozen=True)
+class ASTMemoryLocation:
+    """Hierarchical description of a memory location."""
+
+    base: ASTExpression
+    components: Tuple[
+        "ASTFieldComponent | ASTIndexComponent | ASTNamedIndexComponent | ASTSliceComponent",
+        ...,
+    ] = ()
+
+    def render(self) -> str:
+        rendered = self.base.render()
+        for component in self.components:
+            rendered += component.render()
+        return rendered
+
+
+@dataclass(frozen=True)
+class ASTLocationExpr(ASTExpression):
+    """Read from a concrete memory location."""
+
+    location: ASTMemoryLocation
+    value_kind: SSAValueKind = SSAValueKind.UNKNOWN
+
+    def render(self) -> str:
+        return self.location.render()
 
     def kind(self) -> SSAValueKind:
-        return SSAValueKind.WORD
+        return self.value_kind
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.READ_ONLY
 
 
 @dataclass(frozen=True)
@@ -205,6 +309,9 @@ class ASTCallExpr(ASTExpression):
         prefix = "tail " if self.tail else ""
         suffix = ", ..." if self.varargs else ""
         return f"{prefix}call {target_repr}({rendered_args}{suffix})"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -307,6 +414,9 @@ class ASTStatement:
     def render(self) -> str:  # pragma: no cover - overridden in subclasses
         raise NotImplementedError
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.UNKNOWN
+
 
 @dataclass
 class ASTAssign(ASTStatement):
@@ -318,16 +428,22 @@ class ASTAssign(ASTStatement):
     def render(self) -> str:
         return f"{self.target.render()} = {self.value.render()}"
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.MUTABLE
+
 
 @dataclass
-class ASTStore(ASTStatement):
-    """Store ``value`` into the location described by ``target``."""
+class ASTMemoryWrite(ASTStatement):
+    """Store ``value`` into the described memory location."""
 
-    target: ASTExpression
+    location: ASTMemoryLocation
     value: ASTExpression
 
     def render(self) -> str:
-        return f"store {self.value.render()} -> {self.target.render()}"
+        return f"{self.location.render()} := {self.value.render()}"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.MUTABLE
 
 
 @dataclass
@@ -365,6 +481,9 @@ class ASTCallFrame(ASTStatement):
         suffix = " " + " ".join(parts) if parts else ""
         return f"call_frame{suffix}"
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.MUTABLE
+
 
 @dataclass
 class ASTFrameProtocol(ASTStatement):
@@ -389,6 +508,9 @@ class ASTFrameProtocol(ASTStatement):
         suffix = " " + " ".join(parts) if parts else ""
         return f"frame_protocol{suffix}"
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.READ_ONLY
+
 
 @dataclass
 class ASTIORead(ASTStatement):
@@ -399,6 +521,9 @@ class ASTIORead(ASTStatement):
     def render(self) -> str:
         return f"io.read({self.port})"
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.IO
+
 
 @dataclass
 class ASTIOWrite(ASTStatement):
@@ -408,8 +533,13 @@ class ASTIOWrite(ASTStatement):
     mask: int | None = None
 
     def render(self) -> str:
-        mask = "" if self.mask is None else f", mask=0x{self.mask:04X}"
+        mask = ""
+        if self.mask is not None:
+            mask = f", mask={_format_signed_hex(self.mask, 16)}"
         return f"io.write({self.port}{mask})"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.IO
 
 
 @dataclass
@@ -458,6 +588,9 @@ class ASTReturn(ASTStatement):
             suffix = f" finally {self.finally_branch.render()}"
         return f"return {payload}{suffix}"
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.PURE
+
 
 @dataclass
 class ASTBranch(ASTStatement):
@@ -476,6 +609,9 @@ class ASTBranch(ASTStatement):
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return f"if {condition} then {then_label} else {else_label}"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.READ_ONLY
 
 
 @dataclass
@@ -499,6 +635,9 @@ class ASTTestSet(ASTStatement):
             f"then {then_label} else {else_label}"
         )
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.READ_ONLY
+
 
 @dataclass
 class ASTFlagCheck(ASTStatement):
@@ -515,7 +654,11 @@ class ASTFlagCheck(ASTStatement):
     def render(self) -> str:
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
+        flag_repr = _format_signed_hex(self.flag, 16, force_sign=False)
+        return f"flag {flag_repr} ? then {then_label} else {else_label}"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.READ_ONLY
 
 
 @dataclass
@@ -539,6 +682,9 @@ class ASTFunctionPrologue(ASTStatement):
             f"then {then_label} else {else_label}"
         )
 
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.READ_ONLY
+
 
 @dataclass
 class ASTComment(ASTStatement):
@@ -548,6 +694,9 @@ class ASTComment(ASTStatement):
 
     def render(self) -> str:
         return f"; {self.text}"
+
+    def effect(self) -> ASTEffectCategory:
+        return ASTEffectCategory.PURE
 
 
 @dataclass(frozen=True)
@@ -758,19 +907,25 @@ class ASTProgram:
 __all__ = [
     "ASTExpression",
     "ASTUnknown",
-    "ASTLiteral",
+    "ASTIntegerLiteral",
+    "ASTFloatLiteral",
+    "ASTBooleanLiteral",
+    "ASTStringLiteral",
+    "ASTBytesLiteral",
     "ASTIdentifier",
-    "ASTSlotRef",
-    "ASTMemRefExpr",
-    "ASTIndirectLoadExpr",
-    "ASTBankedRefExpr",
-    "ASTBankedLoadExpr",
+    "ASTRegionRef",
+    "ASTFieldComponent",
+    "ASTIndexComponent",
+    "ASTNamedIndexComponent",
+    "ASTSliceComponent",
+    "ASTMemoryLocation",
+    "ASTLocationExpr",
     "ASTCallExpr",
     "ASTCallResult",
     "ASTTupleExpr",
     "ASTStatement",
     "ASTAssign",
-    "ASTStore",
+    "ASTMemoryWrite",
     "ASTFrameEffect",
     "ASTCallFrameSlot",
     "ASTCallStatement",

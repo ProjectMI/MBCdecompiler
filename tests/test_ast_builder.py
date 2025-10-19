@@ -9,9 +9,11 @@ from mbcdisasm.ast import (
     ASTCallFrame,
     ASTCallStatement,
     ASTFrameProtocol,
-    ASTLiteral,
+    ASTIntegerLiteral,
+    ASTLocationExpr,
+    ASTRegionRef,
+    ASTIndexComponent,
     ASTReturn,
-    ASTSlotRef,
     ASTSwitch,
     ASTTailCall,
 )
@@ -409,9 +411,17 @@ def test_ast_switch_carries_index_metadata() -> None:
 def test_ast_builder_resolves_slot_reference() -> None:
     builder = ASTBuilder()
     expr = builder._resolve_expr("slot(0x0004)", {})
-    assert isinstance(expr, ASTSlotRef)
-    assert expr.slot.space is MemSpace.FRAME
-    assert expr.slot.index == 0x0004
+    assert isinstance(expr, ASTLocationExpr)
+    location = expr.location
+    assert isinstance(location.base, ASTRegionRef)
+    assert location.base.name == "frame"
+    assert location.base.noalias is True
+    assert location.components
+    component = location.components[0]
+    assert isinstance(component, ASTIndexComponent)
+    index_expr = component.index
+    assert isinstance(index_expr, ASTIntegerLiteral)
+    assert index_expr.value == 0x0004
 
 
 def test_ast_builder_reconstructs_dispatch_call_index() -> None:
@@ -452,7 +462,7 @@ def test_ast_builder_reconstructs_dispatch_call_index() -> None:
 
 def test_ast_builder_reuses_call_frame_argument() -> None:
     builder = ASTBuilder()
-    literal = ASTLiteral(0x1234)
+    literal = ASTIntegerLiteral(0x1234)
     call = IRCall(target=0x1000, args=())
     frame = builder._build_call_frame(call, (literal,))
     assert frame is not None

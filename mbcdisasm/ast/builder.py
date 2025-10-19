@@ -36,6 +36,8 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    MemRef,
+    IRStringConstant,
     MemSpace,
     SSAValueKind,
 )
@@ -168,6 +170,7 @@ from .model import (
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTBytesLiteral,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
@@ -177,6 +180,7 @@ from .model import (
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
+    ASTFieldComponent,
     ASTFrameEffect,
     ASTFrameProtocol,
     ASTFlagCheck,
@@ -184,18 +188,19 @@ from .model import (
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
-    ASTIndirectLoadExpr,
-    ASTBankedLoadExpr,
-    ASTBankedRefExpr,
-    ASTLiteral,
+    ASTIntegerLiteral,
+    ASTLocationExpr,
+    ASTMemoryLocation,
+    ASTMemoryWrite,
     ASTMetrics,
+    ASTNamedIndexComponent,
     ASTProcedure,
     ASTProgram,
+    ASTRegionRef,
     ASTReturn,
     ASTSegment,
-    ASTSlotRef,
     ASTStatement,
-    ASTStore,
+    ASTStringLiteral,
     ASTFinally,
     ASTFinallyStep,
     ASTSwitch,
@@ -204,6 +209,9 @@ from .model import (
     ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
+    ASTIndexComponent,
+    ASTSliceComponent,
+    ASTBooleanLiteral,
 )
 
 
@@ -323,6 +331,7 @@ class ASTBuilder:
         self._current_segment_index: int = -1
         self._call_arg_values: Dict[str, ASTExpression] = {}
         self._expression_lookup: Dict[str, ASTExpression] = {}
+        self._string_constants: Dict[str, IRStringConstant] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -333,6 +342,7 @@ class ASTBuilder:
         self._enum_name_usage = {}
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._string_constants = {const.name: const for const in program.string_pool}
         segments: List[ASTSegment] = []
         segment_enum_keys: List[Tuple[str, ...]] = []
         metrics = ASTMetrics()
@@ -1611,6 +1621,95 @@ class ASTBuilder:
                 return candidate
             index += 1
 
+    @staticmethod
+    def _is_known(expr: Optional[ASTExpression]) -> bool:
+        return expr is None or not isinstance(expr, ASTUnknown)
+
+    @staticmethod
+    def _make_integer_literal(value: int, bits: int = 16, signed: bool = False) -> ASTIntegerLiteral:
+        return ASTIntegerLiteral(value=value, bits=bits, signed=signed or value < 0)
+
+    def _build_slot_location(self, slot: IRSlot) -> ASTMemoryLocation:
+        region_name = slot.space.name.lower()
+        base = ASTRegionRef(
+            name=region_name,
+            region=None if region_name in {"frame", "global", "const"} else region_name,
+            noalias=slot.space is MemSpace.FRAME,
+        )
+        index_literal = self._make_integer_literal(slot.index, bits=16, signed=False)
+        return ASTMemoryLocation(base=base, components=(ASTIndexComponent(index_literal),))
+
+    def _build_memref_location(
+        self,
+        ref: MemRef,
+        pointer: Optional[ASTExpression],
+        offset: Optional[ASTExpression],
+        register: Optional[int],
+        register_value: Optional[int],
+    ) -> ASTMemoryLocation:
+        base_name = ref.page_alias or ref.symbol or ref.region or "mem"
+        region_hint = ref.region if ref.region and ref.region != base_name else None
+        base = ASTRegionRef(name=base_name, region=region_hint, noalias=False)
+        components: List[ASTFieldComponent | ASTNamedIndexComponent | ASTIndexComponent | ASTSliceComponent] = []
+        if ref.symbol and ref.symbol != base_name:
+            components.append(ASTFieldComponent(ref.symbol))
+        if ref.base is not None:
+            components.append(
+                ASTNamedIndexComponent("base", self._make_integer_literal(ref.base, bits=16, signed=False))
+            )
+        if ref.bank is not None:
+            components.append(
+                ASTNamedIndexComponent("bank", self._make_integer_literal(ref.bank, bits=16, signed=False))
+            )
+        if ref.page is not None:
+            components.append(
+                ASTNamedIndexComponent("page_hint", self._make_integer_literal(ref.page, bits=8, signed=False))
+            )
+        if ref.offset is not None:
+            components.append(
+                ASTNamedIndexComponent("offset_hint", self._make_integer_literal(ref.offset, bits=16, signed=False))
+            )
+        if pointer is not None:
+            components.append(ASTNamedIndexComponent("ptr", pointer))
+        if offset is not None:
+            components.append(ASTNamedIndexComponent("index", offset))
+        if register_value is not None:
+            components.append(
+                ASTNamedIndexComponent("page", self._make_integer_literal(register_value, bits=16, signed=False))
+            )
+        elif register is not None:
+            components.append(
+                ASTNamedIndexComponent("page_reg", self._make_integer_literal(register, bits=16, signed=False))
+            )
+        return ASTMemoryLocation(base=base, components=tuple(components))
+
+    def _build_banked_location(
+        self,
+        node: IRBankedLoad | IRBankedStore,
+        pointer: Optional[ASTExpression],
+        offset: Optional[ASTExpression],
+    ) -> ASTMemoryLocation:
+        return self._build_memref_location(node.ref, pointer, offset, node.register, node.register_value)
+
+    def _build_indirect_location(
+        self,
+        pointer: ASTExpression,
+        offset: Optional[ASTExpression],
+        ref: Optional[MemRef],
+        base_slot: Optional[IRSlot],
+    ) -> ASTMemoryLocation:
+        if ref is not None:
+            return self._build_memref_location(ref, pointer, offset, None, None)
+        base_expr: ASTExpression
+        if base_slot is not None:
+            base_expr = ASTLocationExpr(self._build_slot_location(base_slot))
+        else:
+            base_expr = pointer
+        components: List[ASTIndexComponent | ASTNamedIndexComponent | ASTFieldComponent | ASTSliceComponent] = []
+        if offset is not None:
+            components.append(ASTIndexComponent(offset))
+        return ASTMemoryLocation(base=base_expr, components=tuple(components))
+
     def _convert_node(
         self,
         node,
@@ -1624,16 +1723,17 @@ class ASTBuilder:
             return [], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
-            expr = ASTSlotRef(node.slot)
+            location = self._build_slot_location(node.slot)
+            expr = ASTLocationExpr(location=location)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
             return [ASTAssign(target=target, value=expr)], []
         if isinstance(node, IRStore):
-            target_expr = ASTSlotRef(node.slot)
+            location = self._build_slot_location(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
-            metrics.observe_store(not isinstance(value_expr, ASTUnknown))
-            return [ASTStore(target=target_expr, value=value_expr)], []
+            metrics.observe_store(self._is_known(value_expr))
+            return [ASTMemoryWrite(location=location, value=value_expr)], []
         if isinstance(node, IRIORead):
             return [ASTIORead(port=node.port)], []
         if isinstance(node, IRIOWrite):
@@ -1647,17 +1747,12 @@ class ASTBuilder:
                 if node.offset_source
                 else None
             )
-            expr = ASTBankedLoadExpr(
-                ref=node.ref,
-                register=node.register,
-                register_value=node.register_value,
-                pointer=pointer_expr,
-                offset=offset_expr,
-            )
+            location = self._build_banked_location(node, pointer_expr, offset_expr)
+            expr = ASTLocationExpr(location=location)
             value_state[node.target] = expr
+            pointer_known = self._is_known(pointer_expr)
+            offset_known = self._is_known(offset_expr)
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
-            pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
-            offset_known = offset_expr is None or not isinstance(offset_expr, ASTUnknown)
             metrics.observe_load(pointer_known and offset_known)
             return [
                 ASTAssign(
@@ -1675,29 +1770,24 @@ class ASTBuilder:
                 else None
             )
             value_expr = self._resolve_expr(node.value, value_state)
-            pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
-            offset_known = offset_expr is None or not isinstance(offset_expr, ASTUnknown)
+            pointer_known = self._is_known(pointer_expr)
+            offset_known = self._is_known(offset_expr)
             value_known = not isinstance(value_expr, ASTUnknown)
             metrics.observe_store(pointer_known and offset_known and value_known)
-            target = ASTBankedRefExpr(
-                ref=node.ref,
-                register=node.register,
-                register_value=node.register_value,
-                pointer=pointer_expr,
-                offset=offset_expr,
-            )
-            return [ASTStore(target=target, value=value_expr)], []
+            location = self._build_banked_location(node, pointer_expr, offset_expr)
+            return [ASTMemoryWrite(location=location, value=value_expr)], []
         if isinstance(node, IRIndirectLoad):
             pointer = self._resolve_expr(node.pointer or node.base, value_state)
             offset_expr = (
                 self._resolve_expr(node.offset_source, value_state)
                 if node.offset_source
-                else ASTLiteral(node.offset)
+                else self._make_integer_literal(node.offset, bits=16, signed=False)
             )
-            expr = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
+            location = self._build_indirect_location(pointer, offset_expr, node.ref, node.base_slot)
+            expr = ASTLocationExpr(location=location)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
-            metrics.observe_load(not isinstance(pointer, ASTUnknown) and not isinstance(offset_expr, ASTUnknown))
+            metrics.observe_load(self._is_known(pointer) and self._is_known(offset_expr))
             return [
                 ASTAssign(
                     target=ASTIdentifier(node.target, self._infer_kind(node.target)),
@@ -1709,14 +1799,14 @@ class ASTBuilder:
             offset_expr = (
                 self._resolve_expr(node.offset_source, value_state)
                 if node.offset_source
-                else ASTLiteral(node.offset)
+                else self._make_integer_literal(node.offset, bits=16, signed=False)
             )
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(
-                not any(isinstance(expr, ASTUnknown) for expr in (pointer, offset_expr, value_expr))
+                self._is_known(pointer) and self._is_known(offset_expr) and not isinstance(value_expr, ASTUnknown)
             )
-            target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
-            return [ASTStore(target=target, value=value_expr)], []
+            location = self._build_indirect_location(pointer, offset_expr, node.ref, node.base_slot)
+            return [ASTMemoryWrite(location=location, value=value_expr)], []
         if isinstance(node, IRCallReturn):
             call_expr, arg_exprs = self._convert_call(
                 node.target,
@@ -2134,6 +2224,19 @@ class ASTBuilder:
             return self._call_arg_values[token]
         if token in self._expression_lookup:
             return self._expression_lookup[token]
+        lowered = token.lower()
+        if lowered == "true":
+            return ASTBooleanLiteral(True)
+        if lowered == "false":
+            return ASTBooleanLiteral(False)
+        if token in self._string_constants:
+            const = self._string_constants[token]
+            data = const.data
+            try:
+                text = data.decode("ascii")
+            except UnicodeDecodeError:
+                return ASTBytesLiteral(data=data, encoding="binary")
+            return ASTStringLiteral(value=text, encoding="ascii")
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
@@ -2144,13 +2247,15 @@ class ASTBuilder:
                 value = int(literal, 16)
             except ValueError:
                 return ASTUnknown(token)
-            return ASTLiteral(value)
+            bits = max(4, len(literal) * 4)
+            return self._make_integer_literal(value, bits=bits, signed=value < 0)
         if token.startswith("slot(") and token.endswith(")"):
             try:
                 index = int(token[5:-1], 16)
             except ValueError:
                 return ASTUnknown(token)
-            return ASTSlotRef(self._build_slot(index))
+            slot = self._build_slot(index)
+            return ASTLocationExpr(location=self._build_slot_location(slot))
         return ASTIdentifier(token, self._infer_kind(token))
 
     @staticmethod
