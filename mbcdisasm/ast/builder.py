@@ -166,21 +166,26 @@ _FRAME_OPERAND_KIND_OVERRIDES = {
     0xF0EB: "io.step",
 }
 from .model import (
+    ASTArgumentMode,
+    ASTCallArgument,
     ASTAliasInfo,
     ASTAliasKind,
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTBreak,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
     ASTCallFrame,
     ASTCallFrameSlot,
     ASTComment,
+    ASTContinue,
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
     ASTFieldElement,
+    ASTFlagPredicate,
     ASTFrameEffect,
     ASTFrameProtocol,
     ASTFlagCheck,
@@ -188,6 +193,7 @@ from .model import (
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
+    ASTIf,
     ASTIntegerLiteral,
     ASTMemoryLocation,
     ASTMemoryRead,
@@ -207,8 +213,10 @@ from .model import (
     ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
+    ASTWhile,
     ASTIndexElement,
 )
+from .structuralizer import ControlFlowStructuralizer
 
 
 @dataclass
@@ -618,12 +626,15 @@ class ASTBuilder:
         if not simplified_blocks:
             return None
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
+        structuralizer = ControlFlowStructuralizer(simplified_blocks)
+        structured_body = structuralizer.build(entry_offset)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=simplified_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
+            body=structured_body,
         )
 
     def _collect_entry_blocks(
@@ -1191,7 +1202,7 @@ class ASTBuilder:
         self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
-            sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+            sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
             len(call_expr.args),
         )
         frame = self._build_call_frame(node, arg_exprs)
@@ -1351,13 +1362,28 @@ class ASTBuilder:
             lhs.target == rhs.target
             and lhs.symbol == rhs.symbol
             and lhs.args == rhs.args
-            and lhs.varargs == rhs.varargs
         )
 
     def _register_expression(self, token: Optional[str], expr: ASTExpression) -> None:
         if not token:
             return
         self._expression_lookup[token] = expr
+
+    @staticmethod
+    def _materialise_assignment(
+        target: ASTExpression, value: ASTExpression
+    ) -> List[ASTStatement]:
+        if isinstance(target, ASTIdentifier):
+            return [ASTAssign(target=target, value=value)]
+        if isinstance(target, ASTMemoryLocation):
+            return [ASTMemoryWrite(location=target, value=value)]
+        if isinstance(target, ASTMemoryRead) and isinstance(target.location, ASTMemoryLocation):
+            return [ASTMemoryWrite(location=target.location, value=value)]
+        return [
+            ASTComment(
+                f"assign({target.render()}) = {value.render()}"
+            )
+        ]
 
     def _build_dispatch_switch(
         self,
@@ -1438,13 +1464,14 @@ class ASTBuilder:
     def _build_dispatch_cases(
         self, cases: Sequence[IRDispatchCase]
     ) -> Tuple[ASTSwitchCase, ...]:
+        ordered = sorted(cases, key=lambda item: item.key)
         return tuple(
             ASTSwitchCase(
                 key=case.key,
                 target=case.target,
                 symbol=case.symbol,
             )
-            for case in cases
+            for case in ordered
         )
 
     def _ensure_dispatch_enum(
@@ -1729,7 +1756,7 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+                sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
                 len(call_expr.args),
             )
             frame = self._build_call_frame(node, arg_exprs)
@@ -1759,7 +1786,7 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+                sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
                 len(call_expr.args),
             )
             frame = self._build_call_frame(node, arg_exprs)
@@ -1819,15 +1846,16 @@ class ASTBuilder:
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTTestSet(
-                var=var_expr,
-                expr=expr,
+            assignments = self._materialise_assignment(var_expr, expr)
+            branch = ASTBranch(
+                condition=expr,
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [statement], [
+            statements = assignments + [branch]
+            return statements, [
                 _BranchLink(
-                    statement=statement,
+                    statement=branch,
                     then_target=then_target,
                     else_target=else_target,
                     origin_offset=origin_offset,
@@ -1838,15 +1866,16 @@ class ASTBuilder:
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFunctionPrologue(
-                var=var_expr,
-                expr=expr,
+            assignments = self._materialise_assignment(var_expr, expr)
+            branch = ASTBranch(
+                condition=expr,
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [statement], [
+            statements = assignments + [branch]
+            return statements, [
                 _BranchLink(
-                    statement=statement,
+                    statement=branch,
                     then_target=then_target,
                     else_target=else_target,
                     origin_offset=origin_offset,
@@ -1855,14 +1884,15 @@ class ASTBuilder:
         if isinstance(node, IRFlagCheck):
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFlagCheck(
-                flag=node.flag,
+            condition = ASTFlagPredicate(node.flag)
+            branch = ASTBranch(
+                condition=condition,
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [statement], [
+            return [branch], [
                 _BranchLink(
-                    statement=statement,
+                    statement=branch,
                     then_target=then_target,
                     else_target=else_target,
                     origin_offset=origin_offset,
@@ -2241,7 +2271,14 @@ class ASTBuilder:
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
         arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
+        call_arguments: List[ASTCallArgument] = []
+        for index, expr in enumerate(arg_exprs):
+            mode = ASTArgumentMode.MOVE
+            if varargs and index == len(arg_exprs) - 1:
+                mode = ASTArgumentMode.VARIADIC
+            call_arguments.append(ASTCallArgument(value=expr, mode=mode))
+        call_arguments_tuple = tuple(call_arguments)
+        call_expr = ASTCallExpr(target=target, args=call_arguments_tuple, symbol=symbol, tail=tail)
         for token, expr in zip(args, arg_exprs):
             if token and not isinstance(expr, ASTUnknown):
                 self._call_arg_values[token] = expr

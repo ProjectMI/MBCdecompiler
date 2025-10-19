@@ -9,11 +9,13 @@ from mbcdisasm.ast import (
     ASTCallFrame,
     ASTCallStatement,
     ASTFrameProtocol,
+    ASTIf,
     ASTIntegerLiteral,
     ASTMemoryRead,
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTWhile,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -56,9 +58,21 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     assert procedure.entry_reasons
     assert procedure.blocks
 
-    block = procedure.blocks[0]
-    assert block.successors is not None
-    rendered = [statement.render() for statement in block.statements]
+    assert procedure.body
+
+    def flatten(statements):
+        collected = []
+        for stmt in statements:
+            collected.append(stmt)
+            if isinstance(stmt, ASTIf):
+                collected.extend(flatten(stmt.then_body))
+                collected.extend(flatten(stmt.else_body))
+            elif isinstance(stmt, ASTWhile):
+                collected.extend(flatten(stmt.body))
+                collected.extend(flatten(stmt.else_body))
+        return collected
+
+    rendered = [statement.render() for statement in flatten(procedure.body)]
     assert any("call" in line for line in rendered)
     assert any(line.startswith("return") for line in rendered)
     assert procedure.name == f"proc_{procedure.entry_offset:04X}"
@@ -105,6 +119,8 @@ def test_ast_builder_splits_after_return_sequences() -> None:
     first = ast_segment.procedures[0]
     assert first.exit_offsets == (0x0100,)
     assert len(first.blocks) == 1
+    assert first.body
+    assert isinstance(first.body[0], ASTReturn)
 
 
 def test_ast_builder_uses_postdominators_for_exits() -> None:
@@ -140,6 +156,8 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     procedure = ast_segment.procedures[0]
     assert tuple(sorted(procedure.exit_offsets)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
+    assert procedure.body
+    assert isinstance(procedure.body[0], ASTIf)
 
 
 def test_ast_builder_converts_dispatch_with_trailing_table() -> None:

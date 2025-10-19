@@ -341,14 +341,40 @@ class ASTMemoryRead(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTArgumentMode(Enum):
+    """Transfer semantics used when passing call arguments."""
+
+    MOVE = "move"
+    BORROW = "borrow"
+    MUT_BORROW = "mut_borrow"
+    VARIADIC = "variadic"
+
+
+@dataclass(frozen=True)
+class ASTCallArgument:
+    """Single argument supplied to a call expression."""
+
+    value: ASTExpression
+    mode: ASTArgumentMode = ASTArgumentMode.MOVE
+
+    def render(self) -> str:
+        expr = self.value.render()
+        if self.mode is ASTArgumentMode.MOVE:
+            return expr
+        if self.mode is ASTArgumentMode.VARIADIC:
+            return f"*{expr}"
+        qualifier = "&" if self.mode is ASTArgumentMode.BORROW else "&mut"
+        return f"{qualifier} {expr}"
+
+
+@dataclass(frozen=True)
 class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
     target: int
-    args: Tuple[ASTExpression, ...]
+    args: Tuple[ASTCallArgument, ...]
     symbol: str | None = None
     tail: bool = False
-    varargs: bool = False
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
 
@@ -358,8 +384,7 @@ class ASTCallExpr(ASTExpression):
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         prefix = "tail " if self.tail else ""
-        suffix = ", ..." if self.varargs else ""
-        return f"{prefix}call {target_repr}({rendered_args}{suffix})"
+        return f"{prefix}call {target_repr}({rendered_args})"
 
 
 @dataclass(frozen=True)
@@ -382,6 +407,16 @@ class ASTTupleExpr(ASTExpression):
     def render(self) -> str:
         inner = ", ".join(item.render() for item in self.items)
         return f"({inner})"
+
+
+@dataclass(frozen=True)
+class ASTFlagPredicate(ASTExpression):
+    """Boolean expression testing a VM flag."""
+
+    flag: int
+
+    def render(self) -> str:
+        return f"flag(0x{self.flag:04X})"
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +664,66 @@ class ASTReturn(ASTStatement):
 
 
 @dataclass
+class ASTBreak(ASTStatement):
+    """Break out of the innermost structured loop."""
+
+    depth: int = 1
+
+    def render(self) -> str:
+        if self.depth == 1:
+            return "break"
+        return f"break {self.depth}"
+
+
+@dataclass
+class ASTContinue(ASTStatement):
+    """Continue with the next iteration of the innermost loop."""
+
+    depth: int = 1
+
+    def render(self) -> str:
+        if self.depth == 1:
+            return "continue"
+        return f"continue {self.depth}"
+
+
+@dataclass
+class ASTIf(ASTStatement):
+    """Canonical structured conditional."""
+
+    condition: ASTExpression
+    then_body: Tuple[ASTStatement, ...]
+    else_body: Tuple[ASTStatement, ...] = tuple()
+
+    def render(self) -> str:
+        then_rendered = "; ".join(stmt.render() for stmt in self.then_body)
+        if not self.else_body:
+            return f"if {self.condition.render()} then [{then_rendered}]"
+        else_rendered = "; ".join(stmt.render() for stmt in self.else_body)
+        return (
+            f"if {self.condition.render()} then [{then_rendered}] else [{else_rendered}]"
+        )
+
+
+@dataclass
+class ASTWhile(ASTStatement):
+    """Canonical pre-test loop."""
+
+    condition: ASTExpression
+    body: Tuple[ASTStatement, ...]
+    else_body: Tuple[ASTStatement, ...] = tuple()
+
+    def render(self) -> str:
+        body_rendered = "; ".join(stmt.render() for stmt in self.body)
+        if not self.else_body:
+            return f"while {self.condition.render()} do [{body_rendered}]"
+        else_rendered = "; ".join(stmt.render() for stmt in self.else_body)
+        return (
+            f"while {self.condition.render()} do [{body_rendered}] else [{else_rendered}]"
+        )
+
+
+@dataclass
 class ASTBranch(ASTStatement):
     """Generic conditional branch with CFG links."""
 
@@ -832,6 +927,7 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry_reasons: Tuple[str, ...] = ()
     exit_offsets: Tuple[int, ...] = ()
+    body: Tuple[ASTStatement, ...] = ()
 
 
 @dataclass
@@ -941,9 +1037,12 @@ __all__ = [
     "ASTConversionKind",
     "ASTEffectCategory",
     "ASTMemoryRead",
+    "ASTArgumentMode",
+    "ASTCallArgument",
     "ASTCallExpr",
     "ASTCallResult",
     "ASTTupleExpr",
+    "ASTFlagPredicate",
     "ASTStatement",
     "ASTAssign",
     "ASTMemoryWrite",
@@ -956,6 +1055,10 @@ __all__ = [
     "ASTIOWrite",
     "ASTTailCall",
     "ASTReturn",
+    "ASTBreak",
+    "ASTContinue",
+    "ASTIf",
+    "ASTWhile",
     "ASTFinallyStep",
     "ASTFinally",
     "ASTBranch",
