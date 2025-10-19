@@ -4922,7 +4922,11 @@ class IRNormalizer:
         if event.delta > 0:
             return False
         if event.pushed_types:
-            return False
+            if not (
+                instruction.mnemonic.startswith("reduce")
+                and self._has_mask_operand(instruction)
+            ):
+                return False
         if self._is_stack_teardown_step(instruction):
             return True
         if self._has_mask_operand(instruction):
@@ -5090,7 +5094,8 @@ class IRNormalizer:
             return False
         mnemonic = entry.mnemonic
         if mnemonic.startswith("reduce"):
-            return False
+            if not self._has_mask_operand(entry):
+                return False
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS:
             return False
         kind = entry.profile.kind
