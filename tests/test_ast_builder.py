@@ -173,12 +173,11 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert switch_stmt.helper == 0x1111
     assert switch_stmt.cases[0].key == 0x01
     assert switch_stmt.cases[0].target == 0x2222
-    assert switch_stmt.enum_name == "Helper1111"
-    assert switch_stmt.cases[0].key_alias == "Helper1111.K_0001"
+    assert switch_stmt.enum_name is None
+    assert switch_stmt.cases[0].key_alias is None
     segment = ast_program.segments[0]
-    assert segment.enums and segment.enums[0].name == "Helper1111"
-    assert segment.enums[0].members[0].name == "K_0001"
-    assert ast_program.enums and ast_program.enums[0].name == "Helper1111"
+    assert not segment.enums
+    assert not ast_program.enums
     assert isinstance(statements[1], ASTReturn)
 
 
@@ -276,8 +275,8 @@ def test_ast_switch_marks_io_dispatch() -> None:
     switch_stmt = statements[0]
     assert isinstance(switch_stmt, ASTSwitch)
     assert switch_stmt.kind == "io"
-    assert switch_stmt.enum_name == "IoFlushTail"
-    assert switch_stmt.cases[0].key_alias == "IoFlushTail.K_0010"
+    assert switch_stmt.enum_name is None
+    assert switch_stmt.cases[0].key_alias is None
 
 
 def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
@@ -498,25 +497,63 @@ def test_ast_builder_merges_enum_members_across_switches() -> None:
     first_switch, second_switch = statements[0], statements[1]
     assert isinstance(first_switch, ASTSwitch)
     assert isinstance(second_switch, ASTSwitch)
-    assert first_switch.enum_name == "Dispatch_0x660A"
-    assert second_switch.enum_name == "Dispatch_0x660A"
-    assert first_switch.cases[0].key_alias == "Dispatch_0x660A.K_0003"
-    assert second_switch.cases[1].key_alias == "Dispatch_0x660A.K_0004"
+    assert first_switch.enum_name is None
+    assert second_switch.enum_name == "Helper660A"
+    assert first_switch.cases[0].key_alias is None
+    assert second_switch.cases[0].key_alias == "Helper660A.K_0003"
+    assert second_switch.cases[1].key_alias == "Helper660A.K_0004"
 
     segment_enums = ast_program.segments[0].enums
-    assert segment_enums and segment_enums[0].name == "Dispatch_0x660A"
+    assert segment_enums and segment_enums[0].name == "Helper660A"
     assert {member.value for member in segment_enums[0].members} == {0x03, 0x04}
+
+
+def test_ast_builder_ignores_single_case_enums() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x07, target=0x3000, symbol=None),),
+        helper=0x1234,
+        helper_symbol=None,
+        default=None,
+    )
+    block = IRBlock(
+        label="block_single_enum",
+        start_offset=0x0500,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    switch_stmt = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.enum_name is None
+    assert not ast_program.segments[0].enums
+    assert not ast_program.enums
 
 
 def test_ast_builder_deduplicates_enums_across_segments() -> None:
     dispatch_a = IRSwitchDispatch(
-        cases=(IRDispatchCase(key=0x01, target=0x4000, symbol=None),),
+        cases=(
+            IRDispatchCase(key=0x01, target=0x4000, symbol=None),
+            IRDispatchCase(key=0x02, target=0x4002, symbol=None),
+        ),
         helper=0x7000,
         helper_symbol="helper_7000",
         default=None,
     )
     dispatch_b = IRSwitchDispatch(
-        cases=(IRDispatchCase(key=0x01, target=0x4000, symbol=None),),
+        cases=(
+            IRDispatchCase(key=0x01, target=0x4000, symbol=None),
+            IRDispatchCase(key=0x02, target=0x4002, symbol=None),
+        ),
         helper=0x7000,
         helper_symbol="helper_7000",
         default=None,
@@ -561,6 +598,40 @@ def test_ast_builder_deduplicates_enums_across_segments() -> None:
     assert ast_program.segments[0].enums and ast_program.segments[0].enums[0] is ast_program.enums[0]
     assert not ast_program.segments[1].enums
     assert len(ast_program.enums) == 1
+
+
+def test_ast_builder_names_enum_from_case_symbols() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(
+            IRDispatchCase(key=0x01, target=0x6100, symbol="npc_trader"),
+            IRDispatchCase(key=0x02, target=0x6200, symbol="npc_banker"),
+        ),
+        helper=0x8000,
+        helper_symbol=None,
+        default=None,
+    )
+    block = IRBlock(
+        label="block_case_names",
+        start_offset=0x0600,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0600,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    switch_stmt = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.enum_name == "Npc"
+    assert ast_program.segments[0].enums[0].name == "Npc"
+    assert ast_program.enums[0].name == "Npc"
 
 
 def test_ast_builder_uses_call_symbol_for_enum_naming() -> None:

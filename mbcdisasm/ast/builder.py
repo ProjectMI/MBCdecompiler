@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -77,6 +78,8 @@ _MASK_STEP_MNEMONICS = {
 
 _MASK_OPERANDS = {RET_MASK, FANOUT_FLAGS_A, FANOUT_FLAGS_B}
 _MASK_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
+
+_SYMBOL_TOKEN_SPLIT = re.compile(r"[^0-9A-Za-z]+")
 
 _FRAME_DROP_MNEMONICS = {
     "op_01_0C",
@@ -301,6 +304,7 @@ class _EnumInfo:
     member_names: Dict[int, str]
     owner_segment: int
     order: int
+    use_count: int = 0
 
 
 class ASTBuilder:
@@ -340,10 +344,15 @@ class ASTBuilder:
         metrics.procedure_count = sum(len(seg.procedures) for seg in segments)
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
+        program_enums: List[ASTEnumDecl] = []
+        for key in self._enum_order:
+            info = self._enum_infos[key]
+            if info.use_count and len(info.decl.members) > 1:
+                program_enums.append(info.decl)
         return ASTProgram(
             segments=tuple(segments),
             metrics=metrics,
-            enums=tuple(self._enum_infos[key].decl for key in self._enum_order),
+            enums=tuple(program_enums),
         )
 
     # ------------------------------------------------------------------
@@ -367,12 +376,17 @@ class ASTBuilder:
         }
         self._current_redirects = redirects
         procedures = self._group_procedures(segment, analyses, entry_reasons, metrics)
+        segment_enums: List[ASTEnumDecl] = []
+        for key in self._segment_declared_enum_keys:
+            info = self._enum_infos[key]
+            if info.use_count and len(info.decl.members) > 1:
+                segment_enums.append(info.decl)
         result = ASTSegment(
             index=segment.index,
             start=segment.start,
             length=segment.length,
             procedures=tuple(procedures),
-            enums=tuple(self._enum_infos[key].decl for key in self._segment_declared_enum_keys),
+            enums=tuple(segment_enums),
         )
         self._clear_context()
         return result
@@ -1323,10 +1337,11 @@ class ASTBuilder:
         value_state: Mapping[str, ASTExpression],
     ) -> ASTSwitch:
         collapse_dispatch = self._should_collapse_dispatch(call_expr, dispatch)
+        use_enum = self._should_use_dispatch_enum(dispatch)
         enum_decl: ASTEnumDecl | None
         alias_lookup: Mapping[int, str]
         enum_name: str | None
-        if collapse_dispatch:
+        if collapse_dispatch or not use_enum:
             enum_decl = None
             alias_lookup = {}
             enum_name = None
@@ -1364,6 +1379,10 @@ class ASTBuilder:
         if dispatch.default is not None:
             return False
         return True
+
+    @staticmethod
+    def _should_use_dispatch_enum(dispatch: IRSwitchDispatch) -> bool:
+        return len(dispatch.cases) > 1
 
     def _resolve_dispatch_index(
         self,
@@ -1429,11 +1448,10 @@ class ASTBuilder:
             )
             self._enum_infos[key] = info
             self._enum_order.append(key)
+        if info.owner_segment == self._current_segment_index:
             self._register_segment_enum(key, info)
-        else:
-            if info.owner_segment == self._current_segment_index:
-                self._register_segment_enum(key, info)
         self._update_enum_members(info, dispatch, call_symbol)
+        info.use_count += 1
         return info.decl, info.member_names
 
     def _register_segment_enum(self, key: str, info: _EnumInfo) -> None:
@@ -1481,9 +1499,9 @@ class ASTBuilder:
     def _allocate_enum_name(
         self, dispatch: IRSwitchDispatch, key: str, call_symbol: str | None
     ) -> str:
-        base = self._normalise_enum_name(
-            dispatch.helper_symbol or call_symbol, dispatch.helper
-        )
+        base = self._normalise_enum_name(dispatch, call_symbol)
+        if base and base[0].isdigit():
+            base = f"Value{base}"
         name = base
         existing = self._enum_name_usage.get(name)
         if existing is not None and existing != key:
@@ -1501,34 +1519,71 @@ class ASTBuilder:
         return name
 
     def _normalise_enum_name(
-        self, symbol: str | None, helper: int | None
+        self, dispatch: IRSwitchDispatch, call_symbol: str | None
     ) -> str:
-        if symbol:
-            lowered = symbol.lower()
-            if lowered.startswith("scheduler.mask_"):
-                base = "SchedulerMask"
-            elif lowered.startswith("io.") and lowered.endswith("write"):
-                parts = [
-                    piece.capitalize()
-                    for part in symbol.split(".")
-                    for piece in part.split("_")
-                    if piece
-                ]
-                base = "".join(parts) or "Dispatch"
-                if not base.endswith("Dispatch"):
-                    base += "Dispatch"
-            else:
-                parts = [
-                    piece.capitalize()
-                    for part in symbol.replace("/", ".").split(".")
-                    for piece in part.split("_")
-                    if piece
-                ]
-                base = "".join(parts) or "Dispatch"
-            return base
+        helper_symbol = dispatch.helper_symbol or call_symbol
+        if helper_symbol:
+            return self._format_symbol_name(helper_symbol)
+        case_symbols = [case.symbol for case in dispatch.cases if case.symbol]
+        case_name = self._derive_case_enum_name(case_symbols)
+        if case_name:
+            return case_name
+        helper = dispatch.helper
         if helper is not None:
-            return f"Dispatch_0x{helper:04X}"
-        return "Dispatch"
+            return f"Helper{helper:04X}"
+        return "HelperDispatch"
+
+    def _format_symbol_name(self, symbol: str) -> str:
+        lowered = symbol.lower()
+        if lowered.startswith("scheduler.mask_"):
+            return "SchedulerMask"
+        if lowered.startswith("io.") and lowered.endswith("write"):
+            parts = [
+                self._format_symbol_token(token)
+                for token in self._split_symbol_tokens(symbol)
+            ]
+            base = "".join(parts) or "HelperDispatch"
+            if not base.endswith("Dispatch"):
+                base += "Dispatch"
+            return base
+        parts = [
+            self._format_symbol_token(token)
+            for token in self._split_symbol_tokens(symbol)
+        ]
+        base = "".join(parts) or "HelperDispatch"
+        return base
+
+    def _derive_case_enum_name(self, symbols: Sequence[str]) -> str | None:
+        tokenised = [self._split_symbol_tokens(symbol) for symbol in symbols if symbol]
+        tokenised = [tokens for tokens in tokenised if tokens]
+        if not tokenised:
+            return None
+        prefix: List[str] = []
+        for group in zip(*tokenised):
+            lowered = {token.lower() for token in group if token}
+            if len(lowered) != 1:
+                break
+            token = next(iter(lowered))
+            prefix.append(token)
+            if len(prefix) >= 3:
+                break
+        if not prefix:
+            return None
+        formatted = "".join(self._format_symbol_token(token) for token in prefix)
+        return formatted or None
+
+    @staticmethod
+    def _format_symbol_token(token: str) -> str:
+        if not token:
+            return ""
+        lowered = token.lower()
+        if lowered.isdigit():
+            return lowered
+        return lowered[0].upper() + lowered[1:]
+
+    @staticmethod
+    def _split_symbol_tokens(symbol: str) -> List[str]:
+        return [piece for piece in _SYMBOL_TOKEN_SPLIT.split(symbol) if piece]
 
     def _resolve_enum_aliases(
         self, dispatch: IRSwitchDispatch, call_symbol: str | None
