@@ -5093,18 +5093,28 @@ class IRNormalizer:
         if entry.mnemonic.startswith("op_2C_") and 0x6600 <= entry.operand <= 0x66FF:
             return False
         mnemonic = entry.mnemonic
+        literal_cleanup = False
         if mnemonic.startswith("reduce"):
             if not self._has_mask_operand(entry):
-                return False
+                literal_cleanup = (
+                    entry.mnemonic == "reduce_pair"
+                    and entry.event.uncertain
+                    and self._is_literal_marker_adjacent(items, index)
+                )
+                if not literal_cleanup:
+                    return False
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic in IO_READ_MNEMONICS:
             return False
         kind = entry.profile.kind
         if kind in STACK_NEUTRAL_CONTROL_KINDS or kind is InstructionKind.LITERAL:
             return False
-        if not self._is_neutral_cleanup_step(entry):
+        if not literal_cleanup and not self._is_neutral_cleanup_step(entry):
             return False
         if self._is_io_handshake_instruction(entry, items, index):
             return False
+
+        if literal_cleanup:
+            return True
 
         neighbor_types = (
             CallLike,
@@ -5150,6 +5160,31 @@ class IRNormalizer:
                     pos += direction
                     continue
                 break
+        return False
+
+    def _is_literal_marker_adjacent(self, items: _ItemList, index: int) -> bool:
+        return self._literal_marker_neighbor(items, index, -1) or self._literal_marker_neighbor(
+            items, index, 1
+        )
+
+    def _literal_marker_neighbor(self, items: _ItemList, index: int, direction: int) -> bool:
+        pos = index + direction
+        steps = 0
+        while 0 <= pos < len(items) and steps < 6:
+            node = items[pos]
+            if isinstance(node, (IRCallCleanup, IRStackDrop)):
+                pos += direction
+                steps += 1
+                continue
+            if isinstance(node, IRDataMarker) and getattr(node, "mnemonic", None) == "literal_marker":
+                return True
+            if isinstance(node, (IRLiteral, IRLiteralChunk, IRLiteralBlock)):
+                pos += direction
+                steps += 1
+                continue
+            if isinstance(node, RawInstruction):
+                return False
+            break
         return False
 
     def _is_dispatch_wrapper_instruction(self, instruction: RawInstruction) -> bool:
