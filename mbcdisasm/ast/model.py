@@ -341,14 +341,36 @@ class ASTMemoryRead(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTCallArgMode(Enum):
+    """Transfer mode for call arguments."""
+
+    MOVE = "move"
+    BORROW = "borrow"
+    SPREAD = "spread"
+
+
+@dataclass(frozen=True)
+class ASTCallArg:
+    """Single argument passed to a call expression."""
+
+    value: ASTExpression
+    mode: ASTCallArgMode = ASTCallArgMode.MOVE
+    name: Optional[str] = None
+
+    def render(self) -> str:
+        prefix = "&" if self.mode is ASTCallArgMode.BORROW else "*" if self.mode is ASTCallArgMode.SPREAD else ""
+        label = f"{self.name}=" if self.name else ""
+        return f"{label}{prefix}{self.value.render()}"
+
+
+@dataclass(frozen=True)
 class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
     target: int
-    args: Tuple[ASTExpression, ...]
+    args: Tuple[ASTCallArg, ...]
     symbol: str | None = None
     tail: bool = False
-    varargs: bool = False
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
 
@@ -358,8 +380,7 @@ class ASTCallExpr(ASTExpression):
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         prefix = "tail " if self.tail else ""
-        suffix = ", ..." if self.varargs else ""
-        return f"{prefix}call {target_repr}({rendered_args}{suffix})"
+        return f"{prefix}call {target_repr}({rendered_args})"
 
 
 @dataclass(frozen=True)
@@ -814,6 +835,88 @@ class ASTSwitch(ASTStatement):
 
 
 @dataclass
+class ASTBlockStatement(ASTStatement):
+    """Sequential composition of statements."""
+
+    statements: Tuple[ASTStatement, ...]
+
+    def render(self) -> str:
+        inner = "; ".join(stmt.render() for stmt in self.statements)
+        return f"block[{inner}]"
+
+
+@dataclass
+class ASTIfStatement(ASTStatement):
+    """Structured conditional with explicit then/else bodies."""
+
+    condition: ASTExpression
+    then_block: ASTBlockStatement
+    else_block: Optional[ASTBlockStatement] = None
+
+    def render(self) -> str:
+        then_repr = self.then_block.render()
+        else_repr = f" else {self.else_block.render()}" if self.else_block else ""
+        return f"if {self.condition.render()} then {then_repr}{else_repr}"
+
+
+@dataclass
+class ASTWhileStatement(ASTStatement):
+    """Canonical pre-test loop."""
+
+    condition: ASTExpression
+    body: ASTBlockStatement
+
+    def render(self) -> str:
+        return f"while {self.condition.render()} do {self.body.render()}"
+
+
+@dataclass
+class ASTBreak(ASTStatement):
+    """Explicit loop break."""
+
+    def render(self) -> str:
+        return "break"
+
+
+@dataclass
+class ASTContinue(ASTStatement):
+    """Explicit loop continue."""
+
+    def render(self) -> str:
+        return "continue"
+
+
+@dataclass
+class ASTThrow(ASTStatement):
+    """Raised exception terminating the current flow."""
+
+    value: Optional[ASTExpression] = None
+
+    def render(self) -> str:
+        payload = self.value.render() if self.value else "()"
+        return f"throw {payload}"
+
+
+@dataclass
+class ASTTryCatch(ASTStatement):
+    """Structured exception handler with optional finally clause."""
+
+    try_block: ASTBlockStatement
+    catch_var: Optional[str] = None
+    catch_block: Optional[ASTBlockStatement] = None
+    finally_block: Optional[ASTBlockStatement] = None
+
+    def render(self) -> str:
+        parts = [f"try {self.try_block.render()}"]
+        if self.catch_block is not None:
+            label = f"catch {self.catch_var}" if self.catch_var else "catch"
+            parts.append(f"{label} {self.catch_block.render()}")
+        if self.finally_block is not None:
+            parts.append(f"finally {self.finally_block.render()}")
+        return " ".join(parts)
+
+
+@dataclass
 class ASTBlock:
     """Block of sequential statements with outgoing CFG edges."""
 
@@ -832,6 +935,7 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry_reasons: Tuple[str, ...] = ()
     exit_offsets: Tuple[int, ...] = ()
+    body: Optional[ASTBlockStatement] = None
 
 
 @dataclass
@@ -941,6 +1045,8 @@ __all__ = [
     "ASTConversionKind",
     "ASTEffectCategory",
     "ASTMemoryRead",
+    "ASTCallArg",
+    "ASTCallArgMode",
     "ASTCallExpr",
     "ASTCallResult",
     "ASTTupleExpr",
@@ -963,6 +1069,13 @@ __all__ = [
     "ASTFlagCheck",
     "ASTFunctionPrologue",
     "ASTComment",
+    "ASTBlockStatement",
+    "ASTIfStatement",
+    "ASTWhileStatement",
+    "ASTBreak",
+    "ASTContinue",
+    "ASTThrow",
+    "ASTTryCatch",
     "ASTEnumDecl",
     "ASTEnumMember",
     "ASTBlock",
