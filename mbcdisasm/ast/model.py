@@ -801,12 +801,12 @@ class ASTTailCall(ASTTerminator):
 
     def render(self) -> str:
         call_repr = self.call.render()
-        if call_repr.startswith("tail "):
-            call_repr = call_repr[len("tail ") :]
-        result = f"tail {call_repr} returns {self.payload.render()}"
+        payload_repr = self.payload.render()
+        if payload_repr != "()":
+            call_repr = f"{call_repr} -> {payload_repr}"
         if self.abi is not None:
-            result = f"{result} {self.abi.render()}"
-        return f"{result} effects={_render_effects(self.effects)}"
+            call_repr = f"{call_repr} {self.abi.render()}"
+        return f"{call_repr} effects={_render_effects(self.effects)}"
 
 
 @dataclass
@@ -1054,6 +1054,12 @@ class ASTProcedure:
     exit_offsets: Tuple[int, ...] = ()
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.entry_reasons:
+            self.entry_reasons = ("synthetic",)
+        if not self.exit_offsets and self.blocks:
+            self.exit_offsets = (self.blocks[-1].start_offset,)
 
 
 @dataclass

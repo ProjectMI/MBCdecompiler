@@ -1855,7 +1855,7 @@ class ASTBuilder:
                 self._pending_epilogue.extend(node.cleanup)
             return_identifiers = []
             for index, name in enumerate(node.returns):
-                identifier = ASTIdentifier(name, self._infer_kind(name))
+                identifier = self._make_identifier(name)
                 value_state[name] = ASTCallResult(call_expr, index)
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
@@ -2484,7 +2484,7 @@ class ASTBuilder:
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
-        return ASTIdentifier(token, self._infer_kind(token))
+        return self._make_identifier(token)
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
@@ -2495,6 +2495,28 @@ class ASTBuilder:
         else:
             space = MemSpace.CONST
         return IRSlot(space=space, index=index)
+
+    def _make_identifier(self, token: str) -> ASTIdentifier:
+        kind = self._infer_kind(token)
+        name = self._canonical_identifier_name(token, kind)
+        return ASTIdentifier(name, kind)
+
+    def _canonical_identifier_name(self, token: str, kind: SSAValueKind) -> str:
+        if token.startswith("ret") and token[3:].isdigit():
+            suffix = token[3:]
+            mapping = {
+                SSAValueKind.UNKNOWN: "word",
+                SSAValueKind.BOOLEAN: "flag",
+                SSAValueKind.BYTE: "byte",
+                SSAValueKind.WORD: "word",
+                SSAValueKind.POINTER: "ptr",
+                SSAValueKind.IO: "io",
+                SSAValueKind.PAGE_REGISTER: "page",
+                SSAValueKind.IDENTIFIER: "id",
+            }
+            prefix = mapping.get(kind, "word")
+            return f"{prefix}{suffix}"
+        return token
 
     def _infer_kind(self, name: str) -> SSAValueKind:
         lowered = name.lower()
