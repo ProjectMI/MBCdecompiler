@@ -36,6 +36,7 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    MemRef,
     MemSpace,
     SSAValueKind,
 )
@@ -165,8 +166,10 @@ _FRAME_OPERAND_KIND_OVERRIDES = {
     0xF0EB: "io.step",
 }
 from .model import (
+    ASTAliasModel,
     ASTAssign,
     ASTBlock,
+    ASTBooleanLiteral,
     ASTBranch,
     ASTCallExpr,
     ASTCallResult,
@@ -184,15 +187,15 @@ from .model import (
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
-    ASTIndirectLoadExpr,
-    ASTBankedLoadExpr,
-    ASTBankedRefExpr,
-    ASTLiteral,
+    ASTMemoryAccess,
+    ASTMemoryAccessKind,
     ASTMetrics,
+    ASTNumericLiteral,
     ASTProcedure,
     ASTProgram,
     ASTReturn,
     ASTSegment,
+    ASTSlice,
     ASTSlotRef,
     ASTStatement,
     ASTStore,
@@ -347,6 +350,7 @@ class ASTBuilder:
         return ASTProgram(
             segments=tuple(segments),
             metrics=metrics,
+            aliasing=ASTAliasModel(),
             enums=program_enums,
         )
 
@@ -1623,14 +1627,16 @@ class ASTBuilder:
                 self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
             return [], []
         if isinstance(node, IRLoad):
-            target = ASTIdentifier(node.target, self._infer_kind(node.target))
-            expr = ASTSlotRef(node.slot)
+            kind_hint = self._infer_kind(node.target)
+            target = ASTIdentifier(node.target, kind_hint)
+            expr = self._build_slot_access(node.slot)
+            expr = self._coerce_expression_for_kind(expr, kind_hint)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
             return [ASTAssign(target=target, value=expr)], []
         if isinstance(node, IRStore):
-            target_expr = ASTSlotRef(node.slot)
+            target_expr = self._build_slot_access(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(not isinstance(value_expr, ASTUnknown))
             return [ASTStore(target=target_expr, value=value_expr)], []
@@ -1647,13 +1653,21 @@ class ASTBuilder:
                 if node.offset_source
                 else None
             )
-            expr = ASTBankedLoadExpr(
-                ref=node.ref,
+            access_kind = (
+                ASTMemoryAccessKind.ELEMENT
+                if pointer_expr is not None or offset_expr is not None
+                else ASTMemoryAccessKind.FIELD
+            )
+            expr = self._build_memory_access(
+                node.ref,
+                pointer_expr,
+                offset_expr,
+                kind=access_kind,
                 register=node.register,
                 register_value=node.register_value,
-                pointer=pointer_expr,
-                offset=offset_expr,
             )
+            kind_hint = self._infer_kind(node.target)
+            expr = self._coerce_expression_for_kind(expr, kind_hint)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
@@ -1661,7 +1675,7 @@ class ASTBuilder:
             metrics.observe_load(pointer_known and offset_known)
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=ASTIdentifier(node.target, kind_hint),
                     value=expr,
                 )
             ], []
@@ -1679,12 +1693,18 @@ class ASTBuilder:
             offset_known = offset_expr is None or not isinstance(offset_expr, ASTUnknown)
             value_known = not isinstance(value_expr, ASTUnknown)
             metrics.observe_store(pointer_known and offset_known and value_known)
-            target = ASTBankedRefExpr(
-                ref=node.ref,
+            access_kind = (
+                ASTMemoryAccessKind.ELEMENT
+                if pointer_expr is not None or offset_expr is not None
+                else ASTMemoryAccessKind.FIELD
+            )
+            target = self._build_memory_access(
+                node.ref,
+                pointer_expr,
+                offset_expr,
+                kind=access_kind,
                 register=node.register,
                 register_value=node.register_value,
-                pointer=pointer_expr,
-                offset=offset_expr,
             )
             return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRIndirectLoad):
@@ -1692,15 +1712,26 @@ class ASTBuilder:
             offset_expr = (
                 self._resolve_expr(node.offset_source, value_state)
                 if node.offset_source
-                else ASTLiteral(node.offset)
+                else self._numeric_literal(node.offset)
             )
-            expr = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
+            base_slot = node.base_slot
+            expr = self._build_memory_access(
+                node.ref,
+                pointer,
+                offset_expr,
+                kind=ASTMemoryAccessKind.ELEMENT,
+                default_space=base_slot.space if base_slot else None,
+                default_base=base_slot.index if base_slot else None,
+                default_offset=node.offset,
+            )
+            kind_hint = self._infer_kind(node.target)
+            expr = self._coerce_expression_for_kind(expr, kind_hint)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(not isinstance(pointer, ASTUnknown) and not isinstance(offset_expr, ASTUnknown))
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=ASTIdentifier(node.target, kind_hint),
                     value=expr,
                 )
             ], []
@@ -1709,13 +1740,22 @@ class ASTBuilder:
             offset_expr = (
                 self._resolve_expr(node.offset_source, value_state)
                 if node.offset_source
-                else ASTLiteral(node.offset)
+                else self._numeric_literal(node.offset)
             )
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(
                 not any(isinstance(expr, ASTUnknown) for expr in (pointer, offset_expr, value_expr))
             )
-            target = ASTIndirectLoadExpr(pointer=pointer, offset=offset_expr, ref=node.ref)
+            base_slot = node.base_slot
+            target = self._build_memory_access(
+                node.ref,
+                pointer,
+                offset_expr,
+                kind=ASTMemoryAccessKind.ELEMENT,
+                default_space=base_slot.space if base_slot else None,
+                default_base=base_slot.index if base_slot else None,
+                default_offset=node.offset,
+            )
             return [ASTStore(target=target, value=value_expr)], []
         if isinstance(node, IRCallReturn):
             call_expr, arg_exprs = self._convert_call(
@@ -2144,7 +2184,9 @@ class ASTBuilder:
                 value = int(literal, 16)
             except ValueError:
                 return ASTUnknown(token)
-            return ASTLiteral(value)
+            digits = len(literal) - 2 if literal.lower().startswith("0x") else len(literal)
+            bits = max(8, digits * 4)
+            return self._numeric_literal(value, bits=bits)
         if token.startswith("slot(") and token.endswith(")"):
             try:
                 index = int(token[5:-1], 16)
@@ -2152,6 +2194,10 @@ class ASTBuilder:
                 return ASTUnknown(token)
             return ASTSlotRef(self._build_slot(index))
         return ASTIdentifier(token, self._infer_kind(token))
+
+    @staticmethod
+    def _numeric_literal(value: int, bits: int = 16, signed: bool = False) -> ASTNumericLiteral:
+        return ASTNumericLiteral(value=value, bits=bits, signed=signed)
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
@@ -2162,6 +2208,61 @@ class ASTBuilder:
         else:
             space = MemSpace.CONST
         return IRSlot(space=space, index=index)
+
+    @staticmethod
+    def _derive_alias_class(ref: MemRef | None, register: int | None = None, register_value: int | None = None) -> Optional[str]:
+        if register_value is not None:
+            return f"bank_{register_value:04X}"
+        if register is not None:
+            return f"bank_reg_{register:04X}"
+        if ref is None:
+            return None
+        if ref.region:
+            return ref.region
+        if ref.symbol:
+            return ref.symbol
+        return None
+
+    def _build_memory_access(
+        self,
+        ref: MemRef | None,
+        base: Optional[ASTExpression],
+        index: Optional[ASTExpression],
+        *,
+        kind: ASTMemoryAccessKind,
+        default_space: MemSpace | None = None,
+        default_base: int | None = None,
+        default_offset: int | None = None,
+        register: int | None = None,
+        register_value: int | None = None,
+        slice_spec: Optional[ASTSlice] = None,
+    ) -> ASTMemoryAccess:
+        region = default_space.name.lower() if default_space else None
+        memref = ref or MemRef(region=region or "mem", base=default_base, offset=default_offset)
+        alias_class = self._derive_alias_class(memref, register=register, register_value=register_value)
+        return ASTMemoryAccess(
+            ref=memref,
+            access_kind=kind,
+            base=base,
+            index=index,
+            slice=slice_spec,
+            alias_class=alias_class,
+        )
+
+    def _build_slot_access(self, slot: IRSlot) -> ASTMemoryAccess:
+        region = slot.space.name.lower()
+        memref = MemRef(region=region, offset=slot.index)
+        alias_class = self._derive_alias_class(memref)
+        return ASTMemoryAccess(ref=memref, access_kind=ASTMemoryAccessKind.FIELD, alias_class=alias_class)
+
+    @staticmethod
+    def _coerce_expression_for_kind(expr: ASTExpression, kind: SSAValueKind) -> ASTExpression:
+        if kind is SSAValueKind.BOOLEAN:
+            if isinstance(expr, ASTBooleanLiteral):
+                return expr
+            if isinstance(expr, ASTNumericLiteral):
+                return ASTBooleanLiteral(bool(expr.value))
+        return expr
 
     def _infer_kind(self, name: str) -> SSAValueKind:
         lowered = name.lower()

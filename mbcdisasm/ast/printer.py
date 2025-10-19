@@ -14,6 +14,7 @@ class ASTTextRenderer:
     def render(self, program: ASTProgram) -> str:
         lines: List[str] = []
         lines.append("; ast metrics: " + program.metrics.describe())
+        lines.append("; alias model: " + program.aliasing.describe())
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"

@@ -9,9 +9,13 @@ from mbcdisasm.ast import (
     ASTCallFrame,
     ASTCallStatement,
     ASTFrameProtocol,
-    ASTLiteral,
+    ASTEffectKind,
+    ASTMemoryAccess,
+    ASTMemoryAccessKind,
+    ASTNumericLiteral,
     ASTReturn,
     ASTSlotRef,
+    ASTStore,
     ASTSwitch,
     ASTTailCall,
 )
@@ -23,6 +27,7 @@ from mbcdisasm.ir.model import (
     IRDispatchIndex,
     IRIf,
     IRLoad,
+    IRStore,
     IRProgram,
     IRReturn,
     IRSegment,
@@ -414,6 +419,35 @@ def test_ast_builder_resolves_slot_reference() -> None:
     assert expr.slot.index == 0x0004
 
 
+def test_ast_builder_lifts_slot_store_to_memory_access() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x10,
+        blocks=(
+            IRBlock(
+                label="store_block",
+                start_offset=0x0400,
+                nodes=(
+                    IRStore(slot=IRSlot(MemSpace.FRAME, 0x0002), value="lit(0x0001)"),
+                    IRReturn(values=(), varargs=False),
+                ),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    store_stmt = statements[0]
+    assert isinstance(store_stmt, ASTStore)
+    assert isinstance(store_stmt.target, ASTMemoryAccess)
+    assert store_stmt.target.ref.region == "frame"
+    assert store_stmt.target.access_kind is ASTMemoryAccessKind.FIELD
+    assert store_stmt.effect is ASTEffectKind.MUTABLE
+
+
 def test_ast_builder_reconstructs_dispatch_call_index() -> None:
     call = IRCall(target=0x4444, args=("word0",), symbol="helper_4444")
     dispatch = IRSwitchDispatch(
@@ -452,7 +486,7 @@ def test_ast_builder_reconstructs_dispatch_call_index() -> None:
 
 def test_ast_builder_reuses_call_frame_argument() -> None:
     builder = ASTBuilder()
-    literal = ASTLiteral(0x1234)
+    literal = ASTNumericLiteral(0x1234)
     call = IRCall(target=0x1000, args=())
     frame = builder._build_call_frame(call, (literal,))
     assert frame is not None
