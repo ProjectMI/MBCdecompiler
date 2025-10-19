@@ -104,8 +104,113 @@ class ASTSliceElement(ASTAccessPathElement):
         return f"0x{value:04X}"
 
 
+@dataclass(frozen=True)
+class ASTBankElement(ASTAccessPathElement):
+    """Access a fixed memory bank."""
+
+    value: int
+
+    def render(self) -> str:
+        return f".bank(0x{self.value:04X})"
+
+
+@dataclass(frozen=True)
+class ASTPageElement(ASTAccessPathElement):
+    """Reference a concrete memory page."""
+
+    value: int
+    alias: Optional[str] = None
+
+    def render(self) -> str:
+        if self.alias:
+            return f".page({self.alias})"
+        return f".page(0x{self.value:02X})"
+
+
+@dataclass(frozen=True)
+class ASTPageRegisterElement(ASTAccessPathElement):
+    """Reference an indirect page register."""
+
+    register: int
+
+    def render(self) -> str:
+        return f".page_reg(0x{self.register:04X})"
+
+
+@dataclass(frozen=True)
+class ASTBaseElement(ASTAccessPathElement):
+    """Reference a fixed base offset in a banked region."""
+
+    value: int
+
+    def render(self) -> str:
+        return f".base(0x{self.value:04X})"
+
+
+@dataclass(frozen=True)
+class ASTOffsetElement(ASTAccessPathElement):
+    """Access a fixed offset within a page or slot."""
+
+    value: int
+
+    def render(self) -> str:
+        return f".offset(0x{self.value:04X})"
+
+
+@dataclass(frozen=True)
+class ASTViewElement(ASTAccessPathElement):
+    """Describe a view of a pointer indexed collection."""
+
+    kind: str
+    index: Optional["ASTExpression"] = None
+
+    def render(self) -> str:
+        if self.index is None:
+            return f".view({self.kind})"
+        return f".view({self.kind}, index={self.index.render()})"
+
+
+@dataclass(frozen=True)
+class ASTSlotElement(ASTAccessPathElement):
+    """Reference a slot within a typed address space."""
+
+    space: str
+    index: "ASTExpression"
+
+    def render(self) -> str:
+        return f".slot(space={self.space}, index={self.index.render()})"
+
+
 def _default_alias() -> ASTAliasInfo:
     return ASTAliasInfo(ASTAliasKind.UNKNOWN)
+
+
+class ASTAddressSpace(Enum):
+    """Canonical address space identifiers used by memory locations."""
+
+    FRAME = "frame"
+    GLOBAL = "global"
+    CONST = "const"
+    MEMORY = "mem"
+    IO = "io"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class ASTAddressDescriptor:
+    """Typed description of a concrete address root."""
+
+    space: ASTAddressSpace
+    region: Optional[str] = None
+    symbol: Optional[str] = None
+
+    def render(self) -> str:
+        if self.symbol:
+            return self.symbol
+        base = self.space.value
+        if self.region and self.region != base:
+            return f"{base}.{self.region}"
+        return base
 
 
 def _escape_string(text: str) -> str:
@@ -532,17 +637,23 @@ class ASTSafeCastExpr(ASTExpression):
 class ASTMemoryLocation:
     """Structured representation of an addressable location."""
 
-    base: str | ASTExpression
+    base: ASTAddressDescriptor | "ASTExpression"
     path: Tuple[ASTAccessPathElement, ...] = ()
     alias: ASTAliasInfo = field(default_factory=_default_alias)
 
     def render(self) -> str:
-        base_repr = self.base.render() if isinstance(self.base, ASTExpression) else self.base
-        alias_repr = self.alias.render()
-        trail = "".join(element.render() for element in self.path)
+        if isinstance(self.base, ASTExpression):
+            base_repr = self.base.render()
+        else:
+            base_repr = self.base.render()
+        metadata: List[str] = []
         if self.alias.kind is not ASTAliasKind.UNKNOWN or self.alias.label:
-            return f"{base_repr}@{alias_repr}:{base_repr}{trail}"
-        return f"{base_repr}{trail}"
+            metadata.append(f"alias={self.alias.render()}")
+        prefix = base_repr
+        if metadata:
+            prefix = f"{base_repr}{{{', '.join(metadata)}}}"
+        trail = "".join(element.render() for element in self.path)
+        return f"{prefix}{trail}"
 
 
 @dataclass(frozen=True)
@@ -624,19 +735,36 @@ class ASTCallArgumentSlot:
 
 
 @dataclass(frozen=True)
+class ASTCallReturnSlot:
+    """Description of a returned value slot for a call."""
+
+    index: int
+    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    name: Optional[str] = None
+
+    def render(self) -> str:
+        prefix = self.kind.name.lower()
+        label = self.name or f"{prefix}{self.index}"
+        return f"ret[{self.index}]={label}:{prefix}"
+
+
+@dataclass(frozen=True)
 class ASTCallABI:
     """Canonical calling convention metadata."""
 
     slots: Tuple[ASTCallArgumentSlot, ...] = ()
+    returns: Tuple[ASTCallReturnSlot, ...] = ()
     effects: Tuple[ASTEffect, ...] = ()
     live_mask: Optional[ASTBitField] = None
-    return_count: Optional[int] = None
-    tail_effects: bool = False
+    tail: bool = False
 
     def __post_init__(self) -> None:
         if self.slots:
             ordered_slots = tuple(sorted(self.slots, key=lambda slot: slot.index))
             object.__setattr__(self, "slots", ordered_slots)
+        if self.returns:
+            ordered_returns = tuple(sorted(self.returns, key=lambda slot: slot.index))
+            object.__setattr__(self, "returns", ordered_returns)
         if self.effects:
             ordered_effects = tuple(
                 sorted(self.effects, key=lambda effect: effect.order_key())
@@ -648,14 +776,15 @@ class ASTCallABI:
         if self.slots:
             rendered_slots = ", ".join(slot.render() for slot in self.slots)
             parts.append(f"slots=[{rendered_slots}]")
+        if self.returns:
+            rendered_returns = ", ".join(slot.render() for slot in self.returns)
+            parts.append(f"returns=[{rendered_returns}]")
         if self.effects:
             parts.append(f"effects={_render_effects(self.effects)}")
         if self.live_mask is not None:
             parts.append(f"return_mask={self.live_mask.render()}")
-        if self.return_count is not None:
-            parts.append(f"returns={self.return_count}")
-        if self.tail_effects:
-            parts.append("tail_effects=true")
+        if self.tail:
+            parts.append("tail=true")
         inner = ", ".join(parts)
         return f"abi{{{inner}}}" if inner else "abi{}"
 
@@ -803,7 +932,10 @@ class ASTTailCall(ASTTerminator):
         call_repr = self.call.render()
         if call_repr.startswith("tail "):
             call_repr = call_repr[len("tail ") :]
-        result = f"tail {call_repr} returns {self.payload.render()}"
+        result = f"tail {call_repr}"
+        payload_repr = self.payload.render()
+        if payload_repr != "()":
+            result = f"{result} -> {payload_repr}"
         if self.abi is not None:
             result = f"{result} {self.abi.render()}"
         return f"{result} effects={_render_effects(self.effects)}"
@@ -957,59 +1089,59 @@ class ASTSwitchCase:
         return f"{key_repr}->{target_repr}"
 
 
+@dataclass(frozen=True)
+class ASTDispatchHelper:
+    """Metadata about the helper responsible for dispatch operations."""
+
+    address: int
+    symbol: Optional[str] = None
+
+    def render(self) -> str:
+        helper_repr = f"0x{self.address:04X}"
+        if self.symbol:
+            helper_repr = f"{self.symbol}({helper_repr})"
+        return helper_repr
+
+
+@dataclass(frozen=True)
+class ASTDispatchIndex:
+    """Description of the index expression used by a dispatch."""
+
+    expression: ASTExpression | None = None
+    mask: Optional[int] = None
+    base: Optional[int] = None
+
+    def render_expression(self) -> str:
+        return self.expression.render() if self.expression is not None else "?"
+
+
 @dataclass
 class ASTSwitch(ASTStatement):
     """Normalised jump table reconstructed from helper dispatch patterns."""
 
     call: ASTCallExpr | None
     cases: Tuple[ASTSwitchCase, ...]
-    helper: int | None = None
-    helper_symbol: str | None = None
+    index: ASTDispatchIndex = field(default_factory=ASTDispatchIndex)
+    helper: Optional[ASTDispatchHelper] = None
     default: int | None = None
-    index_expr: ASTExpression | None = None
-    index_mask: int | None = None
-    index_base: int | None = None
     kind: str | None = None
     enum_name: str | None = None
     abi: Optional["ASTCallABI"] = None
 
-    def _render_helper(self) -> str | None:
-        if self.helper is None:
-            return None
-        helper_repr = f"0x{self.helper:04X}"
-        if self.helper_symbol:
-            helper_repr = f"{self.helper_symbol}({helper_repr})"
-        return f"helper={helper_repr}"
-
-    def _render_index(self) -> str:
-        expr = None
-        if self.index_expr is not None:
-            expr = self.index_expr.render()
-        elif self.call is not None:
-            expr = self.call.render()
-        if self.index_mask is not None:
-            mask_text = f"0x{self.index_mask:04X}"
-            if expr:
-                expr = f"{expr} & {mask_text}"
-            else:
-                expr = f"& {mask_text}"
-        if not expr:
-            expr = "?"
-        return f"index={expr}"
-
     def render(self) -> str:
-        parts: List[str] = [self._render_index()]
-        if self.enum_name:
-            parts.append(f"enum={self.enum_name}")
+        parts: List[str] = [f"index={self.index.render_expression()}"]
+        if self.index.mask is not None:
+            parts.append(f"mask=0x{self.index.mask:04X}")
+        if self.index.base is not None:
+            parts.append(f"base=0x{self.index.base:04X}")
         rendered_cases = ", ".join(case.render() for case in self.cases)
         parts.append(f"table=[{rendered_cases}]")
         if self.default is not None:
             parts.append(f"default=0x{self.default:04X}")
-        if self.index_base is not None:
-            parts.append(f"base=0x{self.index_base:04X}")
-        helper_note = self._render_helper()
-        if helper_note:
-            parts.append(helper_note)
+        if self.enum_name:
+            parts.append(f"enum={self.enum_name}")
+        if self.helper is not None:
+            parts.append(f"helper={self.helper.render()}")
         if self.kind:
             parts.append(f"kind={self.kind}")
         if self.abi is not None:
@@ -1025,8 +1157,8 @@ class ASTBlock:
     start_offset: int
     body: Tuple[ASTStatement, ...]
     terminator: ASTTerminator
-    successors: Tuple["ASTBlock", ...] | None = None
-    predecessors: Tuple["ASTBlock", ...] | None = None
+    successors: Tuple["ASTBlock", ...] = field(default_factory=tuple)
+    predecessors: Tuple["ASTBlock", ...] = field(default_factory=tuple)
 
     @property
     def statements(self) -> Tuple[ASTStatement, ...]:
@@ -1043,17 +1175,68 @@ class ASTBlock:
         self.terminator = terminator
 
 
+@dataclass(frozen=True)
+class ASTEntryReason:
+    """Structured reason used to explain procedure entry points."""
+
+    kind: str
+    detail: Optional[str] = None
+
+    def render(self) -> str:
+        return f"{self.kind}({self.detail})" if self.detail else self.kind
+
+
+@dataclass(frozen=True)
+class ASTEntryPoint:
+    """Canonical description of a procedure entry block."""
+
+    label: str
+    offset: int
+    reasons: Tuple[ASTEntryReason, ...]
+
+    def render(self) -> str:
+        reason_text = ", ".join(reason.render() for reason in self.reasons)
+        return f"label={self.label}, offset=0x{self.offset:04X}, reasons=[{reason_text}]"
+
+
+@dataclass(frozen=True)
+class ASTExitReason:
+    """Explanation for why a particular block is considered an exit."""
+
+    kind: str
+
+    def render(self) -> str:
+        return self.kind
+
+
+@dataclass(frozen=True)
+class ASTExitPoint:
+    """Summary of a reconstructed exit block."""
+
+    label: str
+    offset: int
+    reasons: Tuple[ASTExitReason, ...] = ()
+
+    def render(self) -> str:
+        reason_text = ", ".join(reason.render() for reason in self.reasons)
+        suffix = f" {{{reason_text}}}" if reason_text else ""
+        return f"{self.label}@0x{self.offset:04X}{suffix}"
+
+
 @dataclass
 class ASTProcedure:
     """Single reconstructed procedure."""
 
     name: str
-    entry_offset: int
     blocks: Tuple[ASTBlock, ...]
-    entry_reasons: Tuple[str, ...] = ()
-    exit_offsets: Tuple[int, ...] = ()
+    entry: ASTEntryPoint
+    exits: Tuple[ASTExitPoint, ...]
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+
+    @property
+    def entry_offset(self) -> int:
+        return self.entry.offset
 
 
 @dataclass
@@ -1155,14 +1338,24 @@ __all__ = [
     "ASTIdentifier",
     "ASTSafeCastExpr",
     "ASTMemoryLocation",
+    "ASTAccessPathElement",
     "ASTFieldElement",
     "ASTIndexElement",
     "ASTSliceElement",
+    "ASTBankElement",
+    "ASTPageElement",
+    "ASTPageRegisterElement",
+    "ASTBaseElement",
+    "ASTOffsetElement",
+    "ASTViewElement",
+    "ASTSlotElement",
     "ASTAliasInfo",
     "ASTAliasKind",
     "ASTNumericSign",
     "ASTConversionKind",
     "ASTEffectCategory",
+    "ASTAddressSpace",
+    "ASTAddressDescriptor",
     "ASTBitField",
     "ASTEffect",
     "ASTMemoryRead",
@@ -1178,6 +1371,7 @@ __all__ = [
     "ASTFrameProtocolEffect",
     "ASTHelperEffect",
     "ASTCallArgumentSlot",
+    "ASTCallReturnSlot",
     "ASTCallABI",
     "ASTCallStatement",
     "ASTIORead",
@@ -1195,7 +1389,15 @@ __all__ = [
     "ASTEnumDecl",
     "ASTEnumMember",
     "ASTBlock",
+    "ASTEntryReason",
+    "ASTEntryPoint",
+    "ASTExitReason",
+    "ASTExitPoint",
     "ASTProcedure",
+    "ASTSwitchCase",
+    "ASTDispatchHelper",
+    "ASTDispatchIndex",
+    "ASTSwitch",
     "ASTSegment",
     "ASTMetrics",
     "ASTProgram",

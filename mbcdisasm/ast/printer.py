@@ -49,8 +49,8 @@ class ASTTextRenderer:
         yield "}"
 
     def _render_procedure(self, procedure: ASTProcedure) -> Iterable[str]:
-        reasons = ",".join(procedure.entry_reasons) or "unspecified"
-        exits = ",".join(f"0x{offset:04X}" for offset in procedure.exit_offsets) or "?"
+        entry_repr = procedure.entry.render()
+        exit_entries = ", ".join(exit.render() for exit in procedure.exits) or "-"
         succ_map = ", ".join(
             f"{label}->[{', '.join(targets)}]"
             for label, targets in sorted(procedure.successor_map.items())
@@ -60,9 +60,8 @@ class ASTTextRenderer:
             for label, targets in sorted(procedure.predecessor_map.items())
         ) or "-"
         yield (
-            f"procedure {procedure.name} entry=0x{procedure.entry_offset:04X} "
-            f"reasons={reasons} exits=[{exits}] succ_map={{ {succ_map} }} "
-            f"pred_map={{ {pred_map} }}"
+            f"procedure {procedure.name} entry{{{entry_repr}}} "
+            f"exits=[{exit_entries}] cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
         )
         for block in procedure.blocks:
             yield from self._render_block(block)
