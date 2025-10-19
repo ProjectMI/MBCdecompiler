@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..constants import OPERAND_ALIASES
 from ..ir.model import SSAValueKind
@@ -56,7 +56,7 @@ class ASTAliasInfo:
 
     def render(self) -> str:
         if self.label:
-            return f"{self.kind.value}:{self.label}"
+            return f"{self.kind.value}({self.label})"
         return self.kind.value
 
 
@@ -140,6 +140,230 @@ def _format_operand(value: int, alias: Optional[str] = None) -> str:
             return alias_text
         return f"{alias_text}({hex_value})"
     return hex_value
+
+
+# ---------------------------------------------------------------------------
+# effect modelling
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ASTBitField:
+    """Typed bitfield used by effect descriptors."""
+
+    width: int
+    value: int
+    alias: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.width <= 0:
+            raise ValueError("bitfield width must be positive")
+        if self.value < 0:
+            raise ValueError("bitfield value must be non-negative")
+        max_value = (1 << self.width) - 1
+        if self.value > max_value:
+            raise ValueError(
+                f"bitfield value 0x{self.value:X} exceeds width {self.width}"
+            )
+
+    def render(self) -> str:
+        width = self.width
+        digits = max(1, (width + 3) // 4)
+        value_repr = f"0x{self.value:0{digits}X}"
+        alias_repr = _format_operand(self.value, self.alias)
+        if alias_repr != value_repr:
+            value_repr = alias_repr
+        return f"mask[{width}]={value_repr}"
+
+
+class ASTEffect:
+    """Base class for canonicalised side effects."""
+
+    domain_order: ClassVar[int] = 0
+
+    def render(self) -> str:  # pragma: no cover - overridden
+        raise NotImplementedError
+
+    def order_key(self) -> Tuple[int, ...]:
+        """Ordering key enforcing the canonical sequencing of effects."""
+
+        return (self.domain_order,)
+
+
+class ASTIOOperation(Enum):
+    WRITE = "write"
+    READ = "read"
+    STEP = "step"
+    BRIDGE = "bridge"
+
+
+class ASTFrameOperation(Enum):
+    PROTOCOL = "protocol"
+    WRITE = "write"
+    RESET = "reset"
+    TEARDOWN = "teardown"
+    RETURN_MASK = "return_mask"
+    PAGE_SELECT = "page_select"
+    DROP = "drop"
+    CLEANUP = "cleanup"
+
+
+class ASTHelperOperation(Enum):
+    INVOKE = "invoke"
+    FANOUT = "fanout"
+    MASK_LOW = "mask_low"
+    MASK_HIGH = "mask_high"
+    FORMAT = "format"
+    DISPATCH = "dispatch"
+    REDUCE = "reduce"
+    WRAPPER = "wrapper"
+
+
+@dataclass(frozen=True)
+class ASTIOEffect(ASTEffect):
+    """I/O channel interaction."""
+
+    domain_order: ClassVar[int] = 3
+    _order_map: ClassVar[Dict[ASTIOOperation, int]] = {
+        ASTIOOperation.WRITE: 0,
+        ASTIOOperation.READ: 1,
+        ASTIOOperation.STEP: 2,
+        ASTIOOperation.BRIDGE: 3,
+    }
+
+    operation: ASTIOOperation
+    port: str
+    mask: Optional[ASTBitField] = None
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (
+            self.domain_order,
+            self._order_map.get(self.operation, len(self._order_map)),
+            hash(self.port) & 0xFFFF,
+        )
+
+    def render(self) -> str:
+        mask_text = ""
+        if self.mask is not None:
+            mask_text = f", {self.mask.render()}"
+        return f"io.{self.operation.value}({self.port}{mask_text})"
+
+
+@dataclass(frozen=True)
+class ASTFrameEffect(ASTEffect):
+    """Side effects on the active frame."""
+
+    domain_order: ClassVar[int] = 1
+    _order_map: ClassVar[Dict[ASTFrameOperation, int]] = {
+        ASTFrameOperation.PROTOCOL: 0,
+        ASTFrameOperation.WRITE: 1,
+        ASTFrameOperation.RESET: 2,
+        ASTFrameOperation.TEARDOWN: 3,
+        ASTFrameOperation.RETURN_MASK: 4,
+        ASTFrameOperation.PAGE_SELECT: 5,
+        ASTFrameOperation.DROP: 6,
+        ASTFrameOperation.CLEANUP: 7,
+    }
+
+    operation: ASTFrameOperation
+    operand: Optional[ASTBitField] = None
+    pops: int = 0
+    channel: Optional[str] = None
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (
+            self.domain_order,
+            self._order_map.get(self.operation, len(self._order_map)),
+            self.pops,
+        )
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.channel:
+            details.append(f"channel={self.channel}")
+        if self.operand is not None:
+            details.append(self.operand.render())
+        if self.pops:
+            details.append(f"pops={self.pops}")
+        inner = ""
+        if details:
+            inner = ", ".join(details)
+        return f"frame.{self.operation.value}({inner})" if inner else f"frame.{self.operation.value}()"
+
+
+@dataclass(frozen=True)
+class ASTFrameProtocolEffect(ASTEffect):
+    """Summary of post-call frame protocol actions."""
+
+    domain_order: ClassVar[int] = 0
+    masks: Tuple[ASTBitField, ...]
+    teardown: int = 0
+    drops: int = 0
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (self.domain_order, len(self.masks), self.teardown, self.drops)
+
+    def render(self) -> str:
+        mask_text = ", ".join(mask.render() for mask in self.masks)
+        parts = [f"masks=[{mask_text}]" if mask_text else "masks=[]"]
+        parts.append(f"teardown={self.teardown}")
+        parts.append(f"drops={self.drops}")
+        inner = ", ".join(parts)
+        return f"frame.protocol({inner})"
+
+
+@dataclass(frozen=True)
+class ASTHelperEffect(ASTEffect):
+    """Helper façade interactions used during epilogues."""
+
+    domain_order: ClassVar[int] = 2
+    _order_map: ClassVar[Dict[ASTHelperOperation, int]] = {
+        ASTHelperOperation.INVOKE: 0,
+        ASTHelperOperation.FANOUT: 1,
+        ASTHelperOperation.MASK_LOW: 2,
+        ASTHelperOperation.MASK_HIGH: 3,
+        ASTHelperOperation.FORMAT: 4,
+        ASTHelperOperation.DISPATCH: 5,
+        ASTHelperOperation.REDUCE: 6,
+        ASTHelperOperation.WRAPPER: 7,
+    }
+
+    operation: ASTHelperOperation
+    target: Optional[int] = None
+    symbol: Optional[str] = None
+    mask: Optional[ASTBitField] = None
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (
+            self.domain_order,
+            self._order_map.get(self.operation, len(self._order_map)),
+            self.target or 0,
+        )
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.target is not None:
+            target_repr = f"0x{self.target:04X}"
+            if self.symbol:
+                target_repr = f"{self.symbol}({target_repr})"
+            parts.append(f"target={target_repr}")
+        elif self.symbol:
+            parts.append(f"symbol={self.symbol}")
+        if self.mask is not None:
+            parts.append(self.mask.render())
+        inner = ", ".join(parts)
+        return (
+            f"helpers.{self.operation.value}({inner})"
+            if inner
+            else f"helpers.{self.operation.value}()"
+        )
+
+
+def _render_effects(effects: Sequence[ASTEffect]) -> str:
+    if not effects:
+        return "[]"
+    rendered = ", ".join(effect.render() for effect in effects)
+    return f"[{rendered}]"
 
 
 # ---------------------------------------------------------------------------
@@ -315,11 +539,10 @@ class ASTMemoryLocation:
     def render(self) -> str:
         base_repr = self.base.render() if isinstance(self.base, ASTExpression) else self.base
         alias_repr = self.alias.render()
-        alias_suffix = ""
-        if self.alias.kind is not ASTAliasKind.UNKNOWN or self.alias.label:
-            alias_suffix = f"@{alias_repr}"
         trail = "".join(element.render() for element in self.path)
-        return f"{base_repr}{alias_suffix}{trail}"
+        if self.alias.kind is not ASTAliasKind.UNKNOWN or self.alias.label:
+            return f"{base_repr}@{alias_repr}:{base_repr}{trail}"
+        return f"{base_repr}{trail}"
 
 
 @dataclass(frozen=True)
@@ -390,69 +613,51 @@ class ASTTupleExpr(ASTExpression):
 
 
 @dataclass(frozen=True)
-class ASTFrameEffect:
-    """Side effect applied while constructing a call frame."""
-
-    kind: str
-    operand: Optional[int] = None
-    alias: Optional[str] = None
-    pops: int = 0
-
-    def render(self) -> str:
-        details: List[str] = []
-        if self.pops:
-            details.append(f"pop={self.pops}")
-        if self.operand is not None:
-            details.append(f"value={_format_operand(self.operand, self.alias)}")
-        if not details:
-            return self.kind
-        inner = ", ".join(details)
-        return f"{self.kind}({inner})"
-
-
-@dataclass(frozen=True)
-class ASTCallFrameSlot:
-    """Assignment of a value to a frame slot prior to a helper call."""
+class ASTCallArgumentSlot:
+    """Assignment of a value to a call frame argument slot."""
 
     index: int
     value: ASTExpression
 
     def render(self) -> str:
-        return f"slot[{self.index}]={self.value.render()}"
+        return f"arg[{self.index}]={self.value.render()}"
 
 
 @dataclass(frozen=True)
-class ASTFinallyStep:
-    """Single action performed by a structured epilogue."""
+class ASTCallABI:
+    """Canonical calling convention metadata."""
 
-    kind: str
-    operand: Optional[int] = None
-    alias: Optional[str] = None
-    pops: int = 0
+    slots: Tuple[ASTCallArgumentSlot, ...] = ()
+    effects: Tuple[ASTEffect, ...] = ()
+    live_mask: Optional[ASTBitField] = None
+    return_count: Optional[int] = None
+    tail_effects: bool = False
 
-    def render(self) -> str:
-        details: List[str] = []
-        if self.pops:
-            details.append(f"pop={self.pops}")
-        if self.operand is not None:
-            details.append(f"value={_format_operand(self.operand, self.alias)}")
-        if not details:
-            return self.kind
-        inner = ", ".join(details)
-        return f"{self.kind}({inner})"
-
-
-@dataclass(frozen=True)
-class ASTFinally:
-    """Structured epilogue attached to a return statement."""
-
-    steps: Tuple[ASTFinallyStep, ...]
+    def __post_init__(self) -> None:
+        if self.slots:
+            ordered_slots = tuple(sorted(self.slots, key=lambda slot: slot.index))
+            object.__setattr__(self, "slots", ordered_slots)
+        if self.effects:
+            ordered_effects = tuple(
+                sorted(self.effects, key=lambda effect: effect.order_key())
+            )
+            object.__setattr__(self, "effects", ordered_effects)
 
     def render(self) -> str:
-        if not self.steps:
-            return "[]"
-        rendered = ", ".join(step.render() for step in self.steps)
-        return f"[{rendered}]"
+        parts: List[str] = []
+        if self.slots:
+            rendered_slots = ", ".join(slot.render() for slot in self.slots)
+            parts.append(f"slots=[{rendered_slots}]")
+        if self.effects:
+            parts.append(f"effects={_render_effects(self.effects)}")
+        if self.live_mask is not None:
+            parts.append(f"return_mask={self.live_mask.render()}")
+        if self.return_count is not None:
+            parts.append(f"returns={self.return_count}")
+        if self.tail_effects:
+            parts.append("tail_effects=true")
+        inner = ", ".join(parts)
+        return f"abi{{{inner}}}" if inner else "abi{}"
 
 
 @dataclass
@@ -502,57 +707,16 @@ class ASTCallStatement(ASTStatement):
 
     call: ASTCallExpr
     returns: Tuple[ASTIdentifier, ...] = field(default_factory=tuple)
+    abi: Optional[ASTCallABI] = None
 
     def render(self) -> str:
-        if not self.returns:
-            return self.call.render()
-        rendered = ", ".join(identifier.render() for identifier in self.returns)
-        return f"{self.call.render()} -> ({rendered})"
-
-
-@dataclass
-class ASTCallFrame(ASTStatement):
-    """Structured representation of a helper call frame."""
-
-    slots: Tuple[ASTCallFrameSlot, ...]
-    effects: Tuple[ASTFrameEffect, ...]
-    live_mask: Optional[int] = None
-
-    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
-
-    def render(self) -> str:
-        rendered_slots = ", ".join(slot.render() for slot in self.slots)
-        rendered_effects = ", ".join(effect.render() for effect in self.effects)
-        details = []
-        if rendered_slots:
-            details.append(f"slots=[{rendered_slots}]")
-        if rendered_effects:
-            details.append(f"effects=[{rendered_effects}]")
-        if self.live_mask is not None:
-            details.append(f"live_mask=0x{self.live_mask:04X}")
-        joined = " ".join(details)
-        return f"frame{{{joined}}}"
-
-
-@dataclass
-class ASTFrameProtocol(ASTStatement):
-    """Summary of structured epilogue behaviour."""
-
-    masks: Tuple[Tuple[int, Optional[str]], ...]
-    teardown: int
-    drops: int
-
-    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
-
-    def render(self) -> str:
-        rendered_masks = []
-        for value, alias in self.masks:
-            mask_text = f"0x{value:04X}"
-            if alias:
-                mask_text = f"{alias}({mask_text})"
-            rendered_masks.append(mask_text)
-        masks = ", ".join(rendered_masks)
-        return f"frame.protocol[masks=[{masks}], teardown={self.teardown}, drops={self.drops}]"
+        call_repr = self.call.render()
+        if self.returns:
+            rendered = ", ".join(identifier.render() for identifier in self.returns)
+            call_repr = f"{call_repr} -> ({rendered})"
+        if self.abi is not None:
+            return f"{call_repr} {self.abi.render()}"
+        return call_repr
 
 
 @dataclass
@@ -582,54 +746,91 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
-class ASTTailCall(ASTStatement):
-    """Tail call used as a return."""
-
-    call: ASTCallExpr
-    returns: Tuple[ASTExpression, ...]
-    finally_branch: Optional[ASTFinally] = None
-
-    def render(self) -> str:
-        rendered = ", ".join(expr.render() for expr in self.returns)
-        suffix = f" returns [{rendered}]" if rendered else ""
-        call_repr = self.call.render()
-        if self.call.tail and call_repr.startswith("tail "):
-            call_repr = call_repr[len("tail ") :]
-        finally_suffix = ""
-        if self.finally_branch is not None:
-            finally_suffix = f" finally {self.finally_branch.render()}"
-        return f"tail {call_repr}{suffix}{finally_suffix}"
+class ASTTerminator(ASTStatement):
+    """Base class for normalised block terminators."""
 
 
-@dataclass
-class ASTReturn(ASTStatement):
-    """Return from the current procedure."""
+@dataclass(frozen=True)
+class ASTReturnPayload:
+    """Structured representation of return values."""
 
-    value: Optional[ASTExpression]
+    values: Tuple[ASTExpression, ...] = ()
     varargs: bool = False
-    finally_branch: Optional[ASTFinally] = None
 
     def render(self) -> str:
         if self.varargs:
-            if self.value is None:
-                payload = "varargs"
-            elif isinstance(self.value, ASTTupleExpr):
-                payload = f"varargs{self.value.render()}"
-            else:
-                payload = f"varargs({self.value.render()})"
-        else:
-            if self.value is None:
-                payload = "()"
-            else:
-                payload = self.value.render()
-        suffix = ""
-        if self.finally_branch is not None:
-            suffix = f" finally {self.finally_branch.render()}"
-        return f"return {payload}{suffix}"
+            if not self.values:
+                return "varargs"
+            inner = ", ".join(value.render() for value in self.values)
+            return f"varargs({inner})"
+        if not self.values:
+            return "()"
+        if len(self.values) == 1:
+            return self.values[0].render()
+        inner = ", ".join(value.render() for value in self.values)
+        return f"({inner})"
 
 
 @dataclass
-class ASTBranch(ASTStatement):
+class ASTReturn(ASTTerminator):
+    """Return from the current procedure."""
+
+    payload: ASTReturnPayload
+    effects: Tuple[ASTEffect, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.effects:
+            self.effects = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
+
+    def render(self) -> str:
+        return f"return {self.payload.render()} effects={_render_effects(self.effects)}"
+
+
+@dataclass
+class ASTTailCall(ASTTerminator):
+    """Tail call used as a return."""
+
+    call: ASTCallExpr
+    payload: ASTReturnPayload = field(default_factory=ASTReturnPayload)
+    abi: Optional[ASTCallABI] = None
+    effects: Tuple[ASTEffect, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.effects:
+            self.effects = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
+
+    def render(self) -> str:
+        call_repr = self.call.render()
+        if call_repr.startswith("tail "):
+            call_repr = call_repr[len("tail ") :]
+        result = f"tail {call_repr} returns {self.payload.render()}"
+        if self.abi is not None:
+            result = f"{result} {self.abi.render()}"
+        return f"{result} effects={_render_effects(self.effects)}"
+
+
+@dataclass
+class ASTJump(ASTTerminator):
+    """Unconditional branch to another basic block."""
+
+    target: "ASTBlock | None" = None
+    target_offset: int | None = None
+    hint: str | None = None
+
+    def render(self) -> str:
+        if self.target is not None:
+            destination = self.target.label
+        elif self.hint is not None:
+            destination = self.hint
+        elif self.target_offset is not None:
+            destination = f"0x{self.target_offset:04X}"
+        else:
+            destination = "?"
+        return f"jump {destination}"
+
+
+@dataclass
+class ASTBranch(ASTTerminator):
     """Generic conditional branch with CFG links."""
 
     condition: ASTExpression
@@ -648,7 +849,7 @@ class ASTBranch(ASTStatement):
 
 
 @dataclass
-class ASTTestSet(ASTStatement):
+class ASTTestSet(ASTTerminator):
     """Branch that stores a predicate before testing it."""
 
     var: ASTExpression
@@ -670,7 +871,7 @@ class ASTTestSet(ASTStatement):
 
 
 @dataclass
-class ASTFlagCheck(ASTStatement):
+class ASTFlagCheck(ASTTerminator):
     """Branch that checks a VM flag."""
 
     flag: int
@@ -688,7 +889,7 @@ class ASTFlagCheck(ASTStatement):
 
 
 @dataclass
-class ASTFunctionPrologue(ASTStatement):
+class ASTFunctionPrologue(ASTTerminator):
     """Reconstructed function prologue sequence."""
 
     var: ASTExpression
@@ -770,6 +971,7 @@ class ASTSwitch(ASTStatement):
     index_base: int | None = None
     kind: str | None = None
     enum_name: str | None = None
+    abi: Optional["ASTCallABI"] = None
 
     def _render_helper(self) -> str | None:
         if self.helper is None:
@@ -810,6 +1012,8 @@ class ASTSwitch(ASTStatement):
             parts.append(helper_note)
         if self.kind:
             parts.append(f"kind={self.kind}")
+        if self.abi is not None:
+            parts.append(f"abi={self.abi.render()}")
         return f"Switch{{{', '.join(parts)}}}"
 
 
@@ -819,8 +1023,24 @@ class ASTBlock:
 
     label: str
     start_offset: int
-    statements: Tuple[ASTStatement, ...]
+    body: Tuple[ASTStatement, ...]
+    terminator: ASTTerminator
     successors: Tuple["ASTBlock", ...] | None = None
+    predecessors: Tuple["ASTBlock", ...] | None = None
+
+    @property
+    def statements(self) -> Tuple[ASTStatement, ...]:
+        return self.body + (self.terminator,)
+
+    @statements.setter
+    def statements(self, value: Tuple[ASTStatement, ...]) -> None:
+        if not value:
+            raise ValueError("block statements must include a terminator")
+        terminator = value[-1]
+        if not isinstance(terminator, ASTTerminator):
+            raise ValueError("block terminator must be an ASTTerminator")
+        self.body = tuple(value[:-1])
+        self.terminator = terminator
 
 
 @dataclass
@@ -832,6 +1052,8 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry_reasons: Tuple[str, ...] = ()
     exit_offsets: Tuple[int, ...] = ()
+    successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
 
 
 @dataclass
@@ -843,6 +1065,7 @@ class ASTSegment:
     length: int
     procedures: Tuple[ASTProcedure, ...]
     enums: Tuple[ASTEnumDecl, ...] = ()
+    kind: str = "code"
 
 
 @dataclass
@@ -940,6 +1163,8 @@ __all__ = [
     "ASTNumericSign",
     "ASTConversionKind",
     "ASTEffectCategory",
+    "ASTBitField",
+    "ASTEffect",
     "ASTMemoryRead",
     "ASTCallExpr",
     "ASTCallResult",
@@ -947,17 +1172,21 @@ __all__ = [
     "ASTStatement",
     "ASTAssign",
     "ASTMemoryWrite",
+    "ASTIOEffect",
     "ASTFrameEffect",
-    "ASTCallFrameSlot",
+    "ASTFrameOperation",
+    "ASTFrameProtocolEffect",
+    "ASTHelperEffect",
+    "ASTCallArgumentSlot",
+    "ASTCallABI",
     "ASTCallStatement",
-    "ASTCallFrame",
-    "ASTFrameProtocol",
     "ASTIORead",
     "ASTIOWrite",
+    "ASTTerminator",
     "ASTTailCall",
+    "ASTJump",
     "ASTReturn",
-    "ASTFinallyStep",
-    "ASTFinally",
+    "ASTReturnPayload",
     "ASTBranch",
     "ASTTestSet",
     "ASTFlagCheck",

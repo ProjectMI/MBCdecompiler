@@ -26,7 +26,8 @@ class ASTTextRenderer:
     # ------------------------------------------------------------------
     def _render_segment(self, segment: ASTSegment) -> Iterable[str]:
         header = (
-            f"; segment {segment.index} offset=0x{segment.start:06X} length={segment.length}"
+            f"; segment {segment.index} kind={segment.kind} "
+            f"offset=0x{segment.start:06X} length={segment.length}"
         )
         yield header
         if segment.enums:
@@ -50,16 +51,26 @@ class ASTTextRenderer:
     def _render_procedure(self, procedure: ASTProcedure) -> Iterable[str]:
         reasons = ",".join(procedure.entry_reasons) or "unspecified"
         exits = ",".join(f"0x{offset:04X}" for offset in procedure.exit_offsets) or "?"
+        succ_map = ", ".join(
+            f"{label}->[{', '.join(targets)}]"
+            for label, targets in sorted(procedure.successor_map.items())
+        ) or "-"
+        pred_map = ", ".join(
+            f"{label}->[{', '.join(targets)}]"
+            for label, targets in sorted(procedure.predecessor_map.items())
+        ) or "-"
         yield (
             f"procedure {procedure.name} entry=0x{procedure.entry_offset:04X} "
-            f"reasons={reasons} exits=[{exits}]"
+            f"reasons={reasons} exits=[{exits}] succ_map={{ {succ_map} }} "
+            f"pred_map={{ {pred_map} }}"
         )
         for block in procedure.blocks:
             yield from self._render_block(block)
         yield ""
 
     def _render_block(self, block: ASTBlock) -> Iterable[str]:
-        successors = ", ".join(target.label for target in block.successors)
+        successor_blocks = block.successors or ()
+        successors = ", ".join(target.label for target in successor_blocks)
         yield f"  block {block.label} offset=0x{block.start_offset:04X} succ=[{successors}]"
         for statement in block.statements:
             yield f"    {statement.render()}"
