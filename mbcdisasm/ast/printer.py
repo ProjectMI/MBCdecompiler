@@ -5,7 +5,18 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from .model import ASTBlock, ASTEnumDecl, ASTProcedure, ASTProgram, ASTSegment
+from .model import (
+    ASTBlock,
+    ASTBreak,
+    ASTContinue,
+    ASTEnumDecl,
+    ASTIf,
+    ASTProcedure,
+    ASTProgram,
+    ASTSegment,
+    ASTStatement,
+    ASTWhile,
+)
 
 
 class ASTTextRenderer:
@@ -54,6 +65,10 @@ class ASTTextRenderer:
             f"procedure {procedure.name} entry=0x{procedure.entry_offset:04X} "
             f"reasons={reasons} exits=[{exits}]"
         )
+        if procedure.body:
+            yield "  body {"
+            yield from self._render_structured(procedure.body, indent=4)
+            yield "  }"
         for block in procedure.blocks:
             yield from self._render_block(block)
         yield ""
@@ -63,6 +78,34 @@ class ASTTextRenderer:
         yield f"  block {block.label} offset=0x{block.start_offset:04X} succ=[{successors}]"
         for statement in block.statements:
             yield f"    {statement.render()}"
+
+    def _render_structured(
+        self, statements: Iterable[ASTStatement], indent: int
+    ) -> Iterable[str]:
+        prefix = " " * indent
+        for statement in statements:
+            if isinstance(statement, ASTIf):
+                yield f"{prefix}if {statement.condition.render()} {{"
+                yield from self._render_structured(statement.then_body, indent + 2)
+                if statement.else_body:
+                    yield f"{prefix}else {{"
+                    yield from self._render_structured(statement.else_body, indent + 2)
+                    yield f"{prefix}}}"
+                else:
+                    yield f"{prefix}}}"
+                continue
+            if isinstance(statement, ASTWhile):
+                yield f"{prefix}while {statement.condition.render()} {{"
+                yield from self._render_structured(statement.body, indent + 2)
+                yield f"{prefix}}}"
+                continue
+            if isinstance(statement, ASTBreak):
+                yield f"{prefix}break"
+                continue
+            if isinstance(statement, ASTContinue):
+                yield f"{prefix}continue"
+                continue
+            yield f"{prefix}{statement.render()}"
 
 
 __all__ = ["ASTTextRenderer"]

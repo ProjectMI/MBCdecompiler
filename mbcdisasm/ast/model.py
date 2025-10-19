@@ -47,6 +47,40 @@ class ASTConversionKind(Enum):
     TO_POINTER = "to_pointer"
 
 
+class ASTCallPassMode(Enum):
+    """Argument passing modes used by :class:`ASTCallExpr`."""
+
+    MOVE = "move"
+    BORROW = "borrow"
+
+
+class ASTCallArgumentKind(Enum):
+    """Classification of call arguments."""
+
+    POSITIONAL = "positional"
+    VARIADIC = "vararg"
+    KEYWORD = "keyword"
+
+
+@dataclass(frozen=True)
+class ASTCallArgument:
+    """Single argument passed to a call."""
+
+    value: "ASTExpression"
+    mode: ASTCallPassMode
+    kind: ASTCallArgumentKind = ASTCallArgumentKind.POSITIONAL
+    label: Optional[str] = None
+
+    def render(self) -> str:
+        label = f"{self.label}=" if self.label else ""
+        prefix = self.mode.value
+        if self.kind is ASTCallArgumentKind.VARIADIC:
+            prefix = f"{prefix}*"
+        elif self.kind is ASTCallArgumentKind.KEYWORD:
+            prefix = f"{prefix}&"
+        return f"{label}{prefix} {self.value.render()}"
+
+
 @dataclass(frozen=True)
 class ASTAliasInfo:
     """Alias metadata describing how a location can alias with others."""
@@ -283,6 +317,32 @@ class ASTIdentifier(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTUnaryNot(ASTExpression):
+    """Boolean negation applied to the wrapped expression."""
+
+    operand: ASTExpression
+
+    def render(self) -> str:
+        return f"not({self.operand.render()})"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.BOOLEAN
+
+
+@dataclass(frozen=True)
+class ASTFlagPredicate(ASTExpression):
+    """Predicate that tests a VM flag value."""
+
+    flag: int
+
+    def render(self) -> str:
+        return f"flag(0x{self.flag:04X})"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.BOOLEAN
+
+
+@dataclass(frozen=True)
 class ASTSafeCastExpr(ASTExpression):
     """Safe conversion constrained to the approved conversion set."""
 
@@ -345,21 +405,24 @@ class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
     target: int
-    args: Tuple[ASTExpression, ...]
+    arguments: Tuple["ASTCallArgument", ...]
     symbol: str | None = None
     tail: bool = False
-    varargs: bool = False
+    variadic: bool = False
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
 
     def render(self) -> str:
-        rendered_args = ", ".join(arg.render() for arg in self.args)
+        rendered_args = ", ".join(argument.render() for argument in self.arguments)
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         prefix = "tail " if self.tail else ""
-        suffix = ", ..." if self.varargs else ""
-        return f"{prefix}call {target_repr}({rendered_args}{suffix})"
+        suffix_parts: List[str] = []
+        if self.variadic:
+            suffix_parts.append("variadic")
+        suffix = "" if not suffix_parts else f"; {' '.join(suffix_parts)}"
+        return f"{prefix}call {target_repr}({rendered_args}){suffix}"
 
 
 @dataclass(frozen=True)
@@ -629,6 +692,50 @@ class ASTReturn(ASTStatement):
 
 
 @dataclass
+class ASTBreak(ASTStatement):
+    """Structured break from the nearest enclosing loop."""
+
+    def render(self) -> str:
+        return "break"
+
+
+@dataclass
+class ASTContinue(ASTStatement):
+    """Structured continue for the nearest enclosing loop."""
+
+    def render(self) -> str:
+        return "continue"
+
+
+@dataclass
+class ASTIf(ASTStatement):
+    """Structured conditional statement."""
+
+    condition: ASTExpression
+    then_body: Tuple[ASTStatement, ...]
+    else_body: Tuple[ASTStatement, ...] = ()
+
+    def render(self) -> str:
+        then_rendered = "; ".join(stmt.render() for stmt in self.then_body) or "pass"
+        else_rendered = "; ".join(stmt.render() for stmt in self.else_body)
+        if else_rendered:
+            return f"if {self.condition.render()} then [{then_rendered}] else [{else_rendered}]"
+        return f"if {self.condition.render()} then [{then_rendered}]"
+
+
+@dataclass
+class ASTWhile(ASTStatement):
+    """Canonical pre-test loop."""
+
+    condition: ASTExpression
+    body: Tuple[ASTStatement, ...]
+
+    def render(self) -> str:
+        rendered = "; ".join(stmt.render() for stmt in self.body) or "pass"
+        return f"while {self.condition.render()} do [{rendered}]"
+
+
+@dataclass
 class ASTBranch(ASTStatement):
     """Generic conditional branch with CFG links."""
 
@@ -830,6 +937,7 @@ class ASTProcedure:
     name: str
     entry_offset: int
     blocks: Tuple[ASTBlock, ...]
+    body: Tuple[ASTStatement, ...] = ()
     entry_reasons: Tuple[str, ...] = ()
     exit_offsets: Tuple[int, ...] = ()
 

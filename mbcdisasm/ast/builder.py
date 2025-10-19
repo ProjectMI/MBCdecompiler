@@ -171,7 +171,11 @@ from .model import (
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTBreak,
     ASTCallExpr,
+    ASTCallArgument,
+    ASTCallArgumentKind,
+    ASTCallPassMode,
     ASTCallResult,
     ASTCallStatement,
     ASTCallFrame,
@@ -187,6 +191,7 @@ from .model import (
     ASTFunctionPrologue,
     ASTIORead,
     ASTIOWrite,
+    ASTIf,
     ASTIdentifier,
     ASTIntegerLiteral,
     ASTMemoryLocation,
@@ -208,7 +213,12 @@ from .model import (
     ASTTupleExpr,
     ASTUnknown,
     ASTIndexElement,
+    ASTUnaryNot,
+    ASTFlagPredicate,
+    ASTContinue,
+    ASTWhile,
 )
+from .structurer import ProcedureStructurer
 
 
 @dataclass
@@ -618,13 +628,15 @@ class ASTBuilder:
         if not simplified_blocks:
             return None
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
-        return ASTProcedure(
+        procedure = ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=simplified_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
         )
+        procedure.body = ProcedureStructurer(procedure).build()
+        return procedure
 
     def _collect_entry_blocks(
         self,
@@ -1191,8 +1203,12 @@ class ASTBuilder:
         self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
-            sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-            len(call_expr.args),
+            sum(
+                1
+                for argument in call_expr.arguments
+                if not isinstance(argument.value, ASTUnknown)
+            ),
+            len(call_expr.arguments),
         )
         frame = self._build_call_frame(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
@@ -1350,8 +1366,8 @@ class ASTBuilder:
         return (
             lhs.target == rhs.target
             and lhs.symbol == rhs.symbol
-            and lhs.args == rhs.args
-            and lhs.varargs == rhs.varargs
+            and lhs.arguments == rhs.arguments
+            and lhs.variadic == rhs.variadic
         )
 
     def _register_expression(self, token: Optional[str], expr: ASTExpression) -> None:
@@ -1438,13 +1454,14 @@ class ASTBuilder:
     def _build_dispatch_cases(
         self, cases: Sequence[IRDispatchCase]
     ) -> Tuple[ASTSwitchCase, ...]:
+        ordered = sorted(cases, key=lambda item: item.key)
         return tuple(
             ASTSwitchCase(
                 key=case.key,
                 target=case.target,
                 symbol=case.symbol,
             )
-            for case in cases
+            for case in ordered
         )
 
     def _ensure_dispatch_enum(
@@ -1729,8 +1746,12 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-                len(call_expr.args),
+                sum(
+                    1
+                    for argument in call_expr.arguments
+                    if not isinstance(argument.value, ASTUnknown)
+                ),
+                len(call_expr.arguments),
             )
             frame = self._build_call_frame(node, arg_exprs)
             if frame is not None:
@@ -1759,8 +1780,12 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-                len(call_expr.args),
+                sum(
+                    1
+                    for argument in call_expr.arguments
+                    if not isinstance(argument.value, ASTUnknown)
+                ),
+                len(call_expr.arguments),
             )
             frame = self._build_call_frame(node, arg_exprs)
             if frame is not None:
@@ -2240,12 +2265,30 @@ class ASTBuilder:
         varargs: bool,
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
-        arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
-        for token, expr in zip(args, arg_exprs):
+        exprs: List[ASTExpression] = []
+        arguments: List[ASTCallArgument] = []
+        for token in args:
+            expr = self._resolve_expr(token, value_state)
+            exprs.append(expr)
+            mode = self._infer_call_mode(expr)
+            arguments.append(
+                ASTCallArgument(
+                    value=expr,
+                    mode=mode,
+                    kind=ASTCallArgumentKind.POSITIONAL,
+                )
+            )
+        call_expr = ASTCallExpr(
+            target=target,
+            arguments=tuple(arguments),
+            symbol=symbol,
+            tail=tail,
+            variadic=varargs,
+        )
+        for token, expr in zip(args, exprs):
             if token and not isinstance(expr, ASTUnknown):
                 self._call_arg_values[token] = expr
-        return call_expr, arg_exprs
+        return call_expr, tuple(exprs)
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
@@ -2304,6 +2347,15 @@ class ASTBuilder:
         if lowered.startswith("id"):
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
+
+    def _infer_call_mode(self, expr: ASTExpression) -> ASTCallPassMode:
+        kind = expr.kind()
+        if kind in {SSAValueKind.POINTER, SSAValueKind.IO, SSAValueKind.PAGE_REGISTER}:
+            return ASTCallPassMode.BORROW
+        if isinstance(expr, ASTMemoryRead):
+            if expr.kind() in {SSAValueKind.POINTER, SSAValueKind.IO}:
+                return ASTCallPassMode.BORROW
+        return ASTCallPassMode.MOVE
 
     def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:
         if target_offset in self._current_block_labels:
