@@ -1,9 +1,9 @@
 from pathlib import Path
+from typing import List
 
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
-    ASTBranch,
     ASTBuilder,
     ASTCallExpr,
     ASTCallFrame,
@@ -14,6 +14,11 @@ from mbcdisasm.ast import (
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTBlockStmt,
+    ASTIf,
+    ASTWhile,
+    ASTTry,
+    ASTStatement,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -37,6 +42,29 @@ from mbcdisasm.ir.model import (
 from tests.test_ir_normalizer import build_container
 
 
+def _flatten_statements(block: ASTBlockStmt) -> List[ASTStatement]:
+    result: List[ASTStatement] = []
+    stack: List[ASTStatement] = list(reversed(block.statements))
+    while stack:
+        statement = stack.pop()
+        result.append(statement)
+        if isinstance(statement, ASTIf):
+            stack.extend(reversed(statement.then_branch.statements))
+            if statement.else_branch:
+                stack.extend(reversed(statement.else_branch.statements))
+        elif isinstance(statement, ASTWhile):
+            stack.extend(reversed(statement.body.statements))
+            if statement.else_branch:
+                stack.extend(reversed(statement.else_branch.statements))
+        elif isinstance(statement, ASTTry):
+            stack.extend(reversed(statement.body.statements))
+            for clause in statement.catches:
+                stack.extend(reversed(clause.body.statements))
+            if statement.finally_branch:
+                stack.extend(reversed(statement.finally_branch.statements))
+    return result
+
+
 def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     normalizer = IRNormalizer(knowledge)
@@ -55,12 +83,15 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     procedure = segment.procedures[0]
     assert procedure.entry_reasons
     assert procedure.blocks
+    assert procedure.body is not None
 
     block = procedure.blocks[0]
     assert block.successors is not None
     rendered = [statement.render() for statement in block.statements]
     assert any("call" in line for line in rendered)
     assert any(line.startswith("return") for line in rendered)
+    body_statements = _flatten_statements(procedure.body)
+    assert any(isinstance(statement, ASTCallStatement) for statement in body_statements)
     assert procedure.name == f"proc_{procedure.entry_offset:04X}"
 
     summary = ast_program.metrics.describe()
@@ -140,6 +171,9 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     procedure = ast_segment.procedures[0]
     assert tuple(sorted(procedure.exit_offsets)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
+    assert procedure.body is not None
+    structured = _flatten_statements(procedure.body)
+    assert any(isinstance(statement, ASTIf) for statement in structured)
 
 
 def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
@@ -340,11 +374,9 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
     assert len(segment_ast.procedures) == 1
     procedure = segment_ast.procedures[0]
     assert {block.start_offset for block in procedure.blocks} == {0x0410}
-    assert all(
-        not isinstance(statement, ASTBranch)
-        for block in procedure.blocks
-        for statement in block.statements
-    )
+    assert procedure.body is not None
+    body_statements = _flatten_statements(procedure.body)
+    assert not any(isinstance(statement, ASTIf) for statement in body_statements)
 
 
 def test_ast_builder_drops_empty_procedures() -> None:

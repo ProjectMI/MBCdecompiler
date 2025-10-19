@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, List, Optional, Tuple
+from typing import ClassVar, List, Optional, Sequence, Tuple
 
 from ..constants import OPERAND_ALIASES
 from ..ir.model import SSAValueKind
@@ -45,6 +45,14 @@ class ASTConversionKind(Enum):
     NORMALISE = "normalise"
     TO_BOOLEAN = "to_boolean"
     TO_POINTER = "to_pointer"
+
+
+class ASTCallArgMode(Enum):
+    """Ownership model applied to call arguments."""
+
+    MOVE = "move"
+    IMMUT_BORROW = "borrow"
+    MUT_BORROW = "mut_borrow"
 
 
 @dataclass(frozen=True)
@@ -283,6 +291,20 @@ class ASTIdentifier(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTUnaryOp(ASTExpression):
+    """Unary operation applied to an AST expression."""
+
+    operator: str
+    operand: ASTExpression
+
+    def render(self) -> str:
+        return f"{self.operator}({self.operand.render()})"
+
+    def kind(self) -> SSAValueKind:
+        return self.operand.kind()
+
+
+@dataclass(frozen=True)
 class ASTSafeCastExpr(ASTExpression):
     """Safe conversion constrained to the approved conversion set."""
 
@@ -345,21 +367,23 @@ class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
     target: int
-    args: Tuple[ASTExpression, ...]
+    args: Tuple["ASTCallArgument", ...]
     symbol: str | None = None
     tail: bool = False
-    varargs: bool = False
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
 
     def render(self) -> str:
-        rendered_args = ", ".join(arg.render() for arg in self.args)
+        rendered_args = ", ".join(argument.render() for argument in self.args)
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         prefix = "tail " if self.tail else ""
-        suffix = ", ..." if self.varargs else ""
-        return f"{prefix}call {target_repr}({rendered_args}{suffix})"
+        return f"{prefix}call {target_repr}({rendered_args})"
+
+    @property
+    def varargs(self) -> bool:
+        return any(argument.variadic for argument in self.args)
 
 
 @dataclass(frozen=True)
@@ -824,6 +848,165 @@ class ASTBlock:
 
 
 @dataclass
+class ASTBlockStmt(ASTStatement):
+    """Structured block used by canonical control-flow nodes."""
+
+    statements: Tuple[ASTStatement, ...]
+
+    def render(self) -> str:
+        inner = "; ".join(statement.render() for statement in self.statements)
+        return f"{{{inner}}}"
+
+
+@dataclass
+class ASTIf(ASTStatement):
+    """Structured conditional with explicit branches."""
+
+    condition: ASTExpression
+    then_branch: ASTBlockStmt
+    else_branch: Optional[ASTBlockStmt] = None
+
+    def render(self) -> str:
+        rendered = f"if {self.condition.render()} {self.then_branch.render()}"
+        if self.else_branch and self.else_branch.statements:
+            rendered += f" else {self.else_branch.render()}"
+        return rendered
+
+
+@dataclass
+class ASTWhile(ASTStatement):
+    """Canonical pre-test loop."""
+
+    condition: ASTExpression
+    body: ASTBlockStmt
+    else_branch: Optional[ASTBlockStmt] = None
+
+    def render(self) -> str:
+        rendered = f"while {self.condition.render()} {self.body.render()}"
+        if self.else_branch and self.else_branch.statements:
+            rendered += f" else {self.else_branch.render()}"
+        return rendered
+
+
+@dataclass
+class ASTBreak(ASTStatement):
+    """Exit the nearest enclosing loop."""
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        return "break"
+
+
+@dataclass
+class ASTContinue(ASTStatement):
+    """Skip to the next iteration of the nearest enclosing loop."""
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        return "continue"
+
+
+@dataclass(frozen=True)
+class ASTCatchClause:
+    """Single catch handler attached to a try node."""
+
+    exception: Optional[str]
+    body: ASTBlockStmt
+
+
+@dataclass
+class ASTTry(ASTStatement):
+    """Structured exception handling block."""
+
+    body: ASTBlockStmt
+    catches: Tuple[ASTCatchClause, ...]
+    finally_branch: Optional[ASTBlockStmt] = None
+
+    def render(self) -> str:
+        catches = " ".join(
+            f"catch {clause.exception or '_'} {clause.body.render()}"
+            for clause in self.catches
+        )
+        rendered = f"try {self.body.render()}"
+        if catches:
+            rendered = f"{rendered} {catches}"
+        if self.finally_branch and self.finally_branch.statements:
+            rendered = f"{rendered} finally {self.finally_branch.render()}"
+        return rendered
+
+
+@dataclass
+class ASTThrow(ASTStatement):
+    """Explicit exception throw statement."""
+
+    value: Optional[ASTExpression] = None
+
+    def render(self) -> str:
+        if self.value is None:
+            return "throw"
+        return f"throw {self.value.render()}"
+
+
+@dataclass
+class ASTPrimitiveCall(ASTStatement):
+    """Primitive representing a low-level helper or raw instruction."""
+
+    mnemonic: str
+    operand: Optional[int] = None
+    operand_role: Optional[str] = None
+    operand_alias: Optional[str] = None
+    annotations: Tuple[str, ...] = tuple()
+
+    def render(self) -> str:
+        operand_detail = ""
+        if self.operand is not None:
+            operand_repr = _format_operand(self.operand, self.operand_alias)
+            if self.operand_role:
+                operand_detail = f" {self.operand_role}={operand_repr}"
+            else:
+                operand_detail = f" {operand_repr}"
+        if self.annotations:
+            operand_detail = f"{operand_detail} [{', '.join(self.annotations)}]"
+        return f"primitive {self.mnemonic}{operand_detail}"
+
+
+@dataclass(frozen=True)
+class ASTFlagPredicate(ASTExpression):
+    """Boolean predicate evaluating a VM flag."""
+
+    flag: int
+
+    def render(self) -> str:
+        return f"flag(0x{self.flag:04X})"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.BOOLEAN
+
+
+@dataclass(frozen=True)
+class ASTCallArgument:
+    """Single argument to a call expression."""
+
+    value: ASTExpression
+    mode: ASTCallArgMode = ASTCallArgMode.MOVE
+    name: Optional[str] = None
+    variadic: bool = False
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.name:
+            parts.append(f"{self.name}=")
+        qualifier = "" if self.mode is ASTCallArgMode.MOVE else f"{self.mode.value} "
+        parts.append(f"{qualifier}{self.value.render()}")
+        rendered = "".join(parts)
+        if self.variadic:
+            return f"varargs({rendered})"
+        return rendered
+
+
+@dataclass
 class ASTProcedure:
     """Single reconstructed procedure."""
 
@@ -832,6 +1015,7 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry_reasons: Tuple[str, ...] = ()
     exit_offsets: Tuple[int, ...] = ()
+    body: Optional[ASTBlockStmt] = None
 
 
 @dataclass
@@ -930,6 +1114,7 @@ __all__ = [
     "ASTStringLiteral",
     "ASTBytesLiteral",
     "ASTIdentifier",
+    "ASTUnaryOp",
     "ASTSafeCastExpr",
     "ASTMemoryLocation",
     "ASTFieldElement",
@@ -940,6 +1125,8 @@ __all__ = [
     "ASTNumericSign",
     "ASTConversionKind",
     "ASTEffectCategory",
+    "ASTCallArgMode",
+    "ASTCallArgument",
     "ASTMemoryRead",
     "ASTCallExpr",
     "ASTCallResult",
@@ -956,6 +1143,11 @@ __all__ = [
     "ASTIOWrite",
     "ASTTailCall",
     "ASTReturn",
+    "ASTBlockStmt",
+    "ASTIf",
+    "ASTWhile",
+    "ASTBreak",
+    "ASTContinue",
     "ASTFinallyStep",
     "ASTFinally",
     "ASTBranch",
@@ -963,6 +1155,11 @@ __all__ = [
     "ASTFlagCheck",
     "ASTFunctionPrologue",
     "ASTComment",
+    "ASTPrimitiveCall",
+    "ASTTry",
+    "ASTCatchClause",
+    "ASTThrow",
+    "ASTFlagPredicate",
     "ASTEnumDecl",
     "ASTEnumMember",
     "ASTBlock",

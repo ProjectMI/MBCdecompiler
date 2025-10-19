@@ -36,6 +36,7 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    IRRaw,
     MemRef,
     MemSpace,
     SSAValueKind,
@@ -170,21 +171,29 @@ from .model import (
     ASTAliasKind,
     ASTAssign,
     ASTBlock,
+    ASTBlockStmt,
     ASTBranch,
+    ASTBreak,
     ASTCallExpr,
+    ASTCallArgMode,
+    ASTCallArgument,
     ASTCallResult,
     ASTCallStatement,
     ASTCallFrame,
     ASTCallFrameSlot,
     ASTComment,
+    ASTContinue,
+    ASTConversionKind,
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
+    ASTFlagPredicate,
     ASTFieldElement,
     ASTFrameEffect,
     ASTFrameProtocol,
     ASTFlagCheck,
     ASTFunctionPrologue,
+    ASTIf,
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
@@ -194,9 +203,11 @@ from .model import (
     ASTMemoryWrite,
     ASTMetrics,
     ASTNumericSign,
+    ASTPrimitiveCall,
     ASTProcedure,
     ASTProgram,
     ASTReturn,
+    ASTSafeCastExpr,
     ASTSegment,
     ASTStatement,
     ASTFinally,
@@ -206,6 +217,8 @@ from .model import (
     ASTTailCall,
     ASTTestSet,
     ASTTupleExpr,
+    ASTUnaryOp,
+    ASTWhile,
     ASTUnknown,
     ASTIndexElement,
 )
@@ -306,6 +319,233 @@ class _EnumInfo:
     owner_segment: int
     order: int
     switches: List["ASTSwitch"] = field(default_factory=list)
+
+
+class _StructureRebuilder:
+    """Convert CFG blocks into a structured AST representation."""
+
+    def __init__(self, blocks: Sequence[ASTBlock], entry_offset: int) -> None:
+        self._blocks: Dict[int, ASTBlock] = {block.start_offset: block for block in blocks}
+        self._entry = entry_offset
+        self._structured: Set[int] = set()
+        self._successors: Dict[int, List[int]] = {}
+        for block in blocks:
+            self._successors[block.start_offset] = [
+                successor.start_offset for successor in block.successors
+            ]
+        self._predecessors: Dict[int, Set[int]] = {offset: set() for offset in self._blocks}
+        for origin, successors in self._successors.items():
+            for successor in successors:
+                if successor in self._predecessors:
+                    self._predecessors[successor].add(origin)
+        self._exit_node = "__exit__"
+        self._postdom, self._ipdom = self._compute_postdominators()
+        self._dominators = self._compute_dominators()
+
+    def build(self) -> ASTBlockStmt:
+        structured = self._build_region(self._entry, set())
+        return ASTBlockStmt(statements=tuple(structured))
+
+    def _compute_dominators(self) -> Dict[int, Set[int]]:
+        if not self._blocks:
+            return {}
+        nodes = set(self._blocks)
+        dominators: Dict[int, Set[int]] = {
+            offset: set(nodes) for offset in nodes
+        }
+        dominators[self._entry] = {self._entry}
+        changed = True
+        while changed:
+            changed = False
+            for offset in nodes:
+                if offset == self._entry:
+                    continue
+                predecessors = self._predecessors.get(offset, set())
+                if not predecessors:
+                    new_set = {offset}
+                else:
+                    intersection = set(nodes)
+                    for pred in predecessors:
+                        intersection &= dominators.get(pred, set(nodes))
+                    new_set = intersection | {offset}
+                if new_set != dominators[offset]:
+                    dominators[offset] = new_set
+                    changed = True
+        return dominators
+
+    def _compute_postdominators(self) -> Tuple[Dict[int | str, Set[int | str]], Dict[int, Optional[int]]]:
+        nodes: Set[int | str] = set(self._blocks)
+        nodes.add(self._exit_node)
+        postdom: Dict[int | str, Set[int | str]] = {
+            offset: set(nodes) for offset in nodes if offset != self._exit_node
+        }
+        postdom[self._exit_node] = {self._exit_node}
+        successors: Dict[int | str, Set[int | str]] = {}
+        for offset, block in self._blocks.items():
+            succ: Set[int | str] = set(self._successors.get(offset, []))
+            if not succ or self._block_has_exit(block):
+                succ.add(self._exit_node)
+            successors[offset] = succ
+        changed = True
+        while changed:
+            changed = False
+            for offset in list(self._blocks):
+                succ = successors.get(offset, {self._exit_node})
+                intersection = set(nodes)
+                for candidate in succ:
+                    intersection &= postdom.get(candidate, {self._exit_node})
+                updated = {offset} | intersection
+                if updated != postdom[offset]:
+                    postdom[offset] = updated
+                    changed = True
+        ipdom: Dict[int, Optional[int]] = {}
+        for offset in self._blocks:
+            candidates = postdom[offset] - {offset}
+            immediate: Optional[int | str] = None
+            for candidate in candidates:
+                dominated = False
+                for other in candidates:
+                    if other == candidate:
+                        continue
+                    if candidate in postdom.get(other, set()):
+                        dominated = True
+                        break
+                if not dominated:
+                    immediate = candidate
+                    break
+            if immediate == self._exit_node:
+                ipdom[offset] = None
+            elif isinstance(immediate, int):
+                ipdom[offset] = immediate
+            else:
+                ipdom[offset] = None
+        return postdom, ipdom
+
+    @staticmethod
+    def _block_has_exit(block: ASTBlock) -> bool:
+        for statement in block.statements:
+            if isinstance(statement, (ASTReturn, ASTTailCall)):
+                return True
+        return False
+
+    def _build_region(self, start: Optional[int], stop: Set[int]) -> List[ASTStatement]:
+        if start is None or start in stop:
+            return []
+        result: List[ASTStatement] = []
+        current = start
+        while current is not None and current not in stop:
+            if current in self._structured:
+                break
+            block = self._blocks.get(current)
+            if block is None:
+                break
+            statements, follow = self._structure_block(block, stop)
+            result.extend(statements)
+            if follow is None or follow in stop:
+                break
+            current = follow
+        return result
+
+    def _structure_block(
+        self, block: ASTBlock, stop: Set[int]
+    ) -> Tuple[List[ASTStatement], Optional[int]]:
+        offset = block.start_offset
+        self._structured.add(offset)
+        statements: List[ASTStatement] = []
+        for statement in block.statements:
+            if isinstance(statement, BranchStatement):
+                branch_statements, follow = self._structure_branch(block, statement, stop)
+                statements.extend(branch_statements)
+                return statements, follow
+            if isinstance(statement, (ASTReturn, ASTTailCall)):
+                statements.append(statement)
+                return statements, None
+            statements.append(self._canonicalise_statement(statement))
+        successors = self._successors.get(offset, [])
+        next_offset = successors[0] if successors else None
+        return statements, next_offset
+
+    def _canonicalise_statement(self, statement: ASTStatement) -> ASTStatement:
+        if isinstance(statement, ASTSwitch) and statement.cases:
+            statement.cases = tuple(sorted(statement.cases, key=lambda case: case.key))
+        return statement
+
+    def _structure_branch(
+        self, block: ASTBlock, statement: BranchStatement, stop: Set[int]
+    ) -> Tuple[List[ASTStatement], Optional[int]]:
+        prefix: List[ASTStatement] = []
+        if isinstance(statement, ASTBranch):
+            condition_expr = statement.condition
+        elif isinstance(statement, ASTFlagCheck):
+            condition_expr = ASTFlagPredicate(statement.flag)
+        elif isinstance(statement, (ASTTestSet, ASTFunctionPrologue)):
+            if isinstance(statement.var, ASTIdentifier):
+                prefix.append(ASTAssign(target=statement.var, value=statement.expr))
+            condition_expr = statement.var
+        else:
+            condition_expr = ASTUnknown("branch")
+        condition = self._boolean_condition(condition_expr)
+
+        then_target = self._branch_target(statement, "then")
+        else_target = self._branch_target(statement, "else")
+        header = block.start_offset
+        join_target = self._ipdom.get(header)
+
+        then_dominated = then_target is not None and self._dominates(header, then_target)
+        else_dominated = else_target is not None and self._dominates(header, else_target)
+
+        if then_dominated and (join_target == else_target or else_target is None):
+            body_stop = set(stop)
+            body_stop.add(header)
+            if join_target is not None:
+                body_stop.add(join_target)
+            body = self._build_region(then_target, body_stop)
+            loop = ASTWhile(condition=condition, body=ASTBlockStmt(statements=tuple(body)))
+            return prefix + [loop], join_target
+        if else_dominated and (join_target == then_target or then_target is None):
+            inverted = ASTUnaryOp(operator="not", operand=condition)
+            body_stop = set(stop)
+            body_stop.add(header)
+            if join_target is not None:
+                body_stop.add(join_target)
+            body = self._build_region(else_target, body_stop)
+            loop = ASTWhile(condition=inverted, body=ASTBlockStmt(statements=tuple(body)))
+            return prefix + [loop], join_target
+
+        join_stop = set(stop)
+        if join_target is not None:
+            join_stop.add(join_target)
+        then_body = self._build_region(then_target, join_stop)
+        else_body = self._build_region(else_target, join_stop)
+        then_block = ASTBlockStmt(statements=tuple(then_body))
+        else_block = (
+            ASTBlockStmt(statements=tuple(else_body)) if else_body else None
+        )
+        branch_stmt = ASTIf(condition=condition, then_branch=then_block, else_branch=else_block)
+        return prefix + [branch_stmt], join_target
+
+    def _boolean_condition(self, expr: ASTExpression) -> ASTExpression:
+        if expr.kind() == SSAValueKind.BOOLEAN:
+            return expr
+        return ASTSafeCastExpr(
+            operand=expr,
+            conversion=ASTConversionKind.TO_BOOLEAN,
+            target_kind=SSAValueKind.BOOLEAN,
+        )
+
+    @staticmethod
+    def _branch_target(statement: BranchStatement, prefix: str) -> Optional[int]:
+        branch_attr = f"{prefix}_branch"
+        offset_attr = f"{prefix}_offset"
+        branch = getattr(statement, branch_attr, None)
+        if branch is not None:
+            return branch.start_offset
+        return getattr(statement, offset_attr, None)
+
+    def _dominates(self, origin: int, candidate: int) -> bool:
+        if candidate not in self._dominators:
+            return False
+        return origin in self._dominators[candidate]
 
 
 class ASTBuilder:
@@ -618,12 +858,14 @@ class ASTBuilder:
         if not simplified_blocks:
             return None
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
+        structured_body = self._structure_procedure(simplified_blocks, entry_offset)
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=simplified_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
+            body=structured_body,
         )
 
     def _collect_entry_blocks(
@@ -1080,6 +1322,13 @@ class ASTBuilder:
         return tuple(sorted(exit_offsets))
 
     @staticmethod
+    def _structure_procedure(blocks: Tuple[ASTBlock, ...], entry_offset: int) -> ASTBlockStmt:
+        if not blocks:
+            return ASTBlockStmt(statements=tuple())
+        rebuilder = _StructureRebuilder(blocks, entry_offset)
+        return rebuilder.build()
+
+    @staticmethod
     def _block_has_exit(block: ASTBlock) -> bool:
         for statement in block.statements:
             if isinstance(statement, (ASTReturn, ASTTailCall)):
@@ -1191,7 +1440,7 @@ class ASTBuilder:
         self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
-            sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+            sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
             len(call_expr.args),
         )
         frame = self._build_call_frame(node, arg_exprs)
@@ -1729,7 +1978,9 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+                sum(
+                    1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)
+                ),
                 len(call_expr.args),
             )
             frame = self._build_call_frame(node, arg_exprs)
@@ -1759,7 +2010,9 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+                sum(
+                    1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)
+                ),
                 len(call_expr.args),
             )
             frame = self._build_call_frame(node, arg_exprs)
@@ -1868,6 +2121,16 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRRaw):
+            alias = str(node.operand_alias) if node.operand_alias is not None else None
+            primitive = ASTPrimitiveCall(
+                mnemonic=node.mnemonic,
+                operand=node.operand,
+                operand_role=node.operand_role,
+                operand_alias=alias,
+                annotations=node.annotations,
+            )
+            return [primitive], []
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
@@ -2241,7 +2504,16 @@ class ASTBuilder:
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
         arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
+        call_args: List[ASTCallArgument] = []
+        for index, expr in enumerate(arg_exprs):
+            call_args.append(
+                ASTCallArgument(
+                    value=expr,
+                    mode=ASTCallArgMode.MOVE,
+                    variadic=varargs and index == len(arg_exprs) - 1,
+                )
+            )
+        call_expr = ASTCallExpr(target=target, args=tuple(call_args), symbol=symbol, tail=tail)
         for token, expr in zip(args, arg_exprs):
             if token and not isinstance(expr, ASTUnknown):
                 self._call_arg_values[token] = expr
