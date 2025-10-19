@@ -5,7 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from .model import ASTBlock, ASTEnumDecl, ASTProcedure, ASTProgram, ASTSegment
+from .model import (
+    ASTBlock,
+    ASTEnumDecl,
+    ASTProcedure,
+    ASTProgram,
+    ASTSegment,
+    ASTStatement,
+)
 
 
 class ASTTextRenderer:
@@ -54,9 +61,26 @@ class ASTTextRenderer:
             f"procedure {procedure.name} entry=0x{procedure.entry_offset:04X} "
             f"reasons={reasons} exits=[{exits}]"
         )
-        for block in procedure.blocks:
-            yield from self._render_block(block)
+        if procedure.body:
+            yield "  body {"
+            yield from self._render_structured_statements(procedure.body, indent=4)
+            yield "  }"
+        else:
+            yield "  body {}"
+        if procedure.blocks:
+            yield "  ; cfg"
+            for block in procedure.blocks:
+                yield from self._render_block(block)
+        else:
+            yield "  ; cfg unavailable"
         yield ""
+
+    def _render_structured_statements(
+        self, statements: Iterable[ASTStatement], *, indent: int
+    ) -> Iterable[str]:
+        prefix = " " * indent
+        for statement in statements:
+            yield f"{prefix}{statement.render()}"
 
     def _render_block(self, block: ASTBlock) -> Iterable[str]:
         successors = ", ".join(target.label for target in block.successors)

@@ -47,6 +47,14 @@ class ASTConversionKind(Enum):
     TO_POINTER = "to_pointer"
 
 
+class ASTArgumentMode(Enum):
+    """Calling convention for passing an argument to a call site."""
+
+    VALUE = "value"
+    BORROW = "borrow"
+    MOVE = "move"
+
+
 @dataclass(frozen=True)
 class ASTAliasInfo:
     """Alias metadata describing how a location can alias with others."""
@@ -210,6 +218,32 @@ class ASTIntegerLiteral(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTUnaryExpr(ASTExpression):
+    """Unary operator applied to a single operand."""
+
+    op: str
+    operand: "ASTExpression"
+
+    def render(self) -> str:
+        if self.op == "not":
+            return f"not {self.operand.render()}"
+        return f"{self.op}({self.operand.render()})"
+
+
+@dataclass(frozen=True)
+class ASTFlagExpr(ASTExpression):
+    """Boolean view over a VM flag used in structured conditions."""
+
+    flag: int
+
+    def render(self) -> str:
+        return f"flag(0x{self.flag:04X})"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.BOOLEAN
+
+
+@dataclass(frozen=True)
 class ASTRealLiteral(ASTExpression):
     """Floating-point literal with explicit encoding metadata."""
 
@@ -341,11 +375,27 @@ class ASTMemoryRead(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTCallArg:
+    """Single argument passed to a call expression with explicit mode."""
+
+    value: "ASTExpression"
+    mode: ASTArgumentMode = ASTArgumentMode.VALUE
+
+    def render(self) -> str:
+        prefix = ""
+        if self.mode is ASTArgumentMode.BORROW:
+            prefix = "borrow "
+        elif self.mode is ASTArgumentMode.MOVE:
+            prefix = "move "
+        return f"{prefix}{self.value.render()}"
+
+
+@dataclass(frozen=True)
 class ASTCallExpr(ASTExpression):
     """Call expression with resolved argument expressions."""
 
     target: int
-    args: Tuple[ASTExpression, ...]
+    args: Tuple[ASTCallArg, ...]
     symbol: str | None = None
     tail: bool = False
     varargs: bool = False
@@ -721,6 +771,133 @@ class ASTComment(ASTStatement):
         return f"; {self.text}"
 
 
+@dataclass
+class ASTBreak(ASTStatement):
+    """Exit from the innermost loop."""
+
+    level: int = 1
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        if self.level == 1:
+            return "break"
+        return f"break {self.level}"
+
+
+@dataclass
+class ASTContinue(ASTStatement):
+    """Continue with the next iteration of the innermost loop."""
+
+    level: int = 1
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        if self.level == 1:
+            return "continue"
+        return f"continue {self.level}"
+
+
+@dataclass
+class ASTThrow(ASTStatement):
+    """Raise an exception from the current scope."""
+
+    value: Optional[ASTExpression] = None
+
+    def render(self) -> str:
+        if self.value is None:
+            return "throw"
+        return f"throw {self.value.render()}"
+
+
+@dataclass(frozen=True)
+class ASTCatch:
+    """Catch handler for :class:`ASTTry`."""
+
+    exception: Optional[str]
+    body: Tuple["ASTStatement", ...]
+
+
+@dataclass
+class ASTTry(ASTStatement):
+    """Structured exception handling block."""
+
+    body: Tuple["ASTStatement", ...]
+    handlers: Tuple[ASTCatch, ...] = ()
+    finaliser: Tuple["ASTStatement", ...] = ()
+
+    def render(self) -> str:
+        parts = ["try {"]
+        body = "; ".join(stmt.render() for stmt in self.body)
+        parts.append(body or "pass")
+        parts.append("}")
+        for handler in self.handlers:
+            label = handler.exception or "default"
+            handler_body = "; ".join(stmt.render() for stmt in handler.body) or "pass"
+            parts.append(f" catch {label} {{ {handler_body} }}")
+        if self.finaliser:
+            final_body = "; ".join(stmt.render() for stmt in self.finaliser)
+            parts.append(f" finally {{ {final_body or 'pass'} }}")
+        return "".join(parts)
+
+
+@dataclass
+class ASTIf(ASTStatement):
+    """Structured conditional."""
+
+    condition: ASTExpression | ASTStatement
+    then_branch: Tuple["ASTStatement", ...]
+    else_branch: Tuple["ASTStatement", ...] = ()
+
+    def render(self) -> str:
+        then_body = "; ".join(stmt.render() for stmt in self.then_branch) or "pass"
+        cond = self.condition.render() if isinstance(self.condition, ASTExpression) else self.condition.render()
+        if not self.else_branch:
+            return f"if {cond} then {{ {then_body} }}"
+        else_body = "; ".join(stmt.render() for stmt in self.else_branch) or "pass"
+        return (
+            f"if {cond} then {{ {then_body} }} "
+            f"else {{ {else_body} }}"
+        )
+
+
+@dataclass
+class ASTWhile(ASTStatement):
+    """Canonical pre-test loop."""
+
+    condition: ASTExpression | ASTStatement
+    body: Tuple["ASTStatement", ...]
+
+    def render(self) -> str:
+        inner = "; ".join(stmt.render() for stmt in self.body) or "pass"
+        cond = self.condition.render() if isinstance(self.condition, ASTExpression) else self.condition.render()
+        return f"while {cond} do {{ {inner} }}"
+
+
+@dataclass
+class ASTIntrinsic(ASTStatement):
+    """Encapsulated intrinsic/assembly primitive."""
+
+    mnemonic: str
+    operand: Optional[int] = None
+    alias: Optional[str] = None
+    annotations: Tuple[str, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.operand is not None:
+            details.append(f"operand={_format_operand(self.operand, self.alias)}")
+        if self.annotations:
+            rendered = ", ".join(self.annotations)
+            details.append(f"notes=[{rendered}]")
+        inner = ", ".join(details)
+        suffix = f"({inner})" if inner else ""
+        return f"intrinsic {self.mnemonic}{suffix}"
+
+
 @dataclass(frozen=True)
 class ASTEnumMember:
     """Single member of an enum declaration."""
@@ -745,6 +922,7 @@ class ASTSwitchCase:
     target: int
     symbol: str | None = None
     key_alias: str | None = None
+    body: Tuple["ASTStatement", ...] = ()
 
     def render(self) -> str:
         target_repr = f"0x{self.target:04X}"
@@ -832,6 +1010,7 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry_reasons: Tuple[str, ...] = ()
     exit_offsets: Tuple[int, ...] = ()
+    body: Tuple[ASTStatement, ...] = ()
 
 
 @dataclass
@@ -925,6 +1104,8 @@ __all__ = [
     "ASTExpression",
     "ASTUnknown",
     "ASTIntegerLiteral",
+    "ASTUnaryExpr",
+    "ASTFlagExpr",
     "ASTRealLiteral",
     "ASTBooleanLiteral",
     "ASTStringLiteral",
@@ -937,10 +1118,12 @@ __all__ = [
     "ASTSliceElement",
     "ASTAliasInfo",
     "ASTAliasKind",
+    "ASTArgumentMode",
     "ASTNumericSign",
     "ASTConversionKind",
     "ASTEffectCategory",
     "ASTMemoryRead",
+    "ASTCallArg",
     "ASTCallExpr",
     "ASTCallResult",
     "ASTTupleExpr",
@@ -963,6 +1146,16 @@ __all__ = [
     "ASTFlagCheck",
     "ASTFunctionPrologue",
     "ASTComment",
+    "ASTBreak",
+    "ASTContinue",
+    "ASTThrow",
+    "ASTCatch",
+    "ASTTry",
+    "ASTIf",
+    "ASTWhile",
+    "ASTIntrinsic",
+    "ASTSwitch",
+    "ASTSwitchCase",
     "ASTEnumDecl",
     "ASTEnumMember",
     "ASTBlock",

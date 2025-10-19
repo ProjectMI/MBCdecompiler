@@ -1,20 +1,38 @@
 from pathlib import Path
+from typing import Iterable
 
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTBranch,
+    ASTBreak,
     ASTBuilder,
+    ASTCallArg,
     ASTCallExpr,
+    ASTBlock,
     ASTCallFrame,
     ASTCallStatement,
     ASTFrameProtocol,
+    ASTIf,
+    ASTIntrinsic,
     ASTIntegerLiteral,
     ASTMemoryRead,
+    ASTExpression,
+    ASTFlagExpr,
+    ASTFlagCheck,
+    ASTFunctionPrologue,
+    ASTIdentifier,
     ASTReturn,
     ASTSwitch,
+    ASTTestSet,
     ASTTailCall,
+    ASTWhile,
+    ASTArgumentMode,
+    ASTContinue,
+    ASTStatement,
+    ASTProcedure,
 )
+from mbcdisasm.ast.builder import _StructuredProcedureBuilder
 from mbcdisasm.ir.model import (
     IRBlock,
     IRAbiEffect,
@@ -23,10 +41,15 @@ from mbcdisasm.ir.model import (
     IRDispatchIndex,
     IRIf,
     IRLoad,
+    IRRaw,
+    IRFlagCheck,
+    IRFunctionPrologue,
+    IRNode,
     IRProgram,
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTestSetBranch,
     IRTailCall,
     IRStackEffect,
     IRSlot,
@@ -35,6 +58,16 @@ from mbcdisasm.ir.model import (
 )
 
 from tests.test_ir_normalizer import build_container
+
+
+def _flatten_statements(statements: Iterable[ASTStatement]) -> Iterable[ASTStatement]:
+    for statement in statements:
+        yield statement
+        if isinstance(statement, ASTIf):
+            yield from _flatten_statements(statement.then_branch)
+            yield from _flatten_statements(statement.else_branch)
+        elif isinstance(statement, ASTWhile):
+            yield from _flatten_statements(statement.body)
 
 
 def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
@@ -56,11 +89,10 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     assert procedure.entry_reasons
     assert procedure.blocks
 
-    block = procedure.blocks[0]
-    assert block.successors is not None
-    rendered = [statement.render() for statement in block.statements]
-    assert any("call" in line for line in rendered)
-    assert any(line.startswith("return") for line in rendered)
+    assert procedure.body
+    flattened = list(_flatten_statements(procedure.body))
+    assert any(isinstance(stmt, ASTCallStatement) for stmt in flattened)
+    assert any(isinstance(stmt, ASTReturn) for stmt in flattened)
     assert procedure.name == f"proc_{procedure.entry_offset:04X}"
 
     summary = ast_program.metrics.describe()
@@ -105,6 +137,8 @@ def test_ast_builder_splits_after_return_sequences() -> None:
     first = ast_segment.procedures[0]
     assert first.exit_offsets == (0x0100,)
     assert len(first.blocks) == 1
+    assert len(first.body) == 1
+    assert isinstance(first.body[0], ASTReturn)
 
 
 def test_ast_builder_uses_postdominators_for_exits() -> None:
@@ -140,6 +174,8 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     procedure = ast_segment.procedures[0]
     assert tuple(sorted(procedure.exit_offsets)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
+    if_stmt = next(stmt for stmt in procedure.body if isinstance(stmt, ASTIf))
+    assert isinstance(if_stmt.condition, ASTExpression)
 
 
 def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
@@ -165,7 +201,8 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
 
     builder = ASTBuilder()
     ast_program = builder.build(program)
-    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    procedure = ast_program.segments[0].procedures[0]
+    statements = procedure.blocks[0].statements
 
     assert all("dispatch.data" not in stmt.render() for stmt in statements)
     switch_stmt = statements[0]
@@ -179,6 +216,7 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert not segment.enums
     assert not ast_program.enums
     assert isinstance(statements[1], ASTReturn)
+    assert isinstance(procedure.body[0], ASTSwitch)
 
 
 def test_ast_builder_converts_dispatch_with_leading_call() -> None:
@@ -204,7 +242,8 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
 
     builder = ASTBuilder()
     ast_program = builder.build(program)
-    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    procedure = ast_program.segments[0].procedures[0]
+    statements = procedure.blocks[0].statements
 
     assert all("dispatch.data" not in stmt.render() for stmt in statements)
     call_stmt = statements[0]
@@ -214,6 +253,163 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     enums = ast_program.segments[0].enums
     assert not enums
     assert not ast_program.enums
+    assert isinstance(procedure.body[0], ASTCallStatement)
+
+
+def test_ast_builder_marks_call_argument_modes() -> None:
+    block = IRBlock(
+        label="block_call",
+        start_offset=0x0300,
+        nodes=(
+            IRCall(target=0xAAAA, args=("ptr0&", "word1!", "byte2"), symbol="helper.call"),
+            IRReturn(values=("ret0",), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    call_stmt = next(
+        stmt for stmt in _flatten_statements(procedure.body) if isinstance(stmt, ASTCallStatement)
+    )
+    modes = [arg.mode for arg in call_stmt.call.args]
+    assert modes == [ASTArgumentMode.BORROW, ASTArgumentMode.MOVE, ASTArgumentMode.VALUE]
+
+
+def test_ast_builder_structures_while_loops() -> None:
+    header = IRBlock(
+        label="block_header",
+        start_offset=0x0400,
+        nodes=(IRIf(condition="loop_cond", then_target=0x0410, else_target=0x0420),),
+    )
+    body = IRBlock(
+        label="block_body",
+        start_offset=0x0410,
+        nodes=(
+            IRCall(target=0xBBBB, args=("acc",), symbol=None),
+            IRIf(condition="loop_continue", then_target=0x0400, else_target=0x0420),
+        ),
+    )
+    exit_block = IRBlock(
+        label="block_exit",
+        start_offset=0x0420,
+        nodes=(IRReturn(values=("acc",), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x40,
+        blocks=(header, body, exit_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    assert isinstance(procedure.body[0], ASTWhile)
+    assert isinstance(procedure.body[0].condition, ASTExpression)
+    loop_body = list(procedure.body[0].body)
+    assert any(isinstance(stmt, ASTCallStatement) for stmt in loop_body)
+    assert any(isinstance(stmt, ASTContinue) for stmt in _flatten_statements(procedure.body))
+
+
+def test_ast_builder_normalises_branch_conditions() -> None:
+    def extract_condition(branch: ASTStatement) -> ASTExpression:
+        then_block = ASTBlock(
+            label="then",
+            start_offset=0x0110,
+            statements=(ASTReturn(value=None),),
+        )
+        else_block = ASTBlock(
+            label="else",
+            start_offset=0x0120,
+            statements=(ASTReturn(value=None),),
+        )
+        entry_block = ASTBlock(
+            label="entry",
+            start_offset=0x0100,
+            statements=(branch,),
+            successors=(then_block, else_block),
+        )
+        procedure = ASTProcedure(
+            name="proc",
+            entry_offset=0x0100,
+            blocks=(entry_block, then_block, else_block),
+        )
+        structurer = _StructuredProcedureBuilder(procedure)
+        statements = structurer.build()
+        assert statements
+        assert isinstance(statements[0], ASTIf)
+        return statements[0].condition
+
+    flag_branch = ASTFlagCheck(
+        flag=0x1234,
+        then_branch=None,
+        else_branch=None,
+        then_offset=0x0110,
+        else_offset=0x0120,
+    )
+    flag_cond = extract_condition(flag_branch)
+    assert isinstance(flag_cond, ASTFlagExpr)
+    assert flag_cond.flag == 0x1234
+
+    prologue_branch = ASTFunctionPrologue(
+        var=ASTIdentifier("result"),
+        expr=ASTIdentifier("bool0"),
+        then_branch=None,
+        else_branch=None,
+        then_offset=0x0110,
+        else_offset=0x0120,
+    )
+    prologue_cond = extract_condition(prologue_branch)
+    assert prologue_cond.render() == "bool0"
+
+    testset_branch = ASTTestSet(
+        var=ASTIdentifier("pred"),
+        expr=ASTIdentifier("value"),
+        then_branch=None,
+        else_branch=None,
+        then_offset=0x0110,
+        else_offset=0x0120,
+    )
+    testset_cond = extract_condition(testset_branch)
+    assert testset_cond.render() == "pred"
+
+
+def test_ast_builder_wraps_intrinsic_operations() -> None:
+    block = IRBlock(
+        label="block_raw",
+        start_offset=0x0500,
+        nodes=(
+            IRRaw(mnemonic="op_custom", operand=0x1234, operand_alias="custom", annotations=("flag",)),
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    intrinsic = procedure.body[0]
+    assert isinstance(intrinsic, ASTIntrinsic)
+    assert intrinsic.mnemonic == "op_custom"
+    assert intrinsic.operand == 0x1234
 
 
 def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:

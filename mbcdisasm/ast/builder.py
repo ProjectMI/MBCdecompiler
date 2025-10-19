@@ -35,6 +35,7 @@ from ..ir.model import (
     IRTailcallReturn,
     IRTerminator,
     IRAbiEffect,
+    IRRaw,
     IRStackEffect,
     MemRef,
     MemSpace,
@@ -168,15 +169,20 @@ _FRAME_OPERAND_KIND_OVERRIDES = {
 from .model import (
     ASTAliasInfo,
     ASTAliasKind,
+    ASTArgumentMode,
     ASTAssign,
     ASTBlock,
     ASTBranch,
+    ASTBreak,
+    ASTCallArg,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
     ASTCallFrame,
     ASTCallFrameSlot,
+    ASTCatch,
     ASTComment,
+    ASTContinue,
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
@@ -184,10 +190,13 @@ from .model import (
     ASTFrameEffect,
     ASTFrameProtocol,
     ASTFlagCheck,
+    ASTFlagExpr,
     ASTFunctionPrologue,
+    ASTIf,
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
+    ASTIntrinsic,
     ASTIntegerLiteral,
     ASTMemoryLocation,
     ASTMemoryRead,
@@ -205,7 +214,11 @@ from .model import (
     ASTSwitchCase,
     ASTTailCall,
     ASTTestSet,
+    ASTThrow,
+    ASTTry,
     ASTTupleExpr,
+    ASTUnaryExpr,
+    ASTWhile,
     ASTUnknown,
     ASTIndexElement,
 )
@@ -308,6 +321,415 @@ class _EnumInfo:
     switches: List["ASTSwitch"] = field(default_factory=list)
 
 
+@dataclass
+class _LoopInfo:
+    """Precomputed metadata describing a natural loop."""
+
+    header: int
+    nodes: Set[int] = field(default_factory=set)
+    latch_nodes: Set[int] = field(default_factory=set)
+
+
+class _StructuredProcedureBuilder:
+    """Derive structured control-flow constructs from a procedure CFG."""
+
+    _EXIT_MARKER = "__exit__"
+
+    def __init__(self, procedure: ASTProcedure) -> None:
+        self._procedure = procedure
+        self._blocks: Dict[int, ASTBlock] = {
+            block.start_offset: block for block in procedure.blocks
+        }
+        self._entry = procedure.entry_offset
+        self._successors: Dict[int, Tuple[int, ...]] = {
+            offset: self._extract_successors(block)
+            for offset, block in self._blocks.items()
+        }
+        self._predecessors: Dict[int, Set[int]] = defaultdict(set)
+        for offset, succs in self._successors.items():
+            for succ in succs:
+                if succ in self._blocks:
+                    self._predecessors[succ].add(offset)
+        self._postdominators = self._compute_postdominators()
+        self._immediate_postdom = self._compute_immediate_postdom()
+        self._dominators = self._compute_dominators()
+        self._loop_infos = self._compute_loop_infos()
+
+    def build(self) -> Tuple[ASTStatement, ...]:
+        if not self._blocks:
+            return tuple()
+        return tuple(self._structure_region(self._entry, None))
+
+    def _extract_successors(self, block: ASTBlock) -> Tuple[int, ...]:
+        if not block.successors:
+            return tuple()
+        return tuple(successor.start_offset for successor in block.successors)
+
+    def _compute_postdominators(self) -> Dict[int | str, Set[int | str]]:
+        nodes: Set[int] = set(self._blocks.keys())
+        postdom: Dict[int | str, Set[int | str]] = {
+            node: set(nodes) | {self._EXIT_MARKER} for node in nodes
+        }
+        postdom[self._EXIT_MARKER] = {self._EXIT_MARKER}
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                succs = self._successors.get(node, tuple())
+                if not succs:
+                    updated = {node, self._EXIT_MARKER}
+                else:
+                    intersection: Set[int | str] = set(nodes) | {self._EXIT_MARKER}
+                    for succ in succs:
+                        intersection &= postdom.get(succ, {self._EXIT_MARKER})
+                    updated = {node} | intersection
+                if updated != postdom[node]:
+                    postdom[node] = updated
+                    changed = True
+        return postdom
+
+    def _compute_immediate_postdom(self) -> Dict[int, Optional[int]]:
+        immediate: Dict[int, Optional[int]] = {}
+        for node in self._blocks:
+            candidates = [
+                cand
+                for cand in self._postdominators[node]
+                if cand not in {node, self._EXIT_MARKER}
+            ]
+            best: Optional[int] = None
+            for cand in candidates:
+                if not isinstance(cand, int):
+                    continue
+                if best is None:
+                    best = cand
+                    continue
+                current = self._postdominators.get(cand, set())
+                previous = self._postdominators.get(best, set())
+                if current < previous:
+                    best = cand
+            immediate[node] = best
+        return immediate
+
+    def _structure_region(
+        self,
+        entry: Optional[int],
+        exit_offset: Optional[int],
+        *,
+        allowed: Optional[Set[int]] = None,
+        loop_header: Optional[int] = None,
+        loop_exit: Optional[int] = None,
+    ) -> List[ASTStatement]:
+        if entry is None or entry not in self._blocks:
+            return []
+        statements: List[ASTStatement] = []
+        current = entry
+        visited: Set[int] = set()
+        while current is not None and current != exit_offset:
+            if current in visited:
+                break
+            if allowed is not None and current not in allowed and current != entry:
+                break
+            visited.add(current)
+            block = self._blocks.get(current)
+            if block is None:
+                break
+            branch = None
+            linear = list(block.statements)
+            if linear and isinstance(linear[-1], BranchStatement):
+                branch = linear.pop()
+            for stmt in linear:
+                statements.append(stmt)
+                if isinstance(stmt, (ASTReturn, ASTTailCall)):
+                    branch = None
+                    current = exit_offset
+                    break
+            if branch is None:
+                next_offset = self._default_successor(current)
+                if next_offset is None or next_offset == exit_offset:
+                    if (
+                        loop_exit is not None
+                        and exit_offset is not None
+                        and exit_offset == loop_exit
+                    ):
+                        statements.append(ASTBreak())
+                    break
+                if loop_header is not None and next_offset == loop_header:
+                    statements.append(ASTContinue())
+                    break
+                current = next_offset
+                continue
+            loop_result = self._maybe_build_loop(
+                current, branch, exit_offset, loop_header, loop_exit
+            )
+            if loop_result is not None:
+                loop_stmt, follow = loop_result
+                statements.append(loop_stmt)
+                if follow is None or follow == exit_offset:
+                    break
+                current = follow
+                continue
+            conditional_stmt, follow = self._build_if(
+                current, branch, exit_offset, loop_header, loop_exit
+            )
+            if conditional_stmt is not None:
+                statements.append(conditional_stmt)
+            if follow is None or follow == current:
+                break
+            current = follow
+        return statements
+
+    def _default_successor(self, offset: int) -> Optional[int]:
+        succs = self._successors.get(offset)
+        if not succs:
+            return None
+        return succs[0]
+
+    def _branch_targets(self, branch: BranchStatement) -> Tuple[Optional[int], Optional[int]]:
+        then_target = getattr(branch, "then_branch", None)
+        else_target = getattr(branch, "else_branch", None)
+        if then_target is not None:
+            then_offset = then_target.start_offset
+        else:
+            then_offset = getattr(branch, "then_offset", None)
+        if else_target is not None:
+            else_offset = else_target.start_offset
+        else:
+            else_offset = getattr(branch, "else_offset", None)
+        return then_offset, else_offset
+
+    def _is_loop_edge(self, source: int, target: Optional[int]) -> bool:
+        if target is None or target not in self._blocks:
+            return False
+        return source in self._dominators.get(target, {target})
+
+    def _compute_dominators(self) -> Dict[int, Set[int]]:
+        nodes = set(self._blocks.keys())
+        dominators: Dict[int, Set[int]] = {node: set(nodes) for node in nodes}
+        if self._entry in dominators:
+            dominators[self._entry] = {self._entry}
+        changed = True
+        while changed:
+            changed = False
+            for node in nodes:
+                if node == self._entry:
+                    continue
+                preds = self._predecessors.get(node, set())
+                if not preds:
+                    new_set = {node}
+                else:
+                    intersection = set(nodes)
+                    for pred in preds:
+                        intersection &= dominators.get(pred, set(nodes))
+                    new_set = {node} | intersection
+                if new_set != dominators[node]:
+                    dominators[node] = new_set
+                    changed = True
+        return dominators
+
+    def _compute_loop_infos(self) -> Dict[int, _LoopInfo]:
+        loop_infos: Dict[int, _LoopInfo] = {}
+        for source, succs in self._successors.items():
+            for target in succs:
+                if target not in self._blocks:
+                    continue
+                if target not in self._dominators.get(source, set()):
+                    continue
+                info = loop_infos.get(target)
+                if info is None:
+                    info = _LoopInfo(header=target)
+                    loop_infos[target] = info
+                info.latch_nodes.add(source)
+                loop_nodes = self._collect_natural_loop(target, source)
+                info.nodes |= loop_nodes
+        for header, info in loop_infos.items():
+            info.nodes.add(header)
+        return loop_infos
+
+    def _collect_natural_loop(self, header: int, latch: int) -> Set[int]:
+        loop_nodes: Set[int] = {header}
+        stack = [latch]
+        while stack:
+            node = stack.pop()
+            if node in loop_nodes:
+                continue
+            loop_nodes.add(node)
+            for pred in self._predecessors.get(node, set()):
+                if header not in self._dominators.get(pred, set()):
+                    continue
+                stack.append(pred)
+        return loop_nodes
+
+    def _collect_loop_nodes(
+        self, header: int, body_entry: int, exit_offset: Optional[int]
+    ) -> Set[int]:
+        allowed: Set[int] = set()
+        stack = [body_entry]
+        while stack:
+            node = stack.pop()
+            if node == header or node == exit_offset:
+                continue
+            if node in allowed:
+                continue
+            if header not in self._dominators.get(node, set()):
+                continue
+            allowed.add(node)
+            for succ in self._successors.get(node, tuple()):
+                if succ == exit_offset:
+                    continue
+                stack.append(succ)
+        allowed.add(body_entry)
+        return allowed
+
+    def _maybe_build_loop(
+        self,
+        current: int,
+        branch: BranchStatement,
+        exit_offset: Optional[int],
+        loop_header: Optional[int],
+        loop_exit: Optional[int],
+    ) -> Optional[Tuple[ASTWhile, Optional[int]]]:
+        then_target, else_target = self._branch_targets(branch)
+        info = self._loop_infos.get(current)
+        if info is not None:
+            in_then = then_target in info.nodes if then_target is not None else False
+            in_else = else_target in info.nodes if else_target is not None else False
+            if in_then != in_else:
+                body_entry = then_target if in_then else else_target
+                if body_entry is not None and body_entry in self._blocks:
+                    follow = else_target if in_then else then_target
+                    allowed_nodes = set(info.nodes)
+                    allowed_nodes.discard(current)
+                    stop_offset = follow if follow is not None else current
+                    body = self._structure_region(
+                        body_entry,
+                        stop_offset,
+                        allowed=allowed_nodes,
+                        loop_header=current,
+                        loop_exit=follow,
+                    )
+                    condition = self._normalise_branch_condition(
+                        branch, positive=in_then
+                    )
+                    loop_stmt = ASTWhile(condition=condition, body=tuple(body))
+                    return loop_stmt, follow
+        loop_target: Optional[int] = None
+        follow: Optional[int] = None
+        positive = True
+        if (
+            then_target is not None
+            and current in self._dominators.get(then_target, set())
+            and then_target != current
+            and self._has_path(then_target, current, else_target)
+        ):
+            loop_target = then_target
+            follow = else_target
+            positive = True
+        elif (
+            else_target is not None
+            and current in self._dominators.get(else_target, set())
+            and else_target != current
+            and self._has_path(else_target, current, then_target)
+        ):
+            loop_target = else_target
+            follow = then_target
+            positive = False
+        if loop_target is None:
+            return None
+        stop_offset = follow if follow is not None else current
+        loop_nodes = self._collect_loop_nodes(current, loop_target, stop_offset)
+        body = self._structure_region(
+            loop_target,
+            stop_offset,
+            allowed=loop_nodes,
+            loop_header=current,
+            loop_exit=follow,
+        )
+        condition = self._normalise_branch_condition(branch, positive=positive)
+        loop_stmt = ASTWhile(condition=condition, body=tuple(body))
+        return loop_stmt, follow
+
+    def _normalise_branch_condition(
+        self, branch: BranchStatement, *, positive: bool
+    ) -> ASTExpression:
+        condition = self._branch_condition_expr(branch)
+        if not positive:
+            condition = ASTUnaryExpr(op="not", operand=condition)
+        return condition
+
+    def _branch_condition_expr(self, branch: BranchStatement) -> ASTExpression:
+        if isinstance(branch, ASTBranch):
+            return branch.condition
+        if isinstance(branch, ASTTestSet):
+            return branch.var
+        if isinstance(branch, ASTFunctionPrologue):
+            return branch.expr
+        if isinstance(branch, ASTFlagCheck):
+            return ASTFlagExpr(flag=branch.flag)
+        raise TypeError(f"unsupported branch condition: {branch!r}")
+
+    def _build_if(
+        self,
+        current: int,
+        branch: BranchStatement,
+        exit_offset: Optional[int],
+        loop_header: Optional[int],
+        loop_exit: Optional[int],
+    ) -> Tuple[Optional[ASTIf], Optional[int]]:
+        then_target, else_target = self._branch_targets(branch)
+        merge = self._immediate_postdom.get(current)
+        if merge is None:
+            merge = exit_offset
+        then_body: List[ASTStatement] = []
+        else_body: List[ASTStatement] = []
+        if then_target is not None and then_target != merge:
+            if loop_header is not None and then_target == loop_header:
+                then_body = [ASTContinue()]
+            elif loop_exit is not None and then_target == loop_exit:
+                then_body = [ASTBreak()]
+            else:
+                then_body = self._structure_region(
+                    then_target,
+                    merge,
+                    loop_header=loop_header,
+                    loop_exit=loop_exit,
+                )
+        if else_target is not None and else_target != merge:
+            if loop_header is not None and else_target == loop_header:
+                else_body = [ASTContinue()]
+            elif loop_exit is not None and else_target == loop_exit:
+                else_body = [ASTBreak()]
+            else:
+                else_body = self._structure_region(
+                    else_target,
+                    merge,
+                    loop_header=loop_header,
+                    loop_exit=loop_exit,
+                )
+        if not then_body and not else_body:
+            return (None, merge)
+        condition = self._normalise_branch_condition(branch, positive=True)
+        conditional = ASTIf(
+            condition=condition,
+            then_branch=tuple(then_body),
+            else_branch=tuple(else_body),
+        )
+        return conditional, merge
+
+    def _has_path(self, start: int, goal: int, stop: Optional[int]) -> bool:
+        stack = [start]
+        visited: Set[int] = set()
+        while stack:
+            node = stack.pop()
+            if node == goal:
+                return True
+            if node in visited:
+                continue
+            visited.add(node)
+            for succ in self._successors.get(node, tuple()):
+                if succ == stop:
+                    continue
+                stack.append(succ)
+        return False
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
 
@@ -618,13 +1040,16 @@ class ASTBuilder:
         if not simplified_blocks:
             return None
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
-        return ASTProcedure(
+        procedure = ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=simplified_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
         )
+        structurer = _StructuredProcedureBuilder(procedure)
+        procedure.body = tuple(structurer.build())
+        return procedure
 
     def _collect_entry_blocks(
         self,
@@ -649,7 +1074,8 @@ class ASTBuilder:
                 if successor not in analyses:
                     continue
                 if successor in entry_reasons and successor != entry:
-                    continue
+                    if successor > entry:
+                        continue
                 stack.append(successor)
         return reachable
 
@@ -1191,7 +1617,7 @@ class ASTBuilder:
         self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
-            sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+            sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
             len(call_expr.args),
         )
         frame = self._build_call_frame(node, arg_exprs)
@@ -1729,7 +2155,7 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+                sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
                 len(call_expr.args),
             )
             frame = self._build_call_frame(node, arg_exprs)
@@ -1759,7 +2185,7 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
+                sum(1 for arg in call_expr.args if not isinstance(arg.value, ASTUnknown)),
                 len(call_expr.args),
             )
             frame = self._build_call_frame(node, arg_exprs)
@@ -1789,6 +2215,14 @@ class ASTBuilder:
                 ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)
             )
             return statements, []
+        if isinstance(node, IRRaw):
+            intrinsic = ASTIntrinsic(
+                mnemonic=node.mnemonic,
+                operand=node.operand,
+                alias=str(node.operand_alias) if node.operand_alias else None,
+                annotations=node.annotations,
+            )
+            return [intrinsic], []
         if isinstance(node, IRCallCleanup):
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
@@ -2240,12 +2674,40 @@ class ASTBuilder:
         varargs: bool,
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
-        arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
-        for token, expr in zip(args, arg_exprs):
+        call_entries: List[Tuple[str, ASTExpression, ASTArgumentMode]] = []
+        for raw in args:
+            mode = self._determine_call_mode(raw)
+            token = self._normalise_call_token(raw)
+            expr = self._resolve_expr(token, value_state)
+            call_entries.append((token, expr, mode))
+        call_args = tuple(ASTCallArg(value=expr, mode=mode) for _, expr, mode in call_entries)
+        call_expr = ASTCallExpr(
+            target=target,
+            args=call_args,
+            symbol=symbol,
+            tail=tail,
+            varargs=varargs,
+        )
+        resolved_exprs = tuple(entry[1] for entry in call_entries)
+        for raw, (token, expr, _mode) in zip(args, call_entries):
             if token and not isinstance(expr, ASTUnknown):
                 self._call_arg_values[token] = expr
-        return call_expr, arg_exprs
+                if raw != token:
+                    self._call_arg_values[raw] = expr
+        return call_expr, resolved_exprs
+
+    def _determine_call_mode(self, token: str) -> ASTArgumentMode:
+        if token.endswith("&"):
+            return ASTArgumentMode.BORROW
+        if token.endswith("!"):
+            return ASTArgumentMode.MOVE
+        return ASTArgumentMode.VALUE
+
+    @staticmethod
+    def _normalise_call_token(token: str) -> str:
+        if token.endswith("&") or token.endswith("!"):
+            return token[:-1]
+        return token
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
