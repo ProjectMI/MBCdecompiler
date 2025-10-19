@@ -9,9 +9,9 @@ from mbcdisasm.ast import (
     ASTCallFrame,
     ASTCallStatement,
     ASTFrameProtocol,
-    ASTLiteral,
+    ASTIntegerLiteral,
+    ASTMemoryRead,
     ASTReturn,
-    ASTSlotRef,
     ASTSwitch,
     ASTTailCall,
 )
@@ -409,9 +409,10 @@ def test_ast_switch_carries_index_metadata() -> None:
 def test_ast_builder_resolves_slot_reference() -> None:
     builder = ASTBuilder()
     expr = builder._resolve_expr("slot(0x0004)", {})
-    assert isinstance(expr, ASTSlotRef)
-    assert expr.slot.space is MemSpace.FRAME
-    assert expr.slot.index == 0x0004
+    assert isinstance(expr, ASTMemoryRead)
+    rendered = expr.render()
+    assert rendered.startswith("frame")
+    assert "0x0004" in rendered
 
 
 def test_ast_builder_reconstructs_dispatch_call_index() -> None:
@@ -452,7 +453,7 @@ def test_ast_builder_reconstructs_dispatch_call_index() -> None:
 
 def test_ast_builder_reuses_call_frame_argument() -> None:
     builder = ASTBuilder()
-    literal = ASTLiteral(0x1234)
+    literal = ASTIntegerLiteral(0x1234)
     call = IRCall(target=0x1000, args=())
     frame = builder._build_call_frame(call, (literal,))
     assert frame is not None
