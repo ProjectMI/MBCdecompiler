@@ -169,25 +169,32 @@ from .model import (
     ASTAliasInfo,
     ASTAliasKind,
     ASTAssign,
+    ASTBitField,
     ASTBlock,
     ASTBranch,
+    ASTCallABI,
+    ASTCallArgumentSlot,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
-    ASTCallFrame,
-    ASTCallFrameSlot,
     ASTComment,
+    ASTEffect,
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
     ASTFieldElement,
-    ASTFrameEffect,
-    ASTFrameProtocol,
     ASTFlagCheck,
-    ASTFunctionPrologue,
+    ASTFrameEffect,
+    ASTFrameOperation,
+    ASTFrameProtocolEffect,
+    ASTHelperEffect,
+    ASTHelperOperation,
+    ASTIOEffect,
+    ASTIOOperation,
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
+    ASTIndexElement,
     ASTIntegerLiteral,
     ASTMemoryLocation,
     ASTMemoryRead,
@@ -197,17 +204,18 @@ from .model import (
     ASTProcedure,
     ASTProgram,
     ASTReturn,
+    ASTReturnPayload,
     ASTSegment,
     ASTStatement,
-    ASTFinally,
-    ASTFinallyStep,
+    ASTFunctionPrologue,
+    ASTJump,
+    ASTTerminator,
     ASTSwitch,
     ASTSwitchCase,
     ASTTailCall,
     ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
-    ASTIndexElement,
 )
 
 
@@ -222,6 +230,15 @@ class _BlockAnalysis:
 
 
 BranchStatement = ASTBranch | ASTTestSet | ASTFlagCheck | ASTFunctionPrologue
+
+
+@dataclass
+class _JumpLink:
+    """Pending control-flow link for an unconditional jump."""
+
+    statement: ASTJump
+    target: int
+    origin_offset: int
 
 
 @dataclass
@@ -243,6 +260,7 @@ class _PendingBlock:
     statements: List[ASTStatement]
     successors: Tuple[int, ...]
     branch_links: List[_BranchLink]
+    jump_links: List[_JumpLink]
 
 
 @dataclass
@@ -287,6 +305,7 @@ class _PendingDispatchCall:
     helper: int
     index: int
     call: ASTCallExpr
+    abi: Optional[ASTCallABI]
 
 
 @dataclass
@@ -378,12 +397,14 @@ class ASTBuilder:
         self._current_redirects = redirects
         procedures = self._group_procedures(segment, analyses, entry_reasons, metrics)
         enum_keys = tuple(self._segment_declared_enum_keys)
+        segment_kind = "code" if procedures else "data"
         result = ASTSegment(
             index=segment.index,
             start=segment.start,
             length=segment.length,
             procedures=tuple(procedures),
             enums=tuple(self._enum_infos[key].decl for key in enum_keys),
+            kind=segment_kind,
         )
         self._clear_context()
         return result, enum_keys
@@ -617,13 +638,47 @@ class ASTBuilder:
         )
         if not simplified_blocks:
             return None
+        synthetic_only = True
+        for block in simplified_blocks:
+            analysis = self._current_analyses.get(block.start_offset)
+            exit_reasons = analysis.exit_reasons if analysis else ()
+            terminator = block.terminator
+            if not (
+                not block.body
+                and isinstance(terminator, ASTReturn)
+                and not terminator.effects
+                and not terminator.payload.values
+                and not terminator.payload.varargs
+                and not exit_reasons
+            ):
+                synthetic_only = False
+                break
+        if synthetic_only:
+            return None
         exit_offsets = self._compute_exit_offsets_from_ast(simplified_blocks)
+        successor_map: Dict[str, Tuple[str, ...]] = {
+            block.label: tuple(successor.label for successor in (block.successors or ()))
+            for block in simplified_blocks
+        }
+        predecessor_accum: Dict[str, List[str]] = {
+            block.label: [] for block in simplified_blocks
+        }
+        for block in simplified_blocks:
+            for successor in block.successors or ():
+                if successor.label in predecessor_accum:
+                    predecessor_accum[successor.label].append(block.label)
+        predecessor_map = {
+            label: tuple(values)
+            for label, values in predecessor_accum.items()
+        }
         return ASTProcedure(
             name=name,
             entry_offset=entry_offset,
             entry_reasons=entry_reasons,
             blocks=simplified_blocks,
             exit_offsets=tuple(sorted(exit_offsets)),
+            successor_map=successor_map,
+            predecessor_map=predecessor_map,
         )
 
     def _collect_entry_blocks(
@@ -793,7 +848,9 @@ class ASTBuilder:
         while changed:
             changed = False
             for block in list(block_order):
-                if block.statements:
+                if block.body:
+                    continue
+                if not isinstance(block.terminator, ASTJump):
                     continue
                 if len(block.successors) != 1:
                     continue
@@ -927,7 +984,7 @@ class ASTBuilder:
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
-    ) -> Optional[BranchStatement]:
+    ) -> Optional[ASTStatement]:
         then_target = self._ensure_branch_target(
             statement, "then", block_order, fallthrough
         )
@@ -939,7 +996,12 @@ class ASTBuilder:
             and else_target is not None
             and then_target == else_target
         ):
-            return None
+            target_block = statement.then_branch or statement.else_branch
+            target_offset = statement.then_offset or statement.else_offset
+            if target_block is not None:
+                target_offset = target_block.start_offset
+            hint = statement.then_hint or statement.else_hint
+            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
         return statement
 
     def _ensure_branch_target(
@@ -1012,6 +1074,11 @@ class ASTBuilder:
                 if statement.else_branch is old:
                     statement.else_branch = new
                     statement.else_hint = None
+            elif isinstance(statement, ASTJump):
+                if statement.target is old:
+                    statement.target = new
+                    statement.hint = None
+                    statement.target_offset = new.start_offset
 
     def _compute_exit_offsets_from_ast(self, blocks: Sequence[ASTBlock]) -> Tuple[int, ...]:
         if not blocks:
@@ -1081,17 +1148,15 @@ class ASTBuilder:
 
     @staticmethod
     def _block_has_exit(block: ASTBlock) -> bool:
-        for statement in block.statements:
-            if isinstance(statement, (ASTReturn, ASTTailCall)):
-                return True
-        return False
+        return isinstance(block.terminator, (ASTReturn, ASTTailCall))
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
             block.start_offset: ASTBlock(
                 label=block.label,
                 start_offset=block.start_offset,
-                statements=tuple(),
+                body=tuple(),
+                terminator=ASTReturn(payload=ASTReturnPayload(), effects=tuple()),
                 successors=tuple(),
             )
             for block in blocks
@@ -1112,14 +1177,74 @@ class ASTBuilder:
                     link.statement.else_hint = self._describe_branch_target(
                         link.origin_offset, link.else_target
                     )
+            for link in pending.jump_links:
+                target_block = block_map.get(link.target)
+                if target_block is not None:
+                    link.statement.target = target_block
+                    link.statement.target_offset = target_block.start_offset
+                else:
+                    link.statement.hint = self._describe_branch_target(
+                        link.origin_offset, link.target
+                    )
+                    link.statement.target_offset = link.target
             realised = block_map[pending.start_offset]
-            realised.statements = tuple(pending.statements)
+            body, terminator = self._split_block_statements(pending.statements)
+            realised.body = body
+            realised.terminator = terminator
             realised.successors = tuple(
                 block_map[target]
                 for target in pending.successors
                 if target in block_map
             )
         return tuple(block_map[block.start_offset] for block in blocks)
+
+    @staticmethod
+    def _split_block_statements(
+        statements: Sequence[ASTStatement],
+    ) -> Tuple[Tuple[ASTStatement, ...], ASTTerminator]:
+        if not statements:
+            raise ValueError("block without terminator")
+        terminator = statements[-1]
+        if not isinstance(terminator, ASTTerminator):
+            raise ValueError(f"non-terminator {type(terminator).__name__} at block end")
+        body = tuple(statements[:-1])
+        return body, terminator
+
+    def _ensure_block_terminator(
+        self,
+        analysis: _BlockAnalysis,
+        statements: List[ASTStatement],
+        jump_links: List[_JumpLink],
+    ) -> Optional[ASTTerminator]:
+        if statements:
+            for index in range(len(statements) - 1, -1, -1):
+                candidate = statements[index]
+                if isinstance(candidate, ASTTerminator):
+                    if index != len(statements) - 1:
+                        del statements[index + 1 :]
+                    return None
+        if analysis.successors:
+            targets = analysis.successors
+            unique_targets = tuple(sorted({*targets}))
+            if len(unique_targets) == 1:
+                target = unique_targets[0]
+                jump = ASTJump(target_offset=target)
+                jump_links.append(
+                    _JumpLink(
+                        statement=jump,
+                        target=target,
+                        origin_offset=analysis.block.start_offset,
+                    )
+                )
+                return jump
+            raise ValueError(
+                "block with multiple successors lacks terminator: "
+                f"0x{analysis.block.start_offset:04X} -> "
+                f"{', '.join(f'0x{target:04X}' for target in targets)}"
+            )
+        # No recorded successors: synthesise a canonical return terminator.
+        payload = ASTReturnPayload()
+        return ASTReturn(payload=payload, effects=tuple())
 
     def _convert_block(
         self,
@@ -1130,6 +1255,7 @@ class ASTBuilder:
         block = analysis.block
         statements: List[ASTStatement] = []
         branch_links: List[_BranchLink] = []
+        jump_links: List[_JumpLink] = []
         pending_calls: List[_PendingDispatchCall] = []
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
@@ -1163,12 +1289,16 @@ class ASTBuilder:
             statements.extend(node_statements)
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
+        terminator = self._ensure_block_terminator(analysis, statements, jump_links)
+        if terminator is not None:
+            statements.append(terminator)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
             statements=statements,
             successors=analysis.successors,
             branch_links=branch_links,
+            jump_links=jump_links,
         )
 
     def _handle_dispatch_call(
@@ -1194,29 +1324,20 @@ class ASTBuilder:
             sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
             len(call_expr.args),
         )
-        frame = self._build_call_frame(node, arg_exprs)
+        abi = self._build_call_abi(node, arg_exprs)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
         pending_table = self._pop_dispatch_table(node.target, pending_tables)
         if pending_table is not None:
-            if frame is not None:
-                insert_index = pending_table.index
-                statements.insert(insert_index, frame)
-                self._adjust_pending_indices(pending_calls, insert_index)
-                self._adjust_table_indices(pending_tables, insert_index)
-                target_index = insert_index + 1
-            else:
-                target_index = pending_table.index
+            target_index = pending_table.index
             statements[target_index] = self._build_dispatch_switch(
-                call_expr, pending_table.dispatch, value_state
+                call_expr, pending_table.dispatch, value_state, abi=abi
             )
             return
-        if frame is not None:
-            statements.append(frame)
         index = len(statements)
-        statements.append(ASTCallStatement(call=call_expr))
+        statements.append(ASTCallStatement(call=call_expr, abi=abi))
         pending_calls.append(
-            _PendingDispatchCall(helper=node.target, index=index, call=call_expr)
+            _PendingDispatchCall(helper=node.target, index=index, call=call_expr, abi=abi)
         )
 
     def _handle_dispatch_table(
@@ -1230,7 +1351,7 @@ class ASTBuilder:
         call_info = self._pop_dispatch_call(dispatch, pending_calls)
         if call_info is not None:
             switch_statement = self._build_dispatch_switch(
-                call_info.call, dispatch, value_state
+                call_info.call, dispatch, value_state, abi=call_info.abi
             )
             statements[call_info.index] = switch_statement
             return
@@ -1268,20 +1389,6 @@ class ASTBuilder:
                 return pending_calls.pop(index)
         return None
 
-    def _adjust_pending_indices(
-        self, pending_calls: List[_PendingDispatchCall], insert_index: int
-    ) -> None:
-        for entry in pending_calls:
-            if entry.index >= insert_index:
-                entry.index += 1
-
-    def _adjust_table_indices(
-        self, pending_tables: List[_PendingDispatchTable], insert_index: int
-    ) -> None:
-        for entry in pending_tables:
-            if entry.index >= insert_index:
-                entry.index += 1
-
     def _collapse_dispatch_sequences(
         self, statements: List[ASTStatement]
     ) -> List[ASTStatement]:
@@ -1316,8 +1423,14 @@ class ASTBuilder:
         if statement.default is not None:
             return [statement]
         if statement.call.tail:
-            return [ASTTailCall(call=statement.call, returns=tuple())]
-        return [ASTCallStatement(call=statement.call)]
+            return [
+                ASTTailCall(
+                    call=statement.call,
+                    payload=ASTReturnPayload(values=tuple()),
+                    abi=statement.abi,
+                )
+            ]
+        return [ASTCallStatement(call=statement.call, abi=statement.abi)]
 
     def _is_redundant_dispatch_followup(
         self, primary: ASTStatement, statement: ASTStatement
@@ -1326,7 +1439,10 @@ class ASTBuilder:
         if call_expr is None:
             return False
         if isinstance(statement, ASTTailCall):
-            if statement.returns:
+            payload = statement.payload
+            if payload.values or payload.varargs:
+                return False
+            if statement.effects:
                 return False
             return self._calls_match(statement.call, call_expr)
         if isinstance(statement, ASTCallStatement):
@@ -1364,6 +1480,7 @@ class ASTBuilder:
         call_expr: ASTCallExpr | None,
         dispatch: IRSwitchDispatch,
         value_state: Mapping[str, ASTExpression],
+        abi: Optional[ASTCallABI] = None,
     ) -> ASTSwitch:
         collapse_dispatch = self._should_collapse_dispatch(call_expr, dispatch)
         enum_info: _EnumInfo | None
@@ -1392,6 +1509,7 @@ class ASTBuilder:
             index_base=index_base,
             kind=kind,
             enum_name=enum_name,
+            abi=abi,
         )
         if enum_info:
             self._attach_enum_to_switch(enum_info, switch)
@@ -1732,9 +1850,7 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
-            frame = self._build_call_frame(node, arg_exprs)
-            if frame is not None:
-                statements.append(frame)
+            abi = self._build_call_abi(node, arg_exprs)
             if node.cleanup:
                 self._pending_epilogue.extend(node.cleanup)
             return_identifiers = []
@@ -1743,7 +1859,13 @@ class ASTBuilder:
                 value_state[name] = ASTCallResult(call_expr, index)
                 metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
                 return_identifiers.append(identifier)
-            statements.append(ASTCallStatement(call=call_expr, returns=tuple(return_identifiers)))
+            statements.append(
+                ASTCallStatement(
+                    call=call_expr,
+                    returns=tuple(return_identifiers),
+                    abi=abi,
+                )
+            )
             return statements, []
         if isinstance(node, IRTailCall):
             call_expr, arg_exprs = self._convert_call(
@@ -1762,33 +1884,22 @@ class ASTBuilder:
                 sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
                 len(call_expr.args),
             )
-            frame = self._build_call_frame(node, arg_exprs)
-            if frame is not None:
-                statements.append(frame)
-            protocol_stmt, finally_branch = self._build_finally(
-                node.cleanup, node.abi_effects
-            )
-            if protocol_stmt is not None:
-                statements.append(protocol_stmt)
+            abi = self._build_call_abi(node, arg_exprs)
+            epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             resolved_returns = tuple(self._resolve_expr(name, value_state) for name in node.returns)
             statements.append(
                 ASTTailCall(
                     call=call_expr,
-                    returns=resolved_returns,
-                    finally_branch=finally_branch,
+                    payload=ASTReturnPayload(values=resolved_returns, varargs=node.varargs),
+                    abi=abi,
+                    effects=epilogue_effects,
                 )
             )
             return statements, []
         if isinstance(node, IRReturn):
-            value = self._build_return_value(node, value_state)
-            protocol_stmt, finally_branch = self._build_finally(node.cleanup, node.abi_effects)
-            statements: List[ASTStatement] = []
-            if protocol_stmt is not None:
-                statements.append(protocol_stmt)
-            statements.append(
-                ASTReturn(value=value, varargs=node.varargs, finally_branch=finally_branch)
-            )
-            return statements, []
+            payload = self._build_return_payload(node, value_state)
+            effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
+            return [ASTReturn(payload=payload, effects=effects)], []
         if isinstance(node, IRCallCleanup):
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
@@ -2001,6 +2112,19 @@ class ASTBuilder:
         return step.operand if include_operand else None
 
     @staticmethod
+    def _bitfield(value: int, alias: Optional[str], default_width: int = 16) -> ASTBitField:
+        width = default_width
+        if value:
+            width = max(default_width, ((value.bit_length() + 7) // 8) * 8)
+        alias_key = alias.upper() if alias else ""
+        if alias_key in {"RET_MASK", "FANOUT_FLAGS", "FANOUT_FLAGS_A", "FANOUT_FLAGS_B"}:
+            width = max(width, 16)
+        if width == 0:
+            width = default_width
+        mask = (1 << width) - 1
+        return ASTBitField(width=width, value=value & mask, alias=alias)
+
+    @staticmethod
     def _mnemonic_opcode(mnemonic: str) -> Optional[int]:
         if not mnemonic.startswith("op_"):
             return None
@@ -2008,6 +2132,14 @@ class ASTBuilder:
             return int(mnemonic[3:5], 16)
         except (ValueError, IndexError):
             return None
+
+    @staticmethod
+    def _effect_channel(alias: Optional[str], operand: Optional[int]) -> str:
+        if alias:
+            return str(alias)
+        if operand is not None:
+            return f"0x{operand:04X}"
+        return "?"
 
     def _epilogue_step_kind(self, step: IRStackEffect) -> str:
         mnemonic = step.mnemonic
@@ -2084,108 +2216,181 @@ class ASTBuilder:
 
         return "frame.write"
 
-    def _convert_frame_effect(self, step: IRStackEffect) -> ASTFrameEffect:
+    def _effect_from_kind(
+        self,
+        kind: str,
+        operand: Optional[int],
+        alias: Optional[str],
+        pops: int = 0,
+    ) -> Optional[ASTEffect]:
+        if kind.startswith("frame."):
+            action = kind.split(".", 1)[1]
+            if action == "protocol":
+                return None
+            channel = None
+            operation = ASTFrameOperation.CLEANUP
+            if action == "write":
+                operation = ASTFrameOperation.WRITE
+            elif action == "reset":
+                operation = ASTFrameOperation.RESET
+            elif action == "teardown":
+                operation = ASTFrameOperation.TEARDOWN
+            elif action == "return_mask":
+                operation = ASTFrameOperation.RETURN_MASK
+            elif action == "page_select":
+                operation = ASTFrameOperation.PAGE_SELECT
+            elif action == "drop":
+                operation = ASTFrameOperation.DROP
+            elif action in {"scheduler", "cleanup", "effect"}:
+                operation = ASTFrameOperation.CLEANUP
+                if action == "scheduler":
+                    channel = "scheduler"
+            else:
+                operation = ASTFrameOperation.WRITE
+                channel = action
+            bitfield: Optional[ASTBitField] = None
+            if operand is not None:
+                bitfield = self._bitfield(operand, alias)
+            return ASTFrameEffect(
+                operation=operation,
+                operand=bitfield,
+                pops=pops,
+                channel=channel,
+            )
+        if kind.startswith("helpers."):
+            action = kind.split(".", 1)[1]
+            op_map = {
+                "invoke": ASTHelperOperation.INVOKE,
+                "fanout": ASTHelperOperation.FANOUT,
+                "mask_low": ASTHelperOperation.MASK_LOW,
+                "mask_high": ASTHelperOperation.MASK_HIGH,
+                "dispatch": ASTHelperOperation.DISPATCH,
+                "reduce": ASTHelperOperation.REDUCE,
+                "wrapper": ASTHelperOperation.WRAPPER,
+                "format": ASTHelperOperation.FORMAT,
+            }
+            operation = op_map.get(action, ASTHelperOperation.INVOKE)
+            mask = None
+            if operation in {ASTHelperOperation.MASK_LOW, ASTHelperOperation.MASK_HIGH} and operand is not None:
+                mask = self._bitfield(operand, alias)
+            symbol = alias if alias and not mask else None
+            return ASTHelperEffect(operation=operation, symbol=symbol, mask=mask)
+        if kind.startswith("io."):
+            action = kind.split(".", 1)[1]
+            op_map = {
+                "write": ASTIOOperation.WRITE,
+                "read": ASTIOOperation.READ,
+                "step": ASTIOOperation.STEP,
+                "bridge": ASTIOOperation.BRIDGE,
+                "handshake": ASTIOOperation.BRIDGE,
+            }
+            operation = op_map.get(action, ASTIOOperation.STEP)
+            port = self._effect_channel(alias, operand)
+            mask = None
+            if operation is ASTIOOperation.WRITE and operand is not None:
+                mask = self._bitfield(operand, alias)
+            return ASTIOEffect(operation=operation, port=port, mask=mask)
+        if kind.startswith("abi."):
+            action = kind.split(".", 1)[1]
+            if action == "return_mask" and operand is not None:
+                return ASTFrameEffect(
+                    operation=ASTFrameOperation.RETURN_MASK,
+                    operand=self._bitfield(operand, alias),
+                    pops=pops,
+                )
+            symbol = alias or action
+            return ASTHelperEffect(operation=ASTHelperOperation.INVOKE, symbol=symbol)
+        return None
+
+    def _effects_from_call_step(self, step: IRStackEffect) -> Tuple[ASTEffect, ...]:
+        if step.mnemonic == "stack_shuffle":
+            return tuple()
         operand = self._stack_effect_operand(step)
         alias = str(step.operand_alias) if step.operand_alias is not None else None
-        return ASTFrameEffect(kind=step.mnemonic, operand=operand, alias=alias, pops=step.pops)
+        kind = self._classify_frame_effect_kind(step, operand, alias)
+        effect = self._effect_from_kind(kind, operand, alias, pops=step.pops)
+        return (effect,) if effect else tuple()
 
-    def _convert_epilogue_step(self, step: IRStackEffect) -> ASTFinallyStep:
-        operand = self._stack_effect_operand(step)
-        alias = str(step.operand_alias) if step.operand_alias is not None else None
-        kind = self._epilogue_step_kind(step)
-        return ASTFinallyStep(kind=kind, operand=operand, alias=alias, pops=step.pops)
-
-    def _convert_abi_effect(self, effect: IRAbiEffect) -> ASTFinallyStep:
-        operand = effect.operand
-        alias = str(effect.alias) if effect.alias is not None else None
-        if effect.kind == "return_mask":
-            return ASTFinallyStep(kind="frame.return_mask", operand=operand, alias=alias)
-        return ASTFinallyStep(kind=f"abi.{effect.kind}", operand=operand, alias=alias)
-
-    def _build_call_frame(
+    def _build_call_abi(
         self,
         node: Any,
         arg_exprs: Sequence[ASTExpression],
-    ) -> Optional[ASTCallFrame]:
+    ) -> Optional[ASTCallABI]:
         steps = list(self._pending_call_frame)
         self._pending_call_frame.clear()
-        effects = [
-            self._convert_frame_effect(step)
-            for step in steps
-            if step.mnemonic != "stack_shuffle"
-        ]
+        effects: List[ASTEffect] = []
+        for step in steps:
+            effects.extend(self._effects_from_call_step(step))
         arity = getattr(node, "arity", None)
         slot_count = arity or len(arg_exprs)
-        slots: List[ASTCallFrameSlot] = []
+        slots: List[ASTCallArgumentSlot] = []
         if slot_count:
             values = list(arg_exprs)
             if len(values) < slot_count:
                 deficit = slot_count - len(values)
                 values.extend(ASTUnknown(f"slot_{index}") for index in range(len(values), len(values) + deficit))
             for index in range(slot_count):
-                slots.append(ASTCallFrameSlot(index=index, value=values[index]))
+                slots.append(ASTCallArgumentSlot(index=index, value=values[index]))
                 token = f"slot_{index}"
                 value = values[index]
                 if not isinstance(value, ASTUnknown):
                     self._call_arg_values[token] = value
         live_mask = getattr(node, "cleanup_mask", None)
-        if not slots and not effects and live_mask is None:
+        mask_field = None
+        if live_mask is not None:
+            mask_field = self._bitfield(live_mask, None)
+        return_count = len(getattr(node, "returns", ())) or None
+        tail_allowed = isinstance(node, IRTailCall)
+        if not slots and not effects and mask_field is None and return_count is None and not tail_allowed:
             return None
-        return ASTCallFrame(slots=tuple(slots), effects=tuple(effects), live_mask=live_mask)
+        return ASTCallABI(
+            slots=tuple(slots),
+            effects=tuple(effects),
+            live_mask=mask_field,
+            return_count=return_count,
+            tail_effects=tail_allowed,
+        )
 
-    def _build_return_value(
+    def _build_return_payload(
         self,
         node: IRReturn,
         value_state: Mapping[str, ASTExpression],
-    ) -> Optional[ASTExpression]:
-        values = [self._resolve_expr(name, value_state) for name in node.values]
-        if not values:
-            return None
-        if len(values) == 1:
-            return values[0]
-        return ASTTupleExpr(tuple(values))
+    ) -> ASTReturnPayload:
+        values = tuple(self._resolve_expr(name, value_state) for name in node.values)
+        return ASTReturnPayload(values=values, varargs=node.varargs)
 
-    @staticmethod
-    def _aggregate_finally_steps(steps: Sequence[ASTFinallyStep]) -> List[ASTFinallyStep]:
-        if not steps:
-            return []
-        aggregated: List[ASTFinallyStep] = []
-        index_map: Dict[Tuple[str, Optional[int], Optional[str]], int] = {}
-        for step in steps:
-            key = (step.kind, step.operand, step.alias)
-            if key in index_map:
-                idx = index_map[key]
-                existing = aggregated[idx]
-                aggregated[idx] = ASTFinallyStep(
-                    kind=existing.kind,
-                    operand=existing.operand,
-                    alias=existing.alias,
-                    pops=existing.pops + step.pops,
+    def _policy_effects(self, policy: _FramePolicySummary) -> List[ASTEffect]:
+        summary: List[ASTEffect] = []
+        for value, alias in policy.masks:
+            if value is None:
+                continue
+            summary.append(
+                ASTFrameEffect(
+                    operation=ASTFrameOperation.RETURN_MASK,
+                    operand=self._bitfield(value, alias),
                 )
-            else:
-                index_map[key] = len(aggregated)
-                aggregated.append(step)
-        return aggregated
+            )
+        if policy.teardown:
+            summary.append(
+                ASTFrameEffect(operation=ASTFrameOperation.TEARDOWN, pops=policy.teardown)
+            )
+        if policy.drops:
+            summary.append(
+                ASTFrameEffect(operation=ASTFrameOperation.DROP, pops=policy.drops)
+            )
+        return summary
 
-    @staticmethod
-    def _build_frame_protocol(policy: _FramePolicySummary) -> ASTFrameProtocol:
-        return ASTFrameProtocol(
-            masks=tuple(policy.masks),
-            teardown=policy.teardown,
-            drops=policy.drops,
-        )
-
-    def _build_finally(
+    def _build_epilogue_effects(
         self,
         cleanup_steps: Sequence[IRStackEffect],
         abi_effects: Sequence[IRAbiEffect],
-    ) -> Tuple[Optional[ASTFrameProtocol], Optional[ASTFinally]]:
+    ) -> Tuple[ASTEffect, ...]:
         combined = list(self._pending_epilogue)
         combined.extend(cleanup_steps)
         self._pending_epilogue = []
 
         policy = _FramePolicySummary()
-        effect_steps: List[ASTFinallyStep] = []
+        effects: List[ASTEffect] = []
 
         for step in combined:
             kind = self._epilogue_step_kind(step)
@@ -2202,34 +2407,38 @@ class ASTBuilder:
                 continue
             if kind == "frame.effect":
                 kind = self._classify_frame_effect_kind(step, operand, alias)
-            effect_steps.append(ASTFinallyStep(kind=kind, operand=operand, alias=alias, pops=step.pops))
+            effect = self._effect_from_kind(kind, operand, alias, pops=step.pops)
+            if effect:
+                effects.append(effect)
 
         for effect in abi_effects:
             if effect.kind == "return_mask":
                 alias = str(effect.alias) if effect.alias is not None else None
                 policy.add_mask(effect.operand, alias)
                 continue
-            effect_steps.append(self._convert_abi_effect(effect))
-
-        effect_steps.extend(self._policy_finally_steps(policy))
-
-        aggregated_steps = self._aggregate_finally_steps(effect_steps)
-        protocol_stmt = self._build_frame_protocol(policy) if policy.has_effects() else None
-        finally_stmt = ASTFinally(steps=tuple(aggregated_steps)) if aggregated_steps else None
-        return protocol_stmt, finally_stmt
-
-    @staticmethod
-    def _policy_finally_steps(policy: _FramePolicySummary) -> List[ASTFinallyStep]:
-        summary: List[ASTFinallyStep] = []
-        for value, alias in policy.masks:
-            summary.append(
-                ASTFinallyStep(kind="frame.return_mask", operand=value, alias=alias)
+            converted = self._effect_from_kind(
+                f"abi.{effect.kind}", effect.operand, str(effect.alias) if effect.alias else None
             )
-        if policy.teardown:
-            summary.append(ASTFinallyStep(kind="frame.teardown", pops=policy.teardown))
-        if policy.drops:
-            summary.append(ASTFinallyStep(kind="frame.drop", pops=policy.drops))
-        return summary
+            if converted:
+                effects.append(converted)
+
+        effects.extend(self._policy_effects(policy))
+
+        if policy.has_effects():
+            masks = tuple(
+                self._bitfield(value, alias)
+                for value, alias in policy.masks
+                if value is not None
+            )
+            effects.append(
+                ASTFrameProtocolEffect(
+                    masks=masks,
+                    teardown=policy.teardown,
+                    drops=policy.drops,
+                )
+            )
+
+        return tuple(sorted(effects, key=lambda eff: eff.order_key()))
 
     def _convert_call(
         self,
