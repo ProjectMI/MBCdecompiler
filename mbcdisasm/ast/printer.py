@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List
 
-from .model import ASTBlock, ASTEnumDecl, ASTProcedure, ASTProgram, ASTSegment
+from .model import ASTBlock, ASTEnumDecl, ASTProcedure, ASTProgram, ASTSegment, ASTSymbolTable
 
 
 class ASTTextRenderer:
@@ -14,6 +14,7 @@ class ASTTextRenderer:
     def render(self, program: ASTProgram) -> str:
         lines: List[str] = []
         lines.append("; ast metrics: " + program.metrics.describe())
+        lines.extend(self._render_symbols(program.symbols))
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"
@@ -24,6 +25,13 @@ class ASTTextRenderer:
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
+    def _render_symbols(self, symbols: ASTSymbolTable) -> Iterable[str]:
+        if not symbols.procedures:
+            return []
+        yield "; symbols:"
+        for entry in symbols.procedures:
+            yield f";   {entry.render()}"
+
     def _render_segment(self, segment: ASTSegment) -> Iterable[str]:
         header = (
             f"; segment {segment.index} kind={segment.kind} "
@@ -59,9 +67,16 @@ class ASTTextRenderer:
             f"{label}->[{', '.join(targets)}]"
             for label, targets in sorted(procedure.predecessor_map.items())
         ) or "-"
+        signature_repr = "-"
+        if procedure.signature is not None:
+            args = ", ".join(slot.render() for slot in procedure.signature.arguments)
+            rets = ", ".join(slot.render() for slot in procedure.signature.returns)
+            suffix = " varargs" if procedure.signature.varargs else ""
+            signature_repr = f"[{args}] -> [{rets}]{suffix}"
         yield (
             f"procedure {procedure.name} entry{{{entry_repr}}} "
-            f"exits=[{exit_entries}] cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
+            f"exits=[{exit_entries}] signature={signature_repr} "
+            f"cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
         )
         for block in procedure.blocks:
             yield from self._render_block(block)

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
+from typing import Any, Deque, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
 from ..ir.model import (
@@ -172,22 +172,30 @@ from .model import (
     ASTAddressSpace,
     ASTAccessPathElement,
     ASTAssign,
+    ASTBaseElement,
+    ASTBankElement,
+    ASTPageElement,
+    ASTPageRegisterElement,
+    ASTOffsetElement,
     ASTBitField,
     ASTBlock,
     ASTBranch,
     ASTCallABI,
     ASTCallArgumentSlot,
-    ASTCallReturnSlot,
     ASTCallExpr,
     ASTCallResult,
+    ASTCallReturnSlot,
     ASTCallStatement,
     ASTComment,
+    ASTDispatchHelper,
+    ASTDispatchIndex,
     ASTEffect,
+    ASTEffectPredicate,
+    ASTEntryPoint,
+    ASTEntryReason,
     ASTEnumDecl,
     ASTEnumMember,
     ASTExpression,
-    ASTEntryPoint,
-    ASTEntryReason,
     ASTExitPoint,
     ASTExitReason,
     ASTFieldElement,
@@ -204,32 +212,29 @@ from .model import (
     ASTIdentifier,
     ASTIndexElement,
     ASTIntegerLiteral,
+    ASTBooleanLiteral,
+    ASTJump,
     ASTMemoryLocation,
     ASTMemoryRead,
     ASTMemoryWrite,
     ASTMetrics,
     ASTNumericSign,
     ASTProcedure,
+    ASTProcedureSignature,
     ASTProgram,
-    ASTBaseElement,
-    ASTBankElement,
-    ASTOffsetElement,
-    ASTPageElement,
-    ASTPageRegisterElement,
-    ASTSlotElement,
     ASTReturn,
     ASTReturnPayload,
+    ASTSafeCastExpr,
     ASTSegment,
+    ASTSignatureSlot,
+    ASTSliceElement,
+    ASTSlotElement,
     ASTStatement,
-    ASTFunctionPrologue,
-    ASTJump,
-    ASTTerminator,
     ASTSwitch,
     ASTSwitchCase,
-    ASTDispatchHelper,
-    ASTDispatchIndex,
+    ASTSymbolTable,
     ASTTailCall,
-    ASTTestSet,
+    ASTTerminator,
     ASTTupleExpr,
     ASTUnknown,
     ASTViewElement,
@@ -246,7 +251,7 @@ class _BlockAnalysis:
     fallthrough: Optional[int]
 
 
-BranchStatement = ASTBranch | ASTTestSet | ASTFlagCheck | ASTFunctionPrologue
+BranchStatement = ASTBranch | ASTFlagCheck
 
 
 @dataclass
@@ -344,6 +349,41 @@ class _EnumInfo:
     switches: List["ASTSwitch"] = field(default_factory=list)
 
 
+@dataclass
+class _SignatureSummary:
+    """Aggregated argument/return kinds for a callable entry point."""
+
+    entry: int
+    name: str
+    argument_kinds: Dict[int, Set[SSAValueKind]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    return_kinds: Dict[int, Set[SSAValueKind]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    varargs: bool = False
+
+    def record_arguments(self, builder: "ASTBuilder", args: Sequence[ASTExpression]) -> None:
+        for index, arg in enumerate(args):
+            self.argument_kinds[index].add(builder._expression_kind(arg))
+
+    def record_call_returns(
+        self, builder: "ASTBuilder", returns: Sequence[ASTIdentifier]
+    ) -> None:
+        for index, value in enumerate(returns):
+            self.return_kinds[index].add(builder._expression_kind(value))
+
+    def record_returns(
+        self,
+        builder: "ASTBuilder",
+        values: Sequence[ASTExpression],
+        varargs: bool,
+    ) -> None:
+        for index, value in enumerate(values):
+            self.return_kinds[index].add(builder._expression_kind(value))
+        if varargs:
+            self.varargs = True
+
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
 
@@ -363,6 +403,7 @@ class ASTBuilder:
         self._current_segment_index: int = -1
         self._call_arg_values: Dict[str, ASTExpression] = {}
         self._expression_lookup: Dict[str, ASTExpression] = {}
+        self._cleanup_registry: Dict[str, Deque[Tuple[IRStackEffect, ...]]] = defaultdict(deque)
 
     # ------------------------------------------------------------------
     # public API
@@ -373,6 +414,7 @@ class ASTBuilder:
         self._enum_name_usage = {}
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._cleanup_registry = defaultdict(deque)
         segments: List[ASTSegment] = []
         segment_enum_keys: List[Tuple[str, ...]] = []
         metrics = ASTMetrics()
@@ -384,10 +426,12 @@ class ASTBuilder:
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
         segments, program_enums = self._finalise_enums(segments, segment_enum_keys)
+        symbol_table = self._synthesise_symbols(segments)
         return ASTProgram(
             segments=tuple(segments),
             metrics=metrics,
             enums=program_enums,
+            symbols=symbol_table,
         )
 
     # ------------------------------------------------------------------
@@ -405,7 +449,9 @@ class ASTBuilder:
         analyses, entry_reasons, redirects = self._compact_cfg(analyses, entry_reasons)
         self._current_analyses = analyses
         self._current_entry_reasons = entry_reasons
-        self._current_block_labels = {offset: analysis.block.label for offset, analysis in analyses.items()}
+        self._current_block_labels = {
+            offset: self._canonical_block_label(offset) for offset in analyses
+        }
         self._current_exit_hints = {
             offset: self._format_exit_hint(analysis.exit_reasons)
             for offset, analysis in analyses.items()
@@ -425,6 +471,152 @@ class ASTBuilder:
         )
         self._clear_context()
         return result, enum_keys
+
+    @staticmethod
+    def _canonical_block_label(offset: int) -> str:
+        return f"block_{offset:04X}"
+
+    @staticmethod
+    def _expression_kind(expr: ASTExpression) -> SSAValueKind:
+        kind_method = getattr(expr, "kind", None)
+        if callable(kind_method):
+            try:
+                result = kind_method()
+            except TypeError:
+                result = None
+            if isinstance(result, SSAValueKind):
+                return result
+        if isinstance(expr, ASTIntegerLiteral):
+            return SSAValueKind.WORD
+        if isinstance(expr, ASTBooleanLiteral):
+            return SSAValueKind.BOOLEAN
+        return SSAValueKind.UNKNOWN
+
+    @staticmethod
+    def _resolve_signature_kind(kinds: Set[SSAValueKind]) -> SSAValueKind:
+        filtered = {kind for kind in kinds if kind is not SSAValueKind.UNKNOWN}
+        if not filtered:
+            return SSAValueKind.UNKNOWN
+        if len(filtered) == 1:
+            return next(iter(filtered))
+        return SSAValueKind.UNKNOWN
+
+    def _build_signature_slots(
+        self, mapping: Mapping[int, Set[SSAValueKind]], prefix: str
+    ) -> Tuple[ASTSignatureSlot, ...]:
+        if not mapping:
+            return tuple()
+        max_index = max(mapping.keys())
+        slots: List[ASTSignatureSlot] = []
+        for index in range(max_index + 1):
+            kinds = mapping.get(index, set())
+            kind = self._resolve_signature_kind(kinds)
+            slots.append(ASTSignatureSlot(index=index, kind=kind, name=f"{prefix}{index}"))
+        return tuple(slots)
+
+    def _ensure_signature_summary(
+        self,
+        summaries: Dict[int, _SignatureSummary],
+        entry_map: Mapping[int, ASTProcedure],
+        target: int,
+        symbol: Optional[str],
+    ) -> _SignatureSummary:
+        summary = summaries.get(target)
+        if summary is None:
+            if target in entry_map:
+                name = entry_map[target].name
+            elif symbol:
+                name = symbol
+            else:
+                name = f"func_{target:04X}"
+            summary = _SignatureSummary(entry=target, name=name)
+            summaries[target] = summary
+        elif symbol and target not in entry_map:
+            summary.name = symbol
+        return summary
+
+    def _synthesise_symbols(self, segments: Sequence[ASTSegment]) -> ASTSymbolTable:
+        entry_map: Dict[int, ASTProcedure] = {}
+        summaries: Dict[int, _SignatureSummary] = {}
+        for segment in segments:
+            for procedure in segment.procedures:
+                entry_map[procedure.entry_offset] = procedure
+                summaries.setdefault(
+                    procedure.entry_offset,
+                    _SignatureSummary(entry=procedure.entry_offset, name=procedure.name),
+                )
+
+        for segment in segments:
+            for procedure in segment.procedures:
+                proc_summary = summaries[procedure.entry_offset]
+                for block in procedure.blocks:
+                    for statement in block.body:
+                        if isinstance(statement, ASTCallStatement):
+                            summary = self._ensure_signature_summary(
+                                summaries,
+                                entry_map,
+                                statement.call.target,
+                                statement.call.symbol,
+                            )
+                            summary.record_arguments(self, statement.call.args)
+                            summary.record_call_returns(self, statement.returns)
+                            if statement.call.varargs:
+                                summary.varargs = True
+                        elif isinstance(statement, ASTTailCall):
+                            summary = self._ensure_signature_summary(
+                                summaries,
+                                entry_map,
+                                statement.call.target,
+                                statement.call.symbol,
+                            )
+                            summary.record_arguments(self, statement.call.args)
+                            summary.record_returns(
+                                self,
+                                statement.payload.values,
+                                statement.payload.varargs,
+                            )
+                    terminator = block.terminator
+                    if isinstance(terminator, ASTReturn):
+                        proc_summary.record_returns(
+                            self,
+                            terminator.payload.values,
+                            terminator.payload.varargs,
+                        )
+                    elif isinstance(terminator, ASTTailCall):
+                        summary = self._ensure_signature_summary(
+                            summaries,
+                            entry_map,
+                            terminator.call.target,
+                            terminator.call.symbol,
+                        )
+                        summary.record_arguments(self, terminator.call.args)
+                        summary.record_returns(
+                            self,
+                            terminator.payload.values,
+                            terminator.payload.varargs,
+                        )
+                        proc_summary.record_returns(
+                            self,
+                            terminator.payload.values,
+                            terminator.payload.varargs,
+                        )
+
+        signatures: List[ASTProcedureSignature] = []
+        for target, summary in sorted(summaries.items()):
+            args = self._build_signature_slots(summary.argument_kinds, "arg")
+            rets = self._build_signature_slots(summary.return_kinds, "ret")
+            signature = ASTProcedureSignature(
+                name=summary.name,
+                entry_offset=summary.entry,
+                arguments=args,
+                returns=rets,
+                varargs=summary.varargs,
+            )
+            signatures.append(signature)
+            procedure = entry_map.get(target)
+            if procedure is not None:
+                procedure.signature = signature
+        return ASTSymbolTable(procedures=tuple(signatures))
 
     def _finalise_enums(
         self,
@@ -713,12 +905,8 @@ class ASTBuilder:
                     reason = "switch"
                 elif isinstance(terminator, ASTBranch):
                     reason = "branch"
-                elif isinstance(terminator, ASTTestSet):
-                    reason = "testset"
                 elif isinstance(terminator, ASTFlagCheck):
                     reason = "flag_check"
-                elif isinstance(terminator, ASTFunctionPrologue):
-                    reason = "prologue"
                 if reason:
                     reasons = (ASTExitReason(kind=reason),)
             exit_points.append(
@@ -1360,7 +1548,7 @@ class ASTBuilder:
         if terminator is not None:
             statements.append(terminator)
         return _PendingBlock(
-            label=block.label,
+            label=self._canonical_block_label(block.start_offset),
             start_offset=block.start_offset,
             statements=statements,
             successors=analysis.successors,
@@ -1978,6 +2166,8 @@ class ASTBuilder:
             effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             return [ASTReturn(payload=payload, effects=effects)], []
         if isinstance(node, IRCallCleanup):
+            key = node.describe()
+            self._cleanup_registry.setdefault(key, deque()).append(tuple(node.steps))
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
             else:
@@ -1993,6 +2183,7 @@ class ASTBuilder:
                 condition=condition,
                 then_offset=then_target,
                 else_offset=else_target,
+                effects=self._extract_effects(condition),
             )
             return [branch], [
                 _BranchLink(
@@ -2003,38 +2194,64 @@ class ASTBuilder:
                 )
             ]
         if isinstance(node, IRTestSetBranch):
-            var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTTestSet(
-                var=var_expr,
-                expr=expr,
+            identifier, location = self._resolve_lvalue(node.var)
+            statements: List[ASTStatement] = []
+            if location is not None:
+                metrics.observe_store(not isinstance(expr, ASTUnknown))
+                statements.append(ASTMemoryWrite(location=location, value=expr))
+                condition_expr = expr
+            elif identifier is not None:
+                metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
+                statements.append(ASTAssign(target=identifier, value=expr))
+                value_state[node.var] = expr
+                condition_expr = identifier
+            else:
+                condition_expr = expr
+            branch = ASTBranch(
+                condition=condition_expr,
                 then_offset=then_target,
                 else_offset=else_target,
+                effects=self._extract_effects(expr),
             )
-            return [statement], [
+            statements.append(branch)
+            return statements, [
                 _BranchLink(
-                    statement=statement,
+                    statement=branch,
                     then_target=then_target,
                     else_target=else_target,
                     origin_offset=origin_offset,
                 )
             ]
         if isinstance(node, IRFunctionPrologue):
-            var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFunctionPrologue(
-                var=var_expr,
-                expr=expr,
+            identifier, location = self._resolve_lvalue(node.var)
+            statements = []
+            if location is not None:
+                metrics.observe_store(not isinstance(expr, ASTUnknown))
+                statements.append(ASTMemoryWrite(location=location, value=expr))
+                condition_expr = expr
+            elif identifier is not None:
+                metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
+                statements.append(ASTAssign(target=identifier, value=expr))
+                value_state[node.var] = expr
+                condition_expr = identifier
+            else:
+                condition_expr = expr
+            branch = ASTBranch(
+                condition=condition_expr,
                 then_offset=then_target,
                 else_offset=else_target,
+                effects=self._extract_effects(expr),
             )
-            return [statement], [
+            statements.append(branch)
+            return statements, [
                 _BranchLink(
-                    statement=statement,
+                    statement=branch,
                     then_target=then_target,
                     else_target=else_target,
                     origin_offset=origin_offset,
@@ -2062,11 +2279,14 @@ class ASTBuilder:
     def _slot_descriptor(slot: IRSlot) -> ASTAddressDescriptor:
         if slot.space is MemSpace.FRAME:
             space = ASTAddressSpace.FRAME
+            region = f"frame_{slot.index:04X}"
         elif slot.space is MemSpace.GLOBAL:
             space = ASTAddressSpace.GLOBAL
+            region = f"global_{slot.index:04X}"
         else:
             space = ASTAddressSpace.CONST
-        return ASTAddressDescriptor(space=space, region=space.value)
+            region = f"const_{slot.index:04X}"
+        return ASTAddressDescriptor(space=space, region=region)
 
     @staticmethod
     def _slot_alias(slot: IRSlot) -> ASTAliasInfo:
@@ -2124,15 +2344,23 @@ class ASTBuilder:
             space = ASTAddressSpace.IO
         else:
             space = ASTAddressSpace.MEMORY
+        if ref.bank is not None and space is ASTAddressSpace.MEMORY:
+            region = f"bank_{ref.bank:04X}"
+        elif space in {ASTAddressSpace.GLOBAL, ASTAddressSpace.CONST} and ref.base is not None:
+            region = f"{space.value}_{ref.base:04X}"
         return ASTAddressDescriptor(space=space, region=region, symbol=symbol)
 
     @staticmethod
     def _memref_alias(ref: Optional[MemRef]) -> ASTAliasInfo:
         if ref is None:
-            return ASTAliasInfo(ASTAliasKind.UNKNOWN)
+            return ASTAliasInfo(ASTAliasKind.UNKNOWN, "mem")
         region = ref.region or "mem"
         if region == "frame":
             return ASTAliasInfo(ASTAliasKind.NOALIAS, region)
+        if ref.bank is not None:
+            return ASTAliasInfo(ASTAliasKind.REGION, f"bank_{ref.bank:04X}")
+        if ref.symbol:
+            return ASTAliasInfo(ASTAliasKind.REGION, ref.symbol)
         return ASTAliasInfo(ASTAliasKind.REGION, region)
 
     @staticmethod
@@ -2206,6 +2434,28 @@ class ASTBuilder:
         if not include_operand:
             include_operand = bool(step.operand) or step.mnemonic not in {"stack_teardown"}
         return step.operand if include_operand else None
+
+    @staticmethod
+    def _deduplicate_effects(effects: Sequence[ASTEffect]) -> Tuple[ASTEffect, ...]:
+        seen: Set[ASTEffect] = set()
+        ordered: List[ASTEffect] = []
+        for effect in sorted(effects, key=lambda eff: eff.order_key()):
+            if effect not in seen:
+                ordered.append(effect)
+                seen.add(effect)
+        return tuple(ordered)
+
+    def _consume_cleanup_effects(self, description: str) -> Tuple[ASTEffect, ...]:
+        queue = self._cleanup_registry.get(description)
+        if not queue:
+            return tuple()
+        steps = queue.popleft()
+        if not queue:
+            self._cleanup_registry.pop(description, None)
+        effects: List[ASTEffect] = []
+        for step in steps:
+            effects.extend(self._effects_from_call_step(step))
+        return self._deduplicate_effects(effects)
 
     @staticmethod
     def _bitfield(value: int, alias: Optional[str], default_width: int = 16) -> ASTBitField:
@@ -2417,6 +2667,7 @@ class ASTBuilder:
         effects: List[ASTEffect] = []
         for step in steps:
             effects.extend(self._effects_from_call_step(step))
+        effects_tuple = self._deduplicate_effects(effects)
         arity = getattr(node, "arity", None)
         slot_count = arity or len(arg_exprs)
         slots: List[ASTCallArgumentSlot] = []
@@ -2444,7 +2695,7 @@ class ASTBuilder:
         tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
         if (
             not slots
-            and not effects
+            and not effects_tuple
             and mask_field is None
             and not return_slots
             and not tail_allowed
@@ -2453,7 +2704,7 @@ class ASTBuilder:
         return ASTCallABI(
             slots=tuple(slots),
             returns=tuple(return_slots),
-            effects=tuple(effects),
+            effects=effects_tuple,
             live_mask=mask_field,
             tail=tail_allowed,
         )
@@ -2571,8 +2822,7 @@ class ASTBuilder:
                     drops=policy.drops,
                 )
             )
-
-        return tuple(sorted(effects, key=lambda eff: eff.order_key()))
+        return self._deduplicate_effects(effects)
 
     def _convert_call(
         self,
@@ -2599,6 +2849,8 @@ class ASTBuilder:
             return self._call_arg_values[token]
         if token in self._expression_lookup:
             return self._expression_lookup[token]
+        if token.startswith("cleanup_call["):
+            return self._build_cleanup_predicate(token)
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
@@ -2619,6 +2871,31 @@ class ASTBuilder:
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
         return ASTIdentifier(token, self._infer_kind(token))
+
+    def _build_cleanup_predicate(self, token: str) -> ASTEffectPredicate:
+        effects = self._consume_cleanup_effects(token)
+        head = token.split("[", 1)[0]
+        predicate = ASTEffectPredicate(source=head, effects=effects)
+        self._register_expression(token, predicate)
+        return predicate
+
+    @staticmethod
+    def _extract_effects(expr: ASTExpression) -> Tuple[ASTEffect, ...]:
+        if isinstance(expr, ASTEffectPredicate):
+            return expr.effects
+        return tuple()
+
+    def _resolve_lvalue(
+        self, token: str
+    ) -> Tuple[Optional[ASTIdentifier], Optional[ASTMemoryLocation]]:
+        if token.startswith("slot(") and token.endswith(")"):
+            try:
+                index = int(token[5:-1], 16)
+            except ValueError:
+                return None, None
+            slot = self._build_slot(index)
+            return None, self._build_slot_location(slot)
+        return ASTIdentifier(token, self._infer_kind(token)), None
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
@@ -2721,6 +2998,7 @@ class ASTBuilder:
         self._current_segment_index = -1
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._cleanup_registry = defaultdict(deque)
 
 
 __all__ = ["ASTBuilder"]

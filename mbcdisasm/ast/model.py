@@ -208,7 +208,11 @@ class ASTAddressDescriptor:
         if self.symbol:
             return self.symbol
         base = self.space.value
-        if self.region and self.region != base:
+        if self.region:
+            if self.region == base:
+                return base
+            if self.region.startswith(f"{base}_"):
+                return self.region
             return f"{base}.{self.region}"
         return base
 
@@ -708,6 +712,30 @@ class ASTCallResult(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTEffectPredicate(ASTExpression):
+    """Effectful predicate produced by helper cleanup sequences."""
+
+    source: str
+    effects: Tuple[ASTEffect, ...] = ()
+    operand: Optional[ASTExpression] = None
+
+    def __post_init__(self) -> None:
+        if self.effects:
+            ordered = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
+            object.__setattr__(self, "effects", ordered)
+
+    def render(self) -> str:
+        payload = f"({self.operand.render()})" if self.operand else ""
+        suffix = ""
+        if self.effects:
+            suffix = f" effects={_render_effects(self.effects)}"
+        return f"{self.source}{payload}{suffix}"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.BOOLEAN
+
+
+@dataclass(frozen=True)
 class ASTTupleExpr(ASTExpression):
     """Tuple literal composed of concrete AST expressions."""
 
@@ -972,12 +1000,21 @@ class ASTBranch(ASTTerminator):
     else_hint: str | None = None
     then_offset: int | None = None
     else_offset: int | None = None
+    effects: Tuple[ASTEffect, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.effects:
+            ordered = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
+            object.__setattr__(self, "effects", ordered)
 
     def render(self) -> str:
         condition = self.condition.render()
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return f"if {condition} then {then_label} else {else_label}"
+        base = f"if {condition} then {then_label} else {else_label}"
+        if self.effects:
+            return f"{base} effects={_render_effects(self.effects)}"
+        return base
 
 
 @dataclass
@@ -1233,6 +1270,7 @@ class ASTProcedure:
     exits: Tuple[ASTExitPoint, ...]
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    signature: Optional["ASTProcedureSignature"] = None
 
     @property
     def entry_offset(self) -> int:
@@ -1325,6 +1363,46 @@ class ASTProgram:
     segments: Tuple[ASTSegment, ...]
     metrics: ASTMetrics
     enums: Tuple[ASTEnumDecl, ...] = ()
+    symbols: "ASTSymbolTable" = field(default_factory=lambda: ASTSymbolTable())
+
+
+@dataclass(frozen=True)
+class ASTSignatureSlot:
+    """Formal slot within a procedure signature."""
+
+    index: int
+    kind: SSAValueKind
+    name: str
+
+    def render(self) -> str:
+        return f"{self.name}:{self.kind.name.lower()}"
+
+
+@dataclass(frozen=True)
+class ASTProcedureSignature:
+    """Synthesised signature describing a callable symbol."""
+
+    name: str
+    entry_offset: int
+    arguments: Tuple[ASTSignatureSlot, ...] = ()
+    returns: Tuple[ASTSignatureSlot, ...] = ()
+    varargs: bool = False
+
+    def render(self) -> str:
+        args = ", ".join(slot.render() for slot in self.arguments)
+        rets = ", ".join(slot.render() for slot in self.returns)
+        flags = " varargs" if self.varargs else ""
+        return f"signature {self.name}@0x{self.entry_offset:04X} args=[{args}] returns=[{rets}]{flags}"
+
+
+@dataclass(frozen=True)
+class ASTSymbolTable:
+    """Canonical catalogue of reconstructed symbols."""
+
+    procedures: Tuple[ASTProcedureSignature, ...] = ()
+
+    def lookup(self) -> Dict[str, ASTProcedureSignature]:
+        return {entry.name: entry for entry in self.procedures}
 
 
 __all__ = [
@@ -1382,9 +1460,7 @@ __all__ = [
     "ASTReturn",
     "ASTReturnPayload",
     "ASTBranch",
-    "ASTTestSet",
     "ASTFlagCheck",
-    "ASTFunctionPrologue",
     "ASTComment",
     "ASTEnumDecl",
     "ASTEnumMember",
@@ -1401,4 +1477,8 @@ __all__ = [
     "ASTSegment",
     "ASTMetrics",
     "ASTProgram",
+    "ASTEffectPredicate",
+    "ASTSignatureSlot",
+    "ASTProcedureSignature",
+    "ASTSymbolTable",
 ]
