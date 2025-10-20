@@ -143,6 +143,8 @@ _IO_OPCODE_FALLBACK = {
     0xC0,
     0xC3,
 }
+
+_TRACE_TOKEN = re.compile(r"^(?P<label>[^@]+)@0x(?P<offset>[0-9A-Fa-f]+)$")
 _MASK_OPCODE_FALLBACK = {0x29, 0x31, 0x32, 0x4B, 0x4F, 0x52, 0x5E, 0x70, 0x72}
 _DROP_OPCODE_FALLBACK = {0x01, 0x2D}
 _BRIDGE_OPCODE_FALLBACK = {0x3A, 0x3E, 0x04, 0x4A, 0x4B, 0x76, 0xE1, 0xE8, 0xED, 0xF0}
@@ -170,23 +172,27 @@ _FRAME_OPERAND_KIND_OVERRIDES = {
 from .model import (
     ASTAliasInfo,
     ASTAliasKind,
-    ASTAddressDescriptor,
+    ASTMemoryAddress,
     ASTAddressSpace,
-    ASTAccessPathElement,
     ASTAssign,
     ASTBitField,
     ASTBlock,
     ASTBranch,
     ASTCallABI,
     ASTCallArgumentSlot,
+    ASTCallOperand,
     ASTCallReturnSlot,
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTImmediateOperand,
     ASTSignatureValue,
+    ASTStackOperand,
     ASTSymbolSignature,
     ASTSymbolType,
     ASTSymbolTypeFamily,
+    ASTTraceOperand,
+    ASTValueOperand,
     ASTComment,
     ASTEffect,
     ASTEnumDecl,
@@ -196,11 +202,14 @@ from .model import (
     ASTEntryReason,
     ASTExitPoint,
     ASTExitReason,
-    ASTFieldElement,
     ASTFlagCheck,
-    ASTFrameEffect,
-    ASTFrameOperation,
+    ASTFrameChannelEffect,
+    ASTFrameDropEffect,
+    ASTFrameMaskEffect,
     ASTFrameProtocolEffect,
+    ASTFrameResetEffect,
+    ASTFrameTeardownEffect,
+    ASTFrameWriteEffect,
     ASTHelperEffect,
     ASTHelperOperation,
     ASTIOEffect,
@@ -209,7 +218,6 @@ from .model import (
     ASTIOWrite,
     ASTIdentifier,
     ASTBooleanLiteral,
-    ASTIndexElement,
     ASTIntegerLiteral,
     ASTMemoryLocation,
     ASTMemoryRead,
@@ -218,12 +226,6 @@ from .model import (
     ASTNumericSign,
     ASTProcedure,
     ASTProgram,
-    ASTBaseElement,
-    ASTBankElement,
-    ASTOffsetElement,
-    ASTPageElement,
-    ASTPageRegisterElement,
-    ASTSlotElement,
     ASTReturn,
     ASTReturnPayload,
     ASTSegment,
@@ -239,7 +241,6 @@ from .model import (
     ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
-    ASTViewElement,
 )
 
 
@@ -386,7 +387,8 @@ class _SignatureAccumulator:
             self.attributes.add("varargs")
         convention = "tailcall" if call.tail else "call"
         self.calling_conventions.add(convention)
-        for index, expr in enumerate(call.args):
+        for index, operand in enumerate(call.operands):
+            expr = operand.to_expression()
             signature_type = self._classify_expr(expr)
             self.argument_types[index].add(signature_type)
             name = self._expr_name(expr)
@@ -741,21 +743,36 @@ class ASTBuilder:
 
     @staticmethod
     def _effect_identity(effect: ASTEffect) -> Tuple[Any, ...]:
-        if isinstance(effect, ASTFrameEffect):
-            operand = None
-            if effect.operand is not None:
-                operand = (
-                    effect.operand.width,
-                    effect.operand.value,
-                    effect.operand.alias,
-                )
+        if isinstance(effect, ASTFrameMaskEffect):
             return (
-                "frame",
-                effect.operation,
-                operand,
-                effect.pops,
+                "frame_mask",
                 effect.channel,
+                effect.mask.width,
+                effect.mask.value,
+                effect.mask.alias,
             )
+        if isinstance(effect, ASTFrameResetEffect):
+            mask = effect.mask
+            mask_key = None
+            if mask is not None:
+                mask_key = (mask.width, mask.value, mask.alias)
+            return ("frame_reset", effect.channel, mask_key)
+        if isinstance(effect, ASTFrameTeardownEffect):
+            return ("frame_teardown", effect.pops)
+        if isinstance(effect, ASTFrameDropEffect):
+            return ("frame_drop", effect.pops)
+        if isinstance(effect, ASTFrameWriteEffect):
+            value = effect.value
+            value_key = None
+            if value is not None:
+                value_key = (value.width, value.value, value.alias)
+            return ("frame_write", effect.channel, value_key)
+        if isinstance(effect, ASTFrameChannelEffect):
+            value = effect.value
+            value_key = None
+            if value is not None:
+                value_key = (value.width, value.value, value.alias)
+            return ("frame_channel", effect.channel, value_key)
         if isinstance(effect, ASTFrameProtocolEffect):
             masks = tuple(
                 (mask.width, mask.value, mask.alias) for mask in effect.masks
@@ -1707,7 +1724,7 @@ class ASTBuilder:
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
     ) -> None:
-        call_expr, arg_exprs = self._convert_call(
+        call_expr, operands = self._convert_call(
             node.target,
             node.args,
             node.symbol,
@@ -1718,10 +1735,10 @@ class ASTBuilder:
         self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
-            sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-            len(call_expr.args),
+            sum(1 for operand in call_expr.operands if operand.is_resolved()),
+            len(call_expr.operands),
         )
-        abi = self._build_call_abi(node, arg_exprs)
+        abi = self._build_call_abi(node, operands)
         if getattr(node, "cleanup", tuple()):
             self._pending_epilogue.extend(node.cleanup)
         pending_table = self._pop_dispatch_table(node.target, pending_tables)
@@ -1863,7 +1880,7 @@ class ASTBuilder:
         return (
             lhs.target == rhs.target
             and lhs.symbol == rhs.symbol
-            and lhs.args == rhs.args
+            and lhs.operands == rhs.operands
             and lhs.varargs == rhs.varargs
         )
 
@@ -2237,7 +2254,7 @@ class ASTBuilder:
             location = self._build_indirect_location(node, pointer, offset_expr)
             return [ASTMemoryWrite(location=location, value=value_expr)], []
         if isinstance(node, IRCallReturn):
-            call_expr, arg_exprs = self._convert_call(
+            call_expr, operands = self._convert_call(
                 node.target,
                 node.args,
                 node.symbol,
@@ -2249,10 +2266,10 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-                len(call_expr.args),
+                sum(1 for operand in call_expr.operands if operand.is_resolved()),
+                len(call_expr.operands),
             )
-            abi = self._build_call_abi(node, arg_exprs)
+            abi = self._build_call_abi(node, operands)
             if node.cleanup:
                 self._pending_epilogue.extend(node.cleanup)
             return_identifiers = []
@@ -2270,7 +2287,7 @@ class ASTBuilder:
             )
             return statements, []
         if isinstance(node, IRTailCall):
-            call_expr, arg_exprs = self._convert_call(
+            call_expr, operands = self._convert_call(
                 node.call.target,
                 node.call.args,
                 node.call.symbol,
@@ -2283,10 +2300,10 @@ class ASTBuilder:
             statements: List[ASTStatement] = []
             metrics.call_sites += 1
             metrics.observe_call_args(
-                sum(1 for arg in call_expr.args if not isinstance(arg, ASTUnknown)),
-                len(call_expr.args),
+                sum(1 for operand in call_expr.operands if operand.is_resolved()),
+                len(call_expr.operands),
             )
-            abi = self._build_call_abi(node, arg_exprs)
+            abi = self._build_call_abi(node, operands)
             epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             resolved_returns = tuple(
                 self._canonicalise_return_expr(
@@ -2391,14 +2408,14 @@ class ASTBuilder:
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
-    def _slot_descriptor(slot: IRSlot) -> ASTAddressDescriptor:
+    def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
         if slot.space is MemSpace.FRAME:
-            space = ASTAddressSpace.FRAME
+            kind = ASTAddressSpace.FRAME
         elif slot.space is MemSpace.GLOBAL:
-            space = ASTAddressSpace.GLOBAL
+            kind = ASTAddressSpace.GLOBAL
         else:
-            space = ASTAddressSpace.CONST
-        return ASTAddressDescriptor(space=space, region=space.value)
+            kind = ASTAddressSpace.CONST
+        return ASTMemoryAddress(kind=kind, region=kind.value, offset=slot.index)
 
     @staticmethod
     def _slot_alias(slot: IRSlot) -> ASTAliasInfo:
@@ -2408,16 +2425,8 @@ class ASTBuilder:
         return ASTAliasInfo(ASTAliasKind.REGION, f"{region}_{slot.index:04X}")
 
     def _build_slot_location(self, slot: IRSlot) -> ASTMemoryLocation:
-        descriptor = self._slot_descriptor(slot)
-        index_literal = ASTIntegerLiteral(
-            value=slot.index,
-            bits=16,
-            sign=ASTNumericSign.UNSIGNED,
-        )
-        slot_element = ASTSlotElement(space=descriptor.space.value, index=index_literal)
         return ASTMemoryLocation(
-            base=descriptor,
-            path=(slot_element,),
+            address=self._slot_address(slot),
             alias=self._slot_alias(slot),
         )
 
@@ -2440,24 +2449,32 @@ class ASTBuilder:
         return SSAValueKind.WORD
 
     @staticmethod
-    def _memref_descriptor(ref: Optional[MemRef]) -> ASTAddressDescriptor:
+    def _memref_address(ref: Optional[MemRef]) -> ASTMemoryAddress:
         if ref is None:
-            return ASTAddressDescriptor(space=ASTAddressSpace.MEMORY, region="mem")
-        symbol = ref.symbol
+            return ASTMemoryAddress(kind=ASTAddressSpace.MEMORY, region="mem")
         region = (ref.region or "mem").lower()
-        if symbol:
-            return ASTAddressDescriptor(
-                space=ASTAddressSpace.MEMORY, region=region, symbol=symbol
-            )
-        if region == "frame":
-            return ASTAddressDescriptor(space=ASTAddressSpace.FRAME, region="frame")
-        if region.startswith("global"):
-            return ASTAddressDescriptor(space=ASTAddressSpace.GLOBAL, region=region)
-        if region.startswith("const"):
-            return ASTAddressDescriptor(space=ASTAddressSpace.CONST, region=region)
-        if region.startswith("io"):
-            return ASTAddressDescriptor(space=ASTAddressSpace.IO, region=region)
-        return ASTAddressDescriptor(space=ASTAddressSpace.MEMORY, region=region)
+        if ref.bank is not None:
+            kind = ASTAddressSpace.BANKED
+        elif region == "frame":
+            kind = ASTAddressSpace.FRAME
+        elif region.startswith("global"):
+            kind = ASTAddressSpace.GLOBAL
+        elif region.startswith("const"):
+            kind = ASTAddressSpace.CONST
+        elif region.startswith("io"):
+            kind = ASTAddressSpace.IO
+        else:
+            kind = ASTAddressSpace.MEMORY
+        return ASTMemoryAddress(
+            kind=kind,
+            region=region,
+            bank=ref.bank,
+            page=ref.page,
+            page_alias=ref.page_alias,
+            base_offset=ref.base,
+            offset=ref.offset,
+            symbol=ref.symbol,
+        )
 
     @staticmethod
     def _memref_alias(ref: Optional[MemRef]) -> ASTAliasInfo:
@@ -2470,50 +2487,32 @@ class ASTBuilder:
             return ASTAliasInfo(ASTAliasKind.REGION, f"bank_{ref.bank:04X}")
         return ASTAliasInfo(ASTAliasKind.REGION, region)
 
-    @staticmethod
-    def _memref_prefix_elements(ref: Optional[MemRef]) -> List[ASTAccessPathElement]:
-        if ref is None:
-            return []
-        elements: List[ASTAccessPathElement] = []
-        if ref.bank is not None:
-            elements.append(ASTBankElement(ref.bank))
-        if ref.page_alias:
-            page_value = ref.page if ref.page is not None else 0
-            elements.append(ASTPageElement(page_value, alias=ref.page_alias))
-        elif ref.page is not None:
-            elements.append(ASTPageElement(ref.page))
-        if ref.base is not None:
-            elements.append(ASTBaseElement(ref.base))
-        return elements
-
     def _build_banked_location(
         self,
         node: IRBankedLoad | IRBankedStore,
         pointer: Optional[ASTExpression],
         offset: Optional[ASTExpression],
     ) -> ASTMemoryLocation:
-        descriptor = self._memref_descriptor(node.ref)
+        address = self._memref_address(node.ref)
         alias = self._memref_alias(node.ref)
-        elements = self._memref_prefix_elements(node.ref)
-        if pointer is not None and not isinstance(pointer, ASTUnknown):
-            elements.append(ASTViewElement(kind="pointer", index=pointer))
+        displacement: Optional[ASTExpression] = None
         if node.register_value is not None:
-            elements.append(ASTPageElement(node.register_value))
+            address = replace(address, page=node.register_value, page_alias=None, page_register=None)
         else:
-            elements.append(ASTPageRegisterElement(node.register))
-        if offset is not None and not isinstance(offset, ASTUnknown):
+            address = replace(address, page_register=node.register)
+        if offset is not None:
             if isinstance(offset, ASTIntegerLiteral):
-                elements.append(ASTOffsetElement(offset.value))
+                combined = (address.offset or 0) + offset.value
+                address = replace(address, offset=combined)
             else:
-                elements.append(ASTIndexElement(offset))
-        elif node.ref is not None and node.ref.offset is not None:
-            elements.append(ASTOffsetElement(node.ref.offset))
-        base: ASTAddressDescriptor | ASTExpression
-        if node.ref is None and pointer is not None:
-            base = pointer
-        else:
-            base = descriptor
-        return ASTMemoryLocation(base=base, path=tuple(elements), alias=alias)
+                displacement = offset
+        origin = pointer
+        return ASTMemoryLocation(
+            address=address,
+            origin=origin,
+            displacement=displacement,
+            alias=alias,
+        )
 
     def _build_indirect_location(
         self,
@@ -2521,19 +2520,22 @@ class ASTBuilder:
         pointer: ASTExpression,
         offset: ASTExpression,
     ) -> ASTMemoryLocation:
-        descriptor = self._memref_descriptor(node.ref)
+        address = self._memref_address(node.ref)
         alias = self._memref_alias(node.ref)
-        elements = self._memref_prefix_elements(node.ref)
-        if not isinstance(pointer, ASTUnknown):
-            elements.append(ASTViewElement(kind="pointer", index=pointer))
-        if isinstance(offset, ASTIntegerLiteral) and not isinstance(offset, ASTUnknown):
-            elements.append(ASTOffsetElement(offset.value))
+        displacement: Optional[ASTExpression]
+        if isinstance(offset, ASTIntegerLiteral):
+            combined = (address.offset or 0) + offset.value
+            address = replace(address, offset=combined)
+            displacement = None
         else:
-            elements.append(ASTIndexElement(offset))
-        base: ASTAddressDescriptor | ASTExpression = descriptor
-        if node.ref is None:
-            base = pointer
-        return ASTMemoryLocation(base=base, path=tuple(elements), alias=alias)
+            displacement = offset
+        origin: Optional[ASTExpression] = pointer
+        return ASTMemoryLocation(
+            address=address,
+            origin=origin,
+            displacement=displacement,
+            alias=alias,
+        )
 
     @staticmethod
     def _stack_effect_operand(step: IRStackEffect) -> Optional[int]:
@@ -2658,36 +2660,34 @@ class ASTBuilder:
             action = kind.split(".", 1)[1]
             if action == "protocol":
                 return None
-            channel = None
-            operation = ASTFrameOperation.CLEANUP
+            channel = alias or None
+            if action == "return_mask":
+                if operand is None:
+                    return None
+                return ASTFrameMaskEffect(
+                    mask=self._bitfield(operand, alias), channel=channel
+                )
+            if action == "reset":
+                bitfield = self._bitfield(operand, alias) if operand is not None else None
+                return ASTFrameResetEffect(mask=bitfield, channel=channel)
+            if action == "teardown":
+                return ASTFrameTeardownEffect(pops=pops or 0)
+            if action == "drop":
+                return ASTFrameDropEffect(pops=pops or 0)
+            if action == "page_select":
+                bitfield = self._bitfield(operand, alias) if operand is not None else None
+                return ASTFrameChannelEffect(channel="page_select", value=bitfield)
             if action == "write":
-                operation = ASTFrameOperation.WRITE
-            elif action == "reset":
-                operation = ASTFrameOperation.RESET
-            elif action == "teardown":
-                operation = ASTFrameOperation.TEARDOWN
-            elif action == "return_mask":
-                operation = ASTFrameOperation.RETURN_MASK
-            elif action == "page_select":
-                operation = ASTFrameOperation.PAGE_SELECT
-            elif action == "drop":
-                operation = ASTFrameOperation.DROP
-            elif action in {"scheduler", "cleanup", "effect"}:
-                operation = ASTFrameOperation.CLEANUP
-                if action == "scheduler":
-                    channel = "scheduler"
-            else:
-                operation = ASTFrameOperation.WRITE
-                channel = action
-            bitfield: Optional[ASTBitField] = None
-            if operand is not None:
-                bitfield = self._bitfield(operand, alias)
-            return ASTFrameEffect(
-                operation=operation,
-                operand=bitfield,
-                pops=pops,
-                channel=channel,
-            )
+                bitfield = self._bitfield(operand, alias) if operand is not None else None
+                target = channel or "frame"
+                return ASTFrameWriteEffect(channel=target, value=bitfield)
+            if action in {"scheduler", "cleanup", "effect"}:
+                bitfield = self._bitfield(operand, alias) if operand is not None else None
+                target = channel or action
+                return ASTFrameChannelEffect(channel=target, value=bitfield)
+            bitfield = self._bitfield(operand, alias) if operand is not None else None
+            target = channel or action
+            return ASTFrameWriteEffect(channel=target, value=bitfield)
         if kind.startswith("helpers."):
             action = kind.split(".", 1)[1]
             op_map = {
@@ -2724,10 +2724,8 @@ class ASTBuilder:
         if kind.startswith("abi."):
             action = kind.split(".", 1)[1]
             if action == "return_mask" and operand is not None:
-                return ASTFrameEffect(
-                    operation=ASTFrameOperation.RETURN_MASK,
-                    operand=self._bitfield(operand, alias),
-                    pops=pops,
+                return ASTFrameMaskEffect(
+                    mask=self._bitfield(operand, alias), channel=alias
                 )
             symbol = alias or action
             return ASTHelperEffect(operation=ASTHelperOperation.INVOKE, symbol=symbol)
@@ -2745,7 +2743,7 @@ class ASTBuilder:
     def _build_call_abi(
         self,
         node: Any,
-        arg_exprs: Sequence[ASTExpression],
+        arg_operands: Sequence[ASTCallOperand],
     ) -> Optional[ASTCallABI]:
         steps = list(self._pending_call_frame)
         self._pending_call_frame.clear()
@@ -2753,19 +2751,25 @@ class ASTBuilder:
         for step in steps:
             effects.extend(self._effects_from_call_step(step))
         arity = getattr(node, "arity", None)
-        slot_count = arity or len(arg_exprs)
+        slot_count = arity or len(arg_operands)
         slots: List[ASTCallArgumentSlot] = []
         if slot_count:
-            values = list(arg_exprs)
+            values = list(arg_operands)
             if len(values) < slot_count:
                 deficit = slot_count - len(values)
-                values.extend(ASTUnknown(f"slot_{index}") for index in range(len(values), len(values) + deficit))
+                start = len(values)
+                for index in range(start, start + deficit):
+                    placeholder = ASTValueOperand(
+                        token=f"slot_{index}", value=ASTUnknown(f"slot_{index}")
+                    )
+                    values.append(placeholder)
             for index in range(slot_count):
-                slots.append(ASTCallArgumentSlot(index=index, value=values[index]))
+                operand = values[index]
+                slots.append(ASTCallArgumentSlot(index=index, operand=operand))
                 token = f"slot_{index}"
-                value = values[index]
-                if not isinstance(value, ASTUnknown):
-                    self._call_arg_values[token] = value
+                expr = operand.to_expression()
+                if not isinstance(expr, ASTUnknown):
+                    self._call_arg_values[token] = expr
         live_mask = getattr(node, "cleanup_mask", None)
         mask_field = None
         if live_mask is not None:
@@ -2845,19 +2849,14 @@ class ASTBuilder:
             if value is None:
                 continue
             summary.append(
-                ASTFrameEffect(
-                    operation=ASTFrameOperation.RETURN_MASK,
-                    operand=self._bitfield(value, alias),
+                ASTFrameMaskEffect(
+                    mask=self._bitfield(value, alias), channel=alias
                 )
             )
         if policy.teardown:
-            summary.append(
-                ASTFrameEffect(operation=ASTFrameOperation.TEARDOWN, pops=policy.teardown)
-            )
+            summary.append(ASTFrameTeardownEffect(pops=policy.teardown))
         if policy.drops:
-            summary.append(
-                ASTFrameEffect(operation=ASTFrameOperation.DROP, pops=policy.drops)
-            )
+            summary.append(ASTFrameDropEffect(pops=policy.drops))
         return summary
 
     def _build_epilogue_effects(
@@ -2933,13 +2932,52 @@ class ASTBuilder:
         tail: bool,
         varargs: bool,
         value_state: Mapping[str, ASTExpression],
-    ) -> Tuple[ASTCallExpr, Tuple[ASTExpression, ...]]:
-        arg_exprs = tuple(self._resolve_expr(arg, value_state) for arg in args)
-        call_expr = ASTCallExpr(target=target, args=arg_exprs, symbol=symbol, tail=tail, varargs=varargs)
-        for token, expr in zip(args, arg_exprs):
-            if token and not isinstance(expr, ASTUnknown):
+    ) -> Tuple[ASTCallExpr, Tuple[ASTCallOperand, ...]]:
+        operands = tuple(self._build_operand(arg, value_state) for arg in args)
+        call_expr = ASTCallExpr(
+            target=target,
+            operands=operands,
+            symbol=symbol,
+            tail=tail,
+            varargs=varargs,
+        )
+        for token, operand in zip(args, operands):
+            if not token:
+                continue
+            expr = operand.to_expression()
+            if not isinstance(expr, ASTUnknown):
                 self._call_arg_values[token] = expr
-        return call_expr, arg_exprs
+        return call_expr, operands
+
+    def _build_operand(
+        self, token: Optional[str], value_state: Mapping[str, ASTExpression]
+    ) -> ASTCallOperand:
+        if not token:
+            return ASTValueOperand("", ASTUnknown(""))
+        if token == "stack_top":
+            return ASTStackOperand(token=token, label="stack_top")
+        if token.startswith("slot(") and token.endswith(")"):
+            try:
+                index = int(token[5:-1], 16)
+            except ValueError:
+                expr = self._resolve_expr(token, value_state)
+                return ASTValueOperand(token=token, value=expr)
+            slot = self._build_slot(index)
+            location = self._build_slot_location(slot)
+            return ASTStackOperand(
+                token=token,
+                location=location,
+                value_kind=SSAValueKind.POINTER,
+            )
+        match = _TRACE_TOKEN.match(token)
+        if match:
+            label = match.group("label")
+            offset = int(match.group("offset"), 16)
+            return ASTTraceOperand(token=token, label=label, offset=offset)
+        expr = self._resolve_expr(token, value_state)
+        if isinstance(expr, ASTIntegerLiteral):
+            return ASTImmediateOperand(token=token, literal=expr)
+        return ASTValueOperand(token=token, value=expr)
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
