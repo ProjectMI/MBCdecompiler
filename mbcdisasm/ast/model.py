@@ -1460,6 +1460,38 @@ class ASTExitPoint:
         return f"{self.label}@0x{self.offset:04X}{suffix}"
 
 
+class ASTProcedureResultKind(Enum):
+    """Categorisation of the reconstructed procedure result layout."""
+
+    VOID = "void"
+    FIXED = "fixed"
+    SPARSE = "sparse"
+    VARIADIC = "variadic"
+
+
+@dataclass(frozen=True)
+class ASTProcedureResult:
+    """Summary of the result slots produced by a procedure."""
+
+    kind: ASTProcedureResultKind
+    required_slots: Tuple[int, ...] = ()
+    optional_slots: Tuple[int, ...] = ()
+    varargs: bool = False
+
+    def render(self) -> str:
+        parts: List[str] = [f"kind={self.kind.value}"]
+        if self.required_slots:
+            required = ", ".join(str(index) for index in self.required_slots)
+            parts.append(f"required=[{required}]")
+        if self.optional_slots:
+            optional = ", ".join(str(index) for index in self.optional_slots)
+            parts.append(f"optional=[{optional}]")
+        if self.varargs:
+            parts.append("varargs=true")
+        inner = ", ".join(parts)
+        return f"result{{{inner}}}"
+
+
 @dataclass
 class ASTProcedure:
     """Single reconstructed procedure."""
@@ -1468,8 +1500,10 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry: ASTEntryPoint
     exits: Tuple[ASTExitPoint, ...]
+    result: "ASTProcedureResult"
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    aliases: Tuple[int, ...] = field(default_factory=tuple)
 
     @property
     def entry_offset(self) -> int:
@@ -1639,6 +1673,8 @@ __all__ = [
     "ASTEntryPoint",
     "ASTExitReason",
     "ASTExitPoint",
+    "ASTProcedureResultKind",
+    "ASTProcedureResult",
     "ASTProcedure",
     "ASTSwitchCase",
     "ASTDispatchHelper",

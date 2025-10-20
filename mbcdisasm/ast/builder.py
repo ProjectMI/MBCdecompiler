@@ -169,6 +169,7 @@ _FRAME_OPERAND_KIND_OVERRIDES = {
     0xED4D: "frame.page_select",
     0xF0EB: "io.step",
 }
+
 from .model import (
     ASTAliasInfo,
     ASTAliasKind,
@@ -205,6 +206,7 @@ from .model import (
     ASTFlagCheck,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
+    ASTFrameEffect,
     ASTFrameMaskEffect,
     ASTFrameProtocolEffect,
     ASTFrameResetEffect,
@@ -225,6 +227,8 @@ from .model import (
     ASTMetrics,
     ASTNumericSign,
     ASTProcedure,
+    ASTProcedureResult,
+    ASTProcedureResultKind,
     ASTProgram,
     ASTReturn,
     ASTReturnPayload,
@@ -242,6 +246,13 @@ from .model import (
     ASTTupleExpr,
     ASTUnknown,
 )
+
+_HELPER_EFFECT_ADDRESS = {
+    operation: 0xF000 + index for index, operation in enumerate(ASTHelperOperation)
+}
+_IO_EFFECT_ADDRESS = {
+    operation: 0xF100 + index for index, operation in enumerate(ASTIOOperation)
+}
 
 
 @dataclass
@@ -471,6 +482,73 @@ class _SignatureAccumulator:
             return ASTSymbolType(ASTSymbolTypeFamily.TOKEN)
         return ASTSymbolType(ASTSymbolTypeFamily.OPAQUE)
 
+
+@dataclass
+class _EffectSignatureAccumulator:
+    """Aggregate effect metadata for synthetic helper/io symbols."""
+
+    name: str
+    address: int
+    parameter_types: Dict[str, Set[ASTSymbolType]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    parameter_names: Dict[str, Set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    calling_conventions: Set[str] = field(default_factory=lambda: {"effect"})
+    attributes: Set[str] = field(default_factory=set)
+    effects: Set[str] = field(default_factory=set)
+
+    def add_parameter(
+        self, key: str, signature_type: ASTSymbolType, label: Optional[str] = None
+    ) -> None:
+        self.parameter_types[key].add(signature_type)
+        if label:
+            self.parameter_names[key].add(label)
+
+    def register_helper(self, effect: ASTHelperEffect) -> None:
+        self.attributes.add("helper")
+        if effect.target is not None:
+            self.add_parameter(
+                "target",
+                ASTSymbolType(
+                    ASTSymbolTypeFamily.ADDRESS,
+                    width=16,
+                    space="mem",
+                ),
+            )
+            self.parameter_names["target"].add("target")
+        if effect.symbol:
+            self.add_parameter("symbol", ASTSymbolType(ASTSymbolTypeFamily.TOKEN))
+            self.parameter_names["symbol"].add("symbol")
+        if effect.mask is not None:
+            self.add_parameter(
+                "mask",
+                ASTSymbolType(
+                    ASTSymbolTypeFamily.VALUE,
+                    width=effect.mask.width,
+                    sign=ASTNumericSign.UNSIGNED,
+                ),
+            )
+            self.parameter_names["mask"].add("mask")
+        self.effects.add(effect.render())
+
+    def register_io(self, effect: ASTIOEffect) -> None:
+        self.attributes.add("io")
+        self.add_parameter("port", ASTSymbolType(ASTSymbolTypeFamily.TOKEN))
+        self.parameter_names["port"].add("port")
+        if effect.mask is not None:
+            self.add_parameter(
+                "mask",
+                ASTSymbolType(
+                    ASTSymbolTypeFamily.VALUE,
+                    width=effect.mask.width,
+                    sign=ASTNumericSign.UNSIGNED,
+                ),
+            )
+            self.parameter_names["mask"].add("mask")
+        self.effects.add(effect.render())
+
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
 
@@ -580,14 +658,61 @@ class ASTBuilder:
         program_enums = tuple(self._enum_infos[key].decl for key in active_keys)
         return updated_segments, program_enums
 
+    def _register_statement_effects(
+        self,
+        statement: ASTStatement,
+        accumulators: Dict[str, _EffectSignatureAccumulator],
+    ) -> None:
+        if isinstance(statement, ASTCallStatement):
+            if statement.abi is not None:
+                self._register_effect_sequence(statement.abi.effects, accumulators)
+        elif isinstance(statement, ASTTailCall):
+            self._register_effect_sequence(statement.effects, accumulators)
+            if statement.abi is not None:
+                self._register_effect_sequence(statement.abi.effects, accumulators)
+        elif isinstance(statement, ASTReturn):
+            self._register_effect_sequence(statement.effects, accumulators)
+
+    def _register_effect_sequence(
+        self,
+        effects: Sequence[ASTEffect],
+        accumulators: Dict[str, _EffectSignatureAccumulator],
+    ) -> None:
+        for effect in effects:
+            if isinstance(effect, ASTHelperEffect):
+                name = f"helpers.{effect.operation.value}"
+                address = _HELPER_EFFECT_ADDRESS.get(effect.operation, 0xF000)
+                accumulator = accumulators.setdefault(
+                    name, _EffectSignatureAccumulator(name=name, address=address)
+                )
+                accumulator.register_helper(effect)
+            elif isinstance(effect, ASTIOEffect):
+                name = f"io.{effect.operation.value}"
+                address = _IO_EFFECT_ADDRESS.get(effect.operation, 0xF100)
+                accumulator = accumulators.setdefault(
+                    name, _EffectSignatureAccumulator(name=name, address=address)
+                )
+                accumulator.register_io(effect)
+
+    def _effect_parameter_order(
+        self, name: str, accumulator: _EffectSignatureAccumulator
+    ) -> Tuple[str, ...]:
+        if name.startswith("helpers."):
+            return ("target", "symbol", "mask")
+        if name.startswith("io."):
+            return ("port", "mask")
+        return tuple(sorted(accumulator.parameter_types))
+
     def _synthesise_symbol_signatures(
         self, segments: Sequence[ASTSegment]
     ) -> Tuple[ASTSymbolSignature, ...]:
         accumulators: Dict[int, _SignatureAccumulator] = {}
+        effect_accumulators: Dict[str, _EffectSignatureAccumulator] = {}
         for segment in segments:
             for procedure in segment.procedures:
                 for block in procedure.blocks:
                     for statement in block.statements:
+                        self._register_statement_effects(statement, effect_accumulators)
                         if isinstance(statement, ASTCallStatement):
                             accumulator = accumulators.setdefault(
                                 statement.call.target,
@@ -649,6 +774,39 @@ class ASTBuilder:
                     name=name,
                     arguments=tuple(arguments),
                     returns=tuple(returns),
+                    calling_conventions=calling_conventions,
+                    attributes=attributes,
+                    effects=effects,
+                )
+            )
+        for name in sorted(effect_accumulators):
+            accumulator = effect_accumulators[name]
+            order = self._effect_parameter_order(name, accumulator)
+            arguments: List[ASTSignatureValue] = []
+            index = 0
+            for key in order:
+                types = accumulator.parameter_types.get(key)
+                if not types:
+                    continue
+                signature_type = self._select_signature_type(types)
+                names = set(accumulator.parameter_names.get(key, set()))
+                names.add(key)
+                param_name = self._select_signature_name(
+                    names, signature_type, index, is_return=False
+                )
+                arguments.append(
+                    ASTSignatureValue(index=index, type=signature_type, name=param_name)
+                )
+                index += 1
+            calling_conventions = tuple(sorted(accumulator.calling_conventions))
+            attributes = tuple(sorted(accumulator.attributes | {"effect"}))
+            effects = tuple(sorted(accumulator.effects))
+            signatures.append(
+                ASTSymbolSignature(
+                    address=accumulator.address,
+                    name=name,
+                    arguments=tuple(arguments),
+                    returns=tuple(),
                     calling_conventions=calling_conventions,
                     attributes=attributes,
                     effects=effects,
@@ -797,6 +955,30 @@ class ASTBuilder:
                 )
             return ("helper", effect.operation, effect.target, effect.symbol, mask)
         return ("effect", type(effect).__name__, effect.render())
+
+    def _normalise_effect_list(
+        self,
+        effects: Sequence[ASTEffect],
+        *,
+        ensure_protocol: bool = False,
+    ) -> Tuple[ASTEffect, ...]:
+        if not effects and not ensure_protocol:
+            return tuple()
+        normalised: List[ASTEffect] = list(effects)
+        has_protocol = any(
+            isinstance(effect, ASTFrameProtocolEffect) for effect in normalised
+        )
+        if ensure_protocol and not has_protocol:
+            normalised.append(
+                ASTFrameProtocolEffect(masks=tuple(), teardown=0, drops=0)
+            )
+        unique: Dict[Tuple[Any, ...], ASTEffect] = {}
+        for effect in normalised:
+            key = self._effect_identity(effect)
+            if key not in unique:
+                unique[key] = effect
+        ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
+        return tuple(ordered)
 
     @staticmethod
     def _deactivate_enum(info: _EnumInfo) -> None:
@@ -989,13 +1171,193 @@ class ASTBuilder:
             if procedure is None:
                 continue
             procedures.append(procedure)
-        return procedures
+        return self._deduplicate_procedures(procedures)
+
+    def _deduplicate_procedures(
+        self, procedures: Sequence[ASTProcedure]
+    ) -> List[ASTProcedure]:
+        if not procedures:
+            return []
+        canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
+        alias_offsets: Dict[str, Set[int]] = defaultdict(set)
+        ordered: List[ASTProcedure] = []
+        for procedure in procedures:
+            key = self._procedure_identity(procedure)
+            existing = canonical.get(key)
+            if existing is None:
+                canonical[key] = procedure
+                ordered.append(procedure)
+                if procedure.aliases:
+                    alias_offsets[procedure.name].update(procedure.aliases)
+            else:
+                alias_offsets[existing.name].add(procedure.entry_offset)
+                if procedure.aliases:
+                    alias_offsets[existing.name].update(procedure.aliases)
+        for procedure in ordered:
+            offsets = alias_offsets.get(procedure.name)
+            if offsets:
+                combined = set(procedure.aliases)
+                combined.update(offsets)
+                procedure.aliases = tuple(sorted(combined))
+        return ordered
+
+    def _procedure_identity(self, procedure: ASTProcedure) -> Tuple[Any, ...]:
+        label_map = {
+            block.label: f"B{index}" for index, block in enumerate(procedure.blocks)
+        }
+
+        def canonicalize(text: str) -> str:
+            updated = text
+            for label, alias in label_map.items():
+                updated = re.sub(rf"\b{re.escape(label)}\b", alias, updated)
+            return updated
+
+        block_keys: List[Tuple[str, Tuple[str, ...], Tuple[str, ...]]] = []
+        for block in procedure.blocks:
+            alias = label_map.get(block.label, block.label)
+            statements = tuple(canonicalize(stmt.render()) for stmt in block.statements)
+            successors = tuple(
+                sorted(
+                    label_map.get(successor.label, successor.label)
+                    for successor in block.successors
+                )
+            )
+            block_keys.append((alias, statements, successors))
+        exit_keys = tuple(
+            sorted(
+                (
+                    label_map.get(exit.label, exit.label),
+                    tuple(reason.kind for reason in exit.reasons),
+                )
+                for exit in procedure.exits
+            )
+        )
+        result_key = (
+            procedure.result.kind.value,
+            procedure.result.required_slots,
+            procedure.result.optional_slots,
+            procedure.result.varargs,
+        )
+        return (tuple(block_keys), exit_keys, result_key)
 
     @staticmethod
     def _normalise_entry_reasons(reasons: Set[str]) -> Tuple[str, ...]:
         if not reasons:
             return ("component",)
         return tuple(sorted(reasons))
+
+    def _rebuild_block_links(self, blocks: Sequence[ASTBlock]) -> None:
+        if not blocks:
+            return
+        offset_map = {block.start_offset: block for block in blocks}
+
+        def resolve(target: Optional[ASTBlock], offset: Optional[int]) -> Optional[ASTBlock]:
+            if target is not None:
+                return target
+            if offset is not None:
+                return offset_map.get(offset)
+            return None
+
+        for block in blocks:
+            successors: List[ASTBlock] = []
+            terminator = block.terminator
+
+            def add(candidate: Optional[ASTBlock]) -> None:
+                if candidate is not None and candidate not in successors:
+                    successors.append(candidate)
+
+            if isinstance(terminator, ASTJump):
+                target_block = resolve(terminator.target, terminator.target_offset)
+                if target_block is not None:
+                    terminator.target = target_block
+                    terminator.target_offset = target_block.start_offset
+                    terminator.hint = None
+                add(target_block)
+            elif isinstance(
+                terminator,
+                (ASTBranch, ASTTestSet, ASTFlagCheck, ASTFunctionPrologue),
+            ):
+                then_block = resolve(terminator.then_branch, getattr(terminator, "then_offset", None))
+                else_block = resolve(terminator.else_branch, getattr(terminator, "else_offset", None))
+                if then_block is not None:
+                    terminator.then_branch = then_block
+                    terminator.then_offset = then_block.start_offset
+                    terminator.then_hint = None
+                if else_block is not None:
+                    terminator.else_branch = else_block
+                    terminator.else_offset = else_block.start_offset
+                    terminator.else_hint = None
+                add(then_block)
+                add(else_block)
+            analysis = self._current_analyses.get(block.start_offset)
+            if analysis:
+                for target_offset in analysis.successors:
+                    candidate = offset_map.get(target_offset)
+                    add(candidate)
+                if analysis.fallthrough is not None:
+                    candidate = offset_map.get(analysis.fallthrough)
+                    add(candidate)
+            block.successors = tuple(
+                sorted(successors, key=lambda entry: entry.start_offset)
+            )
+
+        predecessor_lists: Dict[int, List[ASTBlock]] = {
+            id(block): [] for block in blocks
+        }
+        for block in blocks:
+            for successor in block.successors:
+                key = id(successor)
+                if key in predecessor_lists:
+                    predecessor_lists[key].append(block)
+        for block in blocks:
+            preds = predecessor_lists.get(id(block), [])
+            preds.sort(key=lambda entry: entry.start_offset)
+            block.predecessors = tuple(preds)
+
+    def _infer_procedure_result(self, blocks: Sequence[ASTBlock]) -> ASTProcedureResult:
+        payloads: List[ASTReturnPayload] = []
+        for block in blocks:
+            terminator = block.terminator
+            if isinstance(terminator, ASTReturn):
+                payloads.append(terminator.payload)
+            elif isinstance(terminator, ASTTailCall):
+                payloads.append(terminator.payload)
+        if not payloads:
+            return ASTProcedureResult(ASTProcedureResultKind.VOID)
+        total = len(payloads)
+        presence: Dict[int, int] = defaultdict(int)
+        for payload in payloads:
+            for index in range(len(payload.values)):
+                presence[index] += 1
+        required = tuple(
+            sorted(index for index, count in presence.items() if count == total)
+        )
+        optional = tuple(
+            sorted(index for index, count in presence.items() if 0 < count < total)
+        )
+        varargs = any(payload.varargs for payload in payloads)
+        if not presence:
+            kind = (
+                ASTProcedureResultKind.VARIADIC
+                if varargs
+                else ASTProcedureResultKind.VOID
+            )
+            return ASTProcedureResult(kind=kind, varargs=varargs)
+        unique_lengths = {
+            len(payload.values) for payload in payloads if not payload.varargs
+        }
+        if varargs:
+            kind = ASTProcedureResultKind.VARIADIC
+        elif len(unique_lengths) <= 1 and not optional:
+            kind = ASTProcedureResultKind.FIXED
+        else:
+            kind = ASTProcedureResultKind.SPARSE
+        return ASTProcedureResult(
+            kind=kind,
+            required_slots=required,
+            optional_slots=optional,
+            varargs=varargs,
+        )
 
     def _finalise_procedure(
         self,
@@ -1011,6 +1373,7 @@ class ASTBuilder:
         )
         if not simplified_blocks:
             return None
+        self._rebuild_block_links(simplified_blocks)
         synthetic_only = True
         for block in simplified_blocks:
             analysis = self._current_analyses.get(block.start_offset)
@@ -1075,17 +1438,11 @@ class ASTBuilder:
             block.label: tuple(sorted(successor.label for successor in block.successors))
             for block in simplified_blocks
         }
-        predecessor_accum: Dict[str, List[str]] = {
-            block.label: [] for block in simplified_blocks
+        predecessor_map: Dict[str, Tuple[str, ...]] = {
+            block.label: tuple(sorted(pred.label for pred in block.predecessors))
+            for block in simplified_blocks
         }
-        for block in simplified_blocks:
-            for successor in block.successors:
-                if successor.label in predecessor_accum:
-                    predecessor_accum[successor.label].append(block.label)
-        predecessor_map = {
-            label: tuple(sorted(values))
-            for label, values in predecessor_accum.items()
-        }
+        result_summary = self._infer_procedure_result(simplified_blocks)
         return ASTProcedure(
             name=name,
             blocks=simplified_blocks,
@@ -1093,6 +1450,8 @@ class ASTBuilder:
             exits=tuple(exit_points),
             successor_map=successor_map,
             predecessor_map=predecessor_map,
+            result=result_summary,
+            aliases=tuple(),
         )
 
     def _collect_entry_blocks(
@@ -2800,10 +3159,14 @@ class ASTBuilder:
             and not tail_allowed
         ):
             return None
+        ensure_protocol = any(isinstance(effect, ASTFrameEffect) for effect in effects)
+        normalised_effects = self._normalise_effect_list(
+            effects, ensure_protocol=ensure_protocol
+        )
         return ASTCallABI(
             slots=tuple(slots),
             returns=tuple(return_slots),
-            effects=tuple(effects),
+            effects=normalised_effects,
             live_mask=mask_field,
             tail=tail_allowed,
         )
@@ -2917,12 +3280,12 @@ class ASTBuilder:
                 )
             )
 
-        unique: Dict[Tuple[Any, ...], ASTEffect] = {}
-        for effect in effects:
-            key = self._effect_identity(effect)
-            unique[key] = effect
-        ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
-        return tuple(ordered)
+        ensure_protocol = policy.has_effects() or any(
+            isinstance(effect, ASTFrameEffect) for effect in effects
+        )
+        return self._normalise_effect_list(
+            effects, ensure_protocol=ensure_protocol
+        )
 
     def _convert_call(
         self,

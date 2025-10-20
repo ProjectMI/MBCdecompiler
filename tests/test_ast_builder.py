@@ -12,6 +12,7 @@ from mbcdisasm.ast import (
     ASTCallStatement,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
+    ASTFrameResetEffect,
     ASTFrameMaskEffect,
     ASTFrameProtocolEffect,
     ASTFrameTeardownEffect,
@@ -22,6 +23,7 @@ from mbcdisasm.ast import (
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTProcedureResultKind,
     ASTSymbolTypeFamily,
 )
 from mbcdisasm.ir.model import (
@@ -69,6 +71,8 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     assert procedure.entry.reasons
     assert all(exit.reasons for exit in procedure.exits)
     assert procedure.blocks
+    assert isinstance(procedure.result.kind, ASTProcedureResultKind)
+    assert isinstance(procedure.aliases, tuple)
 
     block = procedure.blocks[0]
     assert isinstance(block.successors, tuple)
@@ -76,6 +80,17 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     assert any("call" in line for line in rendered)
     assert any(line.startswith("return") for line in rendered)
     assert procedure.name == f"proc_{procedure.entry_offset:04X}"
+    for block in procedure.blocks:
+        expected_succ = tuple(
+            sorted(successor.label for successor in block.successors)
+        )
+        expected_pred = tuple(sorted(pred.label for pred in block.predecessors))
+        assert procedure.successor_map[block.label] == expected_succ
+        assert procedure.predecessor_map[block.label] == expected_pred
+
+    symbol_names = {signature.name for signature in ast_program.symbols}
+    assert any(name.startswith("io.") for name in symbol_names)
+    assert any(name.startswith("helpers.") or name.startswith("tail_helper_") for name in symbol_names)
 
     summary = ast_program.metrics.describe()
     assert "procedures=" in summary
@@ -120,6 +135,8 @@ def test_ast_builder_splits_after_return_sequences() -> None:
     assert tuple(exit.offset for exit in first.exits) == (0x0100,)
     assert first.exits[0].reasons and first.exits[0].reasons[0].kind == "return"
     assert len(first.blocks) == 1
+    assert first.result.kind == ASTProcedureResultKind.FIXED
+    assert first.result.required_slots == (0,)
 
 
 def test_ast_builder_uses_postdominators_for_exits() -> None:
@@ -155,6 +172,70 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     procedure = ast_segment.procedures[0]
     assert tuple(sorted(exit.offset for exit in procedure.exits)) == (0x0210, 0x0220)
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
+    assert procedure.result.kind == ASTProcedureResultKind.FIXED
+    assert procedure.result.required_slots == (0,)
+
+
+def test_ast_builder_marks_sparse_procedure_results() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x40,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0300,
+                nodes=(IRIf(condition="flag", then_target=0x0310, else_target=0x0320),),
+            ),
+            IRBlock(
+                label="block_then",
+                start_offset=0x0310,
+                nodes=(IRReturn(values=("ret0",), varargs=False),),
+            ),
+            IRBlock(
+                label="block_else",
+                start_offset=0x0320,
+                nodes=(IRReturn(values=("ret0", "ret1"), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+
+    assert procedure.result.kind == ASTProcedureResultKind.SPARSE
+    assert procedure.result.required_slots == (0,)
+    assert procedure.result.optional_slots == (1,)
+    assert not procedure.result.varargs
+
+
+def test_ast_builder_marks_variadic_procedure_results() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x20,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0400,
+                nodes=(IRReturn(values=("ret0",), varargs=True),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+
+    assert procedure.result.kind == ASTProcedureResultKind.VARIADIC
+    assert procedure.result.required_slots == (0,)
+    assert procedure.result.optional_slots == ()
+    assert procedure.result.varargs
 
 
 def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
@@ -196,6 +277,36 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert not segment.enums
     assert not ast_program.enums
     assert isinstance(statements[1], ASTReturn)
+
+
+def test_ast_builder_deduplicates_identical_procedures() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x20,
+        blocks=(
+            IRBlock(
+                label="block_a",
+                start_offset=0x1000,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="block_b",
+                start_offset=0x1010,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedures = ast_program.segments[0].procedures
+    assert len(procedures) == 1
+    procedure = procedures[0]
+    assert procedure.aliases == (0x1010,)
+    assert procedure.result.kind == ASTProcedureResultKind.VOID
 
 
 def test_ast_builder_converts_dispatch_with_leading_call() -> None:
@@ -886,7 +997,9 @@ def test_epilogue_effects_are_deduplicated() -> None:
     procedure = ast_program.segments[0].procedures[0]
     terminator = procedure.blocks[0].statements[-1]
     assert isinstance(terminator, ASTReturn)
-    assert len(terminator.effects) == 1
+    assert len(terminator.effects) == 2
+    assert isinstance(terminator.effects[0], ASTFrameProtocolEffect)
+    assert any(isinstance(effect, ASTFrameResetEffect) for effect in terminator.effects)
 
 
 def test_testset_branch_desugars_into_assignment() -> None:
