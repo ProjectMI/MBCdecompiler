@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -24,6 +25,7 @@ from ..ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRLoad,
+    IRTablePatch,
     IRSlot,
     IRProgram,
     IRReturn,
@@ -38,7 +40,6 @@ from ..ir.model import (
     IRStackEffect,
     MemRef,
     MemSpace,
-    SSAValueKind,
 )
 
 
@@ -226,6 +227,8 @@ from .model import (
     ASTFunctionPrologue,
     ASTJump,
     ASTTerminator,
+    ASTTypeFlavor,
+    ASTValueType,
     ASTSwitch,
     ASTSwitchCase,
     ASTDispatchHelper,
@@ -233,8 +236,11 @@ from .model import (
     ASTTailCall,
     ASTTestSet,
     ASTTupleExpr,
+    ASTTraceOperand,
     ASTUnknown,
     ASTViewElement,
+    ASTStackReference,
+    ASTAdaptiveTable,
 )
 
 
@@ -352,13 +358,13 @@ class _SignatureAccumulator:
 
     address: int
     symbols: Set[str] = field(default_factory=set)
-    argument_kinds: Dict[int, Set[SSAValueKind]] = field(
+    argument_types: Dict[int, Set[ASTValueType]] = field(
         default_factory=lambda: defaultdict(set)
     )
     argument_names: Dict[int, Set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
-    return_kinds: Dict[int, Set[SSAValueKind]] = field(
+    return_types: Dict[int, Set[ASTValueType]] = field(
         default_factory=lambda: defaultdict(set)
     )
     return_names: Dict[int, Set[str]] = field(
@@ -379,13 +385,13 @@ class _SignatureAccumulator:
             self.varargs = True
         for index, expr in enumerate(call.args):
             kind = expr.kind()
-            self.argument_kinds[index].add(kind)
+            self.argument_types[index].add(kind)
             name = self._expr_name(expr)
             if name:
                 self.argument_names[index].add(name)
         for index, expr in enumerate(returns):
             kind = expr.kind()
-            self.return_kinds[index].add(kind)
+            self.return_types[index].add(kind)
             name = self._expr_name(expr)
             if name:
                 self.return_names[index].add(name)
@@ -540,22 +546,22 @@ class ASTBuilder:
             arguments = tuple(
                 ASTSignatureValue(
                     index=index,
-                    kind=self._select_signature_kind(kinds),
+                    type=self._select_signature_type(kinds),
                     name=self._select_signature_name(
                         accumulator.argument_names.get(index, set())
                     ),
                 )
-                for index, kinds in sorted(accumulator.argument_kinds.items())
+                for index, kinds in sorted(accumulator.argument_types.items())
             )
             returns = tuple(
                 ASTSignatureValue(
                     index=index,
-                    kind=self._select_signature_kind(kinds),
+                    type=self._select_signature_type(kinds),
                     name=self._select_signature_name(
                         accumulator.return_names.get(index, set())
                     ),
                 )
-                for index, kinds in sorted(accumulator.return_kinds.items())
+                for index, kinds in sorted(accumulator.return_types.items())
             )
             signatures.append(
                 ASTSymbolSignature(
@@ -570,32 +576,29 @@ class ASTBuilder:
         return tuple(signatures)
 
     @staticmethod
-    def _select_signature_kind(kinds: Set[SSAValueKind]) -> SSAValueKind:
+    def _select_signature_type(kinds: Set[ASTValueType]) -> ASTValueType:
         if not kinds:
-            return SSAValueKind.UNKNOWN
-        priority = [
-            SSAValueKind.BOOLEAN,
-            SSAValueKind.BYTE,
-            SSAValueKind.WORD,
-            SSAValueKind.POINTER,
-            SSAValueKind.IO,
-            SSAValueKind.PAGE_REGISTER,
-            SSAValueKind.IDENTIFIER,
+            return ASTValueType.opaque()
+        filtered = [
+            value
+            for value in kinds
+            if value.flavor not in {ASTTypeFlavor.OPAQUE, ASTTypeFlavor.TOKEN}
         ]
-        for candidate in priority:
-            if candidate in kinds and candidate is not SSAValueKind.UNKNOWN:
-                return candidate
-        if SSAValueKind.UNKNOWN in kinds:
-            return SSAValueKind.UNKNOWN
-        return sorted(kinds, key=lambda kind: kind.name)[0]
+        candidates = filtered or list(kinds)
+        return sorted(candidates, key=lambda value: value.order_key())[0]
 
     @staticmethod
     def _select_signature_name(names: Set[str]) -> Optional[str]:
-        filtered = sorted(
-            name for name in names if name and all(ch not in name for ch in ":@")
-        )
-        if filtered:
-            return filtered[0]
+        candidates: List[str] = []
+        for name in names:
+            if not name or any(ch in name for ch in ":@"):
+                continue
+            lowered = name.lower()
+            if re.fullmatch(r"(id|value|tmp|unk)\d+", lowered):
+                continue
+            candidates.append(name)
+        if candidates:
+            return sorted(candidates)[0]
         return None
 
     @staticmethod
@@ -2016,9 +2019,12 @@ class ASTBuilder:
                 self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
             return [], []
         if isinstance(node, IRLoad):
-            target = ASTIdentifier(node.target, self._infer_kind(node.target))
+            target = ASTIdentifier(node.target, self._infer_type(node.target))
             location = self._build_slot_location(node.slot)
-            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+            expr = ASTMemoryRead(
+                location=location,
+                value_kind=self._slot_value_type(node.slot),
+            )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
@@ -2042,7 +2048,10 @@ class ASTBuilder:
                 else None
             )
             location = self._build_banked_location(node, pointer_expr, offset_expr)
-            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.WORD)
+            expr = ASTMemoryRead(
+                location=location,
+                value_kind=ASTValueType.integer(16),
+            )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
@@ -2050,7 +2059,7 @@ class ASTBuilder:
             metrics.observe_load(pointer_known and offset_known)
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=ASTIdentifier(node.target, self._infer_type(node.target)),
                     value=expr,
                 )
             ], []
@@ -2079,7 +2088,7 @@ class ASTBuilder:
             )
             location = self._build_indirect_location(node, pointer, offset_expr)
             expr = ASTMemoryRead(
-                location=location, value_kind=self._infer_indirect_kind(pointer)
+                location=location, value_kind=self._infer_indirect_type(pointer)
             )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
@@ -2088,7 +2097,7 @@ class ASTBuilder:
             )
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=ASTIdentifier(node.target, self._infer_type(node.target)),
                     value=expr,
                 )
             ], []
@@ -2156,7 +2165,11 @@ class ASTBuilder:
                 len(call_expr.args),
             )
             abi = self._build_call_abi(node, arg_exprs)
-            epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
+            epilogue_effects, protocol = self._build_epilogue_effects(
+                node.cleanup, node.abi_effects
+            )
+            if abi is not None and protocol is not None:
+                abi = replace(abi, protocol=protocol)
             resolved_returns = tuple(
                 self._canonicalise_return_expr(
                     index, self._resolve_expr(name, value_state)
@@ -2174,7 +2187,7 @@ class ASTBuilder:
             return statements, []
         if isinstance(node, IRReturn):
             payload = self._build_return_payload(node, value_state)
-            effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
+            effects, _ = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             return [ASTReturn(payload=payload, effects=effects)], []
         if isinstance(node, IRCallCleanup):
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
@@ -2205,7 +2218,7 @@ class ASTBuilder:
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            target = ASTIdentifier(node.var, self._infer_kind(node.var))
+            target = ASTIdentifier(node.var, self._infer_type(node.var))
             value_state[node.var] = target
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             assignment = ASTAssign(target=target, value=expr)
@@ -2257,6 +2270,9 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRTablePatch):
+            table = self._convert_table_patch(node)
+            return [table], []
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
@@ -2300,13 +2316,16 @@ class ASTBuilder:
         return ASTIntegerLiteral(value=value, bits=bits, sign=sign)
 
     @staticmethod
-    def _infer_indirect_kind(pointer: ASTExpression | None) -> SSAValueKind:
+    def _infer_indirect_type(pointer: ASTExpression | None) -> ASTValueType:
         if pointer is None:
-            return SSAValueKind.UNKNOWN
-        pointer_kind = pointer.kind()
-        if pointer_kind in {SSAValueKind.BYTE, SSAValueKind.BOOLEAN}:
-            return pointer_kind
-        return SSAValueKind.WORD
+            return ASTValueType.opaque("value")
+        pointer_type = pointer.kind()
+        if (
+            pointer_type.flavor is ASTTypeFlavor.INTEGER
+            and pointer_type.bits <= 8
+        ):
+            return pointer_type
+        return ASTValueType.integer(16)
 
     @staticmethod
     def _memref_descriptor(ref: Optional[MemRef]) -> ASTAddressDescriptor:
@@ -2463,8 +2482,7 @@ class ASTBuilder:
             return "frame.return_mask"
 
         if mnemonic in _FRAME_DROP_MNEMONICS or opcode in _DROP_OPCODE_FALLBACK:
-            if step.pops:
-                return "frame.drop"
+            return "frame.drop"
 
         if mnemonic in _IO_BRIDGE_MNEMONICS or opcode in _BRIDGE_OPCODE_FALLBACK:
             return "io.bridge"
@@ -2642,9 +2660,11 @@ class ASTBuilder:
         return_tokens = getattr(node, "returns", ())
         return_slots: List[ASTCallReturnSlot] = []
         for index, token in enumerate(return_tokens):
-            kind = self._infer_kind(token)
-            name = self._canonical_placeholder_name(token, index, kind)
-            return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
+            value_type = self._infer_type(token)
+            name = self._canonical_placeholder_name(token, index, value_type)
+            return_slots.append(
+                ASTCallReturnSlot(index=index, type=value_type, name=name)
+            )
         tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
         if (
             not slots
@@ -2654,18 +2674,22 @@ class ASTBuilder:
             and not tail_allowed
         ):
             return None
+        protocol_effect: Optional[ASTFrameProtocolEffect] = None
+        abi_varargs = bool(getattr(node, "varargs", False))
         return ASTCallABI(
             slots=tuple(slots),
             returns=tuple(return_slots),
             effects=tuple(effects),
             live_mask=mask_field,
             tail=tail_allowed,
+            varargs=abi_varargs,
+            protocol=protocol_effect,
         )
 
     def _build_return_identifier(self, name: str, index: int) -> ASTIdentifier:
-        kind = self._infer_kind(name)
-        canonical = self._canonical_placeholder_name(name, index, kind)
-        return ASTIdentifier(canonical, kind)
+        value_type = self._infer_type(name)
+        canonical = self._canonical_placeholder_name(name, index, value_type)
+        return ASTIdentifier(canonical, value_type)
 
     def _canonicalise_return_expr(
         self, index: int, expr: ASTExpression
@@ -2679,9 +2703,9 @@ class ASTBuilder:
             token = expr.token
             if token and token.startswith("ret"):
                 canonical = self._canonical_placeholder_name(
-                    token, index, SSAValueKind.UNKNOWN
+                    token, index, ASTValueType.opaque()
                 )
-                return ASTIdentifier(canonical, SSAValueKind.UNKNOWN)
+                return ASTIdentifier(canonical, ASTValueType.opaque())
         return expr
 
     def _build_return_payload(
@@ -2722,7 +2746,7 @@ class ASTBuilder:
         self,
         cleanup_steps: Sequence[IRStackEffect],
         abi_effects: Sequence[IRAbiEffect],
-    ) -> Tuple[ASTEffect, ...]:
+    ) -> Tuple[Tuple[ASTEffect, ...], Optional[ASTFrameProtocolEffect]]:
         combined = list(self._pending_epilogue)
         combined.extend(cleanup_steps)
         self._pending_epilogue = []
@@ -2760,28 +2784,28 @@ class ASTBuilder:
             if converted:
                 effects.append(converted)
 
-        effects.extend(self._policy_effects(policy))
-
+        protocol_effect: Optional[ASTFrameProtocolEffect] = None
         if policy.has_effects():
             masks = tuple(
                 self._bitfield(value, alias)
                 for value, alias in policy.masks
                 if value is not None
             )
-            effects.append(
-                ASTFrameProtocolEffect(
-                    masks=masks,
-                    teardown=policy.teardown,
-                    drops=policy.drops,
-                )
+            protocol_effect = ASTFrameProtocolEffect(
+                masks=masks,
+                teardown=policy.teardown,
+                drops=policy.drops,
             )
+            effects.append(protocol_effect)
+
+        effects.extend(self._policy_effects(policy))
 
         unique: Dict[Tuple[Any, ...], ASTEffect] = {}
         for effect in effects:
             key = self._effect_identity(effect)
             unique[key] = effect
         ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
-        return tuple(ordered)
+        return tuple(ordered), protocol_effect
 
     def _convert_call(
         self,
@@ -2798,6 +2822,45 @@ class ASTBuilder:
             if token and not isinstance(expr, ASTUnknown):
                 self._call_arg_values[token] = expr
         return call_expr, arg_exprs
+
+    def _convert_table_patch(self, node: IRTablePatch) -> ASTAdaptiveTable:
+        mode = self._extract_table_mode(node)
+        variant: Optional[str] = None
+        metadata: List[str] = []
+        for note in node.annotations:
+            if not note:
+                continue
+            lowered = note.lower()
+            if lowered == "adaptive_table":
+                continue
+            if lowered.startswith("mode=0x"):
+                try:
+                    mode = int(lowered[6:], 16)
+                except ValueError:
+                    pass
+                continue
+            if lowered.startswith("kind="):
+                variant = lowered.split("=", 1)[1]
+                continue
+            metadata.append(note)
+        unique_meta = sorted(dict.fromkeys(metadata))
+        return ASTAdaptiveTable(
+            mode=mode,
+            operations=tuple(node.operations),
+            variant=variant,
+            metadata=tuple(unique_meta),
+        )
+
+    @staticmethod
+    def _extract_table_mode(node: IRTablePatch) -> int:
+        for mnemonic, _ in node.operations:
+            match = re.fullmatch(r"op_[0-9A-Fa-f]{2}_([0-9A-Fa-f]{2})", mnemonic)
+            if match:
+                try:
+                    return int(match.group(1), 16)
+                except ValueError:
+                    continue
+        return 0
 
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
@@ -2826,8 +2889,20 @@ class ASTBuilder:
                 return ASTUnknown(token)
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
-            return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
-        return ASTIdentifier(token, self._infer_kind(token))
+            return ASTMemoryRead(
+                location=location,
+                value_kind=self._slot_value_type(slot),
+            )
+        trace_match = re.fullmatch(r"([0-9A-Fa-f]{2}):([0-9A-Fa-f]{2})@0x([0-9A-Fa-f]{4})", token)
+        if trace_match:
+            opcode = int(trace_match.group(1), 16)
+            mode = int(trace_match.group(2), 16)
+            offset = int(trace_match.group(3), 16)
+            return ASTTraceOperand(opcode=opcode, mode=mode, offset=offset)
+        if token in {"stack", "stack_top"}:
+            marker = "cursor" if token == "stack" else "top"
+            return ASTStackReference(marker)
+        return ASTIdentifier(token, self._infer_type(token))
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
@@ -2839,42 +2914,39 @@ class ASTBuilder:
             space = MemSpace.CONST
         return IRSlot(space=space, index=index)
 
-    def _infer_kind(self, name: str) -> SSAValueKind:
+    @staticmethod
+    def _slot_value_type(slot: IRSlot) -> ASTValueType:
+        mapping = {
+            MemSpace.FRAME: ASTAddressSpace.FRAME,
+            MemSpace.GLOBAL: ASTAddressSpace.GLOBAL,
+            MemSpace.CONST: ASTAddressSpace.CONST,
+        }
+        space = mapping.get(slot.space, ASTAddressSpace.UNKNOWN)
+        return ASTValueType.pointer(space=space)
+
+    def _infer_type(self, name: str) -> ASTValueType:
         lowered = name.lower()
         if lowered.startswith("bool"):
-            return SSAValueKind.BOOLEAN
+            return ASTValueType.boolean()
         if lowered.startswith("word"):
-            return SSAValueKind.WORD
+            return ASTValueType.integer(16)
         if lowered.startswith("byte"):
-            return SSAValueKind.BYTE
+            return ASTValueType.integer(8)
         if lowered.startswith("ptr"):
-            return SSAValueKind.POINTER
+            return ASTValueType.pointer(space=ASTAddressSpace.MEMORY)
         if lowered.startswith("page"):
-            return SSAValueKind.PAGE_REGISTER
+            return ASTValueType.handle("page_register", space=ASTAddressSpace.MEMORY)
         if lowered.startswith("io"):
-            return SSAValueKind.IO
+            return ASTValueType.handle("io", space=ASTAddressSpace.IO)
         if lowered.startswith("id"):
-            return SSAValueKind.IDENTIFIER
-        return SSAValueKind.UNKNOWN
-
-    @staticmethod
-    def _ret_prefix(kind: SSAValueKind) -> str:
-        mapping = {
-            SSAValueKind.BOOLEAN: "flag",
-            SSAValueKind.BYTE: "byte",
-            SSAValueKind.WORD: "word",
-            SSAValueKind.POINTER: "ptr",
-            SSAValueKind.IO: "io",
-            SSAValueKind.PAGE_REGISTER: "page",
-            SSAValueKind.IDENTIFIER: "id",
-        }
-        return mapping.get(kind, "value")
+            return ASTValueType.handle("identifier")
+        return ASTValueType.opaque()
 
     def _canonical_placeholder_name(
-        self, token: str, index: int, kind: SSAValueKind
+        self, token: str, index: int, value_type: ASTValueType
     ) -> str:
         if token.startswith("ret"):
-            prefix = self._ret_prefix(kind)
+            prefix = value_type.shorthand()
             return f"{prefix}{index}"
         return token
 

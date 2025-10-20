@@ -3,6 +3,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTAdaptiveTable,
     ASTAssign,
     ASTBranch,
     ASTBuilder,
@@ -19,6 +20,7 @@ from mbcdisasm.ast import (
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTTypeFlavor,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -34,6 +36,7 @@ from mbcdisasm.ir.model import (
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTablePatch,
     IRTestSetBranch,
     IRTailCall,
     IRStackEffect,
@@ -41,7 +44,6 @@ from mbcdisasm.ir.model import (
     MemRef,
     MemSpace,
     NormalizerMetrics,
-    SSAValueKind,
 )
 
 from tests.test_ir_normalizer import build_container
@@ -793,8 +795,12 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     assert 0x6601 in symbols
     signature = symbols[0x6601]
     assert signature.name == "helper_6601"
-    assert tuple(value.kind for value in signature.arguments) == (SSAValueKind.POINTER,)
-    assert tuple(value.kind for value in signature.returns) == (SSAValueKind.UNKNOWN,)
+    assert tuple(arg.type.flavor for arg in signature.arguments) == (
+        ASTTypeFlavor.POINTER,
+    )
+    assert tuple(ret.type.flavor for ret in signature.returns) == (
+        ASTTypeFlavor.OPAQUE,
+    )
 
 
 def test_epilogue_effects_are_deduplicated() -> None:
@@ -821,7 +827,55 @@ def test_epilogue_effects_are_deduplicated() -> None:
     procedure = ast_program.segments[0].procedures[0]
     terminator = procedure.blocks[0].statements[-1]
     assert isinstance(terminator, ASTReturn)
-    assert len(terminator.effects) == 1
+    protocol = [
+        effect
+        for effect in terminator.effects
+        if isinstance(effect, ASTFrameProtocolEffect)
+    ]
+    assert len(protocol) == 1
+    frame_effects = [
+        effect
+        for effect in terminator.effects
+        if isinstance(effect, ASTFrameEffect)
+    ]
+    assert len(frame_effects) == 1
+    assert frame_effects[0].operation is ASTFrameOperation.DROP
+    assert frame_effects[0].pops == protocol[0].drops
+
+
+def test_table_patch_converts_to_adaptive_table() -> None:
+    patch = IRTablePatch(
+        operations=(
+            ("op_2C_10", 0x6610),
+            ("op_2C_11", 0x6611),
+            ("op_04_00", 0x0000),
+        ),
+        annotations=("adaptive_table", "mode=0x10", "kind=unknown", "meta=test"),
+    )
+    block = IRBlock(
+        label="block_patch",
+        start_offset=0x0400,
+        nodes=(patch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].body
+    assert statements
+    table_stmt = statements[0]
+    assert isinstance(table_stmt, ASTAdaptiveTable)
+    assert table_stmt.mode == 0x10
+    assert table_stmt.operations == patch.operations
+    assert table_stmt.variant == "unknown"
+    assert table_stmt.metadata == ("meta=test",)
 
 
 def test_testset_branch_desugars_into_assignment() -> None:
@@ -884,5 +938,5 @@ def test_banked_memory_locations_are_canonical() -> None:
     assert isinstance(assign, ASTAssign)
     rendered = assign.value.render()
     assert rendered.startswith("mem.bank_1230{alias=region(bank_1230)}")
-    assert ".page(0x01)" in rendered
-    assert ".base(0x0040)" in rendered
+    assert "page=0x01" in rendered
+    assert "base=0x0040" in rendered
