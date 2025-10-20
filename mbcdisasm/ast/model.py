@@ -104,81 +104,79 @@ class ASTSliceElement(ASTAccessPathElement):
         return f"0x{value:04X}"
 
 
-@dataclass(frozen=True)
-class ASTBankElement(ASTAccessPathElement):
-    """Access a fixed memory bank."""
-
-    value: int
-
-    def render(self) -> str:
-        return f".bank(0x{self.value:04X})"
-
-
-@dataclass(frozen=True)
-class ASTPageElement(ASTAccessPathElement):
-    """Reference a concrete memory page."""
-
-    value: int
-    alias: Optional[str] = None
-
-    def render(self) -> str:
-        if self.alias:
-            return f".page({self.alias})"
-        return f".page(0x{self.value:02X})"
+def _format_hex(value: int) -> str:
+    if value < 0:
+        raise ValueError("address components must be non-negative")
+    if value <= 0xFF:
+        width = 2
+    elif value <= 0xFFFF:
+        width = 4
+    elif value <= 0xFFFFFF:
+        width = 6
+    else:
+        width = 8
+    return f"0x{value:0{width}X}"
 
 
 @dataclass(frozen=True)
-class ASTPageRegisterElement(ASTAccessPathElement):
-    """Reference an indirect page register."""
+class ASTAddressTerm(ASTAccessPathElement):
+    """Canonical description of address metadata for a memory access."""
 
-    register: int
-
-    def render(self) -> str:
-        return f".page_reg(0x{self.register:04X})"
-
-
-@dataclass(frozen=True)
-class ASTBaseElement(ASTAccessPathElement):
-    """Reference a fixed base offset in a banked region."""
-
-    value: int
-
-    def render(self) -> str:
-        return f".base(0x{self.value:04X})"
-
-
-@dataclass(frozen=True)
-class ASTOffsetElement(ASTAccessPathElement):
-    """Access a fixed offset within a page or slot."""
-
-    value: int
+    space: Optional[str] = None
+    region: Optional[str] = None
+    bank: Optional[int] = None
+    page: Optional[int] = None
+    page_alias: Optional[str] = None
+    register: Optional[int] = None
+    base: Optional[int] = None
+    pointer: Optional["ASTExpression"] = None
+    slot_space: Optional[str] = None
+    slot_index: Optional["ASTExpression"] = None
+    offset: Optional["ASTExpression"] = None
 
     def render(self) -> str:
-        return f".offset(0x{self.value:04X})"
+        parts: List[str] = []
+        if self.space:
+            parts.append(f"space={self.space}")
+        if self.region:
+            parts.append(f"region={self.region}")
+        if self.bank is not None:
+            parts.append(f"bank={_format_hex(self.bank)}")
+        if self.page_alias:
+            parts.append(f"page={self.page_alias}")
+        elif self.page is not None:
+            parts.append(f"page={_format_hex(self.page)}")
+        if self.register is not None:
+            parts.append(f"register={_format_hex(self.register)}")
+        if self.base is not None:
+            parts.append(f"base={_format_hex(self.base)}")
+        if self.pointer is not None:
+            parts.append(f"pointer={self.pointer.render()}")
+        if self.slot_space is not None:
+            index_text = (
+                self.slot_index.render() if self.slot_index is not None else "?"
+            )
+            parts.append(f"slot={self.slot_space}:{index_text}")
+        if self.offset is not None:
+            parts.append(f"offset={self.offset.render()}")
+        inner = ", ".join(parts)
+        return f".addr({inner})" if inner else ".addr()"
 
-
-@dataclass(frozen=True)
-class ASTViewElement(ASTAccessPathElement):
-    """Describe a view of a pointer indexed collection."""
-
-    kind: str
-    index: Optional["ASTExpression"] = None
-
-    def render(self) -> str:
-        if self.index is None:
-            return f".view({self.kind})"
-        return f".view({self.kind}, index={self.index.render()})"
-
-
-@dataclass(frozen=True)
-class ASTSlotElement(ASTAccessPathElement):
-    """Reference a slot within a typed address space."""
-
-    space: str
-    index: "ASTExpression"
-
-    def render(self) -> str:
-        return f".slot(space={self.space}, index={self.index.render()})"
+    def is_empty(self) -> bool:
+        return not any(
+            [
+                self.space,
+                self.region,
+                self.bank is not None,
+                self.page is not None,
+                self.page_alias,
+                self.register is not None,
+                self.base is not None,
+                self.pointer is not None,
+                self.slot_space is not None,
+                self.offset is not None,
+            ]
+        )
 
 
 def _default_alias() -> ASTAliasInfo:
@@ -302,17 +300,6 @@ class ASTIOOperation(Enum):
     BRIDGE = "bridge"
 
 
-class ASTFrameOperation(Enum):
-    PROTOCOL = "protocol"
-    WRITE = "write"
-    RESET = "reset"
-    TEARDOWN = "teardown"
-    RETURN_MASK = "return_mask"
-    PAGE_SELECT = "page_select"
-    DROP = "drop"
-    CLEANUP = "cleanup"
-
-
 class ASTHelperOperation(Enum):
     INVOKE = "invoke"
     FANOUT = "fanout"
@@ -354,46 +341,107 @@ class ASTIOEffect(ASTEffect):
         return f"io.{self.operation.value}({self.port}{mask_text})"
 
 
-@dataclass(frozen=True)
-class ASTFrameEffect(ASTEffect):
-    """Side effects on the active frame."""
+class ASTFrameEffectBase(ASTEffect):
+    """Base class shared by all frame effect descriptors."""
 
     domain_order: ClassVar[int] = 1
-    _order_map: ClassVar[Dict[ASTFrameOperation, int]] = {
-        ASTFrameOperation.PROTOCOL: 0,
-        ASTFrameOperation.WRITE: 1,
-        ASTFrameOperation.RESET: 2,
-        ASTFrameOperation.TEARDOWN: 3,
-        ASTFrameOperation.RETURN_MASK: 4,
-        ASTFrameOperation.PAGE_SELECT: 5,
-        ASTFrameOperation.DROP: 6,
-        ASTFrameOperation.CLEANUP: 7,
-    }
 
-    operation: ASTFrameOperation
+
+@dataclass(frozen=True)
+class ASTFrameMaskEffect(ASTFrameEffectBase):
+    """Live return mask propagated across the frame."""
+
+    mask: ASTBitField
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (self.domain_order, 0, self.mask.width, self.mask.value)
+
+    def render(self) -> str:
+        return f"frame.mask({self.mask.render()})"
+
+
+@dataclass(frozen=True)
+class ASTFrameWriteEffect(ASTFrameEffectBase):
+    """Frame write to a helper or channel."""
+
+    mask: ASTBitField
+    channel: Optional[str] = None
+
+    def order_key(self) -> Tuple[int, ...]:
+        channel_key = hash(self.channel or "") & 0xFFFF
+        return (self.domain_order, 1, channel_key, self.mask.width, self.mask.value)
+
+    def render(self) -> str:
+        channel_text = f"channel={self.channel}, " if self.channel else ""
+        return f"frame.write({channel_text}{self.mask.render()})"
+
+
+@dataclass(frozen=True)
+class ASTFrameResetEffect(ASTFrameEffectBase):
+    """Reset of a helper channel or shared register."""
+
+    mask: ASTBitField
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (self.domain_order, 2, self.mask.width, self.mask.value)
+
+    def render(self) -> str:
+        return f"frame.reset({self.mask.render()})"
+
+
+@dataclass(frozen=True)
+class ASTFrameTeardownEffect(ASTFrameEffectBase):
+    """Structured teardown consuming stack slots."""
+
+    pops: int
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (self.domain_order, 3, self.pops)
+
+    def render(self) -> str:
+        if self.pops:
+            return f"frame.teardown(pops={self.pops})"
+        return "frame.teardown()"
+
+
+@dataclass(frozen=True)
+class ASTFrameDropEffect(ASTFrameEffectBase):
+    """Drop values from the active frame."""
+
+    pops: int
+
+    def order_key(self) -> Tuple[int, ...]:
+        return (self.domain_order, 4, self.pops)
+
+    def render(self) -> str:
+        if self.pops:
+            return f"frame.drop(pops={self.pops})"
+        return "frame.drop()"
+
+
+@dataclass(frozen=True)
+class ASTFrameGenericEffect(ASTFrameEffectBase):
+    """Catch-all frame effect for protocol extensions."""
+
+    action: str
     operand: Optional[ASTBitField] = None
     pops: int = 0
     channel: Optional[str] = None
 
     def order_key(self) -> Tuple[int, ...]:
-        return (
-            self.domain_order,
-            self._order_map.get(self.operation, len(self._order_map)),
-            self.pops,
-        )
+        channel_key = hash(self.channel or "") & 0xFFFF
+        return (self.domain_order, 5, channel_key, self.pops)
 
     def render(self) -> str:
-        details: List[str] = []
+        parts: List[str] = []
         if self.channel:
-            details.append(f"channel={self.channel}")
+            parts.append(f"channel={self.channel}")
         if self.operand is not None:
-            details.append(self.operand.render())
+            parts.append(self.operand.render())
         if self.pops:
-            details.append(f"pops={self.pops}")
-        inner = ""
-        if details:
-            inner = ", ".join(details)
-        return f"frame.{self.operation.value}({inner})" if inner else f"frame.{self.operation.value}()"
+            parts.append(f"pops={self.pops}")
+        inner = ", ".join(parts)
+        return f"frame.{self.action}({inner})" if inner else f"frame.{self.action}()"
 
 
 @dataclass(frozen=True)
@@ -609,6 +657,49 @@ class ASTIdentifier(ASTExpression):
 
     def kind(self) -> SSAValueKind:
         return self.kind_hint
+
+
+@dataclass(frozen=True)
+class ASTStackReference(ASTExpression):
+    """Typed reference to a stack slot or top-of-stack marker."""
+
+    space: Optional[ASTAddressSpace] = None
+    index: Optional[ASTExpression] = None
+    label: Optional[str] = None
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.label:
+            parts.append(f"label={self.label}")
+        if self.space:
+            parts.append(f"space={self.space.value}")
+        if self.index is not None:
+            parts.append(f"index={self.index.render()}")
+        inner = ", ".join(parts)
+        return f"operand.stackref({inner})" if inner else "operand.stackref()"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.POINTER
+
+
+@dataclass(frozen=True)
+class ASTTraceReference(ASTExpression):
+    """Trace operand emitted by instrumentation helpers."""
+
+    channel: int
+    code: int
+    address: int
+
+    def render(self) -> str:
+        channel_text = _format_hex(self.channel)
+        code_text = _format_hex(self.code)
+        address_text = _format_hex(self.address)
+        return (
+            f"operand.trace(channel={channel_text}, code={code_text}, at={address_text})"
+        )
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.IDENTIFIER
 
 
 @dataclass(frozen=True)
@@ -1425,19 +1516,15 @@ __all__ = [
     "ASTStringLiteral",
     "ASTBytesLiteral",
     "ASTIdentifier",
+    "ASTStackReference",
+    "ASTTraceReference",
     "ASTSafeCastExpr",
     "ASTMemoryLocation",
     "ASTAccessPathElement",
     "ASTFieldElement",
     "ASTIndexElement",
     "ASTSliceElement",
-    "ASTBankElement",
-    "ASTPageElement",
-    "ASTPageRegisterElement",
-    "ASTBaseElement",
-    "ASTOffsetElement",
-    "ASTViewElement",
-    "ASTSlotElement",
+    "ASTAddressTerm",
     "ASTAliasInfo",
     "ASTAliasKind",
     "ASTNumericSign",
@@ -1455,8 +1542,13 @@ __all__ = [
     "ASTAssign",
     "ASTMemoryWrite",
     "ASTIOEffect",
-    "ASTFrameEffect",
-    "ASTFrameOperation",
+    "ASTFrameEffectBase",
+    "ASTFrameMaskEffect",
+    "ASTFrameWriteEffect",
+    "ASTFrameResetEffect",
+    "ASTFrameTeardownEffect",
+    "ASTFrameDropEffect",
+    "ASTFrameGenericEffect",
     "ASTFrameProtocolEffect",
     "ASTHelperEffect",
     "ASTCallArgumentSlot",
