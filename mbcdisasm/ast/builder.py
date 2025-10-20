@@ -34,6 +34,7 @@ from ..ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRTerminator,
+    IRTablePatch,
     IRAbiEffect,
     IRStackEffect,
     MemRef,
@@ -184,6 +185,7 @@ from .model import (
     ASTSignatureValue,
     ASTSymbolSignature,
     ASTComment,
+    ASTAdaptiveTable,
     ASTEffect,
     ASTEnumDecl,
     ASTEnumMember,
@@ -232,7 +234,10 @@ from .model import (
     ASTDispatchIndex,
     ASTTailCall,
     ASTTestSet,
+    ASTTypeSpec,
     ASTTupleExpr,
+    ASTStackReference,
+    ASTTraceOperand,
     ASTUnknown,
     ASTViewElement,
 )
@@ -541,9 +546,11 @@ class ASTBuilder:
                 ASTSignatureValue(
                     index=index,
                     kind=self._select_signature_kind(kinds),
-                    name=self._select_signature_name(
+                    name=
+                    self._select_signature_name(
                         accumulator.argument_names.get(index, set())
-                    ),
+                    )
+                    or f"arg{index}",
                 )
                 for index, kinds in sorted(accumulator.argument_kinds.items())
             )
@@ -551,9 +558,11 @@ class ASTBuilder:
                 ASTSignatureValue(
                     index=index,
                     kind=self._select_signature_kind(kinds),
-                    name=self._select_signature_name(
+                    name=
+                    self._select_signature_name(
                         accumulator.return_names.get(index, set())
-                    ),
+                    )
+                    or f"res{index}",
                 )
                 for index, kinds in sorted(accumulator.return_kinds.items())
             )
@@ -590,10 +599,22 @@ class ASTBuilder:
         return sorted(kinds, key=lambda kind: kind.name)[0]
 
     @staticmethod
+    def _is_placeholder_name(name: str) -> bool:
+        lowered = name.lower()
+        for prefix in ("arg", "value", "word", "byte", "ptr", "io", "page", "bool", "id", "res"):
+            if lowered.startswith(prefix) and lowered[len(prefix) :].isdigit():
+                return True
+        return False
+
+    @staticmethod
     def _select_signature_name(names: Set[str]) -> Optional[str]:
-        filtered = sorted(
-            name for name in names if name and all(ch not in name for ch in ":@")
-        )
+        filtered = [
+            name
+            for name in names
+            if name and all(ch not in name for ch in ":@")
+        ]
+        filtered = [name for name in filtered if not ASTBuilder._is_placeholder_name(name)]
+        filtered.sort()
         if filtered:
             return filtered[0]
         return None
@@ -2105,6 +2126,9 @@ class ASTBuilder:
             )
             location = self._build_indirect_location(node, pointer, offset_expr)
             return [ASTMemoryWrite(location=location, value=value_expr)], []
+        if isinstance(node, IRTablePatch):
+            table = self._build_adaptive_table(node)
+            return [table], []
         if isinstance(node, IRCallReturn):
             call_expr, arg_exprs = self._convert_call(
                 node.target,
@@ -2611,6 +2635,68 @@ class ASTBuilder:
         effect = self._effect_from_kind(kind, operand, alias, pops=step.pops)
         return (effect,) if effect else tuple()
 
+    @staticmethod
+    def _expression_type(expr: ASTExpression) -> Optional[ASTTypeSpec]:
+        try:
+            kind = expr.kind()
+        except AttributeError:
+            return None
+        if kind is None:
+            return None
+        return ASTTypeSpec.from_kind(kind)
+
+    @staticmethod
+    def _parse_trace_operand(token: str) -> Optional[ASTTraceOperand]:
+        if ":" not in token or "@" not in token:
+            return None
+        prefix, address_text = token.split("@", 1)
+        channel_text, opcode_text = prefix.split(":", 1)
+        try:
+            channel = int(channel_text, 16)
+            opcode = int(opcode_text, 16)
+            address = int(address_text, 16)
+        except ValueError:
+            return None
+        return ASTTraceOperand(channel=channel, opcode=opcode, address=address)
+
+    @staticmethod
+    def _build_adaptive_table(node: IRTablePatch) -> ASTAdaptiveTable:
+        mode = 0
+        kind = "unknown"
+        params: List[str] = []
+        action: Optional[str] = None
+        extras: List[str] = []
+        for note in node.annotations:
+            if not note or note == "adaptive_table":
+                continue
+            if note.startswith("mode="):
+                try:
+                    mode = int(note.split("=", 1)[1], 16)
+                except ValueError:
+                    continue
+            elif note.startswith("kind="):
+                kind = note.split("=", 1)[1]
+            elif note.startswith("params="):
+                payload = note.split("=", 1)[1].strip()
+                if payload.startswith("[") and payload.endswith("]"):
+                    payload = payload[1:-1]
+                for item in payload.split(","):
+                    cleaned = item.strip()
+                    if cleaned:
+                        params.append(cleaned)
+            elif note.startswith("table_") or note == "drop":
+                action = note
+            else:
+                extras.append(note)
+        params.extend(extras)
+        return ASTAdaptiveTable(
+            operations=node.operations,
+            mode=mode,
+            kind=kind,
+            params=tuple(params),
+            action=action,
+        )
+
     def _build_call_abi(
         self,
         node: Any,
@@ -2630,9 +2716,15 @@ class ASTBuilder:
                 deficit = slot_count - len(values)
                 values.extend(ASTUnknown(f"slot_{index}") for index in range(len(values), len(values) + deficit))
             for index in range(slot_count):
-                slots.append(ASTCallArgumentSlot(index=index, value=values[index]))
-                token = f"slot_{index}"
                 value = values[index]
+                slots.append(
+                    ASTCallArgumentSlot(
+                        index=index,
+                        value=value,
+                        type_hint=self._expression_type(value),
+                    )
+                )
+                token = f"slot_{index}"
                 if not isinstance(value, ASTUnknown):
                     self._call_arg_values[token] = value
         live_mask = getattr(node, "cleanup_mask", None)
@@ -2644,14 +2736,24 @@ class ASTBuilder:
         for index, token in enumerate(return_tokens):
             kind = self._infer_kind(token)
             name = self._canonical_placeholder_name(token, index, kind)
-            return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
+            return_slots.append(
+                ASTCallReturnSlot(
+                    index=index,
+                    type=ASTTypeSpec.from_kind(kind),
+                    name=name,
+                )
+            )
         tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
+        variadic = None
+        if getattr(node, "varargs", False):
+            variadic = ASTTypeSpec.opaque("variadic")
         if (
             not slots
             and not effects
             and mask_field is None
             and not return_slots
             and not tail_allowed
+            and variadic is None
         ):
             return None
         return ASTCallABI(
@@ -2660,6 +2762,7 @@ class ASTBuilder:
             effects=tuple(effects),
             live_mask=mask_field,
             tail=tail_allowed,
+            variadic=variadic,
         )
 
     def _build_return_identifier(self, name: str, index: int) -> ASTIdentifier:
@@ -2827,6 +2930,11 @@ class ASTBuilder:
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+        if token == "stack_top":
+            return ASTStackReference()
+        trace_operand = self._parse_trace_operand(token)
+        if trace_operand is not None:
+            return trace_operand
         return ASTIdentifier(token, self._infer_kind(token))
 
     @staticmethod
@@ -2857,25 +2965,24 @@ class ASTBuilder:
             return SSAValueKind.IDENTIFIER
         return SSAValueKind.UNKNOWN
 
-    @staticmethod
-    def _ret_prefix(kind: SSAValueKind) -> str:
-        mapping = {
-            SSAValueKind.BOOLEAN: "flag",
-            SSAValueKind.BYTE: "byte",
-            SSAValueKind.WORD: "word",
-            SSAValueKind.POINTER: "ptr",
-            SSAValueKind.IO: "io",
-            SSAValueKind.PAGE_REGISTER: "page",
-            SSAValueKind.IDENTIFIER: "id",
-        }
-        return mapping.get(kind, "value")
-
     def _canonical_placeholder_name(
         self, token: str, index: int, kind: SSAValueKind
     ) -> str:
-        if token.startswith("ret"):
-            prefix = self._ret_prefix(kind)
-            return f"{prefix}{index}"
+        lowered = token.lower()
+        if lowered.startswith(
+            (
+                "ret",
+                "value",
+                "word",
+                "byte",
+                "ptr",
+                "io",
+                "page",
+                "bool",
+                "id",
+            )
+        ):
+            return f"res{index}"
         return token
 
     def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:

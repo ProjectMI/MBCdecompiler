@@ -11,6 +11,112 @@ from ..constants import OPERAND_ALIASES
 from ..ir.model import SSAValueKind
 
 
+class ASTTypeDomain(Enum):
+    """Canonical domains used by the reconstructed type system."""
+
+    VOID = "void"
+    INTEGER = "int"
+    BOOLEAN = "bool"
+    POINTER = "ptr"
+    ADDRESS = "addr"
+    TOKEN = "token"
+    OPAQUE = "opaque"
+    EFFECT = "effect"
+
+
+@dataclass(frozen=True)
+class ASTTypeSpec:
+    """Structured representation of an AST value type."""
+
+    domain: ASTTypeDomain
+    bits: Optional[int] = None
+    sign: Optional[ASTNumericSign] = None
+    space: Optional["ASTAddressSpace"] = None
+    label: Optional[str] = None
+
+    def render(self) -> str:
+        if self.domain is ASTTypeDomain.VOID:
+            return "–"
+        if self.domain is ASTTypeDomain.OPAQUE and self.label:
+            return f"opaque[{self.label}]"
+        qualifiers: List[str] = []
+        if self.space:
+            qualifiers.append(self.space.value)
+        if self.bits is not None:
+            sign = self.sign.value if self.sign else "unspecified"
+            qualifiers.append(f"{sign}{self.bits}")
+        if self.label:
+            qualifiers.append(self.label)
+        if not qualifiers:
+            return self.domain.value
+        payload = ",".join(qualifiers)
+        return f"{self.domain.value}<{payload}>"
+
+    @classmethod
+    def void(cls) -> "ASTTypeSpec":
+        return cls(ASTTypeDomain.VOID)
+
+    @classmethod
+    def opaque(cls, label: Optional[str] = None) -> "ASTTypeSpec":
+        return cls(ASTTypeDomain.OPAQUE, label=label)
+
+    @classmethod
+    def token(cls, label: Optional[str] = None) -> "ASTTypeSpec":
+        return cls(ASTTypeDomain.TOKEN, label=label)
+
+    @classmethod
+    def effect(cls, label: Optional[str] = None) -> "ASTTypeSpec":
+        return cls(ASTTypeDomain.EFFECT, label=label)
+
+    @staticmethod
+    def from_kind(kind: SSAValueKind) -> "ASTTypeSpec":
+        if kind is SSAValueKind.UNKNOWN:
+            return ASTTypeSpec.opaque()
+        if kind is SSAValueKind.BOOLEAN:
+            return ASTTypeSpec(
+                ASTTypeDomain.BOOLEAN,
+                bits=1,
+                sign=ASTNumericSign.UNSIGNED,
+            )
+        if kind is SSAValueKind.BYTE:
+            return ASTTypeSpec(
+                ASTTypeDomain.INTEGER,
+                bits=8,
+                sign=ASTNumericSign.UNSIGNED,
+            )
+        if kind is SSAValueKind.WORD:
+            return ASTTypeSpec(
+                ASTTypeDomain.INTEGER,
+                bits=16,
+                sign=ASTNumericSign.UNSIGNED,
+            )
+        if kind is SSAValueKind.POINTER:
+            return ASTTypeSpec(
+                ASTTypeDomain.POINTER,
+                bits=16,
+                sign=ASTNumericSign.UNSIGNED,
+                space=ASTAddressSpace.MEMORY,
+            )
+        if kind is SSAValueKind.IO:
+            return ASTTypeSpec(
+                ASTTypeDomain.ADDRESS,
+                bits=16,
+                sign=ASTNumericSign.UNSIGNED,
+                space=ASTAddressSpace.IO,
+            )
+        if kind is SSAValueKind.PAGE_REGISTER:
+            return ASTTypeSpec(
+                ASTTypeDomain.ADDRESS,
+                bits=8,
+                sign=ASTNumericSign.UNSIGNED,
+                space=ASTAddressSpace.MEMORY,
+                label="page",
+            )
+        if kind is SSAValueKind.IDENTIFIER:
+            return ASTTypeSpec.token()
+        return ASTTypeSpec.opaque(kind.name.lower())
+
+
 class ASTNumericSign(Enum):
     """Signedness annotation attached to numeric literals."""
 
@@ -610,6 +716,9 @@ class ASTIdentifier(ASTExpression):
     def kind(self) -> SSAValueKind:
         return self.kind_hint
 
+    def type_spec(self) -> ASTTypeSpec:
+        return ASTTypeSpec.from_kind(self.kind_hint)
+
 
 @dataclass(frozen=True)
 class ASTSafeCastExpr(ASTExpression):
@@ -642,18 +751,79 @@ class ASTMemoryLocation:
     alias: ASTAliasInfo = field(default_factory=_default_alias)
 
     def render(self) -> str:
-        if isinstance(self.base, ASTExpression):
-            base_repr = self.base.render()
+        space = None
+        region = None
+        symbol = None
+        base_expr = None
+        if isinstance(self.base, ASTAddressDescriptor):
+            space = self.base.space.value
+            region = self.base.region
+            symbol = self.base.symbol
         else:
-            base_repr = self.base.render()
-        metadata: List[str] = []
+            base_expr = self.base.render()
+        header_parts: List[str] = []
+        if space:
+            header_parts.append(f"space={space}")
+        if region:
+            header_parts.append(f"region={region}")
+        if symbol:
+            header_parts.append(f"symbol={symbol}")
         if self.alias.kind is not ASTAliasKind.UNKNOWN or self.alias.label:
-            metadata.append(f"alias={self.alias.render()}")
-        prefix = base_repr
-        if metadata:
-            prefix = f"{base_repr}{{{', '.join(metadata)}}}"
-        trail = "".join(element.render() for element in self.path)
-        return f"{prefix}{trail}"
+            header_parts.append(f"alias={self.alias.render()}")
+        header = "addr{" + ", ".join(header_parts) + "}"
+        components: Dict[str, str] = {}
+        trail_fragments: List[str] = []
+        for element in self.path:
+            if isinstance(element, ASTBankElement):
+                components.setdefault("bank", f"0x{element.value:04X}")
+            elif isinstance(element, ASTPageElement):
+                if element.alias:
+                    components.setdefault("page", element.alias)
+                else:
+                    components.setdefault("page", f"0x{element.value:02X}")
+            elif isinstance(element, ASTPageRegisterElement):
+                components.setdefault("page_reg", f"0x{element.register:04X}")
+            elif isinstance(element, ASTBaseElement):
+                components.setdefault("base", f"0x{element.value:04X}")
+            elif isinstance(element, ASTOffsetElement):
+                components.setdefault("offset", f"0x{element.value:04X}")
+            elif isinstance(element, ASTSlotElement):
+                components.setdefault(
+                    "slot",
+                    f"{element.space}:{element.index.render()}",
+                )
+            elif isinstance(element, ASTViewElement):
+                descriptor = element.kind
+                if element.index is not None:
+                    descriptor = f"{descriptor}({element.index.render()})"
+                components.setdefault("view", descriptor)
+            elif isinstance(element, ASTSliceElement):
+                trail_fragments.append(element.render())
+            elif isinstance(element, ASTFieldElement):
+                trail_fragments.append(f".{element.name}")
+            elif isinstance(element, ASTIndexElement):
+                trail_fragments.append(f"[{element.index.render()}]")
+        if base_expr:
+            components.setdefault("base", base_expr)
+        if trail_fragments:
+            components["path"] = "".join(trail_fragments)
+        ordered_keys = [
+            "slot",
+            "bank",
+            "page",
+            "page_reg",
+            "base",
+            "offset",
+            "view",
+            "path",
+        ]
+        rendered_components = [
+            f"{key}={components[key]}" for key in ordered_keys if key in components
+        ]
+        suffix = ""
+        if rendered_components:
+            suffix = f"({', '.join(rendered_components)})"
+        return f"{header}{suffix}"
 
 
 @dataclass(frozen=True)
@@ -718,6 +888,36 @@ class ASTTupleExpr(ASTExpression):
         return f"({inner})"
 
 
+@dataclass(frozen=True)
+class ASTStackReference(ASTExpression):
+    """Reference to an abstract VM stack slot."""
+
+    depth: int = 0
+
+    def render(self) -> str:
+        if self.depth <= 0:
+            return "stack[top]"
+        return f"stack[-{self.depth}]"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.UNKNOWN
+
+
+@dataclass(frozen=True)
+class ASTTraceOperand(ASTExpression):
+    """Traced value captured from an execution log."""
+
+    channel: int
+    opcode: int
+    address: int
+
+    def render(self) -> str:
+        return f"trace[{self.channel:02X}:{self.opcode:02X}@0x{self.address:06X}]"
+
+    def kind(self) -> SSAValueKind:
+        return SSAValueKind.UNKNOWN
+
+
 # ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
@@ -729,9 +929,14 @@ class ASTCallArgumentSlot:
 
     index: int
     value: ASTExpression
+    type_hint: Optional[ASTTypeSpec] = None
 
     def render(self) -> str:
-        return f"arg[{self.index}]={self.value.render()}"
+        operand = self.value.render()
+        hint = self.type_hint.render() if self.type_hint else None
+        if hint:
+            return f"arg[{self.index}]={operand}:{hint}"
+        return f"arg[{self.index}]={operand}"
 
 
 @dataclass(frozen=True)
@@ -739,13 +944,12 @@ class ASTCallReturnSlot:
     """Description of a returned value slot for a call."""
 
     index: int
-    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    type: ASTTypeSpec = field(default_factory=ASTTypeSpec.opaque)
     name: Optional[str] = None
 
     def render(self) -> str:
-        prefix = self.kind.name.lower()
-        label = self.name or f"{prefix}{self.index}"
-        return f"ret[{self.index}]={label}:{prefix}"
+        label = self.name or f"res{self.index}"
+        return f"ret[{self.index}]={label}:{self.type.render()}"
 
 
 @dataclass(frozen=True)
@@ -757,6 +961,7 @@ class ASTCallABI:
     effects: Tuple[ASTEffect, ...] = ()
     live_mask: Optional[ASTBitField] = None
     tail: bool = False
+    variadic: Optional[ASTTypeSpec] = None
 
     def __post_init__(self) -> None:
         if self.slots:
@@ -779,12 +984,16 @@ class ASTCallABI:
         if self.returns:
             rendered_returns = ", ".join(slot.render() for slot in self.returns)
             parts.append(f"returns=[{rendered_returns}]")
+        else:
+            parts.append("returns=[–]")
         if self.effects:
             parts.append(f"effects={_render_effects(self.effects)}")
         if self.live_mask is not None:
             parts.append(f"return_mask={self.live_mask.render()}")
         if self.tail:
             parts.append("tail=true")
+        if self.variadic is not None:
+            parts.append(f"varargs={self.variadic.render()}")
         inner = ", ".join(parts)
         return f"abi{{{inner}}}" if inner else "abi{}"
 
@@ -797,9 +1006,13 @@ class ASTSignatureValue:
     kind: SSAValueKind = SSAValueKind.UNKNOWN
     name: Optional[str] = None
 
+    @property
+    def type(self) -> ASTTypeSpec:
+        return ASTTypeSpec.from_kind(self.kind)
+
     def render(self) -> str:
-        label = self.name or f"{self.kind.name.lower()}{self.index}"
-        return f"{label}:{self.kind.name.lower()}"
+        label = self.name or f"arg{self.index}"
+        return f"{label}:{self.type.render()}"
 
 
 @dataclass(frozen=True)
@@ -814,7 +1027,10 @@ class ASTSymbolSignature:
 
     def render(self) -> str:
         args = ", ".join(value.render() for value in self.arguments) or "-"
-        rets = ", ".join(value.render() for value in self.returns) or "-"
+        if self.returns:
+            rets = ", ".join(value.render() for value in self.returns)
+        else:
+            rets = "–"
         varargs = ", varargs" if self.varargs else ""
         return (
             f"symbol {self.name}(0x{self.address:04X}) args=[{args}]"
@@ -1085,6 +1301,30 @@ class ASTComment(ASTStatement):
 
     def render(self) -> str:
         return f"; {self.text}"
+
+
+@dataclass
+class ASTAdaptiveTable(ASTStatement):
+    """Structured representation of adaptive opcode patch tables."""
+
+    operations: Tuple[Tuple[str, int], ...]
+    mode: int
+    kind: str
+    params: Tuple[str, ...] = ()
+    action: Optional[str] = None
+
+    def render(self) -> str:
+        op_render = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        width = max(2, (self.mode.bit_length() + 3) // 4)
+        parts = [f"mode=0x{self.mode:0{width}X}", f"kind={self.kind}"]
+        if self.params:
+            params = ", ".join(self.params)
+            parts.append(f"params=[{params}]")
+        if op_render:
+            parts.append(f"ops=[{op_render}]")
+        if self.action:
+            parts.append(f"action={self.action}")
+        return f"adaptive_table{{{', '.join(parts)}}}"
 
 
 @dataclass(frozen=True)
@@ -1422,6 +1662,9 @@ __all__ = [
     "ASTFlagCheck",
     "ASTFunctionPrologue",
     "ASTComment",
+    "ASTStackReference",
+    "ASTTraceOperand",
+    "ASTAdaptiveTable",
     "ASTEnumDecl",
     "ASTEnumMember",
     "ASTBlock",

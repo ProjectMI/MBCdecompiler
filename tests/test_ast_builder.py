@@ -19,6 +19,7 @@ from mbcdisasm.ast import (
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTAdaptiveTable,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -36,6 +37,7 @@ from mbcdisasm.ir.model import (
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
+    IRTablePatch,
     IRStackEffect,
     IRSlot,
     MemRef,
@@ -425,7 +427,9 @@ def test_ast_builder_resolves_slot_reference() -> None:
     expr = builder._resolve_expr("slot(0x0004)", {})
     assert isinstance(expr, ASTMemoryRead)
     rendered = expr.render()
-    assert rendered.startswith("frame")
+    assert rendered.startswith("addr{")
+    assert "space=frame" in rendered
+    assert "slot=frame" in rendered
     assert "0x0004" in rendered
 
 
@@ -624,6 +628,43 @@ def test_ast_builder_uses_call_symbol_for_enum_naming() -> None:
     assert segment_enum.name == "SchedulerMask"
 
 
+def test_table_patch_emits_adaptive_table() -> None:
+    patch = IRTablePatch(
+        operations=(("op_FF_10", 0x0000),),
+        annotations=(
+            "adaptive_table",
+            "mode=0x10",
+            "kind=test",
+            "params=[str(str_0001)]",
+            "table_emit",
+        ),
+    )
+    block = IRBlock(
+        label="block_patch",
+        start_offset=0x0400,
+        nodes=(patch,),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x02,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    table = statements[0]
+    assert isinstance(table, ASTAdaptiveTable)
+    assert table.mode == 0x10
+    assert table.kind == "test"
+    assert table.params == ("str(str_0001)",)
+    assert table.action == "table_emit"
+    assert table.operations == (("op_FF_10", 0x0000),)
+    assert isinstance(statements[-1], ASTReturn)
+
+
 def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     container, knowledge = build_container(tmp_path)
     program = IRNormalizer(knowledge).normalise_container(container)
@@ -793,8 +834,10 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     assert 0x6601 in symbols
     signature = symbols[0x6601]
     assert signature.name == "helper_6601"
-    assert tuple(value.kind for value in signature.arguments) == (SSAValueKind.POINTER,)
-    assert tuple(value.kind for value in signature.returns) == (SSAValueKind.UNKNOWN,)
+    assert tuple(value.type.render() for value in signature.arguments) == (
+        "ptr<mem,unsigned16>",
+    )
+    assert tuple(value.type.render() for value in signature.returns) == ("opaque",)
 
 
 def test_epilogue_effects_are_deduplicated() -> None:
@@ -883,6 +926,11 @@ def test_banked_memory_locations_are_canonical() -> None:
     assign = procedure.blocks[0].statements[0]
     assert isinstance(assign, ASTAssign)
     rendered = assign.value.render()
-    assert rendered.startswith("mem.bank_1230{alias=region(bank_1230)}")
-    assert ".page(0x01)" in rendered
-    assert ".base(0x0040)" in rendered
+    assert rendered.startswith("addr{")
+    assert "region=bank_1230" in rendered
+    assert "alias=region(bank_1230)" in rendered
+    assert "bank=0x1230" in rendered
+    assert "page=0x01" in rendered
+    assert "page_reg=0x5000" in rendered
+    assert "base=0x0040" in rendered
+    assert "offset=0x0010" in rendered
