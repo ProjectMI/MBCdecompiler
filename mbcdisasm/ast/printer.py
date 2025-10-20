@@ -18,6 +18,10 @@ class ASTTextRenderer:
             lines.append("; symbol table:")
             for entry in program.symbols:
                 lines.append(f";   {entry.render()}")
+        if program.effects:
+            lines.append("; effect table:")
+            for entry in program.effects:
+                lines.append(f";   {entry.render()}")
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"
@@ -63,9 +67,12 @@ class ASTTextRenderer:
             f"{label}->[{', '.join(targets)}]"
             for label, targets in sorted(procedure.predecessor_map.items())
         ) or "-"
+        alias_suffix = f" alias_of={procedure.alias_of}" if procedure.alias_of else ""
+        result_repr = procedure.result.render()
         yield (
-            f"procedure {procedure.name} entry{{{entry_repr}}} "
-            f"exits=[{exit_entries}] cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
+            f"procedure {procedure.name}{alias_suffix} {result_repr} "
+            f"entry{{{entry_repr}}} exits=[{exit_entries}] "
+            f"cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
         )
         for block in procedure.blocks:
             yield from self._render_block(block)

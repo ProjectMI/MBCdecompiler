@@ -446,20 +446,74 @@ class ASTFrameChannelEffect(ASTFrameEffect):
 
 
 @dataclass(frozen=True)
+class ASTFrameProtocolReset:
+    """Reset action recorded inside a frame protocol summary."""
+
+    channel: Optional[str] = None
+    mask: Optional[ASTBitField] = None
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.channel:
+            parts.append(f"channel={self.channel}")
+        if self.mask is not None:
+            parts.append(self.mask.render())
+        inner = ", ".join(parts)
+        return f"frame.reset({inner})" if inner else "frame.reset()"
+
+
+@dataclass(frozen=True)
+class ASTFrameProtocolWrite:
+    """Channel or metadata write recorded in a frame protocol."""
+
+    channel: str
+    value: Optional[ASTBitField] = None
+
+    def render(self) -> str:
+        if self.value is None:
+            return f"frame.write({self.channel})"
+        return f"frame.write({self.channel}, {self.value.render()})"
+
+
+@dataclass(frozen=True)
 class ASTFrameProtocolEffect(ASTEffect):
     """Summary of post-call frame protocol actions."""
 
     domain_order: ClassVar[int] = 0
-    masks: Tuple[ASTBitField, ...]
+    masks: Tuple[ASTBitField, ...] = ()
+    resets: Tuple[ASTFrameProtocolReset, ...] = ()
+    writes: Tuple[ASTFrameProtocolWrite, ...] = ()
+    channels: Tuple[ASTFrameProtocolWrite, ...] = ()
     teardown: int = 0
     drops: int = 0
 
     def order_key(self) -> Tuple[int, ...]:
-        return (self.domain_order, len(self.masks), self.teardown, self.drops)
+        return (
+            self.domain_order,
+            len(self.masks),
+            len(self.resets),
+            len(self.writes),
+            len(self.channels),
+            self.teardown,
+            self.drops,
+        )
 
     def render(self) -> str:
-        mask_text = ", ".join(mask.render() for mask in self.masks)
-        parts = [f"masks=[{mask_text}]" if mask_text else "masks=[]"]
+        parts: List[str] = []
+        if self.masks:
+            mask_text = ", ".join(mask.render() for mask in self.masks)
+            parts.append(f"masks=[{mask_text}]")
+        else:
+            parts.append("masks[]")
+        if self.resets:
+            resets = ", ".join(reset.render() for reset in self.resets)
+            parts.append(f"resets=[{resets}]")
+        if self.writes:
+            writes = ", ".join(entry.render() for entry in self.writes)
+            parts.append(f"writes=[{writes}]")
+        if self.channels:
+            channels = ", ".join(entry.render() for entry in self.channels)
+            parts.append(f"channels=[{channels}]")
         parts.append(f"teardown={self.teardown}")
         parts.append(f"drops={self.drops}")
         inner = ", ".join(parts)
@@ -898,6 +952,45 @@ class ASTCallReturnSlot:
 
 
 @dataclass(frozen=True)
+class ASTResultSlot:
+    """Single slot in a procedure result layout."""
+
+    index: int
+    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    name: Optional[str] = None
+
+    def render(self) -> str:
+        prefix = self.kind.name.lower()
+        label = self.name or f"{prefix}{self.index}"
+        return f"{label}:{prefix}"
+
+
+@dataclass(frozen=True)
+class ASTResultType:
+    """Canonical description of a procedure's return value layout."""
+
+    slots: Tuple[ASTResultSlot, ...] = ()
+    varargs: bool = False
+
+    def __post_init__(self) -> None:
+        if self.slots:
+            ordered = tuple(sorted(self.slots, key=lambda slot: slot.index))
+            object.__setattr__(self, "slots", ordered)
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.slots:
+            rendered = ", ".join(slot.render() for slot in self.slots)
+            parts.append(f"slots=[{rendered}]")
+        else:
+            parts.append("slots=[]")
+        if self.varargs:
+            parts.append("varargs=true")
+        inner = ", ".join(parts)
+        return f"result{{{inner}}}"
+
+
+@dataclass(frozen=True)
 class ASTCallABI:
     """Canonical calling convention metadata."""
 
@@ -1024,6 +1117,35 @@ class ASTSymbolSignature:
             parts.append(f"effects=[{effects}]")
         inner = " ".join(parts)
         return f"symbol {self.name}(0x{self.address:04X}) {inner}"
+
+
+@dataclass(frozen=True)
+class ASTEffectSignature:
+    """Summary of effect helper usage grouped by symbolic namespace."""
+
+    name: str
+    domain: str
+    operations: Tuple[str, ...] = ()
+    ports: Tuple[str, ...] = ()
+    targets: Tuple[int, ...] = ()
+    masks: Tuple[ASTBitField, ...] = ()
+
+    def render(self) -> str:
+        parts: List[str] = [f"domain={self.domain}"]
+        if self.operations:
+            ops = ", ".join(self.operations)
+            parts.append(f"ops=[{ops}]")
+        if self.targets:
+            rendered = ", ".join(f"0x{target:04X}" for target in self.targets)
+            parts.append(f"targets=[{rendered}]")
+        if self.ports:
+            ports = ", ".join(self.ports)
+            parts.append(f"ports=[{ports}]")
+        if self.masks:
+            masks = ", ".join(mask.render() for mask in self.masks)
+            parts.append(f"masks=[{masks}]")
+        inner = ", ".join(parts)
+        return f"effect {self.name} {{{inner}}}"
 
 
 @dataclass
@@ -1468,8 +1590,10 @@ class ASTProcedure:
     blocks: Tuple[ASTBlock, ...]
     entry: ASTEntryPoint
     exits: Tuple[ASTExitPoint, ...]
+    result: ASTResultType = field(default_factory=ASTResultType)
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    alias_of: Optional[str] = None
 
     @property
     def entry_offset(self) -> int:
@@ -1563,6 +1687,7 @@ class ASTProgram:
     metrics: ASTMetrics
     enums: Tuple[ASTEnumDecl, ...] = ()
     symbols: Tuple[ASTSymbolSignature, ...] = ()
+    effects: Tuple[ASTEffectSignature, ...] = ()
 
 
 __all__ = [
@@ -1610,16 +1735,21 @@ __all__ = [
     "ASTFrameTeardownEffect",
     "ASTFrameDropEffect",
     "ASTFrameChannelEffect",
+    "ASTFrameProtocolReset",
+    "ASTFrameProtocolWrite",
     "ASTFrameProtocolEffect",
     "ASTHelperEffect",
     "ASTCallArgumentSlot",
     "ASTCallReturnSlot",
+    "ASTResultSlot",
+    "ASTResultType",
     "ASTCallABI",
     "ASTCallStatement",
     "ASTSymbolTypeFamily",
     "ASTSymbolType",
     "ASTSignatureValue",
     "ASTSymbolSignature",
+    "ASTEffectSignature",
     "ASTIORead",
     "ASTIOWrite",
     "ASTTerminator",
