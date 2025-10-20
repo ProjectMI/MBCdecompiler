@@ -47,6 +47,14 @@ class ASTConversionKind(Enum):
     TO_POINTER = "to_pointer"
 
 
+class ASTReturnKind(Enum):
+    """Canonical shapes used to describe return payloads."""
+
+    UNIT = "unit"
+    TUPLE = "tuple"
+    VARRET = "varret"
+
+
 @dataclass(frozen=True)
 class ASTAliasInfo:
     """Alias metadata describing how a location can alias with others."""
@@ -1121,20 +1129,49 @@ class ASTReturnPayload:
     """Structured representation of return values."""
 
     values: Tuple[ASTExpression, ...] = ()
-    varargs: bool = False
+    kind: ASTReturnKind = ASTReturnKind.UNIT
+
+    def __post_init__(self) -> None:
+        if self.kind is ASTReturnKind.UNIT:
+            object.__setattr__(self, "values", tuple())
+        elif self.kind is ASTReturnKind.TUPLE:
+            if not self.values:
+                raise ValueError("tuple return payloads require at least one value")
+        elif self.kind is ASTReturnKind.VARRET:
+            object.__setattr__(self, "values", tuple(self.values))
+        else:  # pragma: no cover - defensive for future extensions
+            raise ValueError(f"unsupported return payload kind: {self.kind}")
+
+    @classmethod
+    def unit(cls) -> "ASTReturnPayload":
+        return cls()
+
+    @classmethod
+    def tuple(cls, *values: ASTExpression) -> "ASTReturnPayload":
+        return cls(values=tuple(values), kind=ASTReturnKind.TUPLE)
+
+    @classmethod
+    def varret(cls, *values: ASTExpression) -> "ASTReturnPayload":
+        return cls(values=tuple(values), kind=ASTReturnKind.VARRET)
 
     def render(self) -> str:
-        if self.varargs:
-            if not self.values:
-                return "varargs"
-            inner = ", ".join(value.render() for value in self.values)
-            return f"varargs({inner})"
-        if not self.values:
-            return "()"
-        if len(self.values) == 1:
-            return self.values[0].render()
+        if self.kind is ASTReturnKind.UNIT:
+            return "unit"
         inner = ", ".join(value.render() for value in self.values)
-        return f"({inner})"
+        if self.kind is ASTReturnKind.VARRET:
+            return f"varret({inner})" if inner else "varret"
+        if self.kind is ASTReturnKind.TUPLE:
+            return f"tuple({inner})" if inner else "tuple()"
+        return "?"  # pragma: no cover - unreachable given the constructor guards
+
+    def is_unit(self) -> bool:
+        return self.kind is ASTReturnKind.UNIT
+
+    def is_tuple(self) -> bool:
+        return self.kind is ASTReturnKind.TUPLE
+
+    def is_varret(self) -> bool:
+        return self.kind is ASTReturnKind.VARRET
 
 
 @dataclass
@@ -1170,9 +1207,8 @@ class ASTTailCall(ASTTerminator):
         if call_repr.startswith("tail "):
             call_repr = call_repr[len("tail ") :]
         result = f"tail {call_repr}"
-        payload_repr = self.payload.render()
-        if payload_repr != "()":
-            result = f"{result} -> {payload_repr}"
+        if not self.payload.is_unit():
+            result = f"{result} -> {self.payload.render()}"
         if self.abi is not None:
             result = f"{result} {self.abi.render()}"
         return f"{result} effects={_render_effects(self.effects)}"
@@ -1198,85 +1234,82 @@ class ASTJump(ASTTerminator):
         return f"jump {destination}"
 
 
-@dataclass
-class ASTBranch(ASTTerminator):
-    """Generic conditional branch with CFG links."""
+class ASTPredicateKind(Enum):
+    """Kinds of predicates supported by the canonical conditional node."""
 
-    condition: ASTExpression
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
-
-    def render(self) -> str:
-        condition = self.condition.render()
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return f"if {condition} then {then_label} else {else_label}"
+    VALUE = "value"
+    STORED = "stored"
+    FLAG = "flag"
+    MASK = "mask"
+    PROLOGUE = "prologue"
 
 
-@dataclass
-class ASTTestSet(ASTTerminator):
-    """Branch that stores a predicate before testing it."""
+@dataclass(frozen=True)
+class ASTPredicate:
+    """Typed predicate driving an :class:`ASTConditional` terminator."""
 
-    var: ASTExpression
-    expr: ASTExpression
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
+    kind: ASTPredicateKind
+    expression: Optional[ASTExpression] = None
+    initializer: Optional[ASTExpression] = None
+    flag: Optional[int] = None
+    mask: Optional[ASTBitField] = None
+    label: Optional[str] = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return (
-            f"testset {self.var.render()} = {self.expr.render()} "
-            f"then {then_label} else {else_label}"
-        )
-
-
-@dataclass
-class ASTFlagCheck(ASTTerminator):
-    """Branch that checks a VM flag."""
-
-    flag: int
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
-
-    def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
+        if self.kind is ASTPredicateKind.VALUE:
+            expr = self.expression.render() if self.expression else "?"
+            return f"value({expr})"
+        if self.kind is ASTPredicateKind.STORED:
+            expr = self.expression.render() if self.expression else "?"
+            init = self.initializer.render() if self.initializer else "?"
+            return f"stored({expr}={init})"
+        if self.kind is ASTPredicateKind.FLAG:
+            if self.flag is None:
+                return "flag(?)"
+            return f"flag(0x{self.flag:04X})"
+        if self.kind is ASTPredicateKind.MASK:
+            source = self.expression.render() if self.expression else "?"
+            mask = self.mask.render() if self.mask else "mask"
+            label = f", source={self.label}" if self.label else ""
+            return f"mask({source}, {mask}{label})"
+        if self.kind is ASTPredicateKind.PROLOGUE:
+            expr = self.expression.render() if self.expression else "?"
+            init = self.initializer.render() if self.initializer else "?"
+            return f"prologue({expr}={init})"
+        return "predicate(?)"  # pragma: no cover - defensive
 
 
 @dataclass
-class ASTFunctionPrologue(ASTTerminator):
-    """Reconstructed function prologue sequence."""
+class ASTBranchOutcome:
+    """Resolved outcome for a conditional branch."""
 
-    var: ASTExpression
-    expr: ASTExpression
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
+    block: "ASTBlock | None" = None
+    offset: int | None = None
+    hint: str | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return (
-            f"prologue {self.var.render()} = {self.expr.render()} "
-            f"then {then_label} else {else_label}"
-        )
+        if self.block is not None:
+            return self.block.label
+        if self.hint is not None:
+            return self.hint
+        if self.offset is not None:
+            return f"0x{self.offset:04X}"
+        return "?"
+
+
+@dataclass
+class ASTConditional(ASTTerminator):
+    """Canonical conditional branch with typed predicate."""
+
+    predicate: ASTPredicate
+    then_outcome: ASTBranchOutcome
+    else_outcome: ASTBranchOutcome
+
+    def render(self) -> str:
+        predicate = self.predicate.render()
+        then_label = self.then_outcome.render()
+        else_label = self.else_outcome.render()
+        return f"if {predicate} then {then_label} else {else_label}"
 
 
 @dataclass
@@ -1289,6 +1322,20 @@ class ASTComment(ASTStatement):
 
     def render(self) -> str:
         return f"; {self.text}"
+
+
+@dataclass
+class ASTStringLiteralStatement(ASTStatement):
+    """Standalone string literal emitted as part of the instruction stream."""
+
+    literal: ASTStringLiteral
+    symbol: Optional[str] = None
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        prefix = f"{self.symbol}: " if self.symbol else ""
+        return f"{prefix}{self.literal.render()}"
 
 
 @dataclass(frozen=True)
@@ -1330,14 +1377,13 @@ class ASTSwitchCase:
 class ASTDispatchHelper:
     """Metadata about the helper responsible for dispatch operations."""
 
-    address: int
-    symbol: Optional[str] = None
+    symbol: str
+    address: Optional[int] = None
 
     def render(self) -> str:
-        helper_repr = f"0x{self.address:04X}"
-        if self.symbol:
-            helper_repr = f"{self.symbol}({helper_repr})"
-        return helper_repr
+        if self.address is not None:
+            return f"{self.symbol}(0x{self.address:04X})"
+        return self.symbol
 
 
 @dataclass(frozen=True)
@@ -1384,6 +1430,23 @@ class ASTSwitch(ASTStatement):
         if self.abi is not None:
             parts.append(f"abi={self.abi.render()}")
         return f"Switch{{{', '.join(parts)}}}"
+
+
+@dataclass
+class ASTAdaptiveTable(ASTStatement):
+    """Adaptive table patch extracted from helper-driven dispatch."""
+
+    mode: int
+    operations: Tuple[Tuple[str, int], ...]
+    parameters: Tuple[str, ...] = ()
+    symbol: Optional[str] = None
+
+    def render(self) -> str:
+        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        params = ", ".join(self.parameters)
+        param_text = f" params=[{params}]" if params else ""
+        prefix = f"{self.symbol}: " if self.symbol else ""
+        return f"{prefix}adaptive_table mode=0x{self.mode:02X} ops=[{ops}]{param_text}"
 
 
 @dataclass
@@ -1627,10 +1690,13 @@ __all__ = [
     "ASTJump",
     "ASTReturn",
     "ASTReturnPayload",
-    "ASTBranch",
-    "ASTTestSet",
-    "ASTFlagCheck",
-    "ASTFunctionPrologue",
+    "ASTReturnKind",
+    "ASTConditional",
+    "ASTPredicate",
+    "ASTPredicateKind",
+    "ASTBranchOutcome",
+    "ASTStringLiteralStatement",
+    "ASTAdaptiveTable",
     "ASTComment",
     "ASTEnumDecl",
     "ASTEnumMember",

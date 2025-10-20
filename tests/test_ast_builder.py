@@ -1,15 +1,17 @@
 from pathlib import Path
+from typing import Tuple
 
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTAdaptiveTable,
     ASTAssign,
-    ASTBranch,
     ASTBuilder,
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallExpr,
     ASTCallStatement,
+    ASTConditional,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameMaskEffect,
@@ -19,7 +21,12 @@ from mbcdisasm.ast import (
     ASTIntegerLiteral,
     ASTImmediateOperand,
     ASTMemoryRead,
+    ASTIdentifier,
+    ASTPredicateKind,
     ASTReturn,
+    ASTReturnKind,
+    ASTStringLiteral,
+    ASTStringLiteralStatement,
     ASTSwitch,
     ASTTailCall,
     ASTSymbolTypeFamily,
@@ -27,17 +34,24 @@ from mbcdisasm.ast import (
 from mbcdisasm.ir.model import (
     IRBlock,
     IRAbiEffect,
+    IRAsciiHeader,
     IRBankedLoad,
     IRCall,
     IRCallReturn,
+    IRConditionMask,
+    IRDataMarker,
     IRDispatchCase,
     IRDispatchIndex,
+    IRFlagCheck,
+    IRFunctionPrologue,
     IRIf,
+    IRLiteralChunk,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTablePatch,
     IRTestSetBranch,
     IRTailCall,
     IRStackEffect,
@@ -120,6 +134,38 @@ def test_ast_builder_splits_after_return_sequences() -> None:
     assert tuple(exit.offset for exit in first.exits) == (0x0100,)
     assert first.exits[0].reasons and first.exits[0].reasons[0].kind == "return"
     assert len(first.blocks) == 1
+
+
+def test_return_payload_shapes_are_canonical() -> None:
+    def build_return(values: Tuple[str, ...], varargs: bool = False) -> ASTReturn:
+        block = IRBlock(
+            label="block_return",
+            start_offset=0x1000,
+            nodes=(IRReturn(values=values, varargs=varargs),),
+        )
+        segment = IRSegment(
+            index=0,
+            start=0x1000,
+            length=0x04,
+            blocks=(block,),
+            metrics=NormalizerMetrics(),
+        )
+        program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+        ast_program = ASTBuilder().build(program)
+        return ast_program.segments[0].procedures[0].blocks[0].terminator
+
+    unit_return = build_return(tuple())
+    assert isinstance(unit_return, ASTReturn)
+    assert unit_return.payload.kind is ASTReturnKind.UNIT
+
+    tuple_return = build_return(("word0", "word1"))
+    assert tuple_return.payload.kind is ASTReturnKind.TUPLE
+    rendered = [expr.render() for expr in tuple_return.payload.values]
+    assert rendered == ["word0", "word1"]
+
+    varret_return = build_return(("ret0",), varargs=True)
+    assert varret_return.payload.kind is ASTReturnKind.VARRET
+    assert [expr.render() for expr in varret_return.payload.values] == ["value0"]
 
 
 def test_ast_builder_uses_postdominators_for_exits() -> None:
@@ -358,11 +404,125 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
     procedure = segment_ast.procedures[0]
     assert {block.start_offset for block in procedure.blocks} == {0x0410}
     assert all(
-        not isinstance(statement, ASTBranch)
+        not isinstance(statement, ASTConditional)
         for block in procedure.blocks
         for statement in block.statements
     )
 
+
+def test_condition_mask_promotes_predicate_to_mask() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0600,
+        length=0x30,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0600,
+                nodes=(
+                    IRConditionMask(source="RET_MASK", mask=RET_MASK),
+                    IRIf(condition="word0", then_target=0x0610, else_target=0x0620),
+                ),
+            ),
+            IRBlock(
+                label="block_then",
+                start_offset=0x0610,
+                nodes=(IRReturn(values=("ret0",), varargs=False),),
+            ),
+            IRBlock(
+                label="block_else",
+                start_offset=0x0620,
+                nodes=(IRReturn(values=("ret1",), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    branch = ASTBuilder().build(program).segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(branch, ASTConditional)
+    predicate = branch.predicate
+    assert predicate.kind is ASTPredicateKind.MASK
+    assert predicate.label == "RET_MASK"
+    assert predicate.mask is not None
+    assert predicate.mask.value == RET_MASK
+    assert predicate.mask.alias == "RET_MASK"
+
+
+def test_flag_check_uses_flag_predicate() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0700,
+        length=0x30,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0700,
+                nodes=(IRFlagCheck(flag=0x4000, then_target=0x0710, else_target=0x0720),),
+            ),
+            IRBlock(
+                label="block_then",
+                start_offset=0x0710,
+                nodes=(IRReturn(values=("ret0",), varargs=False),),
+            ),
+            IRBlock(
+                label="block_else",
+                start_offset=0x0720,
+                nodes=(IRReturn(values=("ret1",), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    branch = ASTBuilder().build(program).segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(branch, ASTConditional)
+    predicate = branch.predicate
+    assert predicate.kind is ASTPredicateKind.FLAG
+    assert predicate.flag == 0x4000
+
+
+def test_function_prologue_predicate_captures_initializer() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0800,
+        length=0x30,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0800,
+                nodes=(
+                    IRFunctionPrologue(
+                        var="bool0",
+                        expr="init0",
+                        then_target=0x0810,
+                        else_target=0x0820,
+                    ),
+                ),
+            ),
+            IRBlock(
+                label="block_then",
+                start_offset=0x0810,
+                nodes=(IRReturn(values=("ret0",), varargs=False),),
+            ),
+            IRBlock(
+                label="block_else",
+                start_offset=0x0820,
+                nodes=(IRReturn(values=("ret1",), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    branch = ASTBuilder().build(program).segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(branch, ASTConditional)
+    predicate = branch.predicate
+    assert predicate.kind is ASTPredicateKind.PROLOGUE
+    assert isinstance(predicate.expression, ASTIdentifier)
+    assert predicate.expression.name == "bool0"
+    assert isinstance(predicate.initializer, ASTIdentifier)
+    assert predicate.initializer.name == "init0"
 
 def test_ast_builder_drops_empty_procedures() -> None:
     segment = IRSegment(
@@ -431,6 +591,97 @@ def test_ast_builder_resolves_slot_reference() -> None:
     assert rendered.startswith("addr{")
     assert "type=frame" in rendered
     assert "offset=0x0004" in rendered
+
+
+def test_string_literals_collapse_ascii_nodes() -> None:
+    block = IRBlock(
+        label="block_strings",
+        start_offset=0x0900,
+        nodes=(
+            IRAsciiHeader(chunks=("Hello", " ", "World")),
+            IRLiteralChunk(data=b"!\xFF", source="inline"),
+            IRLiteralChunk(
+                data=b"Sphere",
+                source="inline",
+                annotations=(),
+                symbol="str_sphere",
+            ),
+            IRDataMarker(mnemonic="literal_marker"),
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0900,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    statements = ASTBuilder().build(program).segments[0].procedures[0].blocks[0].statements
+    literals = [stmt for stmt in statements if isinstance(stmt, ASTStringLiteralStatement)]
+    assert [literal.literal.text for literal in literals] == ["Hello World", "!ÿ", "Sphere"]
+    assert literals[0].literal.encoding == "utf-8"
+    assert literals[1].literal.encoding == "latin-1"
+    assert literals[2].symbol == "str_sphere"
+
+
+def test_adaptive_table_statement_is_emitted() -> None:
+    block = IRBlock(
+        label="block_table",
+        start_offset=0x0A00,
+        nodes=(
+            IRTablePatch(
+                operations=(("op_10_00", 0x1000),),
+                annotations=("adaptive_table", "mode=0x05"),
+            ),
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0A00,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    statements = ASTBuilder().build(program).segments[0].procedures[0].blocks[0].statements
+    table_stmt = next(stmt for stmt in statements if isinstance(stmt, ASTAdaptiveTable))
+    assert table_stmt.mode == 0x05
+    assert table_stmt.operations == (("op_10_00", 0x1000),)
+
+
+def test_dispatch_helpers_use_named_symbols_and_metadata() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x01, target=0x2000, symbol=None),),
+        helper=0x660A,
+        helper_symbol=None,
+        default=None,
+    )
+    block = IRBlock(
+        label="block_dispatch",
+        start_offset=0x0B00,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0B00,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    switch_stmt = ASTBuilder().build(program).segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.helper is not None
+    assert switch_stmt.helper.symbol == "dispatch.adaptive.table"
+    assert switch_stmt.helper.address == 0x660A
+    assert switch_stmt.index.mask == 0x00FF
+    assert switch_stmt.index.base == 0x0000
 
 
 def test_ast_builder_reconstructs_dispatch_call_index() -> None:
@@ -518,13 +769,13 @@ def test_ast_builder_merges_enum_members_across_switches() -> None:
     first_switch, second_switch = statements[0], statements[1]
     assert isinstance(first_switch, ASTSwitch)
     assert isinstance(second_switch, ASTSwitch)
-    assert first_switch.enum_name == "Helper660A"
-    assert second_switch.enum_name == "Helper660A"
-    assert first_switch.cases[0].key_alias == "Helper660A.K_0003"
-    assert second_switch.cases[1].key_alias == "Helper660A.K_0004"
+    assert first_switch.enum_name == "DispatchAdaptiveTable"
+    assert second_switch.enum_name == "DispatchAdaptiveTable"
+    assert first_switch.cases[0].key_alias == "DispatchAdaptiveTable.K_0003"
+    assert second_switch.cases[1].key_alias == "DispatchAdaptiveTable.K_0004"
 
     segment_enums = ast_program.segments[0].enums
-    assert segment_enums and segment_enums[0].name == "Helper660A"
+    assert segment_enums and segment_enums[0].name == "DispatchAdaptiveTable"
     assert {member.value for member in segment_enums[0].members} == {0x03, 0x04}
 
 
@@ -916,7 +1167,13 @@ def test_testset_branch_desugars_into_assignment() -> None:
     procedure = ast_program.segments[0].procedures[0]
     statements = procedure.blocks[0].statements
     assert isinstance(statements[0], ASTAssign)
-    assert isinstance(statements[1], ASTBranch)
+    assert isinstance(statements[1], ASTConditional)
+    predicate = statements[1].predicate
+    assert predicate.kind is ASTPredicateKind.STORED
+    assert isinstance(predicate.expression, ASTIdentifier)
+    assert predicate.expression.name == "bool0"
+    assert isinstance(predicate.initializer, ASTIdentifier)
+    assert predicate.initializer.name == "cond0"
 
 
 def test_banked_memory_locations_are_canonical() -> None:
