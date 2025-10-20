@@ -20,6 +20,7 @@ from ..ir.model import (
     IRIOWrite,
     IRIf,
     IRFlagCheck,
+    IRDataMarker,
     IRDispatchCase,
     IRBankedLoad,
     IRBankedStore,
@@ -31,6 +32,9 @@ from ..ir.model import (
     IRReturn,
     IRSegment,
     IRStore,
+    IRConditionMask,
+    IRLiteralChunk,
+    IRTablePatch,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -145,6 +149,7 @@ _IO_OPCODE_FALLBACK = {
 }
 
 _TRACE_TOKEN = re.compile(r"^(?P<label>[^@]+)@0x(?P<offset>[0-9A-Fa-f]+)$")
+_LITERAL_MARKER_BYTES = b"literal_marker"
 _MASK_OPCODE_FALLBACK = {0x29, 0x31, 0x32, 0x4B, 0x4F, 0x52, 0x5E, 0x70, 0x72}
 _DROP_OPCODE_FALLBACK = {0x01, 0x2D}
 _BRIDGE_OPCODE_FALLBACK = {0x3A, 0x3E, 0x04, 0x4A, 0x4B, 0x76, 0xE1, 0xE8, 0xED, 0xF0}
@@ -177,7 +182,9 @@ from .model import (
     ASTAssign,
     ASTBitField,
     ASTBlock,
-    ASTBranch,
+    ASTConditional,
+    ASTConditionPredicate,
+    ASTPredicateKind,
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallOperand,
@@ -194,6 +201,8 @@ from .model import (
     ASTTraceOperand,
     ASTValueOperand,
     ASTComment,
+    ASTLiteralData,
+    ASTAdaptiveTable,
     ASTEffect,
     ASTEnumDecl,
     ASTEnumMember,
@@ -202,7 +211,6 @@ from .model import (
     ASTEntryReason,
     ASTExitPoint,
     ASTExitReason,
-    ASTFlagCheck,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameMaskEffect,
@@ -218,6 +226,7 @@ from .model import (
     ASTIOWrite,
     ASTIdentifier,
     ASTBooleanLiteral,
+    ASTStringLiteral,
     ASTIntegerLiteral,
     ASTMemoryLocation,
     ASTMemoryRead,
@@ -228,9 +237,9 @@ from .model import (
     ASTProgram,
     ASTReturn,
     ASTReturnPayload,
+    ASTReturnPayloadKind,
     ASTSegment,
     ASTStatement,
-    ASTFunctionPrologue,
     ASTJump,
     ASTTerminator,
     ASTSwitch,
@@ -238,7 +247,6 @@ from .model import (
     ASTDispatchHelper,
     ASTDispatchIndex,
     ASTTailCall,
-    ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
 )
@@ -254,7 +262,7 @@ class _BlockAnalysis:
     fallthrough: Optional[int]
 
 
-BranchStatement = ASTBranch | ASTTestSet | ASTFlagCheck | ASTFunctionPrologue
+BranchStatement = ASTConditional
 
 
 @dataclass
@@ -274,6 +282,14 @@ class _BranchLink:
     then_target: int
     else_target: int
     origin_offset: int
+
+
+@dataclass
+class _PendingConditionMask:
+    """Deferred condition mask attached to the next branch."""
+
+    token: str
+    mask: int
 
 
 @dataclass
@@ -379,11 +395,11 @@ class _SignatureAccumulator:
         call: ASTCallExpr,
         returns: Sequence[ASTExpression],
         abi: Optional[ASTCallABI],
-        payload_varargs: bool = False,
+        return_variadic: bool = False,
     ) -> None:
         if call.symbol:
             self.symbols.add(call.symbol)
-        if call.varargs or payload_varargs:
+        if call.varargs or return_variadic:
             self.attributes.add("varargs")
         convention = "tailcall" if call.tail else "call"
         self.calling_conventions.add(convention)
@@ -490,6 +506,7 @@ class ASTBuilder:
         self._current_segment_index: int = -1
         self._call_arg_values: Dict[str, ASTExpression] = {}
         self._expression_lookup: Dict[str, ASTExpression] = {}
+        self._pending_condition_mask: Optional[_PendingConditionMask] = None
 
     # ------------------------------------------------------------------
     # public API
@@ -521,6 +538,9 @@ class ASTBuilder:
 
     # ------------------------------------------------------------------
     # helpers
+    @staticmethod
+    def _sanitize_comment(text: str) -> str:
+        return text.replace("marker literal_marker", "literal_marker")
     # ------------------------------------------------------------------
     def _build_segment(
         self, segment: IRSegment, metrics: ASTMetrics
@@ -607,7 +627,7 @@ class ASTBuilder:
                                 statement.call,
                                 statement.payload.values,
                                 statement.abi,
-                                payload_varargs=statement.payload.varargs,
+                                return_variadic=statement.payload.is_variadic(),
                             )
         signatures: List[ASTSymbolSignature] = []
         for address, accumulator in accumulators.items():
@@ -1020,8 +1040,7 @@ class ASTBuilder:
                 not block.body
                 and isinstance(terminator, ASTReturn)
                 and not terminator.effects
-                and not terminator.payload.values
-                and not terminator.payload.varargs
+                and terminator.payload.is_unit()
                 and not exit_reasons
             ):
                 synthetic_only = False
@@ -1058,14 +1077,8 @@ class ASTBuilder:
                     reason = "jump"
                 elif isinstance(terminator, ASTSwitch):
                     reason = "switch"
-                elif isinstance(terminator, ASTBranch):
+                elif isinstance(terminator, ASTConditional):
                     reason = "branch"
-                elif isinstance(terminator, ASTTestSet):
-                    reason = "testset"
-                elif isinstance(terminator, ASTFlagCheck):
-                    reason = "flag_check"
-                elif isinstance(terminator, ASTFunctionPrologue):
-                    reason = "prologue"
                 if reason:
                     reasons = (ASTExitReason(kind=reason),)
             exit_points.append(
@@ -1357,8 +1370,14 @@ class ASTBuilder:
             if isinstance(statement, ASTReturn):
                 stack.clear()
                 continue
-            if isinstance(statement, ASTBranch):
-                if self._is_stack_top_expr(statement.condition) and stack:
+            if isinstance(statement, ASTConditional):
+                predicate = statement.predicate
+                if (
+                    predicate.kind is ASTPredicateKind.VALUE
+                    and predicate.expression is not None
+                    and self._is_stack_top_expr(predicate.expression)
+                    and stack
+                ):
                     kind, value = stack[-1]
                     if kind == "literal" and value is not None:
                         target = statement.then_branch if value else statement.else_branch
@@ -1674,6 +1693,7 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
+        self._pending_condition_mask = None
         for node in block.nodes:
             if isinstance(node, IRCall):
                 self._handle_dispatch_call(
@@ -1840,7 +1860,7 @@ class ASTBuilder:
             return [
                 ASTTailCall(
                     call=statement.call,
-                    payload=ASTReturnPayload(values=tuple()),
+                    payload=ASTReturnPayload(),
                     abi=statement.abi,
                 )
             ]
@@ -1854,7 +1874,7 @@ class ASTBuilder:
             return False
         if isinstance(statement, ASTTailCall):
             payload = statement.payload
-            if payload.values or payload.varargs:
+            if not payload.is_unit():
                 return False
             if statement.effects:
                 return False
@@ -1911,12 +1931,16 @@ class ASTBuilder:
         index_expr, index_mask, index_base = self._resolve_dispatch_index(
             dispatch, value_state
         )
+        index_mask, index_base = self._ensure_dispatch_index_defaults(
+            dispatch, index_mask, index_base
+        )
         kind = self._classify_dispatch_kind(dispatch)
         index_info = ASTDispatchIndex(
             expression=index_expr, mask=index_mask, base=index_base
         )
+        helper_symbol = self._dispatch_helper_symbol(dispatch.helper, dispatch.helper_symbol)
         helper_info = (
-            ASTDispatchHelper(address=dispatch.helper, symbol=dispatch.helper_symbol)
+            ASTDispatchHelper(address=dispatch.helper, symbol=helper_symbol)
             if dispatch.helper is not None
             else None
         )
@@ -1971,6 +1995,36 @@ class ASTBuilder:
         if lowered.startswith("io.") or lowered.startswith("scheduler.mask_"):
             return "io"
         return None
+
+    @staticmethod
+    def _dispatch_helper_symbol(
+        helper: Optional[int], symbol: Optional[str]
+    ) -> Optional[str]:
+        if helper is None:
+            return symbol
+        if symbol:
+            return symbol
+        return f"helper_{helper:04X}"
+
+    def _ensure_dispatch_index_defaults(
+        self,
+        dispatch: IRSwitchDispatch,
+        mask: Optional[int],
+        base: Optional[int],
+    ) -> Tuple[Optional[int], Optional[int]]:
+        if not dispatch.cases:
+            return mask, base
+        keys = [case.key for case in dispatch.cases]
+        if base is None:
+            base = min(keys)
+        if mask is None:
+            span = max(key - (base or 0) for key in keys)
+            if span <= 0:
+                mask = 0
+            else:
+                bits = span.bit_length()
+                mask = (1 << bits) - 1
+        return mask, base
 
     def _build_dispatch_cases(
         self, cases: Sequence[IRDispatchCase]
@@ -2311,10 +2365,16 @@ class ASTBuilder:
                 )
                 for index, name in enumerate(node.returns)
             )
+            if node.varargs:
+                payload_kind = ASTReturnPayloadKind.VARRET
+            elif resolved_returns:
+                payload_kind = ASTReturnPayloadKind.TUPLE
+            else:
+                payload_kind = ASTReturnPayloadKind.UNIT
             statements.append(
                 ASTTailCall(
                     call=call_expr,
-                    payload=ASTReturnPayload(values=resolved_returns, varargs=node.varargs),
+                    payload=ASTReturnPayload(values=resolved_returns, kind=payload_kind),
                     abi=abi,
                     effects=epilogue_effects,
                 )
@@ -2330,25 +2390,35 @@ class ASTBuilder:
             else:
                 self._pending_epilogue.extend(node.steps)
             return [], []
+        if isinstance(node, IRLiteralChunk):
+            return [self._build_literal_chunk(node)], []
+        if isinstance(node, IRDataMarker):
+            if node.mnemonic in {"literal_marker", "ascii_header", "inline_ascii_chunk"}:
+                return [], []
+            return [ASTComment(self._sanitize_comment(node.describe()))], []
+        if isinstance(node, IRTablePatch):
+            table = self._build_adaptive_table(node)
+            return [table], []
         if isinstance(node, IRTerminator):
+            return [], []
+        if isinstance(node, IRConditionMask):
+            self._pending_condition_mask = _PendingConditionMask(
+                token=node.source, mask=node.mask
+            )
             return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            branch = ASTBranch(
-                condition=condition,
-                then_offset=then_target,
-                else_offset=else_target,
+            statements, links = self._build_conditional(
+                ASTPredicateKind.VALUE,
+                expression=condition,
+                then_target=then_target,
+                else_target=else_target,
+                value_state=value_state,
+                origin_offset=origin_offset,
             )
-            return [branch], [
-                _BranchLink(
-                    statement=branch,
-                    then_target=then_target,
-                    else_target=else_target,
-                    origin_offset=origin_offset,
-                )
-            ]
+            return statements, links
         if isinstance(node, IRTestSetBranch):
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
@@ -2357,55 +2427,152 @@ class ASTBuilder:
             value_state[node.var] = target
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             assignment = ASTAssign(target=target, value=expr)
-            branch = ASTBranch(
-                condition=target,
-                then_offset=then_target,
-                else_offset=else_target,
+            conditional_statements, links = self._build_conditional(
+                ASTPredicateKind.VALUE,
+                expression=target,
+                then_target=then_target,
+                else_target=else_target,
+                value_state=value_state,
+                origin_offset=origin_offset,
             )
-            return [assignment, branch], [
-                _BranchLink(
-                    statement=branch,
-                    then_target=then_target,
-                    else_target=else_target,
-                    origin_offset=origin_offset,
-                )
-            ]
+            return [assignment, *conditional_statements], links
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFunctionPrologue(
-                var=var_expr,
-                expr=expr,
-                then_offset=then_target,
-                else_offset=else_target,
+            statements, links = self._build_conditional(
+                ASTPredicateKind.PROLOGUE,
+                target=var_expr,
+                initializer=expr,
+                then_target=then_target,
+                else_target=else_target,
+                value_state=value_state,
+                origin_offset=origin_offset,
             )
-            return [statement], [
-                _BranchLink(
-                    statement=statement,
-                    then_target=then_target,
-                    else_target=else_target,
-                    origin_offset=origin_offset,
-                )
-            ]
+            return statements, links
         if isinstance(node, IRFlagCheck):
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFlagCheck(
+            statements, links = self._build_conditional(
+                ASTPredicateKind.FLAG,
                 flag=node.flag,
-                then_offset=then_target,
-                else_offset=else_target,
+                then_target=then_target,
+                else_target=else_target,
+                value_state=value_state,
+                origin_offset=origin_offset,
             )
-            return [statement], [
-                _BranchLink(
-                    statement=statement,
-                    then_target=then_target,
-                    else_target=else_target,
-                    origin_offset=origin_offset,
-                )
-            ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+            return statements, links
+        note = getattr(node, "describe", lambda: repr(node))()
+        return [ASTComment(self._sanitize_comment(note))], []
+
+    def _consume_condition_mask(
+        self, value_state: Mapping[str, ASTExpression]
+    ) -> Tuple[Optional[ASTExpression], Optional[ASTBitField]]:
+        pending = self._pending_condition_mask
+        self._pending_condition_mask = None
+        if pending is None:
+            return None, None
+        source = self._resolve_expr(pending.token, value_state)
+        mask = self._bitfield(pending.mask, None)
+        return source, mask
+
+    def _build_conditional(
+        self,
+        kind: ASTPredicateKind,
+        *,
+        expression: Optional[ASTExpression] = None,
+        target: Optional[ASTExpression] = None,
+        initializer: Optional[ASTExpression] = None,
+        flag: Optional[int] = None,
+        then_target: int,
+        else_target: int,
+        value_state: Mapping[str, ASTExpression],
+        origin_offset: int,
+    ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
+        mask_source, mask_field = self._consume_condition_mask(value_state)
+        predicate = ASTConditionPredicate(
+            kind=kind,
+            expression=expression,
+            target=target,
+            initializer=initializer,
+            flag=flag,
+            mask=mask_field,
+            mask_source=mask_source,
+        )
+        statement = ASTConditional(
+            predicate=predicate,
+            then_offset=then_target,
+            else_offset=else_target,
+        )
+        link = _BranchLink(
+            statement=statement,
+            then_target=then_target,
+            else_target=else_target,
+            origin_offset=origin_offset,
+        )
+        return [statement], [link]
+
+    @staticmethod
+    def _adaptive_mode_label(mode: int) -> str:
+        return f"mode_{mode:02X}".lower()
+
+    def _build_adaptive_table(self, table: IRTablePatch) -> ASTAdaptiveTable:
+        mode_value = 0
+        kind = "unspecified"
+        parameters: List[str] = []
+        extras: List[str] = []
+        for note in table.annotations:
+            if not note:
+                continue
+            if note == "adaptive_table":
+                continue
+            if note.startswith("mode="):
+                _, raw = note.split("=", 1)
+                try:
+                    mode_value = int(raw, 16)
+                except ValueError:
+                    mode_value = 0
+                continue
+            if note.startswith("kind="):
+                _, raw = note.split("=", 1)
+                lowered = raw.strip()
+                if lowered and lowered != "unknown":
+                    kind = lowered
+                continue
+            if note.startswith("params="):
+                _, raw = note.split("=", 1)
+                values = raw.strip()
+                if values.startswith("[") and values.endswith("]"):
+                    values = values[1:-1]
+                if values:
+                    parameters = [item.strip() for item in values.split(",") if item.strip()]
+                continue
+            extras.append(note)
+
+        mode_label = self._adaptive_mode_label(mode_value)
+        return ASTAdaptiveTable(
+            mode=mode_value,
+            mode_label=mode_label,
+            kind=kind,
+            operations=table.operations,
+            parameters=tuple(parameters),
+            annotations=tuple(extras),
+        )
+
+    def _build_literal_chunk(self, chunk: IRLiteralChunk) -> ASTLiteralData:
+        literal = self._string_literal_from_bytes(chunk.data)
+        return ASTLiteralData(literal=literal)
+
+    @staticmethod
+    def _string_literal_from_bytes(data: bytes) -> ASTStringLiteral:
+        try:
+            text = data.decode("utf-8")
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            text = data.decode("latin-1")
+            encoding = "latin-1"
+        return ASTStringLiteral(text=text, encoding=encoding)
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
@@ -2841,7 +3008,13 @@ class ASTBuilder:
             )
             for index, name in enumerate(node.values)
         )
-        return ASTReturnPayload(values=values, varargs=node.varargs)
+        if node.varargs:
+            kind = ASTReturnPayloadKind.VARRET
+        elif values:
+            kind = ASTReturnPayloadKind.TUPLE
+        else:
+            kind = ASTReturnPayloadKind.UNIT
+        return ASTReturnPayload(values=values, kind=kind)
 
     def _policy_effects(self, policy: _FramePolicySummary) -> List[ASTEffect]:
         summary: List[ASTEffect] = []
@@ -2982,12 +3155,29 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        token = token.strip()
         if token in value_state:
             return value_state[token]
         if token in self._call_arg_values:
             return self._call_arg_values[token]
         if token in self._expression_lookup:
             return self._expression_lookup[token]
+        if token == "literal_marker":
+            return self._string_literal_from_bytes(_LITERAL_MARKER_BYTES)
+        if token.startswith("marker "):
+            marker = token.split(" ", 1)[1].strip()
+            if marker == "literal_marker":
+                return self._string_literal_from_bytes(_LITERAL_MARKER_BYTES)
+        if "literal_marker" in token:
+            cleaned = (
+                token.replace(", literal_marker", "")
+                .replace(" literal_marker", "")
+                .replace("literal_marker", "")
+                .strip(" ,")
+            )
+            if not cleaned:
+                return self._string_literal_from_bytes(_LITERAL_MARKER_BYTES)
+            return self._resolve_expr(cleaned, value_state)
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
@@ -3110,6 +3300,7 @@ class ASTBuilder:
         self._current_segment_index = -1
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._pending_condition_mask = None
 
 
 __all__ = ["ASTBuilder"]

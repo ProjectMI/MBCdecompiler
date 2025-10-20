@@ -1116,25 +1116,32 @@ class ASTTerminator(ASTStatement):
     """Base class for normalised block terminators."""
 
 
+class ASTReturnPayloadKind(Enum):
+    """Classification applied to structured return payloads."""
+
+    UNIT = "unit"
+    TUPLE = "tuple"
+    VARRET = "varret"
+
+
 @dataclass(frozen=True)
 class ASTReturnPayload:
     """Structured representation of return values."""
 
     values: Tuple[ASTExpression, ...] = ()
-    varargs: bool = False
+    kind: ASTReturnPayloadKind = ASTReturnPayloadKind.UNIT
 
     def render(self) -> str:
-        if self.varargs:
-            if not self.values:
-                return "varargs"
-            inner = ", ".join(value.render() for value in self.values)
-            return f"varargs({inner})"
-        if not self.values:
-            return "()"
-        if len(self.values) == 1:
-            return self.values[0].render()
-        inner = ", ".join(value.render() for value in self.values)
-        return f"({inner})"
+        rendered_values = ", ".join(value.render() for value in self.values)
+        if not rendered_values:
+            return self.kind.value
+        return f"{self.kind.value}({rendered_values})"
+
+    def is_unit(self) -> bool:
+        return self.kind is ASTReturnPayloadKind.UNIT
+
+    def is_variadic(self) -> bool:
+        return self.kind is ASTReturnPayloadKind.VARRET
 
 
 @dataclass
@@ -1171,7 +1178,7 @@ class ASTTailCall(ASTTerminator):
             call_repr = call_repr[len("tail ") :]
         result = f"tail {call_repr}"
         payload_repr = self.payload.render()
-        if payload_repr != "()":
+        if not self.payload.is_unit():
             result = f"{result} -> {payload_repr}"
         if self.abi is not None:
             result = f"{result} {self.abi.render()}"
@@ -1198,11 +1205,58 @@ class ASTJump(ASTTerminator):
         return f"jump {destination}"
 
 
-@dataclass
-class ASTBranch(ASTTerminator):
-    """Generic conditional branch with CFG links."""
+class ASTPredicateKind(Enum):
+    """Kinds of predicates supported by :class:`ASTConditional`."""
 
-    condition: ASTExpression
+    VALUE = "value"
+    FLAG = "flag"
+    PROLOGUE = "prologue"
+
+
+@dataclass(frozen=True)
+class ASTConditionPredicate:
+    """Typed predicate attached to conditional terminators."""
+
+    kind: ASTPredicateKind
+    expression: ASTExpression | None = None
+    target: ASTExpression | None = None
+    initializer: ASTExpression | None = None
+    flag: int | None = None
+    mask: ASTBitField | None = None
+    mask_source: ASTExpression | None = None
+
+    def render(self) -> str:
+        if self.kind is ASTPredicateKind.VALUE:
+            expr = self.expression.render() if self.expression is not None else "?"
+            text = f"value({expr})"
+        elif self.kind is ASTPredicateKind.FLAG:
+            flag_repr = f"0x{self.flag:04X}" if self.flag is not None else "?"
+            text = f"flag({flag_repr})"
+        elif self.kind is ASTPredicateKind.PROLOGUE:
+            target = self.target.render() if self.target is not None else "?"
+            init = self.initializer.render() if self.initializer is not None else "?"
+            text = f"prologue({target} = {init})"
+        else:  # pragma: no cover - exhaustive by construction
+            text = self.kind.value
+
+        extras: List[str] = []
+        if self.mask is not None:
+            extras.append(self.mask.render())
+        if (
+            self.mask_source is not None
+            and (self.expression is None or self.mask_source.render() != self.expression.render())
+        ):
+            extras.append(f"source={self.mask_source.render()}")
+        if extras:
+            return f"{text} {' '.join(extras)}"
+        return text
+
+
+@dataclass
+class ASTConditional(ASTTerminator):
+    """Unified conditional terminator with typed predicate."""
+
+    predicate: ASTConditionPredicate
     then_branch: "ASTBlock | None" = None
     else_branch: "ASTBlock | None" = None
     then_hint: str | None = None
@@ -1211,72 +1265,10 @@ class ASTBranch(ASTTerminator):
     else_offset: int | None = None
 
     def render(self) -> str:
-        condition = self.condition.render()
+        predicate_repr = self.predicate.render()
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return f"if {condition} then {then_label} else {else_label}"
-
-
-@dataclass
-class ASTTestSet(ASTTerminator):
-    """Branch that stores a predicate before testing it."""
-
-    var: ASTExpression
-    expr: ASTExpression
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
-
-    def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return (
-            f"testset {self.var.render()} = {self.expr.render()} "
-            f"then {then_label} else {else_label}"
-        )
-
-
-@dataclass
-class ASTFlagCheck(ASTTerminator):
-    """Branch that checks a VM flag."""
-
-    flag: int
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
-
-    def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
-
-
-@dataclass
-class ASTFunctionPrologue(ASTTerminator):
-    """Reconstructed function prologue sequence."""
-
-    var: ASTExpression
-    expr: ASTExpression
-    then_branch: "ASTBlock | None" = None
-    else_branch: "ASTBlock | None" = None
-    then_hint: str | None = None
-    else_hint: str | None = None
-    then_offset: int | None = None
-    else_offset: int | None = None
-
-    def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
-        return (
-            f"prologue {self.var.render()} = {self.expr.render()} "
-            f"then {then_label} else {else_label}"
-        )
+        return f"branch {predicate_repr} then {then_label} else {else_label}"
 
 
 @dataclass
@@ -1289,6 +1281,18 @@ class ASTComment(ASTStatement):
 
     def render(self) -> str:
         return f"; {self.text}"
+
+
+@dataclass
+class ASTLiteralData(ASTStatement):
+    """Standalone literal value embedded directly in the code stream."""
+
+    literal: ASTExpression
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        return self.literal.render()
 
 
 @dataclass(frozen=True)
@@ -1350,6 +1354,34 @@ class ASTDispatchIndex:
 
     def render_expression(self) -> str:
         return self.expression.render() if self.expression is not None else "?"
+
+
+def _render_table_operation(mnemonic: str, operand: int) -> str:
+    return f"{mnemonic}(0x{operand:04X})"
+
+
+@dataclass
+class ASTAdaptiveTable(ASTStatement):
+    """Structured view of an adaptive table patch sequence."""
+
+    mode: int
+    mode_label: str
+    kind: str
+    operations: Tuple[Tuple[str, int], ...]
+    parameters: Tuple[str, ...] = ()
+    annotations: Tuple[str, ...] = ()
+
+    def render(self) -> str:
+        parts: List[str] = [
+            f"mode={self.mode_label}(0x{self.mode:02X})",
+            f"kind={self.kind}",
+            f"ops=[{', '.join(_render_table_operation(*op) for op in self.operations)}]",
+        ]
+        if self.parameters:
+            parts.append(f"params=[{', '.join(self.parameters)}]")
+        if self.annotations:
+            parts.append(f"notes=[{', '.join(self.annotations)}]")
+        return f"adaptive_table{{{', '.join(parts)}}}"
 
 
 @dataclass
@@ -1627,10 +1659,12 @@ __all__ = [
     "ASTJump",
     "ASTReturn",
     "ASTReturnPayload",
-    "ASTBranch",
-    "ASTTestSet",
-    "ASTFlagCheck",
-    "ASTFunctionPrologue",
+    "ASTReturnPayloadKind",
+    "ASTPredicateKind",
+    "ASTConditionPredicate",
+    "ASTConditional",
+    "ASTAdaptiveTable",
+    "ASTLiteralData",
     "ASTComment",
     "ASTEnumDecl",
     "ASTEnumMember",
