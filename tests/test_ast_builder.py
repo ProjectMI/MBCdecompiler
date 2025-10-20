@@ -10,9 +10,14 @@ from mbcdisasm.ast import (
     ASTCallArgumentSlot,
     ASTCallExpr,
     ASTCallStatement,
-    ASTFrameEffect,
-    ASTFrameOperation,
+    ASTFrameCleanupEffect,
+    ASTFrameDropEffect,
+    ASTFrameMaskEffect,
+    ASTFramePageSelectEffect,
     ASTFrameProtocolEffect,
+    ASTFrameResetEffect,
+    ASTFrameTeardownEffect,
+    ASTFrameWriteEffect,
     ASTIOEffect,
     ASTIntegerLiteral,
     ASTMemoryRead,
@@ -636,8 +641,10 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     call_stmt = next(statement for statement in block.statements if isinstance(statement, ASTCallStatement))
     assert call_stmt.abi is not None
     assert isinstance(call_stmt.abi, ASTCallABI)
-    assert call_stmt.abi.live_mask is not None
-    assert call_stmt.abi.live_mask.value == RET_MASK
+    mask_effects = [
+        effect for effect in call_stmt.abi.effects if isinstance(effect, ASTFrameMaskEffect)
+    ]
+    assert any(effect.mask.value == RET_MASK for effect in mask_effects)
     assert len(call_stmt.abi.slots) == 2
     assert all(isinstance(slot, ASTCallArgumentSlot) for slot in call_stmt.abi.slots)
 
@@ -650,15 +657,22 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert RET_MASK in mask_values
     assert 0x0001 in mask_values
 
-    frame_effects = [
-        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameEffect)
+    frame_mask_effects = [
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
+    ]
+    page_effects = [
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFramePageSelectEffect)
+    ]
+    teardown_effects = [
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameTeardownEffect)
     ]
     io_effects = [effect for effect in return_stmt.effects if isinstance(effect, ASTIOEffect)]
 
-    assert any(effect.operation.value == "page_select" for effect in frame_effects)
-    assert any(effect.operation.value == "teardown" for effect in frame_effects)
-    assert any(effect.operation.value == "return_mask" and effect.operand and effect.operand.value == RET_MASK for effect in frame_effects)
-    assert any(effect.operation.value == "return_mask" and effect.operand and effect.operand.value == 0x0001 for effect in frame_effects)
+    assert page_effects
+    assert teardown_effects
+    assert any(effect.mask.value == RET_MASK for effect in frame_mask_effects)
+    assert any(effect.mask.value == 0x0001 for effect in frame_mask_effects)
+    assert any(effect.pops == protocol_effect.teardown for effect in teardown_effects)
     assert any(effect.operation.value == "bridge" for effect in io_effects)
 
 
@@ -696,10 +710,18 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     mask_values = {mask.value for mask in protocol_effect.masks}
     assert RET_MASK in mask_values
 
-    frame_effects = [effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameEffect)]
-    assert any(effect.operation.value == "return_mask" and effect.operand and effect.operand.value == RET_MASK for effect in frame_effects)
-    assert any(effect.operation.value == "teardown" and effect.pops == protocol_effect.teardown for effect in frame_effects)
-    assert any(effect.operation.value == "drop" and effect.pops == protocol_effect.drops for effect in frame_effects)
+    mask_effects = [
+        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
+    ]
+    teardown_effects = [
+        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameTeardownEffect)
+    ]
+    drop_effects = [
+        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameDropEffect)
+    ]
+    assert any(effect.mask.value == RET_MASK for effect in mask_effects)
+    assert any(effect.pops == protocol_effect.teardown for effect in teardown_effects)
+    assert any(effect.pops == protocol_effect.drops for effect in drop_effects)
 
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(
@@ -733,11 +755,9 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
         effect for effect in return_stmt.effects if isinstance(effect, ASTFrameProtocolEffect)
     )
     mask_pairs = {
-        (effect.operand.value, effect.operand.alias)
+        (effect.mask.value, effect.mask.alias)
         for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameEffect)
-        and effect.operation.value == "return_mask"
-        and effect.operand is not None
+        if isinstance(effect, ASTFrameMaskEffect)
     }
     expected = {(mask.value, mask.alias) for mask in protocol_effect.masks}
     assert mask_pairs == expected
@@ -745,8 +765,7 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     teardown_effects = [
         effect
         for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameEffect)
-        and effect.operation is ASTFrameOperation.TEARDOWN
+        if isinstance(effect, ASTFrameTeardownEffect)
     ]
     assert len(teardown_effects) == 1
     assert teardown_effects[0].pops == protocol_effect.teardown
@@ -754,8 +773,7 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     drop_effects = [
         effect
         for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameEffect)
-        and effect.operation is ASTFrameOperation.DROP
+        if isinstance(effect, ASTFrameDropEffect)
     ]
     assert len(drop_effects) == 1
     assert drop_effects[0].pops == protocol_effect.drops
@@ -931,6 +949,7 @@ def test_banked_memory_locations_are_canonical() -> None:
     assign = procedure.blocks[0].statements[0]
     assert isinstance(assign, ASTAssign)
     rendered = assign.value.render()
-    assert rendered.startswith("mem.bank_1230{alias=region(bank_1230)}")
-    assert ".page(0x01)" in rendered
-    assert ".base(0x0040)" in rendered
+    assert rendered.startswith("mem.bank_1230[kind=banked")
+    assert "selector=0x5000" in rendered
+    assert "offset=0x0010" in rendered
+    assert "alias=region(bank_1230)" in rendered
