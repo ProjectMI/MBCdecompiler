@@ -453,13 +453,95 @@ class ASTFrameProtocolEffect(ASTEffect):
     masks: Tuple[ASTBitField, ...]
     teardown: int = 0
     drops: int = 0
+    resets: Tuple[Tuple[Optional[str], Optional[ASTBitField]], ...] = ()
+    writes: Tuple[Tuple[str, Optional[ASTBitField]], ...] = ()
+    channels: Tuple[Tuple[str, Optional[ASTBitField]], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "masks", self._sorted_masks(self.masks))
+        object.__setattr__(self, "resets", self._sorted_reset_entries(self.resets))
+        object.__setattr__(self, "writes", self._sorted_write_entries(self.writes))
+        object.__setattr__(self, "channels", self._sorted_write_entries(self.channels))
 
     def order_key(self) -> Tuple[int, ...]:
-        return (self.domain_order, len(self.masks), self.teardown, self.drops)
+        return (
+            self.domain_order,
+            len(self.masks),
+            len(self.resets),
+            len(self.writes),
+            len(self.channels),
+            self.teardown,
+            self.drops,
+        )
+
+    @staticmethod
+    def _sorted_masks(entries: Tuple[ASTBitField, ...]) -> Tuple[ASTBitField, ...]:
+        return tuple(
+            sorted(
+                entries,
+                key=lambda field: (field.value, field.width, field.alias or ""),
+            )
+        )
+
+    @staticmethod
+    def _sorted_reset_entries(
+        entries: Tuple[Tuple[Optional[str], Optional[ASTBitField]], ...]
+    ) -> Tuple[Tuple[Optional[str], Optional[ASTBitField]], ...]:
+        return tuple(
+            sorted(
+                entries,
+                key=lambda item: (
+                    item[0] or "",
+                    item[1].value if item[1] is not None else -1,
+                    item[1].width if item[1] is not None else 0,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _sorted_write_entries(
+        entries: Tuple[Tuple[str, Optional[ASTBitField]], ...]
+    ) -> Tuple[Tuple[str, Optional[ASTBitField]], ...]:
+        return tuple(
+            sorted(
+                entries,
+                key=lambda item: (
+                    item[0],
+                    item[1].value if item[1] is not None else -1,
+                    item[1].width if item[1] is not None else 0,
+                ),
+            )
+        )
 
     def render(self) -> str:
         mask_text = ", ".join(mask.render() for mask in self.masks)
         parts = [f"masks=[{mask_text}]" if mask_text else "masks=[]"]
+        if self.resets:
+            reset_parts = []
+            for channel, mask in self.resets:
+                fields: List[str] = []
+                if channel:
+                    fields.append(f"channel={channel}")
+                if mask is not None:
+                    fields.append(mask.render())
+                reset_parts.append(" ".join(fields) if fields else "default")
+            parts.append(f"reset=[{', '.join(reset_parts)}]")
+        if self.writes:
+            write_parts = []
+            for channel, mask in self.writes:
+                fields = [f"channel={channel}"]
+                if mask is not None:
+                    fields.append(mask.render())
+                write_parts.append(" ".join(fields))
+            parts.append(f"writes=[{', '.join(write_parts)}]")
+        if self.channels:
+            channel_parts = []
+            for channel, mask in self.channels:
+                fields = [f"channel={channel}"]
+                if mask is not None:
+                    fields.append(mask.render())
+                channel_parts.append(" ".join(fields))
+            parts.append(f"channels=[{', '.join(channel_parts)}]")
         parts.append(f"teardown={self.teardown}")
         parts.append(f"drops={self.drops}")
         inner = ", ".join(parts)
@@ -771,6 +853,55 @@ class ASTTupleExpr(ASTExpression):
 
 
 # ---------------------------------------------------------------------------
+# result binding
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ASTResultSlot:
+    """Single slot participating in a result binding."""
+
+    index: int
+    value: ASTExpression
+
+    def render(self) -> str:
+        return self.value.render()
+
+
+@dataclass(frozen=True)
+class ASTResultSet:
+    """Ordered collection of result slots with optional vararg marker."""
+
+    slots: Tuple[ASTResultSlot, ...] = ()
+    varargs: bool = False
+
+    def __post_init__(self) -> None:
+        ordered = tuple(sorted(self.slots, key=lambda slot: slot.index))
+        object.__setattr__(self, "slots", ordered)
+
+    def values(self) -> Tuple[ASTExpression, ...]:
+        return tuple(slot.value for slot in self.slots)
+
+    def render(self) -> str:
+        if self.varargs:
+            if not self.slots:
+                return "varargs"
+            inner = ", ".join(slot.render() for slot in self.slots)
+            return f"varargs({inner})"
+        if not self.slots:
+            return "()"
+        if len(self.slots) == 1:
+            return self.slots[0].render()
+        inner = ", ".join(slot.render() for slot in self.slots)
+        return f"({inner})"
+
+    def render_binding(self) -> str:
+        if self.varargs or self.slots:
+            return f" -> {self.render()}"
+        return ""
+
+
+# ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
 
@@ -1072,14 +1203,12 @@ class ASTCallStatement(ASTStatement):
     """Call that yields one or more return values."""
 
     call: ASTCallExpr
-    returns: Tuple[ASTIdentifier, ...] = field(default_factory=tuple)
+    result: ASTResultSet = field(default_factory=ASTResultSet)
     abi: Optional[ASTCallABI] = None
 
     def render(self) -> str:
         call_repr = self.call.render()
-        if self.returns:
-            rendered = ", ".join(identifier.render() for identifier in self.returns)
-            call_repr = f"{call_repr} -> ({rendered})"
+        call_repr = f"{call_repr}{self.result.render_binding()}"
         if self.abi is not None:
             return f"{call_repr} {self.abi.render()}"
         return call_repr
@@ -1120,21 +1249,37 @@ class ASTTerminator(ASTStatement):
 class ASTReturnPayload:
     """Structured representation of return values."""
 
-    values: Tuple[ASTExpression, ...] = ()
-    varargs: bool = False
+    result: ASTResultSet
+
+    def __init__(
+        self,
+        values: Sequence[ASTExpression] | None = None,
+        varargs: bool = False,
+        result: Optional[ASTResultSet] = None,
+    ) -> None:
+        if result is None:
+            value_seq = values or ()
+            slots = tuple(
+                ASTResultSlot(index=index, value=value)
+                for index, value in enumerate(value_seq)
+            )
+            result = ASTResultSet(slots=slots, varargs=varargs)
+        object.__setattr__(self, "result", result)
+
+    @property
+    def values(self) -> Tuple[ASTExpression, ...]:
+        return self.result.values()
+
+    @property
+    def varargs(self) -> bool:
+        return self.result.varargs
+
+    @property
+    def slots(self) -> Tuple[ASTResultSlot, ...]:
+        return self.result.slots
 
     def render(self) -> str:
-        if self.varargs:
-            if not self.values:
-                return "varargs"
-            inner = ", ".join(value.render() for value in self.values)
-            return f"varargs({inner})"
-        if not self.values:
-            return "()"
-        if len(self.values) == 1:
-            return self.values[0].render()
-        inner = ", ".join(value.render() for value in self.values)
-        return f"({inner})"
+        return self.result.render()
 
 
 @dataclass
@@ -1460,6 +1605,32 @@ class ASTExitPoint:
         return f"{self.label}@0x{self.offset:04X}{suffix}"
 
 
+@dataclass(frozen=True)
+class ASTProcedureResult:
+    """Canonical summary of values produced by a procedure."""
+
+    slots: Tuple[ASTCallReturnSlot, ...] = ()
+    varargs: bool = False
+
+    def __post_init__(self) -> None:
+        if self.slots:
+            ordered = tuple(sorted(self.slots, key=lambda slot: slot.index))
+            object.__setattr__(self, "slots", ordered)
+
+    def render(self) -> str:
+        if not self.slots and not self.varargs:
+            return "()"
+        rendered = ", ".join(slot.render() for slot in self.slots)
+        if self.varargs:
+            suffix = ", varargs" if rendered else "varargs"
+            if rendered:
+                return f"tuple({rendered}{suffix})"
+            return suffix
+        if len(self.slots) == 1:
+            return self.slots[0].render()
+        return f"tuple({rendered})"
+
+
 @dataclass
 class ASTProcedure:
     """Single reconstructed procedure."""
@@ -1470,6 +1641,8 @@ class ASTProcedure:
     exits: Tuple[ASTExitPoint, ...]
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    result: ASTProcedureResult = field(default_factory=ASTProcedureResult)
+    aliases: Tuple[int, ...] = field(default_factory=tuple)
 
     @property
     def entry_offset(self) -> int:
@@ -1599,6 +1772,8 @@ __all__ = [
     "ASTCallExpr",
     "ASTCallResult",
     "ASTTupleExpr",
+    "ASTResultSlot",
+    "ASTResultSet",
     "ASTStatement",
     "ASTAssign",
     "ASTMemoryWrite",
@@ -1639,6 +1814,7 @@ __all__ = [
     "ASTEntryPoint",
     "ASTExitReason",
     "ASTExitPoint",
+    "ASTProcedureResult",
     "ASTProcedure",
     "ASTSwitchCase",
     "ASTDispatchHelper",

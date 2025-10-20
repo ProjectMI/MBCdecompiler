@@ -63,9 +63,12 @@ class ASTTextRenderer:
             f"{label}->[{', '.join(targets)}]"
             for label, targets in sorted(procedure.predecessor_map.items())
         ) or "-"
+        result_repr = procedure.result.render()
+        alias_repr = ", ".join(f"0x{offset:04X}" for offset in procedure.aliases) or "-"
         yield (
             f"procedure {procedure.name} entry{{{entry_repr}}} "
-            f"exits=[{exit_entries}] cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
+            f"exits=[{exit_entries}] result={result_repr} aliases=[{alias_repr}] "
+            f"cfg{{succ_map={{ {succ_map} }} pred_map={{ {pred_map} }}}}"
         )
         for block in procedure.blocks:
             yield from self._render_block(block)

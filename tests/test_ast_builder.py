@@ -19,6 +19,7 @@ from mbcdisasm.ast import (
     ASTIntegerLiteral,
     ASTImmediateOperand,
     ASTMemoryRead,
+    ASTProcedureResult,
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
@@ -69,6 +70,8 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
     assert procedure.entry.reasons
     assert all(exit.reasons for exit in procedure.exits)
     assert procedure.blocks
+    assert isinstance(procedure.result, ASTProcedureResult)
+    assert isinstance(procedure.aliases, tuple)
 
     block = procedure.blocks[0]
     assert isinstance(block.successors, tuple)
@@ -294,6 +297,37 @@ def test_ast_switch_marks_io_dispatch() -> None:
     assert switch_stmt.kind == "io"
     assert switch_stmt.enum_name is None
     assert switch_stmt.cases[0].key_alias is None
+
+
+def test_ast_builder_deduplicates_identical_procedures() -> None:
+    block_a = IRBlock(
+        label="block_a",
+        start_offset=0x1000,
+        nodes=(IRReturn(values=("ret0",), varargs=False),),
+    )
+    block_b = IRBlock(
+        label="block_b",
+        start_offset=0x1010,
+        nodes=(IRReturn(values=("ret0",), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x40,
+        blocks=(block_a, block_b),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedures = ast_program.segments[0].procedures
+    assert len(procedures) == 1
+    procedure = procedures[0]
+    assert procedure.aliases == (0x1010,)
+    reason_kinds = {reason.kind for reason in procedure.entry.reasons}
+    assert "alias" in reason_kinds
 
 
 def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
@@ -655,23 +689,9 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert RET_MASK in mask_values
     assert 0x0001 in mask_values
 
-    frame_masks = [
-        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
-    ]
-    frame_channels = [
-        effect
-        for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameChannelEffect)
-    ]
-    frame_teardowns = [
-        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameTeardownEffect)
-    ]
     io_effects = [effect for effect in return_stmt.effects if isinstance(effect, ASTIOEffect)]
 
-    assert any(effect.channel == "page_select" for effect in frame_channels)
-    assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
-    assert any(effect.mask.value == RET_MASK for effect in frame_masks)
-    assert any(effect.mask.value == 0x0001 for effect in frame_masks)
+    assert any(channel == "page_select" for channel, _ in protocol_effect.channels)
     assert any(effect.operation.value == "bridge" for effect in io_effects)
 
 
@@ -709,18 +729,7 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     mask_values = {mask.value for mask in protocol_effect.masks}
     assert RET_MASK in mask_values
 
-    frame_masks = [
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
-    ]
-    frame_teardowns = [
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameTeardownEffect)
-    ]
-    frame_drops = [
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameDropEffect)
-    ]
-    assert any(effect.mask.value == RET_MASK for effect in frame_masks)
-    assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
-    assert any(effect.pops == protocol_effect.drops for effect in frame_drops)
+    assert any(mask.value == RET_MASK for mask in protocol_effect.masks)
 
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(
@@ -750,32 +759,18 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     return_stmt = next(statement for statement in statements if isinstance(statement, ASTReturn))
-    protocol_effect = next(
-        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameProtocolEffect)
-    )
-    mask_pairs = {
-        (effect.mask.value, effect.mask.alias)
-        for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameMaskEffect)
-    }
-    expected = {(mask.value, mask.alias) for mask in protocol_effect.masks}
-    assert mask_pairs == expected
+    assert len(return_stmt.effects) == 1
+    protocol_effect = return_stmt.effects[0]
+    assert isinstance(protocol_effect, ASTFrameProtocolEffect)
 
-    teardown_effects = [
-        effect
-        for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameTeardownEffect)
-    ]
-    assert len(teardown_effects) == 1
-    assert teardown_effects[0].pops == protocol_effect.teardown
-
-    drop_effects = [
-        effect
-        for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameDropEffect)
-    ]
-    assert len(drop_effects) == 1
-    assert drop_effects[0].pops == protocol_effect.drops
+    expected = {(1, None), (RET_MASK, None)}
+    actual = {(mask.value, mask.alias) for mask in protocol_effect.masks}
+    assert actual == expected
+    assert protocol_effect.teardown == 3
+    assert protocol_effect.drops == 4
+    assert not protocol_effect.resets
+    assert not protocol_effect.writes
+    assert not protocol_effect.channels
 
 
 def test_symbol_table_synthesises_call_signatures() -> None:
@@ -887,6 +882,12 @@ def test_epilogue_effects_are_deduplicated() -> None:
     terminator = procedure.blocks[0].statements[-1]
     assert isinstance(terminator, ASTReturn)
     assert len(terminator.effects) == 1
+    protocol_effect = terminator.effects[0]
+    assert isinstance(protocol_effect, ASTFrameProtocolEffect)
+    assert len(protocol_effect.resets) == 1
+    channel, mask = protocol_effect.resets[0]
+    assert channel is None
+    assert mask is not None and mask.value == 0
 
 
 def test_testset_branch_desugars_into_assignment() -> None:
