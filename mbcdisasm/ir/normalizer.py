@@ -1278,18 +1278,42 @@ class IRNormalizer:
 
             index += 1
 
-    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
-        constant = self._string_pool.get(data)
+    @staticmethod
+    def _normalise_string_constant_data(data: bytes) -> Optional[bytes]:
+        stripped = data.rstrip(b"\x00")
+        if not stripped:
+            return None
+
+        has_graphic = False
+        for byte in stripped:
+            if 0x20 <= byte <= 0x7E:
+                if byte != 0x20:
+                    has_graphic = True
+                continue
+            return None
+
+        if not has_graphic:
+            return None
+
+        return stripped
+
+    def _intern_string_constant(self, data: bytes, source: str) -> Optional[IRStringConstant]:
+        payload = self._normalise_string_constant_data(data)
+        if payload is None:
+            return None
+
+        constant = self._string_pool.get(payload)
         if constant is not None:
             return constant
 
-        if data:
-            segments = (data,)
-        else:
-            segments = (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
-        constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
-        self._string_pool[data] = constant
+        constant = IRStringConstant(
+            name=name,
+            data=payload,
+            segments=(payload,),
+            source=source,
+        )
+        self._string_pool[payload] = constant
         self._string_pool_order.append(constant)
         return constant
 
@@ -1297,11 +1321,12 @@ class IRNormalizer:
         self, data: bytes, source: str, annotations: Sequence[str]
     ) -> IRLiteralChunk:
         constant = self._intern_string_constant(data, source)
+        symbol = constant.name if constant is not None else None
         return IRLiteralChunk(
             data=data,
             source=source,
             annotations=tuple(annotations),
-            symbol=constant.name,
+            symbol=symbol,
         )
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:

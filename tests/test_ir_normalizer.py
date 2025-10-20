@@ -941,13 +941,8 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
         (node for node in block.nodes if isinstance(node, IRAsciiHeader)), None
     )
     assert header is not None
-    assert len(header.chunks) == 1
-
-    pool = {const.name: const for const in program.string_pool}
-    assert header.chunks[0] in pool
-    constant = pool[header.chunks[0]]
-    assert constant.data == b"A\x00B\x00\x00C\x00D"
-    assert constant.segments == (constant.data,)
+    assert header.chunks == ("ascii(A\\x00B\\x00)", "ascii(\\x00C\\x00D)")
+    assert not program.string_pool
     assert "lit(0x6704)" in descriptions
 
 
