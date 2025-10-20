@@ -19,6 +19,7 @@ from mbcdisasm.ast import (
     ASTReturn,
     ASTSwitch,
     ASTTailCall,
+    ASTSymbolTypeFamily,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -41,7 +42,6 @@ from mbcdisasm.ir.model import (
     MemRef,
     MemSpace,
     NormalizerMetrics,
-    SSAValueKind,
 )
 
 from tests.test_ir_normalizer import build_container
@@ -793,9 +793,57 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     assert 0x6601 in symbols
     signature = symbols[0x6601]
     assert signature.name == "helper_6601"
-    assert tuple(value.kind for value in signature.arguments) == (SSAValueKind.POINTER,)
-    assert tuple(value.kind for value in signature.returns) == (SSAValueKind.UNKNOWN,)
+    assert tuple(value.type.family for value in signature.arguments) == (
+        ASTSymbolTypeFamily.ADDRESS,
+    )
+    assert signature.arguments[0].type.space == "mem"
+    assert tuple(value.type.family for value in signature.returns) == (
+        ASTSymbolTypeFamily.OPAQUE,
+    )
+    assert signature.returns[0].name == "opaque0"
+    assert signature.calling_conventions == ("call",)
+    assert signature.attributes == tuple()
+    assert signature.effects == tuple()
 
+
+def test_symbol_table_records_call_attributes() -> None:
+    call = IRCallReturn(
+        target=0x3D30,
+        args=("ptr0",),
+        tail=True,
+        returns=(),
+        varargs=True,
+        abi_effects=(IRAbiEffect(kind="io.write", operand=0x2910, alias="ChatOut"),),
+        symbol="io.write",
+    )
+    block = IRBlock(
+        label="block_call",
+        start_offset=0x0200,
+        nodes=(call, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    symbols = {entry.address: entry for entry in ast_program.symbols}
+    assert 0x3D30 in symbols
+    signature = symbols[0x3D30]
+    assert signature.name == "io.write"
+    assert signature.calling_conventions == ("tailcall",)
+    assert set(signature.attributes) == {"tail", "varargs"}
+    assert signature.effects and signature.effects[0].startswith("io.write(")
+    assert not signature.returns
+    assert signature.arguments[0].name == "addr0"
+    assert signature.arguments[0].type.family is ASTSymbolTypeFamily.ADDRESS
+    assert signature.arguments[0].type.space == "mem"
 
 def test_epilogue_effects_are_deduplicated() -> None:
     cleanup = (

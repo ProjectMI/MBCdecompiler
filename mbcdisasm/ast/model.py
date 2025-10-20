@@ -789,17 +789,55 @@ class ASTCallABI:
         return f"abi{{{inner}}}" if inner else "abi{}"
 
 
+class ASTSymbolTypeFamily(Enum):
+    """High-level taxonomy used by :class:`ASTSymbolSignature` entries."""
+
+    VALUE = "value"
+    ADDRESS = "address"
+    TOKEN = "token"
+    FLAG = "flag"
+    OPAQUE = "opaque"
+    EFFECT = "effect"
+
+
+@dataclass(frozen=True)
+class ASTSymbolType:
+    """Structured type descriptor recorded in symbol table entries."""
+
+    family: ASTSymbolTypeFamily
+    width: Optional[int] = None
+    sign: Optional[ASTNumericSign] = None
+    space: Optional[str] = None
+
+    def render(self) -> str:
+        if self.family is ASTSymbolTypeFamily.VALUE:
+            sign = self.sign.value if self.sign is not None else "any"
+            width = self.width or 16
+            return f"value<{sign},{width}>"
+        if self.family is ASTSymbolTypeFamily.ADDRESS:
+            width = self.width or 16
+            space = self.space or "mem"
+            return f"address<{space},{width}>"
+        if self.family is ASTSymbolTypeFamily.TOKEN:
+            return "token"
+        if self.family is ASTSymbolTypeFamily.FLAG:
+            return "flag"
+        if self.family is ASTSymbolTypeFamily.EFFECT:
+            return "effect"
+        return "opaque"
+
+
 @dataclass(frozen=True)
 class ASTSignatureValue:
     """Single argument or return slot recorded in a symbol signature."""
 
     index: int
-    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    type: ASTSymbolType
     name: Optional[str] = None
 
     def render(self) -> str:
-        label = self.name or f"{self.kind.name.lower()}{self.index}"
-        return f"{label}:{self.kind.name.lower()}"
+        label = self.name or f"{self.type.family.value}{self.index}"
+        return f"{label}:{self.type.render()}"
 
 
 @dataclass(frozen=True)
@@ -810,16 +848,33 @@ class ASTSymbolSignature:
     name: str
     arguments: Tuple[ASTSignatureValue, ...] = ()
     returns: Tuple[ASTSignatureValue, ...] = ()
-    varargs: bool = False
+    calling_conventions: Tuple[str, ...] = ()
+    attributes: Tuple[str, ...] = ()
+    effects: Tuple[str, ...] = ()
 
     def render(self) -> str:
         args = ", ".join(value.render() for value in self.arguments) or "-"
-        rets = ", ".join(value.render() for value in self.returns) or "-"
-        varargs = ", varargs" if self.varargs else ""
-        return (
-            f"symbol {self.name}(0x{self.address:04X}) args=[{args}]"
-            f" returns=[{rets}]{varargs}"
-        )
+        if not self.returns:
+            rets = "-"
+        elif len(self.returns) == 1:
+            rets = self.returns[0].render()
+        else:
+            rendered = ", ".join(value.render() for value in self.returns)
+            rets = f"tuple({rendered})"
+        conventions = ", ".join(self.calling_conventions) or "call"
+        attributes = ", ".join(self.attributes)
+        effects = ", ".join(self.effects)
+        parts = [
+            f"args=[{args}]",
+            f"returns=[{rets}]",
+            f"cc=[{conventions}]",
+        ]
+        if attributes:
+            parts.append(f"attrs=[{attributes}]")
+        if effects:
+            parts.append(f"effects=[{effects}]")
+        inner = " ".join(parts)
+        return f"symbol {self.name}(0x{self.address:04X}) {inner}"
 
 
 @dataclass
@@ -1408,6 +1463,8 @@ __all__ = [
     "ASTCallReturnSlot",
     "ASTCallABI",
     "ASTCallStatement",
+    "ASTSymbolTypeFamily",
+    "ASTSymbolType",
     "ASTSignatureValue",
     "ASTSymbolSignature",
     "ASTIORead",
