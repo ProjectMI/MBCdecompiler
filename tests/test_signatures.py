@@ -464,7 +464,7 @@ def test_signature_detector_matches_tailcall_ascii_wrapper():
     words = [
         make_word(0x03, 0x00, 0x0000, 0),
         make_word(0x29, 0x10, 0x0072, 4),
-        InstructionWord(8, int.from_bytes(b"#HO ", "big")),
+        InstructionWord(8, int.from_bytes(b"HOOK", "big")),
         make_word(0x23, 0x4F, 0x0000, 12),
         make_word(0x52, 0x05, 0x0000, 16),
         make_word(0x32, 0x29, 0x0000, 20),

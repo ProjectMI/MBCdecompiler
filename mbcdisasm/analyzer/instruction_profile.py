@@ -499,6 +499,7 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
     printable = 0
     ascii_pairs = 0
     zero_pairs = 0
+    non_zero_bytes: list[int] = []
 
     for pair_start in range(0, 4, 2):
         pair = raw[pair_start : pair_start + 2]
@@ -514,6 +515,7 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
             if byte not in ASCII_ALLOWED:
                 return False
             seen_ascii = True
+            non_zero_bytes.append(byte)
             if 0x20 <= byte <= 0x7E:
                 printable += 1
 
@@ -526,6 +528,9 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
         0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A
         for byte in raw[:2]
         if byte != 0
+    )
+    first_pair_has_letter = any(
+        0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A for byte in raw[:2]
     )
 
     if ascii_pairs == 0:
@@ -544,6 +549,16 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
             return False
         if not first_pair_letters:
             return False
+    elif not first_pair_has_letter:
+        return False
+
+    if len(non_zero_bytes) < 2:
+        return False
+
+    required_printable = max(2, (len(non_zero_bytes) * 3 + 3) // 4)
+
+    if printable < required_printable:
+        return False
 
     return printable >= 2
 

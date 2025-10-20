@@ -943,7 +943,7 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert header is not None
     assert len(header.chunks) == 1
 
-    pool = {const.name: const for const in program.string_pool}
+    pool = {const.name: const for const in program.byte_pool}
     assert header.chunks[0] in pool
     constant = pool[header.chunks[0]]
     assert constant.data == b"A\x00B\x00\x00C\x00D"
@@ -978,7 +978,7 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
     assert not any("reduce_pair" in text for text in descriptions)
 
-    pool = {const.name: const for const in program.string_pool}
+    pool = {const.name: const for const in program.byte_pool}
     assert symbol in pool
     constant = pool[symbol]
     assert constant.data == b"HEAD ER  TEX"
@@ -1001,8 +1001,8 @@ def test_normalizer_drops_intermediate_ascii_chunks(tmp_path: Path) -> None:
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
 
-    assert len(program.string_pool) == 1
-    constant = program.string_pool[0]
+    assert len(program.byte_pool) == 1
+    constant = program.byte_pool[0]
     assert constant.data == b"ABCDEFGH"
 
 

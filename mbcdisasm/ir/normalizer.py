@@ -666,6 +666,8 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._string_categories: Dict[str, str] = {}
+        self._textual_constants: Set[str] = set()
         self._dispatch_index_hints: Dict[int, List[IRDispatchIndex]] = defaultdict(list)
         self._current_block_offset: int = -1
 
@@ -693,6 +695,8 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._string_categories.clear()
+        self._textual_constants.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -701,17 +705,24 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
+        self._finalise_constant_categories(segments)
         used_strings = self._collect_string_pool_references(segments)
-        string_pool = tuple(
-            constant
-            for constant in self._string_pool_order
-            if constant.name in used_strings
-        )
+        string_pool: List[IRStringConstant] = []
+        byte_pool: List[IRStringConstant] = []
+        for constant in self._string_pool_order:
+            if constant.name not in used_strings:
+                continue
+            category = self._string_categories.get(constant.name, "bytes")
+            if category == "text":
+                string_pool.append(constant)
+            elif category == "bytes":
+                byte_pool.append(constant)
 
         return IRProgram(
             segments=tuple(segments),
             metrics=aggregate_metrics,
-            string_pool=string_pool,
+            string_pool=tuple(string_pool),
+            byte_pool=tuple(byte_pool),
         )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
@@ -768,6 +779,116 @@ class IRNormalizer:
             visit(segment)
 
         return referenced
+
+    def _finalise_constant_categories(self, segments: Sequence[IRSegment]) -> None:
+        referenced = self._collect_string_pool_references(segments)
+        for constant in list(self._string_pool_order):
+            if constant.name not in referenced:
+                continue
+            category = self._string_categories.get(constant.name)
+            if category == "text":
+                decoded = self._decode_string_constant(constant.data)
+                if decoded is None:
+                    self._string_categories[constant.name] = "bytes"
+                    continue
+                if decoded != constant.text:
+                    updated = replace(constant, text=decoded)
+                    self._update_constant_entry(constant, updated)
+            else:
+                self._string_categories[constant.name] = "bytes"
+
+    def _update_constant_entry(
+        self, original: IRStringConstant, updated: IRStringConstant
+    ) -> None:
+        self._string_pool[original.data] = updated
+        for index, entry in enumerate(self._string_pool_order):
+            if entry is original:
+                self._string_pool_order[index] = updated
+                break
+
+    def _decode_string_constant(self, data: bytes) -> Optional[str]:
+        if not data:
+            return ""
+
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None and self._valid_decoded_text(text):
+            return self._normalise_decoded_text(text)
+
+        try:
+            text = data.decode("windows-1251")
+        except UnicodeDecodeError:
+            text = None
+        if text is not None and self._valid_decoded_text(text):
+            return self._normalise_decoded_text(text)
+
+        if self._looks_like_utf16le(data):
+            try:
+                text = data.decode("utf-16le")
+            except UnicodeDecodeError:
+                text = None
+            if text is not None and self._valid_decoded_text(text):
+                return self._normalise_decoded_text(text)
+
+            squeezed = data[::2]
+            if squeezed and squeezed != data:
+                decoded = self._decode_string_constant(squeezed)
+                if decoded:
+                    return decoded
+
+        return None
+
+    @staticmethod
+    def _normalise_decoded_text(text: str) -> str:
+        return text.replace("\x00", "").strip()
+
+    @staticmethod
+    def _valid_decoded_text(text: str) -> bool:
+        if not text:
+            return True
+        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
+            return False
+        clean = text.replace("\x00", "").strip()
+        if not clean:
+            return False
+        letters = sum(1 for ch in clean if ch.isalpha())
+        if letters < 2:
+            return False
+        if len(clean) < 3 and letters < len(clean):
+            return False
+        if len(clean) < 4:
+            if not all(ch.isalpha() for ch in clean):
+                return False
+        for ch in clean:
+            if ch.isalpha():
+                code = ord(ch)
+                if not (
+                    0x41 <= code <= 0x5A
+                    or 0x61 <= code <= 0x7A
+                    or 0xC0 <= code <= 0xFF
+                    or 0x0400 <= code <= 0x04FF
+                ):
+                    return False
+        if "#" in clean:
+            return False
+        if any(ch.isdigit() for ch in clean) and "%" not in clean:
+            return False
+        if letters < int(len(clean) * 0.5):
+            return False
+        meaningful = sum(1 for ch in clean if ch.isprintable())
+        return meaningful >= max(letters, len(clean) // 2)
+
+    @staticmethod
+    def _looks_like_utf16le(data: bytes) -> bool:
+        if len(data) < 4 or len(data) % 2:
+            return False
+        pairs = len(data) // 2
+        if pairs == 0:
+            return False
+        zero_pairs = sum(1 for index in range(1, len(data), 2) if data[index] == 0)
+        return zero_pairs >= int(pairs * 0.6)
 
     # ------------------------------------------------------------------
     # parsing helpers
@@ -1297,12 +1418,61 @@ class IRNormalizer:
         self, data: bytes, source: str, annotations: Sequence[str]
     ) -> IRLiteralChunk:
         constant = self._intern_string_constant(data, source)
+        self._string_categories.setdefault(constant.name, "unknown")
         return IRLiteralChunk(
             data=data,
             source=source,
             annotations=tuple(annotations),
             symbol=constant.name,
         )
+
+    def _record_textual_literal(self, chunk: IRLiteralChunk) -> None:
+        symbol = chunk.symbol
+        if not symbol:
+            return
+        current = self._string_categories.get(symbol)
+        if current == "text":
+            return
+        self._string_categories[symbol] = "text"
+        self._textual_constants.add(symbol)
+
+    def _literal_chunks_before(
+        self, items: _ItemList, index: int, *, limit: int = 8
+    ) -> List[IRLiteralChunk]:
+        chunks: List[IRLiteralChunk] = []
+        scan = index - 1
+        steps = 0
+        while scan >= 0 and steps < limit:
+            node = items[scan]
+            if isinstance(node, IRLiteralChunk):
+                chunks.insert(0, node)
+                scan -= 1
+                steps += 1
+                continue
+            if isinstance(
+                node,
+                (
+                    IRLiteral,
+                    IRLiteralBlock,
+                    IRDataMarker,
+                    IRCallCleanup,
+                    IRStackEffect,
+                    IRStackDrop,
+                    IRAsciiPreamble,
+                    IRCallPreparation,
+                ),
+            ):
+                scan -= 1
+                steps += 1
+                continue
+            if isinstance(node, RawInstruction):
+                annotations = getattr(node, "annotations", tuple())
+                if any(note.startswith("literal_marker") for note in annotations):
+                    scan -= 1
+                    steps += 1
+                    continue
+            break
+        return chunks
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
@@ -1387,6 +1557,9 @@ class IRNormalizer:
                     metrics.tail_calls += 1
                 items.replace_slice(start, index + 1, [call])
                 index = start
+                if symbol and symbol.startswith(("fmt.", "text.")):
+                    for chunk in self._literal_chunks_before(items, index):
+                        self._record_textual_literal(chunk)
                 if call.tail:
                     self._collapse_tail_return(items, index, metrics)
                 continue
@@ -2372,7 +2545,10 @@ class IRNormalizer:
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
-            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            node = IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            for chunk in self._literal_chunks_before(items, index):
+                self._record_textual_literal(chunk)
+            return node
         return None
 
     @staticmethod
@@ -4037,6 +4213,10 @@ class IRNormalizer:
                 index += 1
                 continue
 
+            chunk_nodes = self._literal_chunks_before(items, index)
+            for chunk in chunk_nodes:
+                self._record_textual_literal(chunk)
+
             summary = ""
             if index > 0:
                 previous = items[index - 1]
@@ -4051,7 +4231,14 @@ class IRNormalizer:
                 index += 1
                 continue
 
-            finalize = IRAsciiFinalize(helper=helper_operand, summary=summary or "ascii")
+            chunk_names = tuple(
+                chunk.symbol for chunk in chunk_nodes if chunk.symbol is not None
+            )
+            finalize = IRAsciiFinalize(
+                helper=helper_operand,
+                summary=summary or "ascii",
+                chunks=chunk_names,
+            )
             self._transfer_ssa(item, finalize)
 
             if isinstance(item, IRCallCleanup):

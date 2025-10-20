@@ -397,9 +397,12 @@ class IRStringConstant(IRNode):
     data: bytes
     segments: Tuple[bytes, ...]
     source: str
+    text: Optional[str] = None
 
     def describe(self) -> str:
-        if len(self.segments) == 1:
+        if self.text is not None:
+            payload = repr(self.text)
+        elif len(self.segments) == 1:
             body = _render_ascii(self.segments[0])
             payload = f"ascii({body})"
         else:
@@ -924,6 +927,7 @@ class IRAsciiFinalize(IRNode):
 
     helper: int
     summary: str
+    chunks: Tuple[str, ...] = tuple()
 
     def describe(self) -> str:
         return f"ascii_finalize helper=0x{self.helper:04X} source={self.summary}"
@@ -1164,6 +1168,7 @@ class IRProgram:
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
     string_pool: Tuple[IRStringConstant, ...] = tuple()
+    byte_pool: Tuple[IRStringConstant, ...] = tuple()
 
 
 @dataclass
