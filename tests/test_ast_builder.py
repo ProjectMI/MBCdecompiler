@@ -793,8 +793,12 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     assert 0x6601 in symbols
     signature = symbols[0x6601]
     assert signature.name == "helper_6601"
-    assert tuple(value.kind for value in signature.arguments) == (SSAValueKind.POINTER,)
-    assert tuple(value.kind for value in signature.returns) == (SSAValueKind.UNKNOWN,)
+    assert tuple(value.kind for value in signature.arguments) == (
+        SSAValueKind.ADDRESS_MEMORY,
+    )
+    assert tuple(value.kind for value in signature.returns) == (
+        SSAValueKind.OPAQUE,
+    )
 
 
 def test_epilogue_effects_are_deduplicated() -> None:

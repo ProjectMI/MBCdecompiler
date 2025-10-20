@@ -365,6 +365,8 @@ class _SignatureAccumulator:
         default_factory=lambda: defaultdict(set)
     )
     varargs: bool = False
+    tail: bool = False
+    abi_effects: Set[ASTEffect] = field(default_factory=set)
 
     def register_call(
         self,
@@ -377,6 +379,8 @@ class _SignatureAccumulator:
             self.symbols.add(call.symbol)
         if call.varargs or payload_varargs:
             self.varargs = True
+        if call.tail:
+            self.tail = True
         for index, expr in enumerate(call.args):
             kind = expr.kind()
             self.argument_kinds[index].add(kind)
@@ -389,6 +393,11 @@ class _SignatureAccumulator:
             name = self._expr_name(expr)
             if name:
                 self.return_names[index].add(name)
+        if abi is not None:
+            if abi.tail:
+                self.tail = True
+            if abi.effects:
+                self.abi_effects.update(abi.effects)
 
     @staticmethod
     def _expr_name(expr: ASTExpression) -> Optional[str]:
@@ -536,63 +545,100 @@ class ASTBuilder:
                             )
         signatures: List[ASTSymbolSignature] = []
         for address, accumulator in accumulators.items():
-            name = self._canonical_symbol_name(address, accumulator.symbols)
-            arguments = tuple(
-                ASTSignatureValue(
-                    index=index,
-                    kind=self._select_signature_kind(kinds),
-                    name=self._select_signature_name(
-                        accumulator.argument_names.get(index, set())
-                    ),
+            symbol_name = self._canonical_symbol_name(address, accumulator.symbols)
+            argument_values: List[ASTSignatureValue] = []
+            for index, kinds in sorted(accumulator.argument_kinds.items()):
+                kind = self._select_signature_kind(kinds)
+                argument_name = self._select_signature_name(
+                    accumulator.argument_names.get(index, set()), kind
                 )
-                for index, kinds in sorted(accumulator.argument_kinds.items())
-            )
-            returns = tuple(
-                ASTSignatureValue(
-                    index=index,
-                    kind=self._select_signature_kind(kinds),
-                    name=self._select_signature_name(
-                        accumulator.return_names.get(index, set())
-                    ),
+                argument_values.append(
+                    ASTSignatureValue(index=index, kind=kind, name=argument_name)
                 )
-                for index, kinds in sorted(accumulator.return_kinds.items())
+            arguments = tuple(argument_values)
+
+            return_values: List[ASTSignatureValue] = []
+            for index, kinds in sorted(accumulator.return_kinds.items()):
+                kind = self._select_signature_kind(kinds)
+                return_name = self._select_signature_name(
+                    accumulator.return_names.get(index, set()), kind
+                )
+                return_values.append(
+                    ASTSignatureValue(index=index, kind=kind, name=return_name)
+                )
+            returns = tuple(return_values)
+            effects = tuple(
+                sorted(accumulator.abi_effects, key=self._effect_identity)
             )
             signatures.append(
                 ASTSymbolSignature(
                     address=address,
-                    name=name,
+                    name=symbol_name,
                     arguments=arguments,
                     returns=returns,
                     varargs=accumulator.varargs,
+                    tail=accumulator.tail,
+                    effects=effects,
                 )
             )
-        signatures.sort(key=lambda entry: (entry.name, entry.address))
+        signatures.sort(key=lambda entry: (entry.name or "", entry.address))
         return tuple(signatures)
 
     @staticmethod
     def _select_signature_kind(kinds: Set[SSAValueKind]) -> SSAValueKind:
         if not kinds:
-            return SSAValueKind.UNKNOWN
+            return SSAValueKind.OPAQUE
         priority = [
             SSAValueKind.BOOLEAN,
-            SSAValueKind.BYTE,
-            SSAValueKind.WORD,
-            SSAValueKind.POINTER,
-            SSAValueKind.IO,
+            SSAValueKind.SCALAR_U8,
+            SSAValueKind.SCALAR_S8,
+            SSAValueKind.SCALAR_U16,
+            SSAValueKind.SCALAR_S16,
+            SSAValueKind.ADDRESS_MEMORY,
+            SSAValueKind.ADDRESS_IO,
+            SSAValueKind.ADDRESS_SYMBOL,
             SSAValueKind.PAGE_REGISTER,
-            SSAValueKind.IDENTIFIER,
+            SSAValueKind.TOKEN,
+            SSAValueKind.EFFECT,
         ]
         for candidate in priority:
-            if candidate in kinds and candidate is not SSAValueKind.UNKNOWN:
+            if candidate in kinds:
                 return candidate
-        if SSAValueKind.UNKNOWN in kinds:
-            return SSAValueKind.UNKNOWN
+        if SSAValueKind.OPAQUE in kinds:
+            return SSAValueKind.OPAQUE
         return sorted(kinds, key=lambda kind: kind.name)[0]
 
     @staticmethod
-    def _select_signature_name(names: Set[str]) -> Optional[str]:
+    def _is_placeholder_name(name: str, kind: SSAValueKind) -> bool:
+        if not name:
+            return True
+        prefix = kind.placeholder_prefix
+        if prefix and name.startswith(prefix) and name[len(prefix) :].isdigit():
+            return True
+        legacy_prefixes = {
+            "word",
+            "byte",
+            "ptr",
+            "id",
+            "io",
+            "page",
+            "value",
+            "unknown",
+        }
+        for legacy in legacy_prefixes:
+            if name.startswith(legacy) and name[len(legacy) :].isdigit():
+                return True
+        return False
+
+    @classmethod
+    def _select_signature_name(
+        cls, names: Set[str], kind: SSAValueKind
+    ) -> Optional[str]:
         filtered = sorted(
-            name for name in names if name and all(ch not in name for ch in ":@")
+            name
+            for name in names
+            if name and all(ch not in name for ch in ":@")
+            and not cls._is_placeholder_name(name, kind)
         )
         if filtered:
             return filtered[0]
@@ -2018,7 +2064,9 @@ class ASTBuilder:
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             location = self._build_slot_location(node.slot)
-            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+            expr = ASTMemoryRead(
+                location=location, value_kind=SSAValueKind.ADDRESS_MEMORY
+            )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
@@ -2042,7 +2090,7 @@ class ASTBuilder:
                 else None
             )
             location = self._build_banked_location(node, pointer_expr, offset_expr)
-            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.WORD)
+            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.SCALAR_U16)
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
@@ -2302,11 +2350,15 @@ class ASTBuilder:
     @staticmethod
     def _infer_indirect_kind(pointer: ASTExpression | None) -> SSAValueKind:
         if pointer is None:
-            return SSAValueKind.UNKNOWN
+            return SSAValueKind.OPAQUE
         pointer_kind = pointer.kind()
-        if pointer_kind in {SSAValueKind.BYTE, SSAValueKind.BOOLEAN}:
+        if pointer_kind is SSAValueKind.BOOLEAN:
             return pointer_kind
-        return SSAValueKind.WORD
+        if pointer_kind.taxonomy == "scalar":
+            bit_width = pointer_kind.bit_width or 0
+            if bit_width <= 8:
+                return pointer_kind
+        return SSAValueKind.SCALAR_U16
 
     @staticmethod
     def _memref_descriptor(ref: Optional[MemRef]) -> ASTAddressDescriptor:
@@ -2679,9 +2731,9 @@ class ASTBuilder:
             token = expr.token
             if token and token.startswith("ret"):
                 canonical = self._canonical_placeholder_name(
-                    token, index, SSAValueKind.UNKNOWN
+                    token, index, SSAValueKind.OPAQUE
                 )
-                return ASTIdentifier(canonical, SSAValueKind.UNKNOWN)
+                return ASTIdentifier(canonical, SSAValueKind.OPAQUE)
         return expr
 
     def _build_return_payload(
@@ -2826,7 +2878,9 @@ class ASTBuilder:
                 return ASTUnknown(token)
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
-            return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+            return ASTMemoryRead(
+                location=location, value_kind=SSAValueKind.ADDRESS_MEMORY
+            )
         return ASTIdentifier(token, self._infer_kind(token))
 
     @staticmethod
@@ -2841,34 +2895,36 @@ class ASTBuilder:
 
     def _infer_kind(self, name: str) -> SSAValueKind:
         lowered = name.lower()
-        if lowered.startswith("bool"):
-            return SSAValueKind.BOOLEAN
-        if lowered.startswith("word"):
-            return SSAValueKind.WORD
-        if lowered.startswith("byte"):
-            return SSAValueKind.BYTE
-        if lowered.startswith("ptr"):
-            return SSAValueKind.POINTER
-        if lowered.startswith("page"):
-            return SSAValueKind.PAGE_REGISTER
-        if lowered.startswith("io"):
-            return SSAValueKind.IO
-        if lowered.startswith("id"):
-            return SSAValueKind.IDENTIFIER
-        return SSAValueKind.UNKNOWN
+        mapping = [
+            ("bool", SSAValueKind.BOOLEAN),
+            ("u8", SSAValueKind.SCALAR_U8),
+            ("i8", SSAValueKind.SCALAR_S8),
+            ("u16", SSAValueKind.SCALAR_U16),
+            ("i16", SSAValueKind.SCALAR_S16),
+            ("mem", SSAValueKind.ADDRESS_MEMORY),
+            ("sym", SSAValueKind.ADDRESS_SYMBOL),
+            ("io", SSAValueKind.ADDRESS_IO),
+            ("page", SSAValueKind.PAGE_REGISTER),
+            ("opaque", SSAValueKind.OPAQUE),
+            ("token", SSAValueKind.TOKEN),
+            ("effect", SSAValueKind.EFFECT),
+            # legacy prefixes
+            ("word", SSAValueKind.SCALAR_U16),
+            ("byte", SSAValueKind.SCALAR_U8),
+            ("ptr", SSAValueKind.ADDRESS_MEMORY),
+            ("id", SSAValueKind.ADDRESS_SYMBOL),
+            ("unknown", SSAValueKind.OPAQUE),
+            ("value", SSAValueKind.OPAQUE),
+        ]
+        for prefix, kind in mapping:
+            if lowered.startswith(prefix):
+                return kind
+        return SSAValueKind.OPAQUE
 
     @staticmethod
     def _ret_prefix(kind: SSAValueKind) -> str:
-        mapping = {
-            SSAValueKind.BOOLEAN: "flag",
-            SSAValueKind.BYTE: "byte",
-            SSAValueKind.WORD: "word",
-            SSAValueKind.POINTER: "ptr",
-            SSAValueKind.IO: "io",
-            SSAValueKind.PAGE_REGISTER: "page",
-            SSAValueKind.IDENTIFIER: "id",
-        }
-        return mapping.get(kind, "value")
+        prefix = kind.placeholder_prefix
+        return prefix or "ret"
 
     def _canonical_placeholder_name(
         self, token: str, index: int, kind: SSAValueKind

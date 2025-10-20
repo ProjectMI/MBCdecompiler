@@ -20,14 +20,100 @@ class MemSpace(Enum):
 class SSAValueKind(Enum):
     """Lightweight annotation attached to SSA values."""
 
-    UNKNOWN = auto()
-    BYTE = auto()
-    WORD = auto()
-    POINTER = auto()
-    IO = auto()
-    PAGE_REGISTER = auto()
-    BOOLEAN = auto()
-    IDENTIFIER = auto()
+    OPAQUE = ("opaque", None, None, None, "opaque")
+    TOKEN = ("token", None, None, None, "token")
+    EFFECT = ("effect", None, None, None, "effect")
+    BOOLEAN = ("scalar", 1, "unsigned", None, "bool")
+    SCALAR_U8 = ("scalar", 8, "unsigned", None, "u8")
+    SCALAR_S8 = ("scalar", 8, "signed", None, "i8")
+    SCALAR_U16 = ("scalar", 16, "unsigned", None, "u16")
+    SCALAR_S16 = ("scalar", 16, "signed", None, "i16")
+    ADDRESS_MEMORY = ("address", 16, "unsigned", "memory", "mem")
+    ADDRESS_SYMBOL = ("address", 16, "unsigned", "symbol", "sym")
+    ADDRESS_IO = ("address", 16, "unsigned", "io", "io")
+    PAGE_REGISTER = ("register", 8, "unsigned", "page", "page")
+
+    def __init__(
+        self,
+        taxonomy: str,
+        bits: Optional[int],
+        signedness: Optional[str],
+        address_space: Optional[str],
+        placeholder: str,
+    ) -> None:
+        self._taxonomy = taxonomy
+        self._bits = bits
+        self._signedness = signedness
+        self._address_space = address_space
+        self._placeholder = placeholder
+
+    @property
+    def taxonomy(self) -> str:
+        """Return the high level category of the value."""
+
+        return self._taxonomy
+
+    @property
+    def bit_width(self) -> Optional[int]:
+        """Return the number of bits carried by the value, if known."""
+
+        return self._bits
+
+    @property
+    def signedness(self) -> Optional[str]:
+        """Return the signedness descriptor attached to the value."""
+
+        return self._signedness
+
+    @property
+    def address_space(self) -> Optional[str]:
+        """Return the associated address space for address-like values."""
+
+        return self._address_space
+
+    @property
+    def placeholder_prefix(self) -> str:
+        """Prefix used when synthesising canonical placeholder names."""
+
+        return self._placeholder
+
+    def signature_descriptor(self) -> str:
+        """Render a canonical descriptor suitable for symbol signatures."""
+
+        taxonomy = self.taxonomy
+        if taxonomy == "scalar":
+            if self is SSAValueKind.BOOLEAN:
+                return "scalar<bool>"
+            bits = self.bit_width
+            signedness = self.signedness or "unsigned"
+            sign_prefix = {
+                "unsigned": "u",
+                "signed": "s",
+            }.get(signedness, signedness)
+            if bits is None:
+                return f"scalar<{sign_prefix}>"
+            return f"scalar<{sign_prefix}{bits}>"
+        if taxonomy == "address":
+            bits = self.bit_width
+            signedness = self.signedness or "unsigned"
+            sign_prefix = {
+                "unsigned": "u",
+                "signed": "s",
+            }.get(signedness, signedness)
+            width = f"{sign_prefix}{bits}" if bits is not None else sign_prefix
+            space = self.address_space or "-"
+            return f"addr<{space},{width}>"
+        if taxonomy == "register":
+            bits = self.bit_width
+            signedness = self.signedness or "unsigned"
+            sign_prefix = {
+                "unsigned": "u",
+                "signed": "s",
+            }.get(signedness, signedness)
+            width = f"{sign_prefix}{bits}" if bits is not None else sign_prefix
+            space = self.address_space or "-"
+            return f"reg<{space},{width}>"
+        return taxonomy
 
 
 @dataclass(frozen=True)

@@ -1539,8 +1539,8 @@ def test_normalizer_models_indirect_store_cleanup(tmp_path: Path) -> None:
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
 
     assert store.offset == 0
-    assert store.value.startswith("word")
-    assert store.base.startswith("ptr")
+    assert store.value.startswith("u16")
+    assert store.base.startswith("mem")
     assert cleanup.pops == 4
 
 

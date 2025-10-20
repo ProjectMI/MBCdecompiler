@@ -488,7 +488,7 @@ class ASTExpression:
     def kind(self) -> SSAValueKind:
         """Return the inferred :class:`SSAValueKind` for the expression."""
 
-        return SSAValueKind.UNKNOWN
+        return SSAValueKind.OPAQUE
 
     def effect(self) -> ASTEffectCategory:
         """Return the side-effect classification for the expression."""
@@ -533,9 +533,12 @@ class ASTIntegerLiteral(ASTExpression):
         return f"int<{self.sign.value},{self.bits}>({sign_char}{prefix}{magnitude_text})"
 
     def kind(self) -> SSAValueKind:
+        signed = self.sign is ASTNumericSign.SIGNED
         if self.bits <= 8:
-            return SSAValueKind.BYTE
-        return SSAValueKind.WORD
+            return SSAValueKind.SCALAR_S8 if signed else SSAValueKind.SCALAR_U8
+        if self.bits <= 16:
+            return SSAValueKind.SCALAR_S16 if signed else SSAValueKind.SCALAR_U16
+        return SSAValueKind.OPAQUE
 
 
 @dataclass(frozen=True)
@@ -550,7 +553,7 @@ class ASTRealLiteral(ASTExpression):
         return f"real<{self.encoding},{self.precision}>({self.value})"
 
     def kind(self) -> SSAValueKind:
-        return SSAValueKind.WORD
+        return SSAValueKind.OPAQUE
 
 
 @dataclass(frozen=True)
@@ -593,8 +596,8 @@ class ASTBytesLiteral(ASTExpression):
 
     def kind(self) -> SSAValueKind:
         if len(self.data) == 1:
-            return SSAValueKind.BYTE
-        return SSAValueKind.UNKNOWN
+            return SSAValueKind.SCALAR_U8
+        return SSAValueKind.OPAQUE
 
 
 @dataclass(frozen=True)
@@ -602,7 +605,7 @@ class ASTIdentifier(ASTExpression):
     """Named SSA value."""
 
     name: str
-    kind_hint: SSAValueKind = SSAValueKind.UNKNOWN
+    kind_hint: SSAValueKind = SSAValueKind.OPAQUE
 
     def render(self) -> str:
         return self.name
@@ -617,7 +620,7 @@ class ASTSafeCastExpr(ASTExpression):
 
     operand: ASTExpression
     conversion: ASTConversionKind
-    target_kind: SSAValueKind = SSAValueKind.UNKNOWN
+    target_kind: SSAValueKind = SSAValueKind.OPAQUE
     precondition: Optional[str] = None
     postcondition: Optional[str] = None
 
@@ -671,7 +674,7 @@ class ASTMemoryRead(ASTExpression):
     def kind(self) -> SSAValueKind:
         if self.value_kind is not None:
             return self.value_kind
-        return SSAValueKind.UNKNOWN
+        return SSAValueKind.OPAQUE
 
 
 @dataclass(frozen=True)
@@ -739,13 +742,14 @@ class ASTCallReturnSlot:
     """Description of a returned value slot for a call."""
 
     index: int
-    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    kind: SSAValueKind = SSAValueKind.OPAQUE
     name: Optional[str] = None
 
     def render(self) -> str:
-        prefix = self.kind.name.lower()
-        label = self.name or f"{prefix}{self.index}"
-        return f"ret[{self.index}]={label}:{prefix}"
+        descriptor = self.kind.signature_descriptor()
+        placeholder = self.kind.placeholder_prefix or "ret"
+        label = self.name or f"{placeholder}{self.index}"
+        return f"ret[{self.index}]={label}:{descriptor}"
 
 
 @dataclass(frozen=True)
@@ -794,12 +798,14 @@ class ASTSignatureValue:
     """Single argument or return slot recorded in a symbol signature."""
 
     index: int
-    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    kind: SSAValueKind = SSAValueKind.OPAQUE
     name: Optional[str] = None
 
     def render(self) -> str:
-        label = self.name or f"{self.kind.name.lower()}{self.index}"
-        return f"{label}:{self.kind.name.lower()}"
+        descriptor = self.kind.signature_descriptor()
+        placeholder = self.kind.placeholder_prefix or "val"
+        label = self.name or f"{placeholder}{self.index}"
+        return f"{label}:{descriptor}"
 
 
 @dataclass(frozen=True)
@@ -811,15 +817,23 @@ class ASTSymbolSignature:
     arguments: Tuple[ASTSignatureValue, ...] = ()
     returns: Tuple[ASTSignatureValue, ...] = ()
     varargs: bool = False
+    tail: bool = False
+    effects: Tuple[ASTEffect, ...] = ()
+    callconv: str = "vm"
 
     def render(self) -> str:
         args = ", ".join(value.render() for value in self.arguments) or "-"
         rets = ", ".join(value.render() for value in self.returns) or "-"
-        varargs = ", varargs" if self.varargs else ""
-        return (
-            f"symbol {self.name}(0x{self.address:04X}) args=[{args}]"
-            f" returns=[{rets}]{varargs}"
-        )
+        prototype = f"prototype{{args=[{args}], returns=[{rets}]}}"
+        abi_parts = [f"callconv={self.callconv}"]
+        if self.varargs:
+            abi_parts.append("varargs")
+        if self.tail:
+            abi_parts.append("tail")
+        if self.effects:
+            abi_parts.append(f"effects={_render_effects(self.effects)}")
+        abi = f" abi{{{', '.join(abi_parts)}}}" if abi_parts else ""
+        return f"symbol {self.name}(0x{self.address:04X}) {prototype}{abi}"
 
 
 @dataclass

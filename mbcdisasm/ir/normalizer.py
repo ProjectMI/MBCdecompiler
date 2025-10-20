@@ -566,14 +566,18 @@ class IRNormalizer:
     """Drive the multi-pass IR normalisation pipeline."""
 
     _SSA_PREFIX = {
-        SSAValueKind.UNKNOWN: "ssa",
-        SSAValueKind.BYTE: "byte",
-        SSAValueKind.WORD: "word",
-        SSAValueKind.POINTER: "ptr",
-        SSAValueKind.IO: "io",
-        SSAValueKind.PAGE_REGISTER: "page",
+        SSAValueKind.OPAQUE: "opaque",
+        SSAValueKind.TOKEN: "token",
+        SSAValueKind.EFFECT: "effect",
         SSAValueKind.BOOLEAN: "bool",
-        SSAValueKind.IDENTIFIER: "id",
+        SSAValueKind.SCALAR_U8: "u8",
+        SSAValueKind.SCALAR_S8: "i8",
+        SSAValueKind.SCALAR_U16: "u16",
+        SSAValueKind.SCALAR_S16: "i16",
+        SSAValueKind.ADDRESS_MEMORY: "mem",
+        SSAValueKind.ADDRESS_IO: "io",
+        SSAValueKind.ADDRESS_SYMBOL: "sym",
+        SSAValueKind.PAGE_REGISTER: "page",
     }
     _OPCODE_TABLE_MIN_RUN = 4
     _OPCODE_TABLE_MAX_AFFIX = 2
@@ -637,14 +641,18 @@ class IRNormalizer:
     }
 
     _SSA_PRIORITY = {
-        SSAValueKind.UNKNOWN: 0,
-        SSAValueKind.BYTE: 1,
-        SSAValueKind.WORD: 2,
-        SSAValueKind.IDENTIFIER: 2,
-        SSAValueKind.POINTER: 3,
-        SSAValueKind.IO: 4,
-        SSAValueKind.PAGE_REGISTER: 5,
-        SSAValueKind.BOOLEAN: 6,
+        SSAValueKind.OPAQUE: 0,
+        SSAValueKind.TOKEN: 0,
+        SSAValueKind.EFFECT: 0,
+        SSAValueKind.SCALAR_U8: 1,
+        SSAValueKind.SCALAR_S8: 1,
+        SSAValueKind.SCALAR_U16: 2,
+        SSAValueKind.SCALAR_S16: 2,
+        SSAValueKind.ADDRESS_MEMORY: 3,
+        SSAValueKind.ADDRESS_IO: 3,
+        SSAValueKind.ADDRESS_SYMBOL: 3,
+        SSAValueKind.PAGE_REGISTER: 4,
+        SSAValueKind.BOOLEAN: 5,
     }
     _AUTO_HELPER_ALIASES = {
         0x02F0: "fmt.flush",
@@ -821,7 +829,7 @@ class IRNormalizer:
                 for value_type in event.pushed_types[:pushes]:
                     pushed_kinds.append(self._map_stack_type(value_type))
             while len(pushed_kinds) < len(pushed_names):
-                pushed_kinds.append(SSAValueKind.UNKNOWN)
+                pushed_kinds.append(SSAValueKind.OPAQUE)
             if pushed_names:
                 stack_names.extend(pushed_names)
             raw_instructions.append(
@@ -1059,7 +1067,7 @@ class IRNormalizer:
         return self._render_ssa(name)
 
     def _render_ssa(self, name: str) -> str:
-        kind = self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+        kind = self._ssa_types.get(name, SSAValueKind.OPAQUE)
         prefix = self._SSA_PREFIX.get(kind, "ssa")
         alias = self._ssa_aliases.get(name)
         if alias and alias.startswith(prefix):
@@ -1085,12 +1093,12 @@ class IRNormalizer:
 
     def _map_stack_type(self, value_type: StackValueType) -> SSAValueKind:
         if value_type is StackValueType.SLOT:
-            return SSAValueKind.POINTER
+            return SSAValueKind.ADDRESS_MEMORY
         if value_type is StackValueType.NUMBER:
-            return SSAValueKind.WORD
+            return SSAValueKind.SCALAR_U16
         if value_type is StackValueType.IDENTIFIER:
-            return SSAValueKind.IDENTIFIER
-        return SSAValueKind.UNKNOWN
+            return SSAValueKind.ADDRESS_SYMBOL
+        return SSAValueKind.OPAQUE
 
     def _stack_sources(
         self, items: _ItemList, index: int, count: int
@@ -1150,10 +1158,10 @@ class IRNormalizer:
         if value == PAGE_REGISTER:
             return SSAValueKind.PAGE_REGISTER
         if self._operand_is_io_slot(value):
-            return SSAValueKind.IO
+            return SSAValueKind.ADDRESS_IO
         if value <= 0xFF:
-            return SSAValueKind.BYTE
-            return SSAValueKind.WORD
+            return SSAValueKind.SCALAR_U8
+        return SSAValueKind.SCALAR_U16
 
     def _pass_data_markers(self, items: _ItemList) -> None:
         index = 0
@@ -5622,7 +5630,7 @@ class IRNormalizer:
                 base_alias = "stack"
                 if base_sources:
                     base_name, base_node = base_sources[0]
-                    self._promote_ssa_kind(base_name, SSAValueKind.POINTER)
+                    self._promote_ssa_kind(base_name, SSAValueKind.ADDRESS_MEMORY)
                     base_alias = self._render_ssa(base_name)
                     if isinstance(base_node, IRLoad):
                         base_slot = base_node.slot
@@ -5666,7 +5674,7 @@ class IRNormalizer:
                     value_name = None
                 base_slot = base_node.slot if isinstance(base_node, IRLoad) else None
                 if base_name:
-                    self._promote_ssa_kind(base_name, SSAValueKind.POINTER)
+                    self._promote_ssa_kind(base_name, SSAValueKind.ADDRESS_MEMORY)
                 base_alias = self._render_ssa(base_name) if base_name else "stack"
                 value_alias = self._render_ssa(value_name) if value_name else "stack"
                 memref, index = self._collect_memref(items, index, base_slot, base_name, item)
@@ -6087,7 +6095,7 @@ class IRNormalizer:
                 stored = self._ssa_bindings.get(id(candidate))
                 if stored:
                     pending_ssa = stored
-                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in stored)
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.OPAQUE) for name in stored)
                 else:
                     pending_ssa = None
                     pending_kinds = None
@@ -6101,7 +6109,7 @@ class IRNormalizer:
                 pending_literal = None
                 pending_ssa = self._ssa_bindings.get(id(candidate))
                 if pending_ssa:
-                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in pending_ssa)
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.OPAQUE) for name in pending_ssa)
                 else:
                     pending_kinds = None
                 scan += 1
@@ -6147,7 +6155,7 @@ class IRNormalizer:
                         names = self._ssa_bindings.get(id(candidate)) or candidate.ssa_values
                         if names:
                             kinds = tuple(
-                                self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+                                self._ssa_types.get(name, SSAValueKind.OPAQUE)
                                 for name in names
                             )
                             self._record_ssa(page_node, names, kinds=kinds)
@@ -6202,7 +6210,7 @@ class IRNormalizer:
                 stored = self._ssa_bindings.get(id(candidate))
                 if stored:
                     pending_ssa = stored
-                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in stored)
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.OPAQUE) for name in stored)
                 else:
                     pending_ssa = None
                     pending_kinds = None
@@ -6216,7 +6224,7 @@ class IRNormalizer:
                 pending_literal = None
                 pending_ssa = self._ssa_bindings.get(id(candidate))
                 if pending_ssa:
-                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.UNKNOWN) for name in pending_ssa)
+                    pending_kinds = tuple(self._ssa_types.get(name, SSAValueKind.OPAQUE) for name in pending_ssa)
                 else:
                     pending_kinds = None
                 index += 1
@@ -6254,7 +6262,7 @@ class IRNormalizer:
                         names = self._ssa_bindings.get(id(candidate)) or candidate.ssa_values
                         if names:
                             kinds = tuple(
-                                self._ssa_types.get(name, SSAValueKind.UNKNOWN)
+                                self._ssa_types.get(name, SSAValueKind.OPAQUE)
                                 for name in names
                             )
                             self._record_ssa(page_node, names, kinds=kinds)
