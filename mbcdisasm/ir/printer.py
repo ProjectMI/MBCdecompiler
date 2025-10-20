@@ -19,6 +19,11 @@ class IRTextRenderer:
             for const in program.string_pool:
                 lines.append(f"{const.describe()}")
             lines.append("")
+        if program.byte_pool:
+            lines.append("; byte pool")
+            for const in program.byte_pool:
+                lines.append(f"{const.describe()}")
+            lines.append("")
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"

@@ -7,7 +7,10 @@ from mbcdisasm import KnowledgeBase
 from mbcdisasm.analyzer.instruction_profile import (
     InstructionKind,
     InstructionProfile,
+    allow_contextless_ascii,
+    clear_ascii_context,
     looks_like_ascii_chunk,
+    set_ascii_context,
 )
 from mbcdisasm.analyzer.signatures import SignatureDetector
 from mbcdisasm.analyzer.stack import StackTracker
@@ -20,7 +23,13 @@ def make_word(opcode: int, mode: int, operand: int = 0, offset: int = 0) -> Inst
 
 
 def profiles_from_words(words, knowledge):
-    profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    with allow_contextless_ascii():
+        ascii_offsets = {word.offset for word in words if looks_like_ascii_chunk(word)}
+    set_ascii_context(ascii_offsets)
+    try:
+        profiles = [InstructionProfile.from_word(word, knowledge) for word in words]
+    finally:
+        clear_ascii_context()
     stack = StackTracker()
     summary = stack.run(profiles)
     return profiles, summary
@@ -29,8 +38,13 @@ def profiles_from_words(words, knowledge):
 def test_ascii_detection_marks_inline_chunk():
     knowledge = KnowledgeBase({})
     word = InstructionWord(0, int.from_bytes(b"test", "big"))
-    assert looks_like_ascii_chunk(word)
-    profile = InstructionProfile.from_word(word, knowledge)
+    with allow_contextless_ascii():
+        assert looks_like_ascii_chunk(word)
+    set_ascii_context({word.offset})
+    try:
+        profile = InstructionProfile.from_word(word, knowledge)
+    finally:
+        clear_ascii_context()
     assert profile.mnemonic == "inline_ascii_chunk"
     assert profile.kind is InstructionKind.ASCII_CHUNK
     assert profile.traits.get("heuristic")
@@ -41,16 +55,22 @@ def test_ascii_detection_accepts_wide_pairs():
     wide_le = InstructionWord(4, int.from_bytes(b"A\x00B\x00", "big"))
     pair_le = InstructionWord(8, int.from_bytes(struct.pack("<HH", 0x4142, 0x4344), "big"))
 
-    assert looks_like_ascii_chunk(wide_be)
-    assert looks_like_ascii_chunk(wide_le)
-    assert looks_like_ascii_chunk(pair_le)
+    with allow_contextless_ascii():
+        assert looks_like_ascii_chunk(wide_be)
+        assert looks_like_ascii_chunk(wide_le)
+        assert looks_like_ascii_chunk(pair_le)
 
 
 def test_ascii_detection_accepts_padded_pairs():
     padded = InstructionWord(0, int.from_bytes(b"th\x00\x00", "big"))
-    assert looks_like_ascii_chunk(padded)
+    with allow_contextless_ascii():
+        assert looks_like_ascii_chunk(padded)
     knowledge = KnowledgeBase({})
-    profile = InstructionProfile.from_word(padded, knowledge)
+    set_ascii_context({padded.offset})
+    try:
+        profile = InstructionProfile.from_word(padded, knowledge)
+    finally:
+        clear_ascii_context()
     assert profile.kind is InstructionKind.ASCII_CHUNK
     assert profile.mnemonic == "inline_ascii_chunk"
 
@@ -464,7 +484,7 @@ def test_signature_detector_matches_tailcall_ascii_wrapper():
     words = [
         make_word(0x03, 0x00, 0x0000, 0),
         make_word(0x29, 0x10, 0x0072, 4),
-        InstructionWord(8, int.from_bytes(b"#HO ", "big")),
+        InstructionWord(8, int.from_bytes(b"SHOW", "big")),
         make_word(0x23, 0x4F, 0x0000, 12),
         make_word(0x52, 0x05, 0x0000, 16),
         make_word(0x32, 0x29, 0x0000, 20),

@@ -17,7 +17,13 @@ from ..constants import (
     RET_MASK,
     OPERAND_ALIASES,
 )
-from ..analyzer.instruction_profile import InstructionKind, InstructionProfile
+from ..analyzer.instruction_profile import (
+    InstructionKind,
+    InstructionProfile,
+    allow_contextless_ascii,
+    clear_ascii_context,
+    set_ascii_context,
+)
 from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
@@ -60,6 +66,7 @@ from .model import (
     IRStackDuplicate,
     IRStackDrop,
     IRStringConstant,
+    IRByteConstant,
     IRTablePatch,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
@@ -80,6 +87,36 @@ from .model import (
     SSAValueKind,
     NormalizerMetrics,
 )
+
+
+@dataclass
+class _AsciiConstant:
+    name: str
+    data: bytes
+    segments: Tuple[bytes, ...]
+    source: str
+    kind: str = "bytes"
+    text: Optional[str] = None
+    encoding: Optional[str] = None
+
+    def as_string_constant(self) -> IRStringConstant:
+        assert self.text is not None and self.encoding is not None
+        return IRStringConstant(
+            name=self.name,
+            data=self.data,
+            segments=self.segments,
+            source=self.source,
+            encoding=self.encoding,
+            text=self.text,
+        )
+
+    def as_byte_constant(self) -> IRByteConstant:
+        return IRByteConstant(
+            name=self.name,
+            data=self.data,
+            segments=self.segments,
+            source=self.source,
+        )
 
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
@@ -664,8 +701,9 @@ class IRNormalizer:
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
-        self._string_pool: Dict[bytes, IRStringConstant] = {}
-        self._string_pool_order: List[IRStringConstant] = []
+        self._ascii_constants_by_data: Dict[bytes, _AsciiConstant] = {}
+        self._ascii_constants_by_name: Dict[str, _AsciiConstant] = {}
+        self._ascii_constant_order: List[_AsciiConstant] = []
         self._dispatch_index_hints: Dict[int, List[IRDispatchIndex]] = defaultdict(list)
         self._current_block_offset: int = -1
 
@@ -691,8 +729,9 @@ class IRNormalizer:
         segments: List[IRSegment] = []
         aggregate_metrics = NormalizerMetrics()
         selection = set(segment_indices or [])
-        self._string_pool.clear()
-        self._string_pool_order.clear()
+        self._ascii_constants_by_data.clear()
+        self._ascii_constants_by_name.clear()
+        self._ascii_constant_order.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
@@ -701,17 +740,22 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
-        used_strings = self._collect_string_pool_references(segments)
-        string_pool = tuple(
-            constant
-            for constant in self._string_pool_order
-            if constant.name in used_strings
-        )
+        referenced = self._collect_string_pool_references(segments)
+        text_pool: List[IRStringConstant] = []
+        byte_pool: List[IRByteConstant] = []
+        for constant in self._ascii_constant_order:
+            if constant.name not in referenced:
+                continue
+            if constant.kind == "text" and constant.text is not None and constant.encoding is not None:
+                text_pool.append(constant.as_string_constant())
+            else:
+                byte_pool.append(constant.as_byte_constant())
 
         return IRProgram(
             segments=tuple(segments),
             metrics=aggregate_metrics,
-            string_pool=string_pool,
+            string_pool=tuple(text_pool),
+            byte_pool=tuple(byte_pool),
         )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
@@ -736,10 +780,10 @@ class IRNormalizer:
         )
 
     def _collect_string_pool_references(self, segments: Sequence[IRSegment]) -> Set[str]:
-        if not self._string_pool_order:
+        if not self._ascii_constant_order:
             return set()
 
-        constant_names = {constant.name for constant in self._string_pool_order}
+        constant_names = {constant.name for constant in self._ascii_constant_order}
         referenced: Set[str] = set()
 
         def visit(value: object) -> None:
@@ -749,7 +793,7 @@ class IRNormalizer:
                 return
             if isinstance(value, (bytes, bytearray, memoryview)):
                 return
-            if isinstance(value, IRStringConstant):
+            if isinstance(value, (IRStringConstant, IRByteConstant)):
                 referenced.add(value.name)
                 return
             if is_dataclass(value):
@@ -769,6 +813,94 @@ class IRNormalizer:
 
         return referenced
 
+    def _detect_ascii_context(self, profiles: Sequence[InstructionProfile]) -> Set[int]:
+        context: Set[int] = set()
+        run_start: Optional[int] = None
+
+        for index, profile in enumerate(profiles):
+            if self._is_ascii_profile(profile):
+                if run_start is None:
+                    run_start = index
+            else:
+                if run_start is not None:
+                    self._register_ascii_run_context(context, profiles, run_start, index - 1)
+                    run_start = None
+        if run_start is not None:
+            self._register_ascii_run_context(context, profiles, run_start, len(profiles) - 1)
+        return context
+
+    def _register_ascii_run_context(
+        self,
+        context: Set[int],
+        profiles: Sequence[InstructionProfile],
+        start: int,
+        end: int,
+    ) -> None:
+        if end < start:
+            return
+        run_length = end - start + 1
+        if not self._has_ascii_header(profiles, start, run_length):
+            return
+        if not self._has_ascii_consumer(profiles, end):
+            return
+        for offset in range(start, end + 1):
+            context.add(profiles[offset].word.offset)
+
+    @staticmethod
+    def _is_ascii_profile(profile: InstructionProfile) -> bool:
+        if profile.kind is InstructionKind.ASCII_CHUNK:
+            return True
+        mnemonic = profile.mnemonic
+        return mnemonic.startswith("inline_ascii_chunk")
+
+    def _has_ascii_header(
+        self, profiles: Sequence[InstructionProfile], start: int, length: int
+    ) -> bool:
+        if length >= 2:
+            return True
+        if start == 0:
+            return False
+        previous = profiles[start - 1]
+        if previous.is_literal_marker():
+            return True
+        mnemonic = previous.mnemonic.lower()
+        if "ascii" in mnemonic:
+            return True
+        summary = (previous.summary or "").lower()
+        return "ascii" in summary
+
+    def _has_ascii_consumer(
+        self, profiles: Sequence[InstructionProfile], end: int
+    ) -> bool:
+        limit = min(len(profiles), end + 9)
+        for index in range(end + 1, limit):
+            candidate = profiles[index]
+            mnemonic = candidate.mnemonic.lower()
+            if mnemonic == "call_helpers":
+                operand = candidate.operand
+                if operand in ASCII_HELPER_IDS:
+                    return True
+                alias = candidate.operand_alias()
+                if alias:
+                    lowered = alias.lower()
+                    if lowered.startswith("fmt.") or lowered.startswith("io.") or lowered == "chatout":
+                        return True
+            if mnemonic == "reduce_pair" or candidate.kind is InstructionKind.REDUCE:
+                return True
+            alias = candidate.operand_alias()
+            if alias:
+                lowered = alias.lower()
+                if lowered.startswith("fmt.") or lowered.startswith("io.") or lowered == "chatout":
+                    return True
+            summary = (candidate.summary or "").lower()
+            if "fmt" in summary or "chatout" in summary:
+                return True
+            if mnemonic.startswith("fmt.") or mnemonic.startswith("io."):
+                return True
+            if "chatout" in mnemonic:
+                return True
+        return False
+
     # ------------------------------------------------------------------
     # parsing helpers
     # ------------------------------------------------------------------
@@ -777,7 +909,14 @@ class IRNormalizer:
         if not instructions:
             return tuple()
 
-        profiles = [InstructionProfile.from_word(word, self.knowledge) for word in instructions]
+        with allow_contextless_ascii():
+            provisional = [InstructionProfile.from_word(word, self.knowledge) for word in instructions]
+        ascii_context = self._detect_ascii_context(provisional)
+        set_ascii_context(ascii_context)
+        try:
+            profiles = [InstructionProfile.from_word(word, self.knowledge) for word in instructions]
+        finally:
+            clear_ascii_context()
         executable: List[InstructionProfile] = []
         annotations: Dict[int, List[str]] = {}
         pending: List[str] = []
@@ -1278,31 +1417,131 @@ class IRNormalizer:
 
             index += 1
 
-    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
-        constant = self._string_pool.get(data)
+    def _register_ascii_constant(self, data: bytes, source: str) -> _AsciiConstant:
+        constant = self._ascii_constants_by_data.get(data)
         if constant is not None:
             return constant
 
-        if data:
-            segments = (data,)
-        else:
-            segments = (b"",)
-        name = f"str_{len(self._string_pool_order):04d}"
-        constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
-        self._string_pool[data] = constant
-        self._string_pool_order.append(constant)
+        segments = (data,) if data else (b"",)
+        name = f"str_{len(self._ascii_constant_order):04d}"
+        constant = _AsciiConstant(name=name, data=data, segments=segments, source=source)
+        self._ascii_constants_by_data[data] = constant
+        self._ascii_constants_by_name[name] = constant
+        self._ascii_constant_order.append(constant)
         return constant
 
     def _make_literal_chunk(
         self, data: bytes, source: str, annotations: Sequence[str]
     ) -> IRLiteralChunk:
-        constant = self._intern_string_constant(data, source)
+        constant = self._register_ascii_constant(data, source)
         return IRLiteralChunk(
             data=data,
             source=source,
             annotations=tuple(annotations),
             symbol=constant.name,
         )
+
+    def _mark_ascii_constant_text(self, symbol: Optional[str], reason: str = "") -> None:
+        if not symbol:
+            return
+        constant = self._ascii_constants_by_name.get(symbol)
+        if constant is None:
+            return
+        if constant.kind == "text":
+            return
+        decoded = self._decode_ascii_bytes(constant.data)
+        if decoded is None:
+            return
+        text, encoding = decoded
+        text = self._sanitize_decoded_text(text)
+        if not self._is_human_readable_text(text):
+            return
+        constant.kind = "text"
+        constant.text = text
+        constant.encoding = encoding
+
+    @staticmethod
+    def _sanitize_decoded_text(text: str) -> str:
+        trimmed = text.rstrip("\x00")
+        return trimmed
+
+    @staticmethod
+    def _is_human_readable_text(text: str) -> bool:
+        if not text:
+            return False
+        printable = 0
+        for ch in text:
+            if ch in {"\n", "\r", "\t"}:
+                printable += 1
+                continue
+            if ch.isprintable():
+                printable += 1
+        if printable < 3:
+            return False
+        return printable / len(text) >= 0.75
+
+    @staticmethod
+    def _contains_surrogates(text: str) -> bool:
+        return any(0xD800 <= ord(ch) <= 0xDFFF for ch in text)
+
+    def _decode_ascii_bytes(self, data: bytes) -> Optional[Tuple[str, str]]:
+        if not data:
+            return None
+        try:
+            text = data.decode("utf-8")
+            if not self._contains_surrogates(text):
+                return text, "utf-8"
+        except UnicodeDecodeError:
+            pass
+
+        try:
+            text = data.decode("cp1251")
+            return text, "windows-1251"
+        except UnicodeDecodeError:
+            pass
+
+        if len(data) >= 4 and len(data) % 2 == 0:
+            zero_pairs = sum(1 for index in range(1, len(data), 2) if data[index] == 0)
+            if zero_pairs * 2 >= len(data) - 2:
+                try:
+                    text = data.decode("utf-16-le")
+                    return text, "utf-16le"
+                except UnicodeDecodeError:
+                    try:
+                        stripped = data[::2]
+                        text = stripped.decode("utf-8")
+                        return text, "utf-16le"
+                    except UnicodeDecodeError:
+                        pass
+        return None
+
+    def _mark_io_ascii_payload(self, items: _ItemList, index: int) -> None:
+        scan = index - 1
+        steps = 0
+        while scan >= 0 and steps < 6:
+            node = items[scan]
+            if isinstance(node, IRLiteralChunk):
+                self._mark_ascii_constant_text(node.symbol, "io.write")
+                scan -= 1
+                steps += 1
+                continue
+            if isinstance(node, IRStringConstant):
+                self._mark_ascii_constant_text(node.name, "io.write")
+                scan -= 1
+                steps += 1
+                continue
+            if isinstance(node, RawInstruction):
+                profile = node.profile
+                if profile.kind in STACK_NEUTRAL_CONTROL_KINDS or profile.is_control():
+                    break
+                scan -= 1
+                steps += 1
+                continue
+            if isinstance(node, IRLiteral):
+                scan -= 1
+                steps += 1
+                continue
+            break
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
@@ -2359,7 +2598,9 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         if self._is_io_handshake_instruction(instruction, items, index):
             mask = self._io_mask_value(items, index)
-            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            node = IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            self._mark_io_ascii_payload(items, index)
+            return node
         if mnemonic in IO_READ_MNEMONICS:
             return IRIORead(port=IO_PORT_NAME)
         if mnemonic in IO_WRITE_MNEMONICS or mnemonic.startswith("op_10_"):
@@ -2372,7 +2613,9 @@ class IRNormalizer:
             mask = self._io_mask_value(items, index)
             if mask is None and instruction.operand not in IO_ACCEPTED_OPERANDS:
                 mask = instruction.operand
-            return IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            node = IRIOWrite(mask=mask, port=IO_PORT_NAME)
+            self._mark_io_ascii_payload(items, index)
+            return node
         return None
 
     @staticmethod
@@ -4042,6 +4285,7 @@ class IRNormalizer:
                 previous = items[index - 1]
                 if isinstance(previous, IRLiteralChunk):
                     summary = previous.describe()
+                    self._mark_ascii_constant_text(previous.symbol, "ascii_finalize")
                 elif isinstance(previous, IRLiteral):
                     summary = previous.describe()
                 elif isinstance(previous, IRAsciiPreamble):

@@ -97,6 +97,24 @@ def _render_ascii(data: bytes) -> str:
     return "".join(printable)
 
 
+def _escape_string(text: str) -> str:
+    escaped = []
+    for ch in text:
+        if ch == "\\":
+            escaped.append("\\\\")
+        elif ch == '"':
+            escaped.append('\\"')
+        elif ch == "\n":
+            escaped.append("\\n")
+        elif ch == "\r":
+            escaped.append("\\r")
+        elif ch == "\t":
+            escaped.append("\\t")
+        else:
+            escaped.append(ch)
+    return "".join(escaped)
+
+
 @dataclass(frozen=True)
 class IRNode:
     """Base class for IR nodes.
@@ -391,7 +409,23 @@ class IRDataMarker(IRNode):
 
 @dataclass(frozen=True)
 class IRStringConstant(IRNode):
-    """Entry in the global ASCII constant pool."""
+    """Entry in the decoded textual constant pool."""
+
+    name: str
+    data: bytes
+    segments: Tuple[bytes, ...]
+    source: str
+    encoding: str
+    text: str
+
+    def describe(self) -> str:
+        escaped = _escape_string(self.text)
+        return f'const {self.name} = str[{self.encoding}]("{escaped}")'
+
+
+@dataclass(frozen=True)
+class IRByteConstant(IRNode):
+    """Entry in the raw byte constant pool."""
 
     name: str
     data: bytes
@@ -401,9 +435,9 @@ class IRStringConstant(IRNode):
     def describe(self) -> str:
         if len(self.segments) == 1:
             body = _render_ascii(self.segments[0])
-            payload = f"ascii({body})"
+            payload = f"bytes({body})"
         else:
-            parts = ", ".join(f"ascii({_render_ascii(segment)})" for segment in self.segments)
+            parts = ", ".join(f"bytes({_render_ascii(segment)})" for segment in self.segments)
             payload = f"[{parts}]"
         return f"const {self.name} = {payload}"
 
@@ -1164,6 +1198,7 @@ class IRProgram:
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
     string_pool: Tuple[IRStringConstant, ...] = tuple()
+    byte_pool: Tuple[IRByteConstant, ...] = tuple()
 
 
 @dataclass

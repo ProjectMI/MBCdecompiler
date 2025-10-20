@@ -18,9 +18,10 @@ which has traditionally been scattered across private notes.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple
 
 from ..instruction import InstructionWord
 from ..knowledge import KnowledgeBase, OpcodeInfo
@@ -32,6 +33,36 @@ from ..constants import OPERAND_ALIASES
 
 ASCII_ALLOWED = set(range(0x20, 0x7F))
 ASCII_ALLOWED.update({0x09, 0x0A, 0x0D})  # tab/newline characters often occur
+
+ASCII_LETTERS = set(range(0x41, 0x5B)) | set(range(0x61, 0x7B))
+
+_ASCII_CONTEXT_OFFSETS: set[int] = set()
+_FORCE_CONTEXTLESS_ASCII = 0
+
+
+def set_ascii_context(offsets: Iterable[int]) -> None:
+    """Register offsets that participate in recognised string contexts."""
+
+    global _ASCII_CONTEXT_OFFSETS
+    _ASCII_CONTEXT_OFFSETS = set(int(offset) for offset in offsets)
+
+
+def clear_ascii_context() -> None:
+    """Clear previously registered ASCII context offsets."""
+
+    _ASCII_CONTEXT_OFFSETS.clear()
+
+
+@contextmanager
+def allow_contextless_ascii() -> Iterator[None]:
+    """Temporarily bypass the context requirement for ASCII detection."""
+
+    global _FORCE_CONTEXTLESS_ASCII
+    _FORCE_CONTEXTLESS_ASCII += 1
+    try:
+        yield
+    finally:
+        _FORCE_CONTEXTLESS_ASCII -= 1
 
 ASCII_HEURISTIC_SUMMARY = (
     "Эвристически восстановленный ASCII-блок (четыре печатаемых байта)."
@@ -497,6 +528,7 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
         return False
 
     printable = 0
+    printable_pairs = 0
     ascii_pairs = 0
     zero_pairs = 0
 
@@ -508,6 +540,7 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
             continue
 
         seen_ascii = False
+        seen_printable = False
         for byte in pair:
             if byte == 0:
                 continue
@@ -516,19 +549,22 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
             seen_ascii = True
             if 0x20 <= byte <= 0x7E:
                 printable += 1
+                seen_printable = True
 
         if not seen_ascii:
             return False
 
         ascii_pairs += 1
-
-    first_pair_letters = all(
-        0x41 <= byte <= 0x5A or 0x61 <= byte <= 0x7A
-        for byte in raw[:2]
-        if byte != 0
-    )
+        if seen_printable:
+            printable_pairs += 1
 
     if ascii_pairs == 0:
+        return False
+
+    # The first pair must contain alphabetic characters (ignoring padding).
+    first_pair = raw[:2]
+    first_pair_letters = [byte for byte in first_pair if byte != 0]
+    if not first_pair_letters or not all(byte in ASCII_LETTERS for byte in first_pair_letters):
         return False
 
     if zero_pairs:
@@ -536,16 +572,22 @@ def looks_like_ascii_chunk(word: InstructionWord) -> bool:
         # permissive matches where the word is otherwise zero.
         if zero_pairs > 1:
             return False
-        if raw[:2] == b"\x00\x00":
+        if first_pair == b"\x00\x00":
             return False
 
-    if ascii_pairs == 1:
-        if zero_pairs != 1:
-            return False
-        if not first_pair_letters:
+    # Tighten the printable threshold to favour actual text blocks.
+    if printable < 3 and printable_pairs < 2:
+        if ascii_pairs == 1:
+            if printable < 2:
+                return False
+        else:
             return False
 
-    return printable >= 2
+    if not _FORCE_CONTEXTLESS_ASCII:
+        if word.offset not in _ASCII_CONTEXT_OFFSETS:
+            return False
+
+    return True
 
 
 def heuristic_stack_adjustment(profile: InstructionProfile) -> Optional[int]:
