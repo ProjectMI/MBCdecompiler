@@ -652,9 +652,14 @@ class IRNormalizer:
         0x05F0: "fmt.reset",
     }
     _INDEX_MASK_MAX_BITS = 4
+    _ASCII_PRINTABLE = set(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
+    _ASCII_LETTERS = set(range(ord("A"), ord("Z") + 1)) | set(
+        range(ord("a"), ord("z") + 1)
+    )
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
+        self._ascii_candidates: Set[bytes] = set()
         self._annotation_offsets: Set[int] = set()
         self._ssa_bindings: Dict[int, Tuple[str, ...]] = {}
         self._ssa_types: Dict[str, SSAValueKind] = {}
@@ -694,6 +699,8 @@ class IRNormalizer:
         self._string_pool.clear()
         self._string_pool_order.clear()
 
+        self._ascii_candidates = self._collect_ascii_candidates(container)
+
         for segment in container.segments():
             if selection and segment.index not in selection:
                 continue
@@ -707,6 +714,8 @@ class IRNormalizer:
             for constant in self._string_pool_order
             if constant.name in used_strings
         )
+
+        self._ascii_candidates.clear()
 
         return IRProgram(
             segments=tuple(segments),
@@ -1278,31 +1287,202 @@ class IRNormalizer:
 
             index += 1
 
-    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
-        constant = self._string_pool.get(data)
+    def _intern_string_constant(
+        self, segments: Tuple[bytes, ...], source: str
+    ) -> IRStringConstant:
+        canonical = b"\x00".join(segments)
+        constant = self._string_pool.get(canonical)
         if constant is not None:
             return constant
 
-        if data:
-            segments = (data,)
-        else:
-            segments = (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
-        constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
-        self._string_pool[data] = constant
+        constant = IRStringConstant(name=name, data=canonical, segments=segments, source=source)
+        self._string_pool[canonical] = constant
         self._string_pool_order.append(constant)
         return constant
 
     def _make_literal_chunk(
         self, data: bytes, source: str, annotations: Sequence[str]
     ) -> IRLiteralChunk:
-        constant = self._intern_string_constant(data, source)
+        symbol: Optional[str] = None
+        segments = self._extract_string_segments(data)
+        if not segments and data and not self._ascii_candidates:
+            if "ascii" in source or any("ascii" in note for note in annotations):
+                segments = (data,)
+        if segments:
+            constant = self._intern_string_constant(segments, source)
+            symbol = constant.name
         return IRLiteralChunk(
             data=data,
             source=source,
             annotations=tuple(annotations),
-            symbol=constant.name,
+            symbol=symbol,
         )
+
+    def _ascii_literal_payload(
+        self, node: Union[IRLiteral, IRLiteralChunk]
+    ) -> Optional[Tuple[bytes, Sequence[str]]]:
+        if isinstance(node, IRLiteralChunk):
+            data, terminator = self._clip_ascii_prefix(node.data)
+            if not data and not terminator:
+                return None
+            payload = data + (b"\x00" if terminator else b"")
+            return payload, node.annotations
+        if isinstance(node, IRLiteral):
+            raw = self._literal_ascii_bytes(node)
+            if raw is None:
+                return None
+            data, terminator = self._clip_ascii_prefix(raw)
+            if not data and not terminator:
+                return None
+            payload = data + (b"\x00" if terminator else b"")
+            return payload, node.annotations
+        return None
+
+    def _ascii_raw_payload(
+        self, instruction: RawInstruction
+    ) -> Optional[Tuple[bytes, Sequence[str]]]:
+        profile = instruction.profile
+        if not (
+            profile.kind is InstructionKind.ASCII_CHUNK
+            or profile.mnemonic.startswith("inline_ascii_chunk")
+            or any("ascii" in note for note in instruction.annotations)
+        ):
+            return None
+        raw = instruction.profile.word.raw.to_bytes(4, "big")
+        data, terminator = self._clip_ascii_prefix(raw)
+        if not data and not terminator:
+            return None
+        payload = data + (b"\x00" if terminator else b"")
+        return payload, instruction.annotations
+
+    def _literal_ascii_bytes(self, node: IRLiteral) -> Optional[bytes]:
+        value = node.value
+        if value == 0:
+            return b"\x00"
+        if value <= 0xFF:
+            return value.to_bytes(1, "big", signed=False)
+        if value <= 0xFFFF:
+            return value.to_bytes(2, "big", signed=False)
+        return value.to_bytes(4, "big", signed=False)
+
+    def _clip_ascii_prefix(self, data: bytes) -> Tuple[bytes, bool]:
+        prefix = bytearray()
+        terminator = False
+        index = 0
+
+        while index < len(data) and data[index] == 0:
+            index += 1
+
+        while index < len(data):
+            byte = data[index]
+            if byte == 0:
+                terminator = True
+                break
+            if byte not in self._ASCII_PRINTABLE:
+                break
+            prefix.append(byte)
+            index += 1
+
+        return bytes(prefix), terminator
+
+    def _extract_string_segments(self, data: bytes) -> Tuple[bytes, ...]:
+        segments: List[Tuple[bytes, bool]] = []
+        current = bytearray()
+
+        for byte in data:
+            if byte == 0:
+                if current:
+                    segments.append((bytes(current), True))
+                    current.clear()
+                else:
+                    segments.append((b"", True))
+                continue
+            if byte in self._ASCII_PRINTABLE:
+                current.append(byte)
+                continue
+            if current:
+                segments.append((bytes(current), False))
+                current.clear()
+
+        if current:
+            segments.append((bytes(current), False))
+
+        filtered: List[bytes] = []
+        for segment, terminated in segments:
+            if not segment:
+                continue
+
+            candidate: Optional[bytes] = None
+            if self._ascii_candidates:
+                if terminated and segment in self._ascii_candidates:
+                    candidate = segment
+                else:
+                    limit = len(segment)
+                    while limit >= 4:
+                        prefix = segment[:limit]
+                        if prefix in self._ascii_candidates:
+                            candidate = prefix
+                            break
+                        limit -= 1
+            else:
+                candidate = segment
+
+            if candidate is None:
+                continue
+            if not self._looks_like_string(candidate):
+                continue
+            filtered.append(candidate)
+
+        return tuple(filtered)
+
+    def _looks_like_string(self, segment: bytes) -> bool:
+        if len(segment) < 4:
+            return False
+
+        allowed = self._ASCII_LETTERS | set(range(ord("0"), ord("9") + 1)) | {ord("_"), ord(" ")}
+        if any(byte not in allowed for byte in segment):
+            return False
+
+        uppercase = sum(1 for byte in segment if 0x41 <= byte <= 0x5A)
+        if uppercase == 0:
+            return False
+
+        first = segment[0]
+        if 0x61 <= first <= 0x7A and uppercase == 1:
+            prefix = segment[:2].lower()
+            if prefix not in {b"if", b"is"}:
+                return False
+
+        return True
+
+    def _collect_ascii_candidates(self, container: MbcContainer) -> Set[bytes]:
+        candidates: Set[bytes] = set()
+        for segment in container.segments():
+            data = segment.data
+            index = 0
+            length = len(data)
+            while index < length:
+                byte = data[index]
+                if byte == 0:
+                    index += 1
+                    continue
+                if byte not in self._ASCII_PRINTABLE:
+                    index += 1
+                    continue
+
+                start = index
+                index += 1
+                while index < length and data[index] in self._ASCII_PRINTABLE:
+                    index += 1
+
+                if index < length and data[index] == 0 and index - start >= 4:
+                    candidates.add(data[start:index])
+
+                if index < length and data[index] == 0:
+                    index += 1
+
+        return candidates
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
