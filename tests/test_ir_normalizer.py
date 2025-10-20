@@ -943,11 +943,7 @@ def test_normalizer_collapses_ascii_runs_and_literal_hints(tmp_path: Path) -> No
     assert header is not None
     assert len(header.chunks) == 1
 
-    pool = {const.name: const for const in program.string_pool}
-    assert header.chunks[0] in pool
-    constant = pool[header.chunks[0]]
-    assert constant.data == b"A\x00B\x00\x00C\x00D"
-    assert constant.segments == (constant.data,)
+    assert not program.string_pool
     assert "lit(0x6704)" in descriptions
 
 
@@ -978,11 +974,7 @@ def test_normalizer_glues_ascii_reduce_chains(tmp_path: Path) -> None:
     descriptions = [getattr(node, "describe", lambda: "")() for node in block.nodes]
     assert not any("reduce_pair" in text for text in descriptions)
 
-    pool = {const.name: const for const in program.string_pool}
-    assert symbol in pool
-    constant = pool[symbol]
-    assert constant.data == b"HEAD ER  TEX"
-    assert constant.segments == (constant.data,)
+    assert not program.string_pool
 
 
 def test_normalizer_drops_intermediate_ascii_chunks(tmp_path: Path) -> None:
@@ -1001,9 +993,7 @@ def test_normalizer_drops_intermediate_ascii_chunks(tmp_path: Path) -> None:
     normalizer = IRNormalizer(knowledge)
     program = normalizer.normalise_container(container)
 
-    assert len(program.string_pool) == 1
-    constant = program.string_pool[0]
-    assert constant.data == b"ABCDEFGH"
+    assert not program.string_pool
 
 
 def test_normalizer_ignores_ascii_bridge_annotations() -> None:
@@ -1038,9 +1028,23 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     assert cleanup_nodes and any(
         step.mnemonic == "op_AA_00" for cleanup in cleanup_nodes for step in cleanup.steps
     )
-    assert any(
-        isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
+
+
+def test_normalizer_extracts_string_table() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    knowledge = KnowledgeBase.load(repo_root / "knowledge")
+    container = MbcContainer.load(
+        repo_root / "mbc/_pcontrol.mbc", repo_root / "mbc/_pcontrol.adb"
     )
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    extracted = {const.data for const in program.string_pool}
+    assert b"SetShowText" in extracted
+    assert b"CheckTrade" in extracted
+    assert b"WinTrade" in extracted
+    assert b"0AI5" not in extracted
 
 
 def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:

@@ -666,8 +666,17 @@ class IRNormalizer:
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
         self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._string_offsets: Dict[int, IRStringConstant] = {}
+        self._string_pool_forced: Set[str] = set()
         self._dispatch_index_hints: Dict[int, List[IRDispatchIndex]] = defaultdict(list)
         self._current_block_offset: int = -1
+
+    _STRING_TABLE_ALLOWED = frozenset(
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_"
+    )
+    _STRING_TABLE_MIN_RUN = 5
+    _STRING_TABLE_MAX_GAP = 32
+    _STRING_TABLE_MAX_PRINTABLE = 4
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -693,19 +702,24 @@ class IRNormalizer:
         selection = set(segment_indices or [])
         self._string_pool.clear()
         self._string_pool_order.clear()
+        self._string_offsets.clear()
+        self._string_pool_forced.clear()
 
         for segment in container.segments():
             if selection and segment.index not in selection:
                 continue
+            self._extract_segment_strings(segment)
             normalised = self.normalise_segment(segment)
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
         used_strings = self._collect_string_pool_references(segments)
+        if self._string_pool_forced:
+            used_strings.update(self._string_pool_forced)
         string_pool = tuple(
             constant
             for constant in self._string_pool_order
-            if constant.name in used_strings
+            if constant.name in used_strings and constant.source.startswith("segment_")
         )
 
         return IRProgram(
@@ -752,6 +766,8 @@ class IRNormalizer:
             if isinstance(value, IRStringConstant):
                 referenced.add(value.name)
                 return
+            if isinstance(value, IRLiteralChunk):
+                return
             if is_dataclass(value):
                 for field in fields(value):
                     visit(getattr(value, field.name))
@@ -768,6 +784,82 @@ class IRNormalizer:
             visit(segment)
 
         return referenced
+
+    def _extract_segment_strings(self, segment: Segment) -> None:
+        data = segment.data
+        if not data:
+            return
+
+        allowed = self._STRING_TABLE_ALLOWED
+        length = len(data)
+        candidates: List[Tuple[int, int, bytes]] = []
+
+        pos = 0
+        while pos < length:
+            while pos < length and data[pos] not in allowed:
+                pos += 1
+            if pos >= length:
+                break
+
+            start = pos
+            pos += 1
+            while pos < length and data[pos] in allowed:
+                pos += 1
+            if pos >= length or data[pos] != 0:
+                pos += 1
+                continue
+
+            literal = data[start:pos]
+            if len(literal) < 3:
+                pos += 1
+                continue
+
+            terminator = pos + 1
+            candidates.append((start, terminator, bytes(literal)))
+            pos = terminator
+
+        if not candidates:
+            return
+
+        runs: List[List[Tuple[int, int, bytes]]] = []
+        current: List[Tuple[int, int, bytes]] = []
+        prev_end: Optional[int] = None
+
+        for start, end, literal in candidates:
+            if not current:
+                current = [(start, end, literal)]
+                prev_end = end
+                continue
+
+            assert prev_end is not None
+            gap = start - prev_end
+            meta = data[prev_end:start]
+            printable = sum(1 for byte in meta if 32 <= byte <= 126)
+            if 0 < gap <= self._STRING_TABLE_MAX_GAP and printable <= self._STRING_TABLE_MAX_PRINTABLE:
+                current.append((start, end, literal))
+                prev_end = end
+                continue
+
+            if len(current) >= self._STRING_TABLE_MIN_RUN:
+                runs.append(current)
+            current = [(start, end, literal)]
+            prev_end = end
+
+        if current and len(current) >= self._STRING_TABLE_MIN_RUN:
+            runs.append(current)
+
+        if not runs:
+            return
+
+        base = segment.start
+        for run in runs:
+            for start, _end, literal in run:
+                offset = base + start
+                constant = self._intern_string_constant(
+                    literal, f"segment_{segment.index}:0x{offset:06X}"
+                )
+                self._string_offsets[offset] = constant
+                self._string_pool_forced.add(constant.name)
 
     # ------------------------------------------------------------------
     # parsing helpers
@@ -1304,6 +1396,32 @@ class IRNormalizer:
             symbol=constant.name,
         )
 
+    @staticmethod
+    def _looks_like_ascii_literal(data: bytes) -> bool:
+        chunk = data.rstrip(b"\x00")
+        if not chunk:
+            return False
+
+        cleaned = chunk.replace(b"\x00", b"")
+        if not cleaned:
+            return False
+
+        contains_zero = b"\x00" in chunk
+        if len(cleaned) < 3 and not contains_zero:
+            return False
+
+        if any(byte < 0x20 or byte > 0x7E for byte in cleaned):
+            return False
+
+        letters = cleaned.replace(b" ", b"")
+        if len(letters) < 2:
+            return False
+
+        if any(not (65 <= byte <= 90 or 97 <= byte <= 122) for byte in letters):
+            return False
+
+        return True
+
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
         profile = instruction.profile
 
@@ -1323,6 +1441,8 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
+            if not self._looks_like_ascii_literal(data):
+                return None
             return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
