@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace, fields, is_dataclass
+from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
@@ -389,6 +390,9 @@ ASCII_NEIGHBOR_NODE_TYPES = (
     IRAsciiHeader,
 )
 
+ASCII_ALLOWED_BYTES: Set[int] = set(range(0x20, 0x7F))
+ASCII_ALLOWED_BYTES.update({0x09, 0x0A, 0x0D})
+
 STACK_NEUTRAL_CONTROL_KINDS = {
     InstructionKind.CONTROL,
     InstructionKind.TERMINATOR,
@@ -664,10 +668,13 @@ class IRNormalizer:
         self._memref_symbols: Dict[Tuple[str, Optional[int], Optional[int], Optional[int]], str] = {}
         self._memref_symbol_counters: Dict[str, int] = defaultdict(int)
         self._pending_tail_targets: Dict[int, List[int]] = defaultdict(list)
-        self._string_pool: Dict[bytes, IRStringConstant] = {}
         self._string_pool_order: List[IRStringConstant] = []
+        self._string_offsets: Dict[str, int] = {}
+        self._container_bytes: bytes = b""
         self._dispatch_index_hints: Dict[int, List[IRDispatchIndex]] = defaultdict(list)
         self._current_block_offset: int = -1
+        self._header_string_name: Optional[str] = None
+        self._container_path: Optional[Path] = None
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -691,10 +698,16 @@ class IRNormalizer:
         segments: List[IRSegment] = []
         aggregate_metrics = NormalizerMetrics()
         selection = set(segment_indices or [])
-        self._string_pool.clear()
         self._string_pool_order.clear()
+        self._string_offsets.clear()
+        self._header_string_name = None
+        self._container_path = container.path
 
-        for segment in container.segments():
+        materialized_segments = list(container.segments())
+        self._container_bytes = self._assemble_container_bytes(materialized_segments)
+        self._register_header_string()
+
+        for segment in materialized_segments:
             if selection and segment.index not in selection:
                 continue
             normalised = self.normalise_segment(segment)
@@ -702,9 +715,12 @@ class IRNormalizer:
             aggregate_metrics.observe(normalised.metrics)
 
         used_strings = self._collect_string_pool_references(segments)
+        if self._header_string_name:
+            used_strings.add(self._header_string_name)
+
         string_pool = tuple(
             constant
-            for constant in self._string_pool_order
+            for constant in self._finalize_string_pool()
             if constant.name in used_strings
         )
 
@@ -713,6 +729,131 @@ class IRNormalizer:
             metrics=aggregate_metrics,
             string_pool=string_pool,
         )
+
+    def _assemble_container_bytes(self, segments: Sequence[Segment]) -> bytes:
+        if not segments:
+            return b""
+        total_length = max(segment.end for segment in segments)
+        if total_length <= 0:
+            return b""
+        buffer = bytearray(total_length)
+        for segment in segments:
+            data = segment.data
+            if not data:
+                continue
+            start = segment.start
+            buffer[start : start + len(data)] = data
+        return bytes(buffer)
+
+    def _finalize_string_pool(self) -> Tuple[IRStringConstant, ...]:
+        if not self._string_pool_order:
+            return tuple()
+
+        finalized: List[IRStringConstant] = []
+        for constant in self._string_pool_order:
+            offset = self._string_offsets.get(constant.name)
+            if offset is None:
+                finalized.append(constant)
+                continue
+            refined = self._refine_string_constant(constant, offset)
+            finalized.append(refined)
+
+        self._string_pool_order = finalized
+        return tuple(finalized)
+
+    def _refine_string_constant(
+        self, constant: IRStringConstant, offset: int
+    ) -> IRStringConstant:
+        if not self._container_bytes:
+            return constant
+
+        total_length = len(self._container_bytes)
+        if offset < 0 or offset >= total_length:
+            return constant
+
+        start = offset
+        while start < total_length and self._container_bytes[start] == 0:
+            start += 1
+        if start >= total_length:
+            return constant
+
+        pos = start
+        terminated = False
+        while pos < total_length:
+            byte = self._container_bytes[pos]
+            if byte == 0:
+                terminated = True
+                break
+            if byte not in ASCII_ALLOWED_BYTES:
+                terminated = False
+                break
+            pos += 1
+
+        if not terminated:
+            return constant
+
+        string_bytes = self._container_bytes[start:pos]
+        if not string_bytes:
+            return constant
+
+        trimmed = string_bytes.rstrip(b"\r\n")
+        if not trimmed or len(trimmed) < 2:
+            return constant
+
+        segments = (trimmed,) if trimmed else (b"",)
+        self._string_offsets[constant.name] = start
+        return IRStringConstant(
+            name=constant.name,
+            data=trimmed,
+            segments=segments,
+            source=constant.source,
+        )
+
+    def _register_header_string(self) -> None:
+        header = self._extract_header_string()
+        if header is None:
+            return
+        if any(const.data == header for const in self._string_pool_order):
+            return
+        name = f"str_{len(self._string_pool_order):04d}"
+        constant = IRStringConstant(
+            name=name,
+            data=header,
+            segments=(header,),
+            source="container_header",
+        )
+        self._string_pool_order.append(constant)
+        self._header_string_name = name
+
+    def _extract_header_string(self) -> Optional[bytes]:
+        if not self._container_path or self._container_path.suffix.lower() != ".mbc":
+            return None
+
+        source_bytes: bytes
+        if self._container_path.exists():
+            with self._container_path.open("rb") as handle:
+                source_bytes = handle.read(64)
+        else:
+            source_bytes = self._container_bytes[:64]
+
+        if not source_bytes:
+            return None
+
+        limit = min(len(source_bytes), 64)
+        pos = 0
+        while pos < limit:
+            byte = source_bytes[pos]
+            if byte == 0:
+                break
+            if byte not in ASCII_ALLOWED_BYTES:
+                return None
+            pos += 1
+        if pos == 0:
+            return None
+        header = source_bytes[:pos].rstrip(b"\r\n")
+        if len(header) < 2:
+            return None
+        return header
 
     def normalise_segment(self, segment: Segment) -> IRSegment:
         raw_blocks = self._parse_segment(segment)
@@ -1278,30 +1419,32 @@ class IRNormalizer:
 
             index += 1
 
-    def _intern_string_constant(self, data: bytes, source: str) -> IRStringConstant:
-        constant = self._string_pool.get(data)
-        if constant is not None:
-            return constant
-
-        if data:
-            segments = (data,)
-        else:
-            segments = (b"",)
+    def _intern_string_constant(
+        self, data: bytes, source: str, *, offset: Optional[int] = None
+    ) -> IRStringConstant:
+        segments = (data,) if data else (b"",)
         name = f"str_{len(self._string_pool_order):04d}"
         constant = IRStringConstant(name=name, data=data, segments=segments, source=source)
-        self._string_pool[data] = constant
         self._string_pool_order.append(constant)
+        if offset is not None:
+            self._string_offsets[name] = offset
         return constant
 
     def _make_literal_chunk(
-        self, data: bytes, source: str, annotations: Sequence[str]
+        self,
+        data: bytes,
+        source: str,
+        annotations: Sequence[str],
+        *,
+        offset: Optional[int] = None,
     ) -> IRLiteralChunk:
-        constant = self._intern_string_constant(data, source)
+        constant = self._intern_string_constant(data, source, offset=offset)
         return IRLiteralChunk(
             data=data,
             source=source,
             annotations=tuple(annotations),
             symbol=constant.name,
+            offset=offset,
         )
 
     def _literal_from_instruction(self, instruction: RawInstruction) -> Optional[IRNode]:
@@ -1323,7 +1466,12 @@ class IRNormalizer:
             "inline_ascii_chunk"
         ):
             data = instruction.profile.word.raw.to_bytes(4, "big")
-            return self._make_literal_chunk(data, profile.mnemonic, instruction.annotations)
+            return self._make_literal_chunk(
+                data,
+                profile.mnemonic,
+                instruction.annotations,
+                offset=instruction.offset,
+            )
 
         if profile.kind is InstructionKind.LITERAL and instruction.pushes_value():
             return IRLiteral(
@@ -1408,12 +1556,14 @@ class IRNormalizer:
             start = index
             data_parts: List[bytes] = []
             annotations: List[str] = []
+            chunk_nodes: List[IRLiteralChunk] = []
 
             while index < len(items):
                 candidate = items[index]
                 if isinstance(candidate, IRLiteralChunk):
                     data_parts.append(candidate.data)
                     annotations.extend(candidate.annotations)
+                    chunk_nodes.append(candidate)
                     index += 1
                     continue
 
@@ -1427,8 +1577,12 @@ class IRNormalizer:
                 index = start + 1
                 continue
 
+            base_offset = chunk_nodes[0].offset if chunk_nodes else None
             chunk = self._make_literal_chunk(
-                b"".join(data_parts), "ascii_run", annotations
+                b"".join(data_parts),
+                "ascii_run",
+                annotations,
+                offset=base_offset,
             )
             items.replace_slice(start, index, [chunk])
             index = start + 1
@@ -1484,7 +1638,13 @@ class IRNormalizer:
                     merged_annotations.append(note)
 
             data = b"".join(chunk.data for chunk in chunk_nodes)
-            combined = self._make_literal_chunk(data, "ascii_glue", merged_annotations)
+            base_offset = chunk_nodes[0].offset if chunk_nodes else None
+            combined = self._make_literal_chunk(
+                data,
+                "ascii_glue",
+                merged_annotations,
+                offset=base_offset,
+            )
             self._transfer_ssa(source, combined)
 
             for removed in removed_items:
@@ -4148,7 +4308,10 @@ class IRNormalizer:
                     for pos in range(0, len(literal.data), 4):
                         segment = literal.data[pos : pos + 4]
                         piece = self._make_literal_chunk(
-                            segment, literal.source, literal.annotations
+                            segment,
+                            literal.source,
+                            literal.annotations,
+                            offset=(literal.offset + pos) if literal.offset is not None else None,
                         )
                         parts.append(piece.symbol or piece.describe())
                     if len(parts) >= 2:

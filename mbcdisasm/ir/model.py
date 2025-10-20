@@ -362,6 +362,7 @@ class IRLiteralChunk(IRNode):
     source: str
     annotations: Tuple[str, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
+    offset: Optional[int] = None
 
     def describe(self) -> str:
         if self.symbol:
