@@ -18,6 +18,27 @@ class ASTNumericSign(Enum):
     SIGNED = "signed"
 
 
+class ASTSignedness(Enum):
+    """Signedness metadata attached to scalar value types."""
+
+    UNSIGNED = "unsigned"
+    SIGNED = "signed"
+    ANY = "any"
+
+
+class ASTTypeDomain(Enum):
+    """Coarse grained classification for canonical value types."""
+
+    SCALAR = "scalar"
+    POINTER = "pointer"
+    HANDLE = "handle"
+    CHANNEL = "channel"
+    REGISTER = "register"
+    TOKEN = "token"
+    OPAQUE = "opaque"
+    EFFECT = "effect"
+
+
 class ASTEffectCategory(Enum):
     """Side-effect categories recognised by the canonical AST."""
 
@@ -45,6 +66,137 @@ class ASTConversionKind(Enum):
     NORMALISE = "normalise"
     TO_BOOLEAN = "to_boolean"
     TO_POINTER = "to_pointer"
+
+
+@dataclass(frozen=True)
+class ASTValueType:
+    """Formalised description of values exchanged between procedures."""
+
+    domain: ASTTypeDomain
+    width: Optional[int] = None
+    signedness: ASTSignedness = ASTSignedness.ANY
+    space: Optional["ASTAddressSpace"] = None
+    label: Optional[str] = None
+
+    @classmethod
+    def scalar(
+        cls, width: int, signedness: ASTSignedness = ASTSignedness.UNSIGNED
+    ) -> "ASTValueType":
+        return cls(ASTTypeDomain.SCALAR, width=width, signedness=signedness)
+
+    @classmethod
+    def pointer(
+        cls,
+        space: "ASTAddressSpace" = None,
+        width: int = 16,
+    ) -> "ASTValueType":
+        return cls(ASTTypeDomain.POINTER, width=width, space=space)
+
+    @classmethod
+    def handle(cls, label: str = "identifier") -> "ASTValueType":
+        return cls(ASTTypeDomain.HANDLE, label=label)
+
+    @classmethod
+    def channel(cls, label: str = "io") -> "ASTValueType":
+        return cls(ASTTypeDomain.CHANNEL, label=label)
+
+    @classmethod
+    def register(
+        cls, label: str = "register", width: int = 16
+    ) -> "ASTValueType":
+        return cls(ASTTypeDomain.REGISTER, width=width, label=label)
+
+    @classmethod
+    def token(cls, label: str = "token") -> "ASTValueType":
+        return cls(ASTTypeDomain.TOKEN, label=label)
+
+    @classmethod
+    def opaque(cls, label: str = "opaque") -> "ASTValueType":
+        return cls(ASTTypeDomain.OPAQUE, label=label)
+
+    @classmethod
+    def effect(cls) -> "ASTValueType":
+        return cls(ASTTypeDomain.EFFECT)
+
+    @classmethod
+    def from_kind(cls, kind: SSAValueKind) -> "ASTValueType":
+        mapping = {
+            SSAValueKind.UNKNOWN: cls.opaque(),
+            SSAValueKind.BYTE: cls.scalar(8, ASTSignedness.UNSIGNED),
+            SSAValueKind.WORD: cls.scalar(16, ASTSignedness.UNSIGNED),
+            SSAValueKind.POINTER: cls.pointer(),
+            SSAValueKind.IO: cls.channel(),
+            SSAValueKind.PAGE_REGISTER: cls.register("page_register"),
+            SSAValueKind.BOOLEAN: cls.scalar(1, ASTSignedness.UNSIGNED),
+            SSAValueKind.IDENTIFIER: cls.handle(),
+        }
+        return mapping.get(kind, cls.opaque())
+
+    def render(self) -> str:
+        if self.domain is ASTTypeDomain.SCALAR:
+            sign = {
+                ASTSignedness.SIGNED: "s",
+                ASTSignedness.UNSIGNED: "u",
+                ASTSignedness.ANY: "x",
+            }[self.signedness]
+            width = f"{self.width}" if self.width is not None else "?"
+            return f"scalar<{sign}{width}>"
+        if self.domain is ASTTypeDomain.POINTER:
+            space = self.space.value if isinstance(self.space, ASTAddressSpace) else "mem"
+            width = f"{self.width}" if self.width is not None else "?"
+            return f"pointer<{space},{width}>"
+        if self.domain is ASTTypeDomain.HANDLE:
+            label = self.label or "handle"
+            return f"handle<{label}>"
+        if self.domain is ASTTypeDomain.CHANNEL:
+            label = self.label or "io"
+            return f"channel<{label}>"
+        if self.domain is ASTTypeDomain.REGISTER:
+            label = self.label or "register"
+            width = f"{self.width}" if self.width is not None else "?"
+            return f"register<{label},{width}>"
+        if self.domain is ASTTypeDomain.TOKEN:
+            label = self.label or "token"
+            return f"token<{label}>"
+        if self.domain is ASTTypeDomain.EFFECT:
+            return "effect"
+        label = self.label or "opaque"
+        return f"opaque<{label}>"
+
+    def placeholder_prefix(self) -> str:
+        mapping = {
+            ASTTypeDomain.SCALAR: "scalar",
+            ASTTypeDomain.POINTER: "ptr",
+            ASTTypeDomain.HANDLE: "handle",
+            ASTTypeDomain.CHANNEL: "channel",
+            ASTTypeDomain.REGISTER: "reg",
+            ASTTypeDomain.TOKEN: "token",
+            ASTTypeDomain.OPAQUE: "opaque",
+            ASTTypeDomain.EFFECT: "void",
+        }
+        prefix = mapping[self.domain]
+        if self.domain is ASTTypeDomain.POINTER and isinstance(self.space, ASTAddressSpace):
+            return f"{self.space.value}_ptr"
+        return prefix
+
+    def to_legacy_kind(self) -> SSAValueKind:
+        if self.domain is ASTTypeDomain.SCALAR:
+            if self.width == 1:
+                return SSAValueKind.BOOLEAN
+            if self.width == 8:
+                return SSAValueKind.BYTE
+            if self.width == 16:
+                return SSAValueKind.WORD
+            return SSAValueKind.UNKNOWN
+        if self.domain is ASTTypeDomain.POINTER:
+            return SSAValueKind.POINTER
+        if self.domain is ASTTypeDomain.CHANNEL:
+            return SSAValueKind.IO
+        if self.domain is ASTTypeDomain.REGISTER:
+            return SSAValueKind.PAGE_REGISTER
+        if self.domain is ASTTypeDomain.HANDLE:
+            return SSAValueKind.IDENTIFIER
+        return SSAValueKind.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -302,17 +454,6 @@ class ASTIOOperation(Enum):
     BRIDGE = "bridge"
 
 
-class ASTFrameOperation(Enum):
-    PROTOCOL = "protocol"
-    WRITE = "write"
-    RESET = "reset"
-    TEARDOWN = "teardown"
-    RETURN_MASK = "return_mask"
-    PAGE_SELECT = "page_select"
-    DROP = "drop"
-    CLEANUP = "cleanup"
-
-
 class ASTHelperOperation(Enum):
     INVOKE = "invoke"
     FANOUT = "fanout"
@@ -354,46 +495,143 @@ class ASTIOEffect(ASTEffect):
         return f"io.{self.operation.value}({self.port}{mask_text})"
 
 
-@dataclass(frozen=True)
 class ASTFrameEffect(ASTEffect):
-    """Side effects on the active frame."""
+    """Base class for side effects on the active frame."""
 
     domain_order: ClassVar[int] = 1
-    _order_map: ClassVar[Dict[ASTFrameOperation, int]] = {
-        ASTFrameOperation.PROTOCOL: 0,
-        ASTFrameOperation.WRITE: 1,
-        ASTFrameOperation.RESET: 2,
-        ASTFrameOperation.TEARDOWN: 3,
-        ASTFrameOperation.RETURN_MASK: 4,
-        ASTFrameOperation.PAGE_SELECT: 5,
-        ASTFrameOperation.DROP: 6,
-        ASTFrameOperation.CLEANUP: 7,
-    }
 
-    operation: ASTFrameOperation
-    operand: Optional[ASTBitField] = None
-    pops: int = 0
-    channel: Optional[str] = None
+    def _order_index(self) -> int:  # pragma: no cover - overridden in subclasses
+        raise NotImplementedError
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return ()
 
     def order_key(self) -> Tuple[int, ...]:
-        return (
-            self.domain_order,
-            self._order_map.get(self.operation, len(self._order_map)),
-            self.pops,
-        )
+        return (self.domain_order, self._order_index()) + self._order_extra()
+
+
+@dataclass(frozen=True)
+class ASTFrameReturnMaskEffect(ASTFrameEffect):
+    """Effect exposing a return mask update on the frame."""
+
+    mask: ASTBitField
+
+    def _order_index(self) -> int:
+        return 0
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return (self.mask.width, self.mask.value)
+
+    def render(self) -> str:
+        return f"frame.return_mask({self.mask.render()})"
+
+
+@dataclass(frozen=True)
+class ASTFrameWriteEffect(ASTFrameEffect):
+    """Effect describing a frame channel write."""
+
+    mask: Optional[ASTBitField] = None
+    channel: Optional[str] = None
+
+    def _order_index(self) -> int:
+        return 1
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        channel_hash = hash(self.channel or "") & 0xFFFF
+        mask_value = (self.mask.value if self.mask is not None else 0)
+        mask_width = (self.mask.width if self.mask is not None else 0)
+        return (channel_hash, mask_width, mask_value)
 
     def render(self) -> str:
         details: List[str] = []
         if self.channel:
             details.append(f"channel={self.channel}")
-        if self.operand is not None:
-            details.append(self.operand.render())
-        if self.pops:
-            details.append(f"pops={self.pops}")
-        inner = ""
-        if details:
-            inner = ", ".join(details)
-        return f"frame.{self.operation.value}({inner})" if inner else f"frame.{self.operation.value}()"
+        if self.mask is not None:
+            details.append(self.mask.render())
+        inner = ", ".join(details)
+        return f"frame.write({inner})" if inner else "frame.write()"
+
+
+@dataclass(frozen=True)
+class ASTFrameResetEffect(ASTFrameEffect):
+    """Effect describing a frame reset mask application."""
+
+    mask: ASTBitField
+
+    def _order_index(self) -> int:
+        return 2
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return (self.mask.width, self.mask.value)
+
+    def render(self) -> str:
+        return f"frame.reset({self.mask.render()})"
+
+
+@dataclass(frozen=True)
+class ASTFrameTeardownEffect(ASTFrameEffect):
+    """Effect tearing down the active frame."""
+
+    pops: int
+
+    def _order_index(self) -> int:
+        return 3
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return (self.pops,)
+
+    def render(self) -> str:
+        return f"frame.teardown(pops={self.pops})"
+
+
+@dataclass(frozen=True)
+class ASTFrameDropEffect(ASTFrameEffect):
+    """Effect dropping values from the frame."""
+
+    pops: int
+
+    def _order_index(self) -> int:
+        return 4
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return (self.pops,)
+
+    def render(self) -> str:
+        return f"frame.drop(pops={self.pops})"
+
+
+@dataclass(frozen=True)
+class ASTFramePageSelectEffect(ASTFrameEffect):
+    """Effect selecting a page register for subsequent accesses."""
+
+    channel: str
+
+    def _order_index(self) -> int:
+        return 5
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return (hash(self.channel) & 0xFFFF,)
+
+    def render(self) -> str:
+        return f"frame.page_select(channel={self.channel})"
+
+
+@dataclass(frozen=True)
+class ASTFrameCleanupEffect(ASTFrameEffect):
+    """Effect covering helper-driven cleanup interactions."""
+
+    channel: Optional[str] = None
+
+    def _order_index(self) -> int:
+        return 6
+
+    def _order_extra(self) -> Tuple[int, ...]:
+        return (hash(self.channel or "") & 0xFFFF,)
+
+    def render(self) -> str:
+        if self.channel:
+            return f"frame.cleanup(channel={self.channel})"
+        return "frame.cleanup()"
 
 
 @dataclass(frozen=True)
@@ -485,10 +723,15 @@ class ASTExpression:
     def render(self) -> str:  # pragma: no cover - overridden in subclasses
         raise NotImplementedError
 
-    def kind(self) -> SSAValueKind:
-        """Return the inferred :class:`SSAValueKind` for the expression."""
+    def value_type(self) -> ASTValueType:
+        """Return the canonical value type for the expression."""
 
-        return SSAValueKind.UNKNOWN
+        return ASTValueType.opaque()
+
+    def kind(self) -> SSAValueKind:
+        """Return the legacy :class:`SSAValueKind` for compatibility."""
+
+        return self.value_type().to_legacy_kind()
 
     def effect(self) -> ASTEffectCategory:
         """Return the side-effect classification for the expression."""
@@ -532,10 +775,13 @@ class ASTIntegerLiteral(ASTExpression):
             prefix = "0x"
         return f"int<{self.sign.value},{self.bits}>({sign_char}{prefix}{magnitude_text})"
 
-    def kind(self) -> SSAValueKind:
-        if self.bits <= 8:
-            return SSAValueKind.BYTE
-        return SSAValueKind.WORD
+    def value_type(self) -> ASTValueType:
+        signedness = (
+            ASTSignedness.SIGNED
+            if self.sign is ASTNumericSign.SIGNED
+            else ASTSignedness.UNSIGNED
+        )
+        return ASTValueType.scalar(self.bits, signedness)
 
 
 @dataclass(frozen=True)
@@ -549,8 +795,8 @@ class ASTRealLiteral(ASTExpression):
     def render(self) -> str:
         return f"real<{self.encoding},{self.precision}>({self.value})"
 
-    def kind(self) -> SSAValueKind:
-        return SSAValueKind.WORD
+    def value_type(self) -> ASTValueType:
+        return ASTValueType.scalar(self.precision, ASTSignedness.ANY)
 
 
 @dataclass(frozen=True)
@@ -562,8 +808,8 @@ class ASTBooleanLiteral(ASTExpression):
     def render(self) -> str:
         return f"bool({'true' if self.value else 'false'})"
 
-    def kind(self) -> SSAValueKind:
-        return SSAValueKind.BOOLEAN
+    def value_type(self) -> ASTValueType:
+        return ASTValueType.scalar(1, ASTSignedness.UNSIGNED)
 
 
 @dataclass(frozen=True)
@@ -591,10 +837,10 @@ class ASTBytesLiteral(ASTExpression):
             payload = self.data.decode(self.encoding)
         return f"bytes[{self.encoding}]({payload})"
 
-    def kind(self) -> SSAValueKind:
+    def value_type(self) -> ASTValueType:
         if len(self.data) == 1:
-            return SSAValueKind.BYTE
-        return SSAValueKind.UNKNOWN
+            return ASTValueType.scalar(8, ASTSignedness.ANY)
+        return ASTValueType.token("bytes")
 
 
 @dataclass(frozen=True)
@@ -602,13 +848,13 @@ class ASTIdentifier(ASTExpression):
     """Named SSA value."""
 
     name: str
-    kind_hint: SSAValueKind = SSAValueKind.UNKNOWN
+    type_hint: ASTValueType = field(default_factory=ASTValueType.opaque)
 
     def render(self) -> str:
         return self.name
 
-    def kind(self) -> SSAValueKind:
-        return self.kind_hint
+    def value_type(self) -> ASTValueType:
+        return self.type_hint
 
 
 @dataclass(frozen=True)
@@ -617,7 +863,7 @@ class ASTSafeCastExpr(ASTExpression):
 
     operand: ASTExpression
     conversion: ASTConversionKind
-    target_kind: SSAValueKind = SSAValueKind.UNKNOWN
+    target_type: ASTValueType = field(default_factory=ASTValueType.opaque)
     precondition: Optional[str] = None
     postcondition: Optional[str] = None
 
@@ -629,8 +875,8 @@ class ASTSafeCastExpr(ASTExpression):
             metadata.append(f"ensures={self.postcondition}")
         return f"cast[{', '.join(metadata)}]({self.operand.render()})"
 
-    def kind(self) -> SSAValueKind:
-        return self.target_kind
+    def value_type(self) -> ASTValueType:
+        return self.target_type
 
 
 @dataclass(frozen=True)
@@ -642,17 +888,74 @@ class ASTMemoryLocation:
     alias: ASTAliasInfo = field(default_factory=_default_alias)
 
     def render(self) -> str:
+        metadata: Dict[str, str] = {}
+        suffix: List[str] = []
+
         if isinstance(self.base, ASTExpression):
             base_repr = self.base.render()
         else:
-            base_repr = self.base.render()
-        metadata: List[str] = []
+            descriptor = self.base
+            base_repr = descriptor.symbol or descriptor.space.value
+            metadata["space"] = descriptor.space.value
+            if descriptor.region and descriptor.region != descriptor.space.value:
+                metadata["region"] = descriptor.region
+            if descriptor.symbol:
+                metadata.setdefault("symbol", descriptor.symbol)
+
         if self.alias.kind is not ASTAliasKind.UNKNOWN or self.alias.label:
-            metadata.append(f"alias={self.alias.render()}")
+            metadata["alias"] = self.alias.render()
+
+        for element in self.path:
+            if isinstance(element, ASTBankElement):
+                metadata["bank"] = f"0x{element.value:04X}"
+            elif isinstance(element, ASTPageElement):
+                metadata["page"] = element.alias or f"0x{element.value:02X}"
+            elif isinstance(element, ASTPageRegisterElement):
+                metadata["page_reg"] = f"0x{element.register:04X}"
+            elif isinstance(element, ASTBaseElement):
+                metadata["base"] = f"0x{element.value:04X}"
+            elif isinstance(element, ASTOffsetElement):
+                metadata["offset"] = f"0x{element.value:04X}"
+            elif isinstance(element, ASTSlotElement):
+                metadata["slot"] = f"{element.space}:{element.index.render()}"
+            elif isinstance(element, ASTViewElement):
+                metadata["view"] = element.kind
+                if element.index is not None:
+                    metadata["index"] = element.index.render()
+            elif isinstance(element, ASTFieldElement):
+                suffix.append(f".{element.name}")
+            elif isinstance(element, ASTIndexElement):
+                suffix.append(f"[{element.index.render()}]")
+            elif isinstance(element, ASTSliceElement):
+                suffix.append(element.render())
+            else:
+                suffix.append(element.render())
+
+        order = [
+            "space",
+            "region",
+            "symbol",
+            "alias",
+            "bank",
+            "page",
+            "page_reg",
+            "base",
+            "offset",
+            "slot",
+            "view",
+            "index",
+        ]
+        ordered_items: List[str] = []
+        for key in order:
+            if key in metadata:
+                ordered_items.append(f"{key}={metadata[key]}")
+        for key, value in metadata.items():
+            if key not in order:
+                ordered_items.append(f"{key}={value}")
         prefix = base_repr
-        if metadata:
-            prefix = f"{base_repr}{{{', '.join(metadata)}}}"
-        trail = "".join(element.render() for element in self.path)
+        if ordered_items:
+            prefix = f"{base_repr}{{{', '.join(ordered_items)}}}"
+        trail = "".join(suffix)
         return f"{prefix}{trail}"
 
 
@@ -661,17 +964,17 @@ class ASTMemoryRead(ASTExpression):
     """Read a value from a structured location."""
 
     location: ASTMemoryLocation
-    value_kind: SSAValueKind | None = None
+    value_type_hint: ASTValueType | None = None
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.READ
 
     def render(self) -> str:
         return self.location.render()
 
-    def kind(self) -> SSAValueKind:
-        if self.value_kind is not None:
-            return self.value_kind
-        return SSAValueKind.UNKNOWN
+    def value_type(self) -> ASTValueType:
+        if self.value_type_hint is not None:
+            return self.value_type_hint
+        return ASTValueType.opaque()
 
 
 @dataclass(frozen=True)
@@ -718,6 +1021,77 @@ class ASTTupleExpr(ASTExpression):
         return f"({inner})"
 
 
+@dataclass(frozen=True)
+class ASTTraceOperand(ASTExpression):
+    """Operand referencing a traced literal or instruction value."""
+
+    opcode: int
+    mode: int
+    address: int
+
+    def render(self) -> str:
+        return f"trace[0x{self.opcode:02X}:0x{self.mode:02X}@0x{self.address:06X}]"
+
+    def value_type(self) -> ASTValueType:
+        return ASTValueType.token("trace")
+
+
+@dataclass(frozen=True)
+class ASTStackOperand(ASTExpression):
+    """Operand pointing at a stack reference."""
+
+    tag: str
+    offset: Optional[int] = None
+
+    def render(self) -> str:
+        if self.offset is not None:
+            return f"stack[{self.tag}, offset=0x{self.offset:04X}]"
+        return f"stack[{self.tag}]"
+
+    def value_type(self) -> ASTValueType:
+        return ASTValueType.pointer(ASTAddressSpace.FRAME)
+
+
+# ---------------------------------------------------------------------------
+# adaptive tables
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ASTAdaptiveTableOperation:
+    """Single operation participating in an adaptive table build."""
+
+    mnemonic: str
+    operand: int
+
+    def render(self) -> str:
+        return f"{self.mnemonic}(0x{self.operand:04X})"
+
+
+@dataclass(frozen=True)
+class ASTAdaptiveTableExpr(ASTExpression):
+    """Expression referencing an adaptive table realisation."""
+
+    mode: ASTIntegerLiteral
+    operations: Tuple[ASTAdaptiveTableOperation, ...]
+    variant: Optional[str] = None
+    annotations: Tuple[str, ...] = ()
+
+    def render(self) -> str:
+        parts: List[str] = [f"mode={self.mode.render()}"]
+        rendered_ops = ", ".join(op.render() for op in self.operations)
+        parts.append(f"ops=[{rendered_ops}]")
+        if self.variant:
+            parts.append(f"variant={self.variant}")
+        if self.annotations:
+            notes = ", ".join(self.annotations)
+            parts.append(f"notes=[{notes}]")
+        return f"adaptive_table{{{', '.join(parts)}}}"
+
+    def value_type(self) -> ASTValueType:
+        return ASTValueType.token("adaptive_table")
+
+
 # ---------------------------------------------------------------------------
 # statements
 # ---------------------------------------------------------------------------
@@ -739,13 +1113,13 @@ class ASTCallReturnSlot:
     """Description of a returned value slot for a call."""
 
     index: int
-    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    value_type: ASTValueType = field(default_factory=ASTValueType.opaque)
     name: Optional[str] = None
 
     def render(self) -> str:
-        prefix = self.kind.name.lower()
+        prefix = self.value_type.placeholder_prefix()
         label = self.name or f"{prefix}{self.index}"
-        return f"ret[{self.index}]={label}:{prefix}"
+        return f"ret[{self.index}]={label}:{self.value_type.render()}"
 
 
 @dataclass(frozen=True)
@@ -794,12 +1168,12 @@ class ASTSignatureValue:
     """Single argument or return slot recorded in a symbol signature."""
 
     index: int
-    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    value_type: ASTValueType = field(default_factory=ASTValueType.opaque)
     name: Optional[str] = None
 
     def render(self) -> str:
-        label = self.name or f"{self.kind.name.lower()}{self.index}"
-        return f"{label}:{self.kind.name.lower()}"
+        label = self.name or f"{self.value_type.placeholder_prefix()}{self.index}"
+        return f"{label}:{self.value_type.render()}"
 
 
 @dataclass(frozen=True)
@@ -813,8 +1187,8 @@ class ASTSymbolSignature:
     varargs: bool = False
 
     def render(self) -> str:
-        args = ", ".join(value.render() for value in self.arguments) or "-"
-        rets = ", ".join(value.render() for value in self.returns) or "-"
+        args = ", ".join(value.render() for value in self.arguments) or "–"
+        rets = ", ".join(value.render() for value in self.returns) or "–"
         varargs = ", varargs" if self.varargs else ""
         return (
             f"symbol {self.name}(0x{self.address:04X}) args=[{args}]"
@@ -879,6 +1253,18 @@ class ASTCallStatement(ASTStatement):
         if self.abi is not None:
             return f"{call_repr} {self.abi.render()}"
         return call_repr
+
+
+@dataclass
+class ASTAdaptiveTable(ASTStatement):
+    """Statement materialising an adaptive table patch."""
+
+    table: ASTAdaptiveTableExpr
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        return self.table.render()
 
 
 @dataclass
@@ -1386,22 +1772,33 @@ __all__ = [
     "ASTAliasInfo",
     "ASTAliasKind",
     "ASTNumericSign",
+    "ASTSignedness",
+    "ASTTypeDomain",
     "ASTConversionKind",
     "ASTEffectCategory",
     "ASTAddressSpace",
     "ASTAddressDescriptor",
+    "ASTValueType",
     "ASTBitField",
     "ASTEffect",
     "ASTMemoryRead",
     "ASTCallExpr",
     "ASTCallResult",
     "ASTTupleExpr",
+    "ASTTraceOperand",
+    "ASTStackOperand",
     "ASTStatement",
     "ASTAssign",
     "ASTMemoryWrite",
     "ASTIOEffect",
     "ASTFrameEffect",
-    "ASTFrameOperation",
+    "ASTFrameReturnMaskEffect",
+    "ASTFrameWriteEffect",
+    "ASTFrameResetEffect",
+    "ASTFrameTeardownEffect",
+    "ASTFrameDropEffect",
+    "ASTFramePageSelectEffect",
+    "ASTFrameCleanupEffect",
     "ASTFrameProtocolEffect",
     "ASTHelperEffect",
     "ASTCallArgumentSlot",

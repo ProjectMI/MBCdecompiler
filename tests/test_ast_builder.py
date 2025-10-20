@@ -3,6 +3,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTAdaptiveTable,
     ASTAssign,
     ASTBranch,
     ASTBuilder,
@@ -11,8 +12,11 @@ from mbcdisasm.ast import (
     ASTCallExpr,
     ASTCallStatement,
     ASTFrameEffect,
-    ASTFrameOperation,
+    ASTFrameDropEffect,
+    ASTFrameReturnMaskEffect,
+    ASTFrameTeardownEffect,
     ASTFrameProtocolEffect,
+    ASTFramePageSelectEffect,
     ASTIOEffect,
     ASTIntegerLiteral,
     ASTMemoryRead,
@@ -36,6 +40,7 @@ from mbcdisasm.ir.model import (
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
+    IRTablePatch,
     IRStackEffect,
     IRSlot,
     MemRef,
@@ -324,6 +329,43 @@ def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
 
     assert any(isinstance(stmt, ASTCallStatement) for stmt in statements)
     assert not any(isinstance(stmt, ASTTailCall) for stmt in statements)
+
+
+def test_ast_builder_converts_adaptive_table() -> None:
+    patch = IRTablePatch(
+        operations=(
+            ("op_35_15", 0x0000),
+            ("op_47_15", 0x0000),
+        ),
+        annotations=("adaptive_table", "mode=0x15", "kind=unknown", "op_67_15"),
+    )
+    block = IRBlock(
+        label="block_table",
+        start_offset=0x0500,
+        nodes=(patch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert isinstance(statements[0], ASTAdaptiveTable)
+    table_expr = statements[0].table
+    assert table_expr.mode.value == 0x15
+    assert table_expr.mode.bits == 8
+    assert table_expr.variant is None
+    assert table_expr.annotations == ("op_67_15",)
+    rendered = statements[0].render()
+    assert rendered.startswith("adaptive_table{")
+    assert "ops=[op_35_15(0x0000), op_47_15(0x0000)]" in rendered
 
 
 def test_ast_builder_prunes_redundant_branch_blocks() -> None:
@@ -655,10 +697,16 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     ]
     io_effects = [effect for effect in return_stmt.effects if isinstance(effect, ASTIOEffect)]
 
-    assert any(effect.operation.value == "page_select" for effect in frame_effects)
-    assert any(effect.operation.value == "teardown" for effect in frame_effects)
-    assert any(effect.operation.value == "return_mask" and effect.operand and effect.operand.value == RET_MASK for effect in frame_effects)
-    assert any(effect.operation.value == "return_mask" and effect.operand and effect.operand.value == 0x0001 for effect in frame_effects)
+    assert any(isinstance(effect, ASTFramePageSelectEffect) for effect in frame_effects)
+    assert any(isinstance(effect, ASTFrameTeardownEffect) for effect in frame_effects)
+    assert any(
+        isinstance(effect, ASTFrameReturnMaskEffect) and effect.mask.value == RET_MASK
+        for effect in frame_effects
+    )
+    assert any(
+        isinstance(effect, ASTFrameReturnMaskEffect) and effect.mask.value == 0x0001
+        for effect in frame_effects
+    )
     assert any(effect.operation.value == "bridge" for effect in io_effects)
 
 
@@ -697,9 +745,19 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert RET_MASK in mask_values
 
     frame_effects = [effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameEffect)]
-    assert any(effect.operation.value == "return_mask" and effect.operand and effect.operand.value == RET_MASK for effect in frame_effects)
-    assert any(effect.operation.value == "teardown" and effect.pops == protocol_effect.teardown for effect in frame_effects)
-    assert any(effect.operation.value == "drop" and effect.pops == protocol_effect.drops for effect in frame_effects)
+    assert any(
+        isinstance(effect, ASTFrameReturnMaskEffect) and effect.mask.value == RET_MASK
+        for effect in frame_effects
+    )
+    assert any(
+        isinstance(effect, ASTFrameTeardownEffect)
+        and effect.pops == protocol_effect.teardown
+        for effect in frame_effects
+    )
+    assert any(
+        isinstance(effect, ASTFrameDropEffect) and effect.pops == protocol_effect.drops
+        for effect in frame_effects
+    )
 
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(
@@ -733,11 +791,9 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
         effect for effect in return_stmt.effects if isinstance(effect, ASTFrameProtocolEffect)
     )
     mask_pairs = {
-        (effect.operand.value, effect.operand.alias)
+        (effect.mask.value, effect.mask.alias)
         for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameEffect)
-        and effect.operation.value == "return_mask"
-        and effect.operand is not None
+        if isinstance(effect, ASTFrameReturnMaskEffect)
     }
     expected = {(mask.value, mask.alias) for mask in protocol_effect.masks}
     assert mask_pairs == expected
@@ -745,8 +801,7 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     teardown_effects = [
         effect
         for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameEffect)
-        and effect.operation is ASTFrameOperation.TEARDOWN
+        if isinstance(effect, ASTFrameTeardownEffect)
     ]
     assert len(teardown_effects) == 1
     assert teardown_effects[0].pops == protocol_effect.teardown
@@ -754,8 +809,7 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     drop_effects = [
         effect
         for effect in return_stmt.effects
-        if isinstance(effect, ASTFrameEffect)
-        and effect.operation is ASTFrameOperation.DROP
+        if isinstance(effect, ASTFrameDropEffect)
     ]
     assert len(drop_effects) == 1
     assert drop_effects[0].pops == protocol_effect.drops
@@ -793,8 +847,12 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     assert 0x6601 in symbols
     signature = symbols[0x6601]
     assert signature.name == "helper_6601"
-    assert tuple(value.kind for value in signature.arguments) == (SSAValueKind.POINTER,)
-    assert tuple(value.kind for value in signature.returns) == (SSAValueKind.UNKNOWN,)
+    assert tuple(value.value_type.to_legacy_kind() for value in signature.arguments) == (
+        SSAValueKind.POINTER,
+    )
+    assert tuple(value.value_type.to_legacy_kind() for value in signature.returns) == (
+        SSAValueKind.UNKNOWN,
+    )
 
 
 def test_epilogue_effects_are_deduplicated() -> None:
@@ -883,6 +941,10 @@ def test_banked_memory_locations_are_canonical() -> None:
     assign = procedure.blocks[0].statements[0]
     assert isinstance(assign, ASTAssign)
     rendered = assign.value.render()
-    assert rendered.startswith("mem.bank_1230{alias=region(bank_1230)}")
-    assert ".page(0x01)" in rendered
-    assert ".base(0x0040)" in rendered
+    assert rendered.startswith("mem{")
+    assert "region=bank_1230" in rendered
+    assert "alias=region(bank_1230)" in rendered
+    assert "bank=0x1230" in rendered
+    assert "page=0x01" in rendered
+    assert "base=0x0040" in rendered
+    assert "page_reg=0x5000" in rendered

@@ -34,11 +34,11 @@ from ..ir.model import (
     IRTailCall,
     IRTailcallReturn,
     IRTerminator,
+    IRTablePatch,
     IRAbiEffect,
     IRStackEffect,
     MemRef,
     MemSpace,
-    SSAValueKind,
 )
 
 
@@ -194,9 +194,15 @@ from .model import (
     ASTExitReason,
     ASTFieldElement,
     ASTFlagCheck,
+    ASTFrameCleanupEffect,
+    ASTFrameDropEffect,
     ASTFrameEffect,
-    ASTFrameOperation,
+    ASTFramePageSelectEffect,
     ASTFrameProtocolEffect,
+    ASTFrameResetEffect,
+    ASTFrameReturnMaskEffect,
+    ASTFrameTeardownEffect,
+    ASTFrameWriteEffect,
     ASTHelperEffect,
     ASTHelperOperation,
     ASTIOEffect,
@@ -206,11 +212,14 @@ from .model import (
     ASTIdentifier,
     ASTIndexElement,
     ASTIntegerLiteral,
+    ASTSignedness,
     ASTMemoryLocation,
     ASTMemoryRead,
     ASTMemoryWrite,
     ASTMetrics,
     ASTNumericSign,
+    ASTTypeDomain,
+    ASTValueType,
     ASTProcedure,
     ASTProgram,
     ASTBaseElement,
@@ -233,9 +242,22 @@ from .model import (
     ASTTailCall,
     ASTTestSet,
     ASTTupleExpr,
+    ASTTraceOperand,
+    ASTStackOperand,
+    ASTAdaptiveTable,
+    ASTAdaptiveTableExpr,
+    ASTAdaptiveTableOperation,
     ASTUnknown,
     ASTViewElement,
 )
+
+
+def _canonical_value_type(value_type: ASTValueType) -> ASTValueType:
+    if value_type.domain is ASTTypeDomain.POINTER and value_type.space is None:
+        return ASTValueType.pointer(ASTAddressSpace.MEMORY, width=value_type.width or 16)
+    if value_type.domain is ASTTypeDomain.SCALAR and value_type.width is None:
+        return ASTValueType.scalar(16, ASTSignedness.ANY)
+    return value_type
 
 
 @dataclass
@@ -352,13 +374,13 @@ class _SignatureAccumulator:
 
     address: int
     symbols: Set[str] = field(default_factory=set)
-    argument_kinds: Dict[int, Set[SSAValueKind]] = field(
+    argument_types: Dict[int, Set[ASTValueType]] = field(
         default_factory=lambda: defaultdict(set)
     )
     argument_names: Dict[int, Set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
-    return_kinds: Dict[int, Set[SSAValueKind]] = field(
+    return_types: Dict[int, Set[ASTValueType]] = field(
         default_factory=lambda: defaultdict(set)
     )
     return_names: Dict[int, Set[str]] = field(
@@ -378,14 +400,14 @@ class _SignatureAccumulator:
         if call.varargs or payload_varargs:
             self.varargs = True
         for index, expr in enumerate(call.args):
-            kind = expr.kind()
-            self.argument_kinds[index].add(kind)
+            value_type = _canonical_value_type(expr.value_type())
+            self.argument_types[index].add(value_type)
             name = self._expr_name(expr)
             if name:
                 self.argument_names[index].add(name)
         for index, expr in enumerate(returns):
-            kind = expr.kind()
-            self.return_kinds[index].add(kind)
+            value_type = _canonical_value_type(expr.value_type())
+            self.return_types[index].add(value_type)
             name = self._expr_name(expr)
             if name:
                 self.return_names[index].add(name)
@@ -540,22 +562,22 @@ class ASTBuilder:
             arguments = tuple(
                 ASTSignatureValue(
                     index=index,
-                    kind=self._select_signature_kind(kinds),
+                    value_type=self._select_signature_type(types),
                     name=self._select_signature_name(
                         accumulator.argument_names.get(index, set())
                     ),
                 )
-                for index, kinds in sorted(accumulator.argument_kinds.items())
+                for index, types in sorted(accumulator.argument_types.items())
             )
             returns = tuple(
                 ASTSignatureValue(
                     index=index,
-                    kind=self._select_signature_kind(kinds),
+                    value_type=self._select_signature_type(types),
                     name=self._select_signature_name(
                         accumulator.return_names.get(index, set())
                     ),
                 )
-                for index, kinds in sorted(accumulator.return_kinds.items())
+                for index, types in sorted(accumulator.return_types.items())
             )
             signatures.append(
                 ASTSymbolSignature(
@@ -570,24 +592,38 @@ class ASTBuilder:
         return tuple(signatures)
 
     @staticmethod
-    def _select_signature_kind(kinds: Set[SSAValueKind]) -> SSAValueKind:
-        if not kinds:
-            return SSAValueKind.UNKNOWN
-        priority = [
-            SSAValueKind.BOOLEAN,
-            SSAValueKind.BYTE,
-            SSAValueKind.WORD,
-            SSAValueKind.POINTER,
-            SSAValueKind.IO,
-            SSAValueKind.PAGE_REGISTER,
-            SSAValueKind.IDENTIFIER,
-        ]
-        for candidate in priority:
-            if candidate in kinds and candidate is not SSAValueKind.UNKNOWN:
-                return candidate
-        if SSAValueKind.UNKNOWN in kinds:
-            return SSAValueKind.UNKNOWN
-        return sorted(kinds, key=lambda kind: kind.name)[0]
+    def _select_signature_type(types: Set[ASTValueType]) -> ASTValueType:
+        if not types:
+            return ASTValueType.opaque()
+
+        def priority(value: ASTValueType) -> Tuple[int, int, int, int, str]:
+            domain_priority = {
+                ASTTypeDomain.SCALAR: 0,
+                ASTTypeDomain.POINTER: 1,
+                ASTTypeDomain.HANDLE: 2,
+                ASTTypeDomain.CHANNEL: 3,
+                ASTTypeDomain.REGISTER: 4,
+                ASTTypeDomain.TOKEN: 5,
+                ASTTypeDomain.OPAQUE: 6,
+                ASTTypeDomain.EFFECT: 7,
+            }
+            signed_priority = {
+                ASTSignedness.UNSIGNED: 0,
+                ASTSignedness.SIGNED: 1,
+                ASTSignedness.ANY: 2,
+            }
+            width_defined = 0 if value.width is not None else 1
+            width_value = value.width if value.width is not None else 0xFFFF
+            return (
+                domain_priority.get(value.domain, 8),
+                width_defined,
+                width_value,
+                signed_priority.get(value.signedness, 3),
+                value.render(),
+            )
+
+        selected = min((_canonical_value_type(value) for value in types), key=priority)
+        return selected
 
     @staticmethod
     def _select_signature_name(names: Set[str]) -> Optional[str]:
@@ -611,20 +647,30 @@ class ASTBuilder:
     @staticmethod
     def _effect_identity(effect: ASTEffect) -> Tuple[Any, ...]:
         if isinstance(effect, ASTFrameEffect):
-            operand = None
-            if effect.operand is not None:
-                operand = (
-                    effect.operand.width,
-                    effect.operand.value,
-                    effect.operand.alias,
-                )
-            return (
-                "frame",
-                effect.operation,
-                operand,
-                effect.pops,
-                effect.channel,
-            )
+            if isinstance(effect, ASTFrameReturnMaskEffect):
+                mask = effect.mask
+                return ("frame", "return_mask", mask.width, mask.value, mask.alias)
+            if isinstance(effect, ASTFrameWriteEffect):
+                mask = None
+                if effect.mask is not None:
+                    mask = (
+                        effect.mask.width,
+                        effect.mask.value,
+                        effect.mask.alias,
+                    )
+                return ("frame", "write", effect.channel, mask)
+            if isinstance(effect, ASTFrameResetEffect):
+                mask = effect.mask
+                return ("frame", "reset", mask.width, mask.value, mask.alias)
+            if isinstance(effect, ASTFrameTeardownEffect):
+                return ("frame", "teardown", effect.pops)
+            if isinstance(effect, ASTFrameDropEffect):
+                return ("frame", "drop", effect.pops)
+            if isinstance(effect, ASTFramePageSelectEffect):
+                return ("frame", "page_select", effect.channel)
+            if isinstance(effect, ASTFrameCleanupEffect):
+                return ("frame", "cleanup", effect.channel)
+            return ("frame", type(effect).__name__, effect.render())
         if isinstance(effect, ASTFrameProtocolEffect):
             masks = tuple(
                 (mask.width, mask.value, mask.alias) for mask in effect.masks
@@ -1226,7 +1272,11 @@ class ASTBuilder:
 
     @staticmethod
     def _is_stack_top_expr(expr: ASTExpression) -> bool:
-        return isinstance(expr, ASTIdentifier) and expr.name == "stack_top"
+        if isinstance(expr, ASTStackOperand):
+            return expr.tag == "top" and (expr.offset is None or expr.offset == 0)
+        if isinstance(expr, ASTIdentifier):
+            return expr.name == "stack_top"
+        return False
 
     def _simplify_branch_targets(
         self, block: ASTBlock, block_order: Sequence[ASTBlock]
@@ -2016,9 +2066,12 @@ class ASTBuilder:
                 self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
             return [], []
         if isinstance(node, IRLoad):
-            target = ASTIdentifier(node.target, self._infer_kind(node.target))
+            target = ASTIdentifier(node.target, self._infer_type(node.target))
             location = self._build_slot_location(node.slot)
-            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+            expr = ASTMemoryRead(
+                location=location,
+                value_type_hint=ASTValueType.pointer(ASTAddressSpace.MEMORY),
+            )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
@@ -2042,7 +2095,10 @@ class ASTBuilder:
                 else None
             )
             location = self._build_banked_location(node, pointer_expr, offset_expr)
-            expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.WORD)
+            expr = ASTMemoryRead(
+                location=location,
+                value_type_hint=ASTValueType.scalar(16, ASTSignedness.ANY),
+            )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
@@ -2050,7 +2106,7 @@ class ASTBuilder:
             metrics.observe_load(pointer_known and offset_known)
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=ASTIdentifier(node.target, self._infer_type(node.target)),
                     value=expr,
                 )
             ], []
@@ -2079,7 +2135,7 @@ class ASTBuilder:
             )
             location = self._build_indirect_location(node, pointer, offset_expr)
             expr = ASTMemoryRead(
-                location=location, value_kind=self._infer_indirect_kind(pointer)
+                location=location, value_type_hint=self._infer_indirect_type(pointer)
             )
             value_state[node.target] = expr
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
@@ -2088,7 +2144,7 @@ class ASTBuilder:
             )
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=ASTIdentifier(node.target, self._infer_type(node.target)),
                     value=expr,
                 )
             ], []
@@ -2184,6 +2240,9 @@ class ASTBuilder:
             return [], []
         if isinstance(node, IRTerminator):
             return [], []
+        if isinstance(node, IRTablePatch):
+            table_stmt = self._build_adaptive_table(node)
+            return [table_stmt], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             then_target = self._resolve_target(node.then_target)
@@ -2205,7 +2264,7 @@ class ASTBuilder:
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            target = ASTIdentifier(node.var, self._infer_kind(node.var))
+            target = ASTIdentifier(node.var, self._infer_type(node.var))
             value_state[node.var] = target
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             assignment = ASTAssign(target=target, value=expr)
@@ -2300,13 +2359,13 @@ class ASTBuilder:
         return ASTIntegerLiteral(value=value, bits=bits, sign=sign)
 
     @staticmethod
-    def _infer_indirect_kind(pointer: ASTExpression | None) -> SSAValueKind:
+    def _infer_indirect_type(pointer: ASTExpression | None) -> ASTValueType:
         if pointer is None:
-            return SSAValueKind.UNKNOWN
-        pointer_kind = pointer.kind()
-        if pointer_kind in {SSAValueKind.BYTE, SSAValueKind.BOOLEAN}:
-            return pointer_kind
-        return SSAValueKind.WORD
+            return ASTValueType.opaque()
+        pointer_type = pointer.value_type()
+        if pointer_type.domain is ASTTypeDomain.SCALAR and pointer_type.width in {1, 8}:
+            return pointer_type
+        return ASTValueType.scalar(16, ASTSignedness.ANY)
 
     @staticmethod
     def _memref_descriptor(ref: Optional[MemRef]) -> ASTAddressDescriptor:
@@ -2403,6 +2462,76 @@ class ASTBuilder:
         if node.ref is None:
             base = pointer
         return ASTMemoryLocation(base=base, path=tuple(elements), alias=alias)
+
+    @staticmethod
+    def _infer_table_mode_from_operations(
+        operations: Sequence[Tuple[str, int]]
+    ) -> Optional[int]:
+        mode: Optional[int] = None
+        for mnemonic, _ in operations:
+            if "_" not in mnemonic:
+                continue
+            suffix = mnemonic.rsplit("_", 1)[-1]
+            try:
+                candidate = int(suffix, 16)
+            except ValueError:
+                continue
+            if mode is None:
+                mode = candidate
+            elif mode != candidate:
+                return mode
+        return mode
+
+    def _parse_adaptive_table_metadata(
+        self, node: IRTablePatch
+    ) -> Tuple[int, Optional[str], Tuple[str, ...]]:
+        mode_value: Optional[int] = None
+        variant: Optional[str] = None
+        notes: List[str] = []
+        for annotation in node.annotations:
+            if not annotation:
+                continue
+            if annotation == "adaptive_table":
+                continue
+            if annotation.startswith("mode="):
+                try:
+                    mode_value = int(annotation.split("=", 1)[1], 16)
+                except ValueError:
+                    pass
+                continue
+            if annotation.startswith("kind="):
+                value = annotation.split("=", 1)[1]
+                lowered = value.lower()
+                if lowered not in {"unknown", "adaptive_table"}:
+                    variant = value
+                continue
+            notes.append(annotation)
+        if mode_value is None:
+            mode_value = self._infer_table_mode_from_operations(node.operations) or 0
+        return mode_value, variant, tuple(notes)
+
+    def _build_adaptive_table(self, node: IRTablePatch) -> ASTAdaptiveTable:
+        mode_value, variant, notes = self._parse_adaptive_table_metadata(node)
+        bits = 16 if mode_value >= 0x100 else 8
+        mode_literal = ASTIntegerLiteral(
+            value=mode_value,
+            bits=bits,
+            sign=ASTNumericSign.UNSIGNED,
+            radix=16,
+        )
+        operations = tuple(
+            ASTAdaptiveTableOperation(mnemonic=mnemonic, operand=operand)
+            for mnemonic, operand in node.operations
+        )
+        expr = ASTAdaptiveTableExpr(
+            mode=mode_literal,
+            operations=operations,
+            variant=variant,
+            annotations=notes,
+        )
+        statement = ASTAdaptiveTable(table=expr)
+        self._register_expression(node.describe(), expr)
+        return statement
 
     @staticmethod
     def _stack_effect_operand(step: IRStackEffect) -> Optional[int]:
@@ -2527,36 +2656,28 @@ class ASTBuilder:
             action = kind.split(".", 1)[1]
             if action == "protocol":
                 return None
-            channel = None
-            operation = ASTFrameOperation.CLEANUP
+            if action == "return_mask" and operand is not None:
+                return ASTFrameReturnMaskEffect(
+                    mask=self._bitfield(operand, alias)
+                )
             if action == "write":
-                operation = ASTFrameOperation.WRITE
-            elif action == "reset":
-                operation = ASTFrameOperation.RESET
-            elif action == "teardown":
-                operation = ASTFrameOperation.TEARDOWN
-            elif action == "return_mask":
-                operation = ASTFrameOperation.RETURN_MASK
-            elif action == "page_select":
-                operation = ASTFrameOperation.PAGE_SELECT
-            elif action == "drop":
-                operation = ASTFrameOperation.DROP
-            elif action in {"scheduler", "cleanup", "effect"}:
-                operation = ASTFrameOperation.CLEANUP
-                if action == "scheduler":
-                    channel = "scheduler"
-            else:
-                operation = ASTFrameOperation.WRITE
-                channel = action
-            bitfield: Optional[ASTBitField] = None
-            if operand is not None:
-                bitfield = self._bitfield(operand, alias)
-            return ASTFrameEffect(
-                operation=operation,
-                operand=bitfield,
-                pops=pops,
-                channel=channel,
-            )
+                mask = self._bitfield(operand, alias) if operand is not None else None
+                channel_name = alias or None
+                return ASTFrameWriteEffect(mask=mask, channel=channel_name)
+            if action == "reset" and operand is not None:
+                return ASTFrameResetEffect(mask=self._bitfield(operand, alias))
+            if action == "teardown":
+                return ASTFrameTeardownEffect(pops=pops)
+            if action == "drop":
+                return ASTFrameDropEffect(pops=pops or 1)
+            if action == "page_select":
+                channel = self._effect_channel(alias, operand)
+                return ASTFramePageSelectEffect(channel=channel)
+            if action in {"scheduler", "cleanup", "effect"}:
+                cleanup_channel = "scheduler" if action == "scheduler" else alias or None
+                return ASTFrameCleanupEffect(channel=cleanup_channel)
+            mask = self._bitfield(operand, alias) if operand is not None else None
+            return ASTFrameWriteEffect(mask=mask, channel=action)
         if kind.startswith("helpers."):
             action = kind.split(".", 1)[1]
             op_map = {
@@ -2593,10 +2714,8 @@ class ASTBuilder:
         if kind.startswith("abi."):
             action = kind.split(".", 1)[1]
             if action == "return_mask" and operand is not None:
-                return ASTFrameEffect(
-                    operation=ASTFrameOperation.RETURN_MASK,
-                    operand=self._bitfield(operand, alias),
-                    pops=pops,
+                return ASTFrameReturnMaskEffect(
+                    mask=self._bitfield(operand, alias)
                 )
             symbol = alias or action
             return ASTHelperEffect(operation=ASTHelperOperation.INVOKE, symbol=symbol)
@@ -2642,9 +2761,11 @@ class ASTBuilder:
         return_tokens = getattr(node, "returns", ())
         return_slots: List[ASTCallReturnSlot] = []
         for index, token in enumerate(return_tokens):
-            kind = self._infer_kind(token)
-            name = self._canonical_placeholder_name(token, index, kind)
-            return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
+            value_type = self._infer_type(token)
+            name = self._canonical_placeholder_name(token, index, value_type)
+            return_slots.append(
+                ASTCallReturnSlot(index=index, value_type=value_type, name=name)
+            )
         tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
         if (
             not slots
@@ -2663,25 +2784,27 @@ class ASTBuilder:
         )
 
     def _build_return_identifier(self, name: str, index: int) -> ASTIdentifier:
-        kind = self._infer_kind(name)
-        canonical = self._canonical_placeholder_name(name, index, kind)
-        return ASTIdentifier(canonical, kind)
+        value_type = self._infer_type(name)
+        canonical = self._canonical_placeholder_name(name, index, value_type)
+        return ASTIdentifier(canonical, value_type)
 
     def _canonicalise_return_expr(
         self, index: int, expr: ASTExpression
     ) -> ASTExpression:
         if isinstance(expr, ASTIdentifier):
-            kind = expr.kind()
-            canonical = self._canonical_placeholder_name(expr.name, index, kind)
+            value_type = expr.value_type()
+            canonical = self._canonical_placeholder_name(
+                expr.name, index, value_type
+            )
             if canonical != expr.name:
-                return ASTIdentifier(canonical, kind)
+                return ASTIdentifier(canonical, value_type)
         if isinstance(expr, ASTUnknown):
             token = expr.token
             if token and token.startswith("ret"):
                 canonical = self._canonical_placeholder_name(
-                    token, index, SSAValueKind.UNKNOWN
+                    token, index, ASTValueType.opaque()
                 )
-                return ASTIdentifier(canonical, SSAValueKind.UNKNOWN)
+                return ASTIdentifier(canonical, ASTValueType.opaque())
         return expr
 
     def _build_return_payload(
@@ -2703,19 +2826,14 @@ class ASTBuilder:
             if value is None:
                 continue
             summary.append(
-                ASTFrameEffect(
-                    operation=ASTFrameOperation.RETURN_MASK,
-                    operand=self._bitfield(value, alias),
+                ASTFrameReturnMaskEffect(
+                    mask=self._bitfield(value, alias)
                 )
             )
         if policy.teardown:
-            summary.append(
-                ASTFrameEffect(operation=ASTFrameOperation.TEARDOWN, pops=policy.teardown)
-            )
+            summary.append(ASTFrameTeardownEffect(pops=policy.teardown))
         if policy.drops:
-            summary.append(
-                ASTFrameEffect(operation=ASTFrameOperation.DROP, pops=policy.drops)
-            )
+            summary.append(ASTFrameDropEffect(pops=policy.drops))
         return summary
 
     def _build_epilogue_effects(
@@ -2808,6 +2926,12 @@ class ASTBuilder:
             return self._call_arg_values[token]
         if token in self._expression_lookup:
             return self._expression_lookup[token]
+        trace = self._parse_trace_token(token)
+        if trace is not None:
+            opcode, mode, address = trace
+            return ASTTraceOperand(opcode=opcode, mode=mode, address=address)
+        if token == "stack_top":
+            return ASTStackOperand(tag="top")
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
@@ -2826,8 +2950,15 @@ class ASTBuilder:
                 return ASTUnknown(token)
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
-            return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
-        return ASTIdentifier(token, self._infer_kind(token))
+            base_descriptor = (
+                location.base if isinstance(location.base, ASTAddressDescriptor) else None
+            )
+            space = base_descriptor.space if base_descriptor is not None else ASTAddressSpace.MEMORY
+            return ASTMemoryRead(
+                location=location,
+                value_type_hint=ASTValueType.pointer(space),
+            )
+        return ASTIdentifier(token, self._infer_type(token))
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
@@ -2839,42 +2970,29 @@ class ASTBuilder:
             space = MemSpace.CONST
         return IRSlot(space=space, index=index)
 
-    def _infer_kind(self, name: str) -> SSAValueKind:
+    def _infer_type(self, name: str) -> ASTValueType:
         lowered = name.lower()
         if lowered.startswith("bool"):
-            return SSAValueKind.BOOLEAN
+            return ASTValueType.scalar(1, ASTSignedness.UNSIGNED)
         if lowered.startswith("word"):
-            return SSAValueKind.WORD
+            return ASTValueType.scalar(16, ASTSignedness.ANY)
         if lowered.startswith("byte"):
-            return SSAValueKind.BYTE
+            return ASTValueType.scalar(8, ASTSignedness.UNSIGNED)
         if lowered.startswith("ptr"):
-            return SSAValueKind.POINTER
+            return ASTValueType.pointer(ASTAddressSpace.MEMORY)
         if lowered.startswith("page"):
-            return SSAValueKind.PAGE_REGISTER
+            return ASTValueType.register("page_register")
         if lowered.startswith("io"):
-            return SSAValueKind.IO
+            return ASTValueType.channel("io")
         if lowered.startswith("id"):
-            return SSAValueKind.IDENTIFIER
-        return SSAValueKind.UNKNOWN
-
-    @staticmethod
-    def _ret_prefix(kind: SSAValueKind) -> str:
-        mapping = {
-            SSAValueKind.BOOLEAN: "flag",
-            SSAValueKind.BYTE: "byte",
-            SSAValueKind.WORD: "word",
-            SSAValueKind.POINTER: "ptr",
-            SSAValueKind.IO: "io",
-            SSAValueKind.PAGE_REGISTER: "page",
-            SSAValueKind.IDENTIFIER: "id",
-        }
-        return mapping.get(kind, "value")
+            return ASTValueType.handle()
+        return ASTValueType.opaque()
 
     def _canonical_placeholder_name(
-        self, token: str, index: int, kind: SSAValueKind
+        self, token: str, index: int, value_type: ASTValueType
     ) -> str:
         if token.startswith("ret"):
-            prefix = self._ret_prefix(kind)
+            prefix = value_type.placeholder_prefix()
             return f"{prefix}{index}"
         return token
 
@@ -2916,6 +3034,22 @@ class ASTBuilder:
         except ValueError:
             return False
         return False
+
+    @staticmethod
+    def _parse_trace_token(token: str) -> Optional[Tuple[int, int, int]]:
+        if ":" not in token or "@" not in token:
+            return None
+        prefix, addr_part = token.split("@", 1)
+        if ":" not in prefix:
+            return None
+        opcode_part, mode_part = prefix.split(":", 1)
+        try:
+            opcode = int(opcode_part, 16)
+            mode = int(mode_part, 16)
+            address = int(addr_part, 16)
+        except ValueError:
+            return None
+        return opcode, mode, address
 
     def _clear_context(self) -> None:
         self._current_analyses = {}
