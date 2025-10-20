@@ -3,6 +3,7 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTAssign,
     ASTBranch,
     ASTBuilder,
     ASTCallABI,
@@ -22,7 +23,9 @@ from mbcdisasm.ast import (
 from mbcdisasm.ir.model import (
     IRBlock,
     IRAbiEffect,
+    IRBankedLoad,
     IRCall,
+    IRCallReturn,
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
@@ -31,11 +34,14 @@ from mbcdisasm.ir.model import (
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTestSetBranch,
     IRTailCall,
     IRStackEffect,
     IRSlot,
+    MemRef,
     MemSpace,
     NormalizerMetrics,
+    SSAValueKind,
 )
 
 from tests.test_ir_normalizer import build_container
@@ -753,3 +759,130 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     ]
     assert len(drop_effects) == 1
     assert drop_effects[0].pops == protocol_effect.drops
+
+
+def test_symbol_table_synthesises_call_signatures() -> None:
+    block = IRBlock(
+        label="block_entry",
+        start_offset=0x0100,
+        nodes=(
+            IRCallReturn(
+                target=0x6601,
+                args=("ptr0",),
+                symbol=None,
+                tail=False,
+                returns=("ret0",),
+                varargs=False,
+            ),
+            IRReturn(values=("ret0",), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    symbols = {entry.address: entry for entry in ast_program.symbols}
+    assert 0x6601 in symbols
+    signature = symbols[0x6601]
+    assert signature.name == "helper_6601"
+    assert tuple(value.kind for value in signature.arguments) == (SSAValueKind.POINTER,)
+    assert tuple(value.kind for value in signature.returns) == (SSAValueKind.UNKNOWN,)
+
+
+def test_epilogue_effects_are_deduplicated() -> None:
+    cleanup = (
+        IRStackEffect(mnemonic="op_01_0C", operand=0x0000),
+        IRStackEffect(mnemonic="op_01_0C", operand=0x0000),
+    )
+    block = IRBlock(
+        label="block_return",
+        start_offset=0x0200,
+        nodes=(IRReturn(values=(), varargs=False, cleanup=cleanup),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    terminator = procedure.blocks[0].statements[-1]
+    assert isinstance(terminator, ASTReturn)
+    assert len(terminator.effects) == 1
+
+
+def test_testset_branch_desugars_into_assignment() -> None:
+    block = IRBlock(
+        label="block_branch",
+        start_offset=0x0300,
+        nodes=(
+            IRTestSetBranch(
+                var="bool0",
+                expr="cond0",
+                then_target=0x0310,
+                else_target=0x0320,
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    statements = procedure.blocks[0].statements
+    assert isinstance(statements[0], ASTAssign)
+    assert isinstance(statements[1], ASTBranch)
+
+
+def test_banked_memory_locations_are_canonical() -> None:
+    memref = MemRef(region="bank_1230", bank=0x1230, base=0x0040, page=0x01, offset=0x10)
+    block = IRBlock(
+        label="block_load",
+        start_offset=0x0400,
+        nodes=(
+            IRBankedLoad(
+                ref=memref,
+                target="word0",
+                register=0x5000,
+                pointer="ptr0",
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0400,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    assign = procedure.blocks[0].statements[0]
+    assert isinstance(assign, ASTAssign)
+    rendered = assign.value.render()
+    assert rendered.startswith("mem.bank_1230{alias=region(bank_1230)}")
+    assert ".page(0x01)" in rendered
+    assert ".base(0x0040)" in rendered

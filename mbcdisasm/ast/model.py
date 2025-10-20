@@ -789,6 +789,39 @@ class ASTCallABI:
         return f"abi{{{inner}}}" if inner else "abi{}"
 
 
+@dataclass(frozen=True)
+class ASTSignatureValue:
+    """Single argument or return slot recorded in a symbol signature."""
+
+    index: int
+    kind: SSAValueKind = SSAValueKind.UNKNOWN
+    name: Optional[str] = None
+
+    def render(self) -> str:
+        label = self.name or f"{self.kind.name.lower()}{self.index}"
+        return f"{label}:{self.kind.name.lower()}"
+
+
+@dataclass(frozen=True)
+class ASTSymbolSignature:
+    """Synthesised call signature describing a known symbol."""
+
+    address: int
+    name: str
+    arguments: Tuple[ASTSignatureValue, ...] = ()
+    returns: Tuple[ASTSignatureValue, ...] = ()
+    varargs: bool = False
+
+    def render(self) -> str:
+        args = ", ".join(value.render() for value in self.arguments) or "-"
+        rets = ", ".join(value.render() for value in self.returns) or "-"
+        varargs = ", varargs" if self.varargs else ""
+        return (
+            f"symbol {self.name}(0x{self.address:04X}) args=[{args}]"
+            f" returns=[{rets}]{varargs}"
+        )
+
+
 @dataclass
 class ASTStatement:
     """Base class for AST statements."""
@@ -1325,6 +1358,7 @@ class ASTProgram:
     segments: Tuple[ASTSegment, ...]
     metrics: ASTMetrics
     enums: Tuple[ASTEnumDecl, ...] = ()
+    symbols: Tuple[ASTSymbolSignature, ...] = ()
 
 
 __all__ = [
@@ -1374,6 +1408,8 @@ __all__ = [
     "ASTCallReturnSlot",
     "ASTCallABI",
     "ASTCallStatement",
+    "ASTSignatureValue",
+    "ASTSymbolSignature",
     "ASTIORead",
     "ASTIOWrite",
     "ASTTerminator",
