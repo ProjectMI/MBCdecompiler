@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
@@ -183,6 +185,8 @@ from .model import (
     ASTCallStatement,
     ASTSignatureValue,
     ASTSymbolSignature,
+    ASTSymbolType,
+    ASTSymbolTypeFamily,
     ASTComment,
     ASTEffect,
     ASTEnumDecl,
@@ -204,6 +208,7 @@ from .model import (
     ASTIORead,
     ASTIOWrite,
     ASTIdentifier,
+    ASTBooleanLiteral,
     ASTIndexElement,
     ASTIntegerLiteral,
     ASTMemoryLocation,
@@ -352,19 +357,21 @@ class _SignatureAccumulator:
 
     address: int
     symbols: Set[str] = field(default_factory=set)
-    argument_kinds: Dict[int, Set[SSAValueKind]] = field(
+    argument_types: Dict[int, Set[ASTSymbolType]] = field(
         default_factory=lambda: defaultdict(set)
     )
     argument_names: Dict[int, Set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
-    return_kinds: Dict[int, Set[SSAValueKind]] = field(
+    return_types: Dict[int, Set[ASTSymbolType]] = field(
         default_factory=lambda: defaultdict(set)
     )
     return_names: Dict[int, Set[str]] = field(
         default_factory=lambda: defaultdict(set)
     )
-    varargs: bool = False
+    calling_conventions: Set[str] = field(default_factory=set)
+    attributes: Set[str] = field(default_factory=set)
+    effects: Set[str] = field(default_factory=set)
 
     def register_call(
         self,
@@ -376,25 +383,91 @@ class _SignatureAccumulator:
         if call.symbol:
             self.symbols.add(call.symbol)
         if call.varargs or payload_varargs:
-            self.varargs = True
+            self.attributes.add("varargs")
+        convention = "tailcall" if call.tail else "call"
+        self.calling_conventions.add(convention)
         for index, expr in enumerate(call.args):
-            kind = expr.kind()
-            self.argument_kinds[index].add(kind)
+            signature_type = self._classify_expr(expr)
+            self.argument_types[index].add(signature_type)
             name = self._expr_name(expr)
             if name:
                 self.argument_names[index].add(name)
         for index, expr in enumerate(returns):
-            kind = expr.kind()
-            self.return_kinds[index].add(kind)
+            signature_type = self._classify_expr(expr)
+            self.return_types[index].add(signature_type)
             name = self._expr_name(expr)
             if name:
                 self.return_names[index].add(name)
+        if abi is not None:
+            if abi.tail:
+                self.attributes.add("tail")
+            for effect in abi.effects:
+                self.effects.add(effect.render())
 
     @staticmethod
     def _expr_name(expr: ASTExpression) -> Optional[str]:
         if isinstance(expr, ASTIdentifier):
             return expr.name
         return None
+
+    @staticmethod
+    def _classify_expr(expr: ASTExpression) -> ASTSymbolType:
+        if isinstance(expr, ASTIntegerLiteral):
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.VALUE,
+                width=expr.bits,
+                sign=expr.sign,
+            )
+        if isinstance(expr, ASTBooleanLiteral):
+            return ASTSymbolType(ASTSymbolTypeFamily.FLAG, width=1, sign=ASTNumericSign.UNSIGNED)
+        if isinstance(expr, ASTMemoryRead) and expr.value_kind is not None:
+            return _SignatureAccumulator._type_from_kind(expr.value_kind)
+        if isinstance(expr, ASTIdentifier):
+            return _SignatureAccumulator._type_from_kind(expr.kind())
+        kind = expr.kind()
+        return _SignatureAccumulator._type_from_kind(kind)
+
+    @staticmethod
+    def _type_from_kind(kind: SSAValueKind) -> ASTSymbolType:
+        if kind is SSAValueKind.BOOLEAN:
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.FLAG,
+                width=1,
+                sign=ASTNumericSign.UNSIGNED,
+            )
+        if kind is SSAValueKind.BYTE:
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.VALUE,
+                width=8,
+                sign=ASTNumericSign.UNSIGNED,
+            )
+        if kind is SSAValueKind.WORD:
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.VALUE,
+                width=16,
+                sign=ASTNumericSign.UNSIGNED,
+            )
+        if kind is SSAValueKind.POINTER:
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.ADDRESS,
+                width=16,
+                space="mem",
+            )
+        if kind is SSAValueKind.IO:
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.ADDRESS,
+                width=16,
+                space="io",
+            )
+        if kind is SSAValueKind.PAGE_REGISTER:
+            return ASTSymbolType(
+                ASTSymbolTypeFamily.ADDRESS,
+                width=16,
+                space="page",
+            )
+        if kind is SSAValueKind.IDENTIFIER:
+            return ASTSymbolType(ASTSymbolTypeFamily.TOKEN)
+        return ASTSymbolType(ASTSymbolTypeFamily.OPAQUE)
 
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
@@ -537,70 +610,128 @@ class ASTBuilder:
         signatures: List[ASTSymbolSignature] = []
         for address, accumulator in accumulators.items():
             name = self._canonical_symbol_name(address, accumulator.symbols)
-            arguments = tuple(
-                ASTSignatureValue(
-                    index=index,
-                    kind=self._select_signature_kind(kinds),
-                    name=self._select_signature_name(
-                        accumulator.argument_names.get(index, set())
-                    ),
+            arguments: List[ASTSignatureValue] = []
+            for index, type_set in sorted(accumulator.argument_types.items()):
+                signature_type = self._select_signature_type(type_set)
+                arg_name = self._select_signature_name(
+                    accumulator.argument_names.get(index, set()),
+                    signature_type,
+                    index,
+                    is_return=False,
                 )
-                for index, kinds in sorted(accumulator.argument_kinds.items())
-            )
-            returns = tuple(
-                ASTSignatureValue(
-                    index=index,
-                    kind=self._select_signature_kind(kinds),
-                    name=self._select_signature_name(
-                        accumulator.return_names.get(index, set())
-                    ),
+                arguments.append(
+                    ASTSignatureValue(index=index, type=signature_type, name=arg_name)
                 )
-                for index, kinds in sorted(accumulator.return_kinds.items())
+            returns: List[ASTSignatureValue] = []
+            for index, type_set in sorted(accumulator.return_types.items()):
+                signature_type = self._select_signature_type(type_set)
+                ret_name = self._select_signature_name(
+                    accumulator.return_names.get(index, set()),
+                    signature_type,
+                    index,
+                    is_return=True,
+                )
+                returns.append(
+                    ASTSignatureValue(index=index, type=signature_type, name=ret_name)
+                )
+            calling_conventions = (
+                tuple(sorted(accumulator.calling_conventions))
+                if accumulator.calling_conventions
+                else ("call",)
             )
+            attributes = tuple(sorted(accumulator.attributes))
+            effects = tuple(sorted(accumulator.effects))
             signatures.append(
                 ASTSymbolSignature(
                     address=address,
                     name=name,
-                    arguments=arguments,
-                    returns=returns,
-                    varargs=accumulator.varargs,
+                    arguments=tuple(arguments),
+                    returns=tuple(returns),
+                    calling_conventions=calling_conventions,
+                    attributes=attributes,
+                    effects=effects,
                 )
             )
         signatures.sort(key=lambda entry: (entry.name, entry.address))
         return tuple(signatures)
 
     @staticmethod
-    def _select_signature_kind(kinds: Set[SSAValueKind]) -> SSAValueKind:
-        if not kinds:
-            return SSAValueKind.UNKNOWN
-        priority = [
-            SSAValueKind.BOOLEAN,
-            SSAValueKind.BYTE,
-            SSAValueKind.WORD,
-            SSAValueKind.POINTER,
-            SSAValueKind.IO,
-            SSAValueKind.PAGE_REGISTER,
-            SSAValueKind.IDENTIFIER,
-        ]
-        for candidate in priority:
-            if candidate in kinds and candidate is not SSAValueKind.UNKNOWN:
-                return candidate
-        if SSAValueKind.UNKNOWN in kinds:
-            return SSAValueKind.UNKNOWN
-        return sorted(kinds, key=lambda kind: kind.name)[0]
+    def _select_signature_type(types: Set[ASTSymbolType]) -> ASTSymbolType:
+        if not types:
+            return ASTSymbolType(ASTSymbolTypeFamily.OPAQUE)
+
+        def sort_key(entry: ASTSymbolType) -> Tuple[int, str, int]:
+            priority = {
+                ASTSymbolTypeFamily.VALUE: 0,
+                ASTSymbolTypeFamily.FLAG: 1,
+                ASTSymbolTypeFamily.ADDRESS: 2,
+                ASTSymbolTypeFamily.TOKEN: 3,
+                ASTSymbolTypeFamily.EFFECT: 4,
+                ASTSymbolTypeFamily.OPAQUE: 5,
+            }
+            return (
+                priority.get(entry.family, 99),
+                entry.space or "",
+                entry.width or 0,
+            )
+
+        ordered = sorted(types, key=sort_key)
+        primary = ordered[0]
+        same_family = [entry for entry in ordered if entry.family is primary.family]
+        width_candidates = [entry.width for entry in same_family if entry.width is not None]
+        width = max(width_candidates) if width_candidates else None
+        sign_candidates = [entry.sign for entry in same_family if entry.sign is not None]
+        sign: Optional[ASTNumericSign]
+        if not sign_candidates:
+            sign = primary.sign
+        else:
+            sign = sign_candidates[0]
+            if any(candidate != sign for candidate in sign_candidates[1:]):
+                sign = None
+        space = next((entry.space for entry in same_family if entry.space), primary.space)
+        return ASTSymbolType(primary.family, width=width, sign=sign, space=space)
 
     @staticmethod
-    def _select_signature_name(names: Set[str]) -> Optional[str]:
+    def _select_signature_name(
+        names: Set[str],
+        signature_type: ASTSymbolType,
+        index: int,
+        *,
+        is_return: bool,
+    ) -> Optional[str]:
+        placeholder_pattern = re.compile(r"^(?:ret|id|word|byte|ptr|io|page|value)\d+$")
         filtered = sorted(
-            name for name in names if name and all(ch not in name for ch in ":@")
+            name
+            for name in names
+            if name
+            and all(ch not in name for ch in ":@")
+            and not placeholder_pattern.match(name.lower())
         )
         if filtered:
             return filtered[0]
-        return None
+        base = ASTBuilder._placeholder_base(signature_type, is_return)
+        return f"{base}{index}"
+
+    @staticmethod
+    def _placeholder_base(signature_type: ASTSymbolType, is_return: bool) -> str:
+        mapping = {
+            ASTSymbolTypeFamily.VALUE: "value" if not is_return else "result",
+            ASTSymbolTypeFamily.ADDRESS: "addr",
+            ASTSymbolTypeFamily.TOKEN: "token",
+            ASTSymbolTypeFamily.FLAG: "flag",
+            ASTSymbolTypeFamily.EFFECT: "effect",
+            ASTSymbolTypeFamily.OPAQUE: "opaque",
+        }
+        return mapping.get(signature_type.family, "value")
 
     @staticmethod
     def _canonical_symbol_name(address: int, candidates: Set[str]) -> str:
-        filtered = sorted(name for name in candidates if name)
+        placeholder_pattern = re.compile(r"^(?:ret|id|word|byte|ptr|io|page|value|addr|opaque|result)\d+$")
+        filtered = sorted(
+            name
+            for name in candidates
+            if name and not placeholder_pattern.match(name.lower())
+        )
         if filtered:
             return filtered[0]
         masked = address & 0xFFFF
@@ -2645,6 +2776,17 @@ class ASTBuilder:
             kind = self._infer_kind(token)
             name = self._canonical_placeholder_name(token, index, kind)
             return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
+        abi_effects = getattr(node, "abi_effects", ())
+        for spec in abi_effects:
+            alias = str(spec.alias) if spec.alias is not None else None
+            if spec.kind == "return_mask":
+                converted = self._effect_from_kind(
+                    "frame.return_mask", spec.operand, alias
+                )
+            else:
+                converted = self._effect_from_kind(spec.kind, spec.operand, alias)
+            if converted:
+                effects.append(converted)
         tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
         if (
             not slots
