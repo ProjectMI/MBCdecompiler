@@ -3,13 +3,16 @@ from pathlib import Path
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
+    ASTAdaptivePredicate,
+    ASTAdaptiveTable,
     ASTAssign,
-    ASTBranch,
+    ASTAssignmentPredicate,
     ASTBuilder,
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallExpr,
     ASTCallStatement,
+    ASTConditional,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameMaskEffect,
@@ -38,6 +41,10 @@ from mbcdisasm.ir.model import (
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTablePatch,
+    IRStackDrop,
     IRTestSetBranch,
     IRTailCall,
     IRStackEffect,
@@ -358,7 +365,7 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
     procedure = segment_ast.procedures[0]
     assert {block.start_offset for block in procedure.blocks} == {0x0410}
     assert all(
-        not isinstance(statement, ASTBranch)
+        not isinstance(statement, ASTConditional)
         for block in procedure.blocks
         for statement in block.statements
     )
@@ -915,8 +922,11 @@ def test_testset_branch_desugars_into_assignment() -> None:
     ast_program = builder.build(program)
     procedure = ast_program.segments[0].procedures[0]
     statements = procedure.blocks[0].statements
-    assert isinstance(statements[0], ASTAssign)
-    assert isinstance(statements[1], ASTBranch)
+    assert len(statements) == 1
+    assert isinstance(statements[0], ASTConditional)
+    predicate = statements[0].predicate
+    assert isinstance(predicate, ASTAssignmentPredicate)
+    assert not predicate.prologue
 
 
 def test_banked_memory_locations_are_canonical() -> None:
@@ -957,3 +967,102 @@ def test_banked_memory_locations_are_canonical() -> None:
     assert "base=0x0040" in rendered
     assert "offset=0x0010" in rendered
     assert "alias=region(bank_1230)" in rendered
+
+
+def test_ast_builder_parses_adaptive_predicates_without_patch_nodes() -> None:
+    condition = (
+        "table_patch[op_10_00(0x0000), op_20_00(0x0000)] adaptive_table, mode=0x00, kind=unknown"
+    )
+    entry = IRBlock(
+        label="entry",
+        start_offset=0x0000,
+        nodes=(
+            IRTableBuilderBegin(mode=0x00, prologue=tuple()),
+            IRTableBuilderEmit(
+                mode=0x00,
+                kind="adaptive_table",
+                operations=(("op_10_00", 0x0000), ("op_20_00", 0x0000)),
+                annotations=("adaptive_table", "mode=0x00", "kind=unknown"),
+                parameters=tuple(),
+            ),
+            IRIf(condition=condition, then_target=0x0002, else_target=0x0004),
+        ),
+    )
+    branch_then = IRBlock(
+        label="then",
+        start_offset=0x0002,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    branch_else = IRBlock(
+        label="else",
+        start_offset=0x0004,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0000,
+        length=0x10,
+        blocks=(entry, branch_then, branch_else),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    predicate = ast_program.segments[0].procedures[0].blocks[0].terminator.predicate
+    assert isinstance(predicate, ASTAdaptivePredicate)
+    assert predicate.table.mode.value == 0x00
+
+
+def test_ast_builder_skips_stack_drop_for_adaptive_tables() -> None:
+    table_token = "table_patch[op_30_00(0x0000)] adaptive_table, mode=0x00, kind=unknown"
+    block = IRBlock(
+        label="table",
+        start_offset=0x0100,
+        nodes=(
+            IRTablePatch(operations=(("op_30_00", 0x0000),), annotations=("adaptive_table",)),
+            IRStackDrop(value=table_token),
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+    assert any(isinstance(stmt, ASTAdaptiveTable) for stmt in statements)
+    assert not any("drop" in stmt.render() for stmt in statements if not isinstance(stmt, ASTReturn))
+
+
+def test_ast_builder_canonicalises_io_read_in_dispatch_indices() -> None:
+    dispatch = IRSwitchDispatch(
+        cases=(IRDispatchCase(key=0x01, target=0x2200),),
+        helper=0x660A,
+        default=None,
+        index=IRDispatchIndex(source="io.read()", mask=0x1000, base=0x1000),
+    )
+    block = IRBlock(
+        label="dispatch",
+        start_offset=0x0200,
+        nodes=(dispatch, IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    switch_stmt = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(switch_stmt, ASTSwitch)
+    assert switch_stmt.helper is not None
+    assert switch_stmt.helper.symbol == "helper_660A"
+    assert switch_stmt.index.render_expression() == "io.read(ChatOut)"

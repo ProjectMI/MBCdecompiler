@@ -18,6 +18,10 @@ class ASTTextRenderer:
             lines.append("; symbol table:")
             for entry in program.symbols:
                 lines.append(f";   {entry.render()}")
+        if program.strings:
+            lines.append("; string pool:")
+            for entry in program.strings:
+                lines.append(f";   {entry.render()}")
         for segment in program.segments:
             lines.extend(self._render_segment(segment))
         return "\n".join(lines) + "\n"

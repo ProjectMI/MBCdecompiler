@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
-from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
+from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, IO_PORT_NAME, RET_MASK
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -26,6 +26,14 @@ from ..ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRLoad,
+    IRAsciiHeader,
+    IRDataMarker,
+    IRLiteralChunk,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTablePatch,
+    IRStackDrop,
+    IRStringConstant,
     IRSlot,
     IRProgram,
     IRReturn,
@@ -177,7 +185,6 @@ from .model import (
     ASTAssign,
     ASTBitField,
     ASTBlock,
-    ASTBranch,
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallOperand,
@@ -202,7 +209,11 @@ from .model import (
     ASTEntryReason,
     ASTExitPoint,
     ASTExitReason,
-    ASTFlagCheck,
+    ASTAdaptiveMode,
+    ASTAdaptivePredicate,
+    ASTAdaptiveTable,
+    ASTAdaptiveTableExpr,
+    ASTAdaptiveTableOp,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameMaskEffect,
@@ -230,7 +241,14 @@ from .model import (
     ASTReturnPayload,
     ASTSegment,
     ASTStatement,
-    ASTFunctionPrologue,
+    ASTAssignmentPredicate,
+    ASTBooleanPredicate,
+    ASTBooleanLiteral,
+    ASTFlagPredicate,
+    ASTConditional,
+    ASTStringEmit,
+    ASTStringEntry,
+    ASTStringLiteral,
     ASTJump,
     ASTTerminator,
     ASTSwitch,
@@ -238,7 +256,6 @@ from .model import (
     ASTDispatchHelper,
     ASTDispatchIndex,
     ASTTailCall,
-    ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
 )
@@ -254,7 +271,7 @@ class _BlockAnalysis:
     fallthrough: Optional[int]
 
 
-BranchStatement = ASTBranch | ASTTestSet | ASTFlagCheck | ASTFunctionPrologue
+BranchStatement = ASTConditional
 
 
 @dataclass
@@ -490,6 +507,7 @@ class ASTBuilder:
         self._current_segment_index: int = -1
         self._call_arg_values: Dict[str, ASTExpression] = {}
         self._expression_lookup: Dict[str, ASTExpression] = {}
+        self._string_pool_lookup: Dict[str, IRStringConstant] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -500,6 +518,7 @@ class ASTBuilder:
         self._enum_name_usage = {}
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._string_pool_lookup = {entry.name: entry for entry in program.string_pool}
         segments: List[ASTSegment] = []
         segment_enum_keys: List[Tuple[str, ...]] = []
         metrics = ASTMetrics()
@@ -511,12 +530,14 @@ class ASTBuilder:
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
         segments, program_enums = self._finalise_enums(segments, segment_enum_keys)
+        string_entries = tuple(self._build_string_entry(entry) for entry in program.string_pool)
         symbol_table = self._synthesise_symbol_signatures(segments)
         return ASTProgram(
             segments=tuple(segments),
             metrics=metrics,
             enums=program_enums,
             symbols=symbol_table,
+            strings=string_entries,
         )
 
     # ------------------------------------------------------------------
@@ -1058,14 +1079,16 @@ class ASTBuilder:
                     reason = "jump"
                 elif isinstance(terminator, ASTSwitch):
                     reason = "switch"
-                elif isinstance(terminator, ASTBranch):
-                    reason = "branch"
-                elif isinstance(terminator, ASTTestSet):
-                    reason = "testset"
-                elif isinstance(terminator, ASTFlagCheck):
-                    reason = "flag_check"
-                elif isinstance(terminator, ASTFunctionPrologue):
-                    reason = "prologue"
+                elif isinstance(terminator, ASTConditional):
+                    predicate = terminator.predicate
+                    if isinstance(predicate, ASTFlagPredicate):
+                        reason = "flag_check"
+                    elif isinstance(predicate, ASTAssignmentPredicate):
+                        reason = "prologue" if predicate.prologue else "testset"
+                    elif isinstance(predicate, ASTAdaptivePredicate):
+                        reason = "adaptive_table"
+                    else:
+                        reason = "branch"
                 if reason:
                     reasons = (ASTExitReason(kind=reason),)
             exit_points.append(
@@ -1357,8 +1380,13 @@ class ASTBuilder:
             if isinstance(statement, ASTReturn):
                 stack.clear()
                 continue
-            if isinstance(statement, ASTBranch):
-                if self._is_stack_top_expr(statement.condition) and stack:
+            if isinstance(statement, ASTConditional):
+                predicate = statement.predicate
+                if isinstance(predicate, ASTBooleanPredicate):
+                    condition_expr = predicate.expression
+                else:
+                    condition_expr = None
+                if condition_expr is not None and self._is_stack_top_expr(condition_expr) and stack:
                     kind, value = stack[-1]
                     if kind == "literal" and value is not None:
                         target = statement.then_branch if value else statement.else_branch
@@ -1915,11 +1943,12 @@ class ASTBuilder:
         index_info = ASTDispatchIndex(
             expression=index_expr, mask=index_mask, base=index_base
         )
-        helper_info = (
-            ASTDispatchHelper(address=dispatch.helper, symbol=dispatch.helper_symbol)
-            if dispatch.helper is not None
-            else None
-        )
+        helper_info = None
+        if dispatch.helper is not None:
+            helper_symbol = dispatch.helper_symbol or f"helper_{dispatch.helper:04X}"
+            helper_info = ASTDispatchHelper(
+                address=dispatch.helper, symbol=helper_symbol
+            )
         switch = ASTSwitch(
             call=call_expr,
             cases=cases,
@@ -2253,6 +2282,58 @@ class ASTBuilder:
             )
             location = self._build_indirect_location(node, pointer, offset_expr)
             return [ASTMemoryWrite(location=location, value=value_expr)], []
+        if isinstance(node, IRStackDrop):
+            dropped = self._resolve_expr(node.value, value_state)
+            if isinstance(dropped, (ASTAdaptiveTableExpr, ASTBooleanLiteral)):
+                return [], []
+            return [ASTComment(node.describe())], []
+        if isinstance(node, IRLiteralChunk):
+            literal = self._string_literal_from_data(node.data, node.symbol)
+            self._register_expression(node.describe(), literal)
+            return [ASTStringEmit(literal=literal)], []
+        if isinstance(node, IRAsciiHeader):
+            statements: List[ASTStatement] = []
+            for chunk in node.chunks:
+                literal = self._string_literal_from_symbol(chunk)
+                statements.append(ASTStringEmit(literal=literal))
+            tuple_expr = ASTTupleExpr(items=tuple(stmt.literal for stmt in statements))
+            self._register_expression(node.describe(), tuple_expr)
+            return statements, []
+        if isinstance(node, IRDataMarker):
+            if node.mnemonic == "literal_marker":
+                return [], []
+            return [ASTComment(node.describe())], []
+        if isinstance(node, IRTableBuilderBegin):
+            table_expr = self._build_adaptive_table_expr(
+                node.prologue,
+                node.annotations,
+                tuple(),
+                value_state,
+                default_mode=node.mode,
+                flavour_hint="table_begin",
+            )
+            self._register_expression(node.describe(), table_expr)
+            return [ASTAdaptiveTable(table=table_expr)], []
+        if isinstance(node, IRTableBuilderEmit):
+            table_expr = self._build_adaptive_table_expr(
+                node.operations,
+                node.annotations,
+                node.parameters,
+                value_state,
+                default_mode=node.mode,
+                flavour_hint=node.kind,
+            )
+            self._register_expression(node.describe(), table_expr)
+            return [ASTAdaptiveTable(table=table_expr)], []
+        if isinstance(node, IRTablePatch):
+            table_expr = self._build_adaptive_table_expr(
+                node.operations,
+                node.annotations,
+                tuple(),
+                value_state,
+            )
+            self._register_expression(node.describe(), table_expr)
+            return [ASTAdaptiveTable(table=table_expr)], []
         if isinstance(node, IRCallReturn):
             call_expr, operands = self._convert_call(
                 node.target,
@@ -2336,8 +2417,12 @@ class ASTBuilder:
             condition = self._resolve_expr(node.condition, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            branch = ASTBranch(
-                condition=condition,
+            if isinstance(condition, ASTAdaptiveTableExpr):
+                predicate = ASTAdaptivePredicate(condition)
+            else:
+                predicate = ASTBooleanPredicate(condition)
+            branch = ASTConditional(
+                predicate=predicate,
                 then_offset=then_target,
                 else_offset=else_target,
             )
@@ -2356,13 +2441,13 @@ class ASTBuilder:
             target = ASTIdentifier(node.var, self._infer_kind(node.var))
             value_state[node.var] = target
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
-            assignment = ASTAssign(target=target, value=expr)
-            branch = ASTBranch(
-                condition=target,
+            predicate = ASTAssignmentPredicate(target=target, value=expr)
+            branch = ASTConditional(
+                predicate=predicate,
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [assignment, branch], [
+            return [branch], [
                 _BranchLink(
                     statement=branch,
                     then_target=then_target,
@@ -2375,9 +2460,13 @@ class ASTBuilder:
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFunctionPrologue(
-                var=var_expr,
-                expr=expr,
+            predicate = ASTAssignmentPredicate(
+                target=var_expr,
+                value=expr,
+                prologue=True,
+            )
+            statement = ASTConditional(
+                predicate=predicate,
                 then_offset=then_target,
                 else_offset=else_target,
             )
@@ -2392,8 +2481,9 @@ class ASTBuilder:
         if isinstance(node, IRFlagCheck):
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTFlagCheck(
-                flag=node.flag,
+            predicate = ASTFlagPredicate(flag=node.flag)
+            statement = ASTConditional(
+                predicate=predicate,
                 then_offset=then_target,
                 else_offset=else_target,
             )
@@ -2843,6 +2933,120 @@ class ASTBuilder:
         )
         return ASTReturnPayload(values=values, varargs=node.varargs)
 
+    _ADAPTIVE_TABLE_TOKEN = re.compile(
+        r"^(?:drop\s+)?table_patch\[(?P<body>[^\]]+)\](?:\s+(?P<notes>.*))?$"
+    )
+
+    _ADAPTIVE_TABLE_OPERAND = re.compile(
+        r"(?P<mnemonic>[A-Za-z0-9_]+)\((?P<operand>0x[0-9A-Fa-f]+)\)"
+    )
+
+    def _build_adaptive_table_expr(
+        self,
+        operations: Sequence[Tuple[str, int]],
+        annotations: Sequence[str],
+        parameters: Sequence[str],
+        value_state: Mapping[str, ASTExpression],
+        default_mode: Optional[int] = None,
+        flavour_hint: Optional[str] = None,
+    ) -> ASTAdaptiveTableExpr:
+        mode_value = default_mode if default_mode is not None else 0
+        flavour = flavour_hint or "adaptive_table"
+        alias: Optional[str] = None
+        for note in annotations:
+            if not note:
+                continue
+            lower = note.lower()
+            if lower.startswith("mode=0x"):
+                try:
+                    mode_value = int(lower[6:], 16)
+                except ValueError:
+                    continue
+                continue
+            if lower in {"adaptive_table", "opcode_table"}:
+                if not flavour_hint:
+                    flavour = lower
+                continue
+            if lower.startswith("kind="):
+                kind_value = lower.split("=", 1)[1]
+                if kind_value and kind_value != "unknown":
+                    flavour = kind_value
+                continue
+            if alias is None and "=" not in note and note.lower() != "drop":
+                alias = note.replace("/", "_").replace(".", "_")
+        if flavour == "unknown":
+            flavour = "adaptive_table"
+        mode_alias = alias
+        if not mode_alias and flavour not in {"adaptive_table", "table_patch"}:
+            mode_alias = flavour.replace("/", "_").replace(".", "_")
+        mode = ASTAdaptiveMode(mode_value, alias=mode_alias)
+        ops = tuple(ASTAdaptiveTableOp(mnemonic=mnemonic, operand=operand) for mnemonic, operand in operations)
+        params = tuple(self._resolve_expr(param, value_state) for param in parameters)
+        return ASTAdaptiveTableExpr(mode=mode, operations=ops, flavour=flavour, parameters=params)
+
+    def _decode_string(self, data: bytes) -> Tuple[str, str]:
+        try:
+            return data.decode("utf-8"), "utf-8"
+        except UnicodeDecodeError:
+            return data.decode("latin-1"), "latin-1"
+
+    def _string_literal_from_symbol(self, symbol: str) -> ASTStringLiteral:
+        entry = self._string_pool_lookup.get(symbol)
+        if entry is not None:
+            text, encoding = self._decode_string(entry.data)
+            return ASTStringLiteral(text=text, encoding=encoding, symbol=symbol)
+        return ASTStringLiteral(text=symbol, encoding="symbol", symbol=symbol)
+
+    def _string_literal_from_data(
+        self, data: bytes, symbol: Optional[str] = None
+    ) -> ASTStringLiteral:
+        if symbol:
+            return self._string_literal_from_symbol(symbol)
+        text, encoding = self._decode_string(data)
+        return ASTStringLiteral(text=text, encoding=encoding)
+
+    def _build_string_entry(self, entry: IRStringConstant) -> ASTStringEntry:
+        literal = self._string_literal_from_symbol(entry.name)
+        return ASTStringEntry(name=entry.name, literal=literal)
+
+    def _parse_adaptive_table_token(
+        self, token: str, value_state: Mapping[str, ASTExpression]
+    ) -> Optional[ASTAdaptiveTableExpr]:
+        match = self._ADAPTIVE_TABLE_TOKEN.match(token.strip())
+        if not match:
+            return None
+        body = match.group("body")
+        if not body:
+            return None
+        operations: List[Tuple[str, int]] = []
+        for op_match in self._ADAPTIVE_TABLE_OPERAND.finditer(body):
+            mnemonic = op_match.group("mnemonic")
+            operand_text = op_match.group("operand")
+            try:
+                operand = int(operand_text, 16)
+            except ValueError:
+                continue
+            operations.append((mnemonic, operand))
+        if not operations:
+            return None
+        notes_field = match.group("notes") or ""
+        annotations = [note.strip() for note in notes_field.split(",") if note.strip()]
+        mode_hint: Optional[int] = None
+        for note in annotations:
+            lower = note.lower()
+            if lower.startswith("mode=0x"):
+                try:
+                    mode_hint = int(lower.split("=", 1)[1], 16)
+                except ValueError:
+                    mode_hint = None
+        return self._build_adaptive_table_expr(
+            operations,
+            annotations,
+            tuple(),
+            value_state,
+            default_mode=mode_hint,
+        )
+
     def _policy_effects(self, policy: _FramePolicySummary) -> List[ASTEffect]:
         summary: List[ASTEffect] = []
         for value, alias in policy.masks:
@@ -2988,6 +3192,23 @@ class ASTBuilder:
             return self._call_arg_values[token]
         if token in self._expression_lookup:
             return self._expression_lookup[token]
+        if token.startswith("drop "):
+            return self._resolve_expr(token[5:].strip(), value_state)
+        if "literal_marker" in token:
+            return ASTBooleanLiteral(True)
+        table_expr = self._parse_adaptive_table_token(token, value_state)
+        if table_expr is not None:
+            self._expression_lookup[token] = table_expr
+            return table_expr
+        if token.startswith("io.read("):
+            inner = token[len("io.read(") : -1]
+            pieces = [piece.strip() for piece in inner.split(",") if piece.strip()]
+            port = IO_PORT_NAME
+            for piece in pieces:
+                if piece.startswith("port="):
+                    port = piece.split("=", 1)[1]
+                    break
+            return ASTIdentifier(f"io.read({port})", SSAValueKind.UNKNOWN)
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
@@ -3007,6 +3228,14 @@ class ASTBuilder:
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+        if token.startswith("str(") and token.endswith(")"):
+            symbol = token[4:-1]
+            return self._string_literal_from_symbol(symbol)
+        if token.startswith("ascii_header[") and token.endswith("]"):
+            body = token[len("ascii_header[") : -1]
+            chunks = [chunk.strip() for chunk in body.split(",") if chunk.strip()]
+            literals = tuple(self._string_literal_from_symbol(chunk) for chunk in chunks)
+            return ASTTupleExpr(items=literals)
         return ASTIdentifier(token, self._infer_kind(token))
 
     @staticmethod
