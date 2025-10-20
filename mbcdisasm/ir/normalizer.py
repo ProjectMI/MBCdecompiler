@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, replace, fields, is_dataclass
+import string
 from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
@@ -85,6 +86,13 @@ from .model import (
 ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 DATA_MARKER_MNEMONICS = {"op_DE_00", "op_94_00"}
+
+
+_HUMAN_STRING_MIN_LENGTH = 3
+_HUMAN_STRING_CLUSTER_GAP = 256
+_HUMAN_STRING_CLUSTER_MIN_SIZE = 10
+_HUMAN_STRING_PRELUDE_WINDOW = 2048
+_HUMAN_STRING_CLUSTER_MIN_AVG_LENGTH = 6.0
 
 
 CALL_PREPARATION_PREFIXES = {"stack_shuffle", "fanout", "op_59_FE"}
@@ -701,12 +709,14 @@ class IRNormalizer:
             segments.append(normalised)
             aggregate_metrics.observe(normalised.metrics)
 
-        used_strings = self._collect_string_pool_references(segments)
-        string_pool = tuple(
-            constant
-            for constant in self._string_pool_order
-            if constant.name in used_strings
-        )
+        string_pool = self._build_container_string_pool(container)
+        if not string_pool:
+            used_strings = self._collect_string_pool_references(segments)
+            string_pool = tuple(
+                constant
+                for constant in self._string_pool_order
+                if constant.name in used_strings
+            )
 
         return IRProgram(
             segments=tuple(segments),
@@ -768,6 +778,151 @@ class IRNormalizer:
             visit(segment)
 
         return referenced
+
+    def _build_container_string_pool(self, container: MbcContainer) -> Tuple[IRStringConstant, ...]:
+        try:
+            data = container.path.read_bytes()
+        except OSError:
+            data = b"".join(segment.data for segment in container.segments())
+        strings = self._scan_human_string_candidates(data)
+        if not strings:
+            return tuple()
+
+        header: List[Tuple[int, str]] = []
+        if strings and strings[0][0] == 0:
+            first_text = strings[0][1]
+            if self._is_human_string(first_text):
+                header.append(strings[0])
+
+        clusters = self._cluster_string_candidates(strings)
+        main_index: Optional[int] = None
+        for index, cluster in enumerate(clusters):
+            if self._is_human_cluster(cluster):
+                main_index = index
+                break
+
+        if main_index is None:
+            return tuple()
+
+        main_cluster = clusters[main_index]
+        main_start = main_cluster[0][0]
+
+        selected_clusters: List[Sequence[Tuple[int, str]]] = []
+
+        # include nearby prefix clusters with plausible human-readable strings
+        prefix_index = main_index - 1
+        while prefix_index >= 0:
+            cluster = clusters[prefix_index]
+            if main_start - cluster[0][0] > _HUMAN_STRING_PRELUDE_WINDOW:
+                break
+            if self._cluster_average_length(cluster) >= _HUMAN_STRING_CLUSTER_MIN_AVG_LENGTH:
+                selected_clusters.insert(0, cluster)
+            prefix_index -= 1
+
+        # include the main cluster and all subsequent clusters with readable content
+        for cluster in clusters[main_index:]:
+            if self._cluster_average_length(cluster) < _HUMAN_STRING_CLUSTER_MIN_AVG_LENGTH:
+                continue
+            selected_clusters.append(cluster)
+
+        selected: List[Tuple[int, str]] = []
+
+        if header:
+            selected.append(header[0])
+
+        for cluster in selected_clusters:
+            for offset, text in cluster:
+                if not self._is_human_string(text):
+                    continue
+                if header and offset == header[0][0]:
+                    continue
+                selected.append((offset, text))
+
+        if not selected:
+            return tuple()
+
+        constants: List[IRStringConstant] = []
+        for index, (offset, text) in enumerate(selected):
+            payload = text.encode("ascii")
+            constant = IRStringConstant(
+                name=f"str_{index:04d}",
+                data=payload,
+                segments=(payload,),
+                source=f"string_table@0x{offset:06X}",
+            )
+            constants.append(constant)
+
+        return tuple(constants)
+
+    def _scan_human_string_candidates(self, data: bytes) -> List[Tuple[int, str]]:
+        allowed = set(range(0x20, 0x7F)) | {0x09, 0x0A}
+        candidates: List[Tuple[int, str]] = []
+        index = 0
+        total = len(data)
+
+        while index < total:
+            byte = data[index]
+            if byte in allowed:
+                start = index
+                while index < total and data[index] in allowed:
+                    index += 1
+                if index < total and data[index] == 0:
+                    length = index - start
+                    if length >= _HUMAN_STRING_MIN_LENGTH:
+                        text = data[start:index].decode("ascii", "ignore")
+                        candidates.append((start, text))
+                continue
+            index += 1
+
+        return candidates
+
+    def _cluster_string_candidates(
+        self, entries: Sequence[Tuple[int, str]]
+    ) -> List[List[Tuple[int, str]]]:
+        if not entries:
+            return []
+
+        clusters: List[List[Tuple[int, str]]] = []
+        current: List[Tuple[int, str]] = [entries[0]]
+
+        for offset, text in entries[1:]:
+            if offset - current[-1][0] <= _HUMAN_STRING_CLUSTER_GAP:
+                current.append((offset, text))
+                continue
+            clusters.append(current)
+            current = [(offset, text)]
+
+        clusters.append(current)
+        return clusters
+
+    @staticmethod
+    def _cluster_average_length(cluster: Sequence[Tuple[int, str]]) -> float:
+        if not cluster:
+            return 0.0
+        total = sum(len(entry[1]) for entry in cluster)
+        return total / len(cluster) if cluster else 0.0
+
+    @staticmethod
+    def _is_human_string(text: str) -> bool:
+        return any(ch.isalpha() for ch in text)
+
+    def _is_human_cluster(self, cluster: Sequence[Tuple[int, str]]) -> bool:
+        if len(cluster) < _HUMAN_STRING_CLUSTER_MIN_SIZE:
+            return False
+        letters = sum(
+            sum(1 for ch in entry[1] if ch in string.ascii_letters)
+            for entry in cluster
+        )
+        total = sum(len(entry[1]) for entry in cluster)
+        if not total:
+            return False
+        letter_ratio = letters / total
+        if letter_ratio < 0.25:
+            return False
+        average_length = self._cluster_average_length(cluster)
+        if average_length < _HUMAN_STRING_CLUSTER_MIN_AVG_LENGTH:
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # parsing helpers
