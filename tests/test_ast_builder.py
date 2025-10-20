@@ -4,7 +4,7 @@ from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTAssign,
-    ASTBranch,
+    ASTConditional,
     ASTBuilder,
     ASTCallABI,
     ASTCallArgumentSlot,
@@ -23,6 +23,7 @@ from mbcdisasm.ast import (
     ASTSwitch,
     ASTTailCall,
     ASTSymbolTypeFamily,
+    ASTPredicateKind,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -198,6 +199,21 @@ def test_ast_builder_converts_dispatch_with_trailing_table() -> None:
     assert isinstance(statements[1], ASTReturn)
 
 
+def test_ast_builder_strips_literal_marker_tokens(tmp_path: Path) -> None:
+    container, knowledge = build_container(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    for segment in ast_program.segments:
+        for procedure in segment.procedures:
+            for block in procedure.blocks:
+                for statement in block.statements:
+                    assert "literal_marker" not in statement.render()
+
+
 def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     dispatch = IRSwitchDispatch(
         cases=(IRDispatchCase(key=0x02, target=0x4444, symbol=None),),
@@ -358,7 +374,7 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
     procedure = segment_ast.procedures[0]
     assert {block.start_offset for block in procedure.blocks} == {0x0410}
     assert all(
-        not isinstance(statement, ASTBranch)
+        not isinstance(statement, ASTConditional)
         for block in procedure.blocks
         for statement in block.statements
     )
@@ -916,7 +932,8 @@ def test_testset_branch_desugars_into_assignment() -> None:
     procedure = ast_program.segments[0].procedures[0]
     statements = procedure.blocks[0].statements
     assert isinstance(statements[0], ASTAssign)
-    assert isinstance(statements[1], ASTBranch)
+    assert isinstance(statements[1], ASTConditional)
+    assert statements[1].predicate.kind is ASTPredicateKind.VALUE
 
 
 def test_banked_memory_locations_are_canonical() -> None:
