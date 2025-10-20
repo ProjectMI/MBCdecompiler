@@ -181,6 +181,8 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTSignatureValue,
+    ASTSymbolSignature,
     ASTComment,
     ASTEffect,
     ASTEnumDecl,
@@ -344,6 +346,56 @@ class _EnumInfo:
     switches: List["ASTSwitch"] = field(default_factory=list)
 
 
+@dataclass
+class _SignatureAccumulator:
+    """Collect argument and return metadata for a single symbol."""
+
+    address: int
+    symbols: Set[str] = field(default_factory=set)
+    argument_kinds: Dict[int, Set[SSAValueKind]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    argument_names: Dict[int, Set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    return_kinds: Dict[int, Set[SSAValueKind]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    return_names: Dict[int, Set[str]] = field(
+        default_factory=lambda: defaultdict(set)
+    )
+    varargs: bool = False
+
+    def register_call(
+        self,
+        call: ASTCallExpr,
+        returns: Sequence[ASTExpression],
+        abi: Optional[ASTCallABI],
+        payload_varargs: bool = False,
+    ) -> None:
+        if call.symbol:
+            self.symbols.add(call.symbol)
+        if call.varargs or payload_varargs:
+            self.varargs = True
+        for index, expr in enumerate(call.args):
+            kind = expr.kind()
+            self.argument_kinds[index].add(kind)
+            name = self._expr_name(expr)
+            if name:
+                self.argument_names[index].add(name)
+        for index, expr in enumerate(returns):
+            kind = expr.kind()
+            self.return_kinds[index].add(kind)
+            name = self._expr_name(expr)
+            if name:
+                self.return_names[index].add(name)
+
+    @staticmethod
+    def _expr_name(expr: ASTExpression) -> Optional[str]:
+        if isinstance(expr, ASTIdentifier):
+            return expr.name
+        return None
+
 class ASTBuilder:
     """Construct a high level AST with CFG and reconstruction metrics."""
 
@@ -384,10 +436,12 @@ class ASTBuilder:
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
         segments, program_enums = self._finalise_enums(segments, segment_enum_keys)
+        symbol_table = self._synthesise_symbol_signatures(segments)
         return ASTProgram(
             segments=tuple(segments),
             metrics=metrics,
             enums=program_enums,
+            symbols=symbol_table,
         )
 
     # ------------------------------------------------------------------
@@ -450,6 +504,151 @@ class ASTBuilder:
         ]
         program_enums = tuple(self._enum_infos[key].decl for key in active_keys)
         return updated_segments, program_enums
+
+    def _synthesise_symbol_signatures(
+        self, segments: Sequence[ASTSegment]
+    ) -> Tuple[ASTSymbolSignature, ...]:
+        accumulators: Dict[int, _SignatureAccumulator] = {}
+        for segment in segments:
+            for procedure in segment.procedures:
+                for block in procedure.blocks:
+                    for statement in block.statements:
+                        if isinstance(statement, ASTCallStatement):
+                            accumulator = accumulators.setdefault(
+                                statement.call.target,
+                                _SignatureAccumulator(statement.call.target),
+                            )
+                            accumulator.register_call(
+                                statement.call,
+                                statement.returns,
+                                statement.abi,
+                            )
+                        elif isinstance(statement, ASTTailCall):
+                            accumulator = accumulators.setdefault(
+                                statement.call.target,
+                                _SignatureAccumulator(statement.call.target),
+                            )
+                            accumulator.register_call(
+                                statement.call,
+                                statement.payload.values,
+                                statement.abi,
+                                payload_varargs=statement.payload.varargs,
+                            )
+        signatures: List[ASTSymbolSignature] = []
+        for address, accumulator in accumulators.items():
+            name = self._canonical_symbol_name(address, accumulator.symbols)
+            arguments = tuple(
+                ASTSignatureValue(
+                    index=index,
+                    kind=self._select_signature_kind(kinds),
+                    name=self._select_signature_name(
+                        accumulator.argument_names.get(index, set())
+                    ),
+                )
+                for index, kinds in sorted(accumulator.argument_kinds.items())
+            )
+            returns = tuple(
+                ASTSignatureValue(
+                    index=index,
+                    kind=self._select_signature_kind(kinds),
+                    name=self._select_signature_name(
+                        accumulator.return_names.get(index, set())
+                    ),
+                )
+                for index, kinds in sorted(accumulator.return_kinds.items())
+            )
+            signatures.append(
+                ASTSymbolSignature(
+                    address=address,
+                    name=name,
+                    arguments=arguments,
+                    returns=returns,
+                    varargs=accumulator.varargs,
+                )
+            )
+        signatures.sort(key=lambda entry: (entry.name, entry.address))
+        return tuple(signatures)
+
+    @staticmethod
+    def _select_signature_kind(kinds: Set[SSAValueKind]) -> SSAValueKind:
+        if not kinds:
+            return SSAValueKind.UNKNOWN
+        priority = [
+            SSAValueKind.BOOLEAN,
+            SSAValueKind.BYTE,
+            SSAValueKind.WORD,
+            SSAValueKind.POINTER,
+            SSAValueKind.IO,
+            SSAValueKind.PAGE_REGISTER,
+            SSAValueKind.IDENTIFIER,
+        ]
+        for candidate in priority:
+            if candidate in kinds and candidate is not SSAValueKind.UNKNOWN:
+                return candidate
+        if SSAValueKind.UNKNOWN in kinds:
+            return SSAValueKind.UNKNOWN
+        return sorted(kinds, key=lambda kind: kind.name)[0]
+
+    @staticmethod
+    def _select_signature_name(names: Set[str]) -> Optional[str]:
+        filtered = sorted(
+            name for name in names if name and all(ch not in name for ch in ":@")
+        )
+        if filtered:
+            return filtered[0]
+        return None
+
+    @staticmethod
+    def _canonical_symbol_name(address: int, candidates: Set[str]) -> str:
+        filtered = sorted(name for name in candidates if name)
+        if filtered:
+            return filtered[0]
+        masked = address & 0xFFFF
+        if 0x6600 <= masked <= 0x66FF:
+            return f"helper_{masked:04X}"
+        return f"proc_{masked:04X}"
+
+    @staticmethod
+    def _effect_identity(effect: ASTEffect) -> Tuple[Any, ...]:
+        if isinstance(effect, ASTFrameEffect):
+            operand = None
+            if effect.operand is not None:
+                operand = (
+                    effect.operand.width,
+                    effect.operand.value,
+                    effect.operand.alias,
+                )
+            return (
+                "frame",
+                effect.operation,
+                operand,
+                effect.pops,
+                effect.channel,
+            )
+        if isinstance(effect, ASTFrameProtocolEffect):
+            masks = tuple(
+                (mask.width, mask.value, mask.alias) for mask in effect.masks
+            )
+            return ("frame_protocol", masks, effect.teardown, effect.drops)
+        if isinstance(effect, ASTIOEffect):
+            mask = None
+            if effect.mask is not None:
+                mask = (
+                    effect.mask.width,
+                    effect.mask.value,
+                    effect.mask.alias,
+                )
+            return ("io", effect.operation, effect.port, mask)
+        if isinstance(effect, ASTHelperEffect):
+            mask = None
+            if effect.mask is not None:
+                mask = (
+                    effect.mask.width,
+                    effect.mask.value,
+                    effect.mask.alias,
+                )
+            return ("helper", effect.operation, effect.target, effect.symbol, mask)
+        return ("effect", type(effect).__name__, effect.render())
 
     @staticmethod
     def _deactivate_enum(info: _EnumInfo) -> None:
@@ -2003,19 +2202,21 @@ class ASTBuilder:
                 )
             ]
         if isinstance(node, IRTestSetBranch):
-            var_expr = self._resolve_expr(node.var, value_state)
             expr = self._resolve_expr(node.expr, value_state)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
-            statement = ASTTestSet(
-                var=var_expr,
-                expr=expr,
+            target = ASTIdentifier(node.var, self._infer_kind(node.var))
+            value_state[node.var] = target
+            metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
+            assignment = ASTAssign(target=target, value=expr)
+            branch = ASTBranch(
+                condition=target,
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [statement], [
+            return [assignment, branch], [
                 _BranchLink(
-                    statement=statement,
+                    statement=branch,
                     then_target=then_target,
                     else_target=else_target,
                     origin_offset=origin_offset,
@@ -2111,28 +2312,31 @@ class ASTBuilder:
     def _memref_descriptor(ref: Optional[MemRef]) -> ASTAddressDescriptor:
         if ref is None:
             return ASTAddressDescriptor(space=ASTAddressSpace.MEMORY, region="mem")
-        region = ref.region or "mem"
         symbol = ref.symbol
-        lowered = region.lower()
-        if lowered == "frame":
-            space = ASTAddressSpace.FRAME
-        elif lowered == "global":
-            space = ASTAddressSpace.GLOBAL
-        elif lowered == "const":
-            space = ASTAddressSpace.CONST
-        elif lowered.startswith("io"):
-            space = ASTAddressSpace.IO
-        else:
-            space = ASTAddressSpace.MEMORY
-        return ASTAddressDescriptor(space=space, region=region, symbol=symbol)
+        region = (ref.region or "mem").lower()
+        if symbol:
+            return ASTAddressDescriptor(
+                space=ASTAddressSpace.MEMORY, region=region, symbol=symbol
+            )
+        if region == "frame":
+            return ASTAddressDescriptor(space=ASTAddressSpace.FRAME, region="frame")
+        if region.startswith("global"):
+            return ASTAddressDescriptor(space=ASTAddressSpace.GLOBAL, region=region)
+        if region.startswith("const"):
+            return ASTAddressDescriptor(space=ASTAddressSpace.CONST, region=region)
+        if region.startswith("io"):
+            return ASTAddressDescriptor(space=ASTAddressSpace.IO, region=region)
+        return ASTAddressDescriptor(space=ASTAddressSpace.MEMORY, region=region)
 
     @staticmethod
     def _memref_alias(ref: Optional[MemRef]) -> ASTAliasInfo:
         if ref is None:
             return ASTAliasInfo(ASTAliasKind.UNKNOWN)
-        region = ref.region or "mem"
+        region = (ref.region or "mem").lower()
         if region == "frame":
-            return ASTAliasInfo(ASTAliasKind.NOALIAS, region)
+            return ASTAliasInfo(ASTAliasKind.NOALIAS, "frame")
+        if ref.bank is not None and region.startswith("mem"):
+            return ASTAliasInfo(ASTAliasKind.REGION, f"bank_{ref.bank:04X}")
         return ASTAliasInfo(ASTAliasKind.REGION, region)
 
     @staticmethod
@@ -2572,7 +2776,12 @@ class ASTBuilder:
                 )
             )
 
-        return tuple(sorted(effects, key=lambda eff: eff.order_key()))
+        unique: Dict[Tuple[Any, ...], ASTEffect] = {}
+        for effect in effects:
+            key = self._effect_identity(effect)
+            unique[key] = effect
+        ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
+        return tuple(ordered)
 
     def _convert_call(
         self,
