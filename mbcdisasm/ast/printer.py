@@ -66,7 +66,7 @@ class ASTTextRenderer:
         result_repr = procedure.result.render()
         alias_repr = ""
         if procedure.aliases:
-            alias_values = ", ".join(f"0x{offset:04X}" for offset in procedure.aliases)
+            alias_values = ", ".join(alias.render() for alias in procedure.aliases)
             alias_repr = f" aliases=[{alias_values}]"
         yield (
             f"procedure {procedure.name} entry{{{entry_repr}}} {result_repr}{alias_repr} "

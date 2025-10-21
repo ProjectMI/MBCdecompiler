@@ -229,6 +229,8 @@ from .model import (
     ASTProcedure,
     ASTProcedureResult,
     ASTProcedureResultKind,
+    ASTProcedureResultSlot,
+    ASTProcedureAlias,
     ASTProgram,
     ASTReturn,
     ASTReturnPayload,
@@ -363,6 +365,68 @@ class _EnumInfo:
     switches: List["ASTSwitch"] = field(default_factory=list)
 
 
+def _type_from_kind(kind: SSAValueKind) -> ASTSymbolType:
+    if kind is SSAValueKind.BOOLEAN:
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.FLAG,
+            width=1,
+            sign=ASTNumericSign.UNSIGNED,
+        )
+    if kind is SSAValueKind.BYTE:
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.VALUE,
+            width=8,
+            sign=ASTNumericSign.UNSIGNED,
+        )
+    if kind is SSAValueKind.WORD:
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.VALUE,
+            width=16,
+            sign=ASTNumericSign.UNSIGNED,
+        )
+    if kind is SSAValueKind.POINTER:
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.ADDRESS,
+            width=16,
+            space="mem",
+        )
+    if kind is SSAValueKind.IO:
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.ADDRESS,
+            width=16,
+            space="io",
+        )
+    if kind is SSAValueKind.PAGE_REGISTER:
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.ADDRESS,
+            width=16,
+            space="page",
+        )
+    if kind is SSAValueKind.IDENTIFIER:
+        return ASTSymbolType(ASTSymbolTypeFamily.TOKEN)
+    return ASTSymbolType(ASTSymbolTypeFamily.OPAQUE)
+
+
+def _classify_expression(expr: ASTExpression) -> ASTSymbolType:
+    if isinstance(expr, ASTIntegerLiteral):
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.VALUE,
+            width=expr.bits,
+            sign=expr.sign,
+        )
+    if isinstance(expr, ASTBooleanLiteral):
+        return ASTSymbolType(
+            ASTSymbolTypeFamily.FLAG,
+            width=1,
+            sign=ASTNumericSign.UNSIGNED,
+        )
+    if isinstance(expr, ASTMemoryRead) and expr.value_kind is not None:
+        return _type_from_kind(expr.value_kind)
+    if isinstance(expr, ASTIdentifier):
+        return _type_from_kind(expr.kind())
+    return _type_from_kind(expr.kind())
+
+
 @dataclass
 class _SignatureAccumulator:
     """Collect argument and return metadata for a single symbol."""
@@ -396,17 +460,18 @@ class _SignatureAccumulator:
             self.symbols.add(call.symbol)
         if call.varargs or payload_varargs:
             self.attributes.add("varargs")
-        convention = "tailcall" if call.tail else "call"
-        self.calling_conventions.add(convention)
+        if call.tail:
+            self.attributes.add("tailcall")
+        self.calling_conventions.add("call")
         for index, operand in enumerate(call.operands):
             expr = operand.to_expression()
-            signature_type = self._classify_expr(expr)
+            signature_type = _classify_expression(expr)
             self.argument_types[index].add(signature_type)
             name = self._expr_name(expr)
             if name:
                 self.argument_names[index].add(name)
         for index, expr in enumerate(returns):
-            signature_type = self._classify_expr(expr)
+            signature_type = _classify_expression(expr)
             self.return_types[index].add(signature_type)
             name = self._expr_name(expr)
             if name:
@@ -422,65 +487,6 @@ class _SignatureAccumulator:
         if isinstance(expr, ASTIdentifier):
             return expr.name
         return None
-
-    @staticmethod
-    def _classify_expr(expr: ASTExpression) -> ASTSymbolType:
-        if isinstance(expr, ASTIntegerLiteral):
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.VALUE,
-                width=expr.bits,
-                sign=expr.sign,
-            )
-        if isinstance(expr, ASTBooleanLiteral):
-            return ASTSymbolType(ASTSymbolTypeFamily.FLAG, width=1, sign=ASTNumericSign.UNSIGNED)
-        if isinstance(expr, ASTMemoryRead) and expr.value_kind is not None:
-            return _SignatureAccumulator._type_from_kind(expr.value_kind)
-        if isinstance(expr, ASTIdentifier):
-            return _SignatureAccumulator._type_from_kind(expr.kind())
-        kind = expr.kind()
-        return _SignatureAccumulator._type_from_kind(kind)
-
-    @staticmethod
-    def _type_from_kind(kind: SSAValueKind) -> ASTSymbolType:
-        if kind is SSAValueKind.BOOLEAN:
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.FLAG,
-                width=1,
-                sign=ASTNumericSign.UNSIGNED,
-            )
-        if kind is SSAValueKind.BYTE:
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.VALUE,
-                width=8,
-                sign=ASTNumericSign.UNSIGNED,
-            )
-        if kind is SSAValueKind.WORD:
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.VALUE,
-                width=16,
-                sign=ASTNumericSign.UNSIGNED,
-            )
-        if kind is SSAValueKind.POINTER:
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.ADDRESS,
-                width=16,
-                space="mem",
-            )
-        if kind is SSAValueKind.IO:
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.ADDRESS,
-                width=16,
-                space="io",
-            )
-        if kind is SSAValueKind.PAGE_REGISTER:
-            return ASTSymbolType(
-                ASTSymbolTypeFamily.ADDRESS,
-                width=16,
-                space="page",
-            )
-        if kind is SSAValueKind.IDENTIFIER:
-            return ASTSymbolType(ASTSymbolTypeFamily.TOKEN)
-        return ASTSymbolType(ASTSymbolTypeFamily.OPAQUE)
 
 
 @dataclass
@@ -585,10 +591,16 @@ class ASTBuilder:
             segment_result, enum_keys = self._build_segment(segment, metrics)
             segments.append(segment_result)
             segment_enum_keys.append(enum_keys)
+        segments, program_enums = self._finalise_enums(segments, segment_enum_keys)
+        segments = self._canonicalise_segments(segments)
         metrics.procedure_count = sum(len(seg.procedures) for seg in segments)
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
-        metrics.edge_count = sum(len(block.successors) for seg in segments for proc in seg.procedures for block in proc.blocks)
-        segments, program_enums = self._finalise_enums(segments, segment_enum_keys)
+        metrics.edge_count = sum(
+            len(block.successors)
+            for seg in segments
+            for proc in seg.procedures
+            for block in proc.blocks
+        )
         symbol_table = self._synthesise_symbol_signatures(segments)
         return ASTProgram(
             segments=tuple(segments),
@@ -658,6 +670,65 @@ class ASTBuilder:
         program_enums = tuple(self._enum_infos[key].decl for key in active_keys)
         return updated_segments, program_enums
 
+    def _canonicalise_segments(self, segments: Sequence[ASTSegment]) -> List[ASTSegment]:
+        if not segments:
+            return []
+        canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
+        canonical_origin: Dict[Tuple[Any, ...], ASTProcedureAlias] = {}
+        updated_segments: List[ASTSegment] = []
+        for segment in segments:
+            updated_procs: List[ASTProcedure] = []
+            for procedure in segment.procedures:
+                key = self._procedure_identity(procedure)
+                alias_entry = ASTProcedureAlias(segment=segment.index, offset=procedure.entry_offset)
+                existing = canonical.get(key)
+                if existing is None:
+                    canonical[key] = procedure
+                    canonical_origin[key] = alias_entry
+                    alias_set = {(alias.segment, alias.offset) for alias in procedure.aliases}
+                    alias_set.add((alias_entry.segment, alias_entry.offset))
+                    procedure.aliases = tuple(
+                        sorted(
+                            (
+                                ASTProcedureAlias(segment=seg, offset=off)
+                                for seg, off in alias_set
+                            ),
+                            key=lambda entry: (entry.segment, entry.offset),
+                        )
+                    )
+                else:
+                    origin = canonical_origin[key]
+                    combined = {(alias.segment, alias.offset) for alias in existing.aliases}
+                    combined.add((origin.segment, origin.offset))
+                    combined.add((segment.index, procedure.entry_offset))
+                    for alias in procedure.aliases:
+                        combined.add((alias.segment, alias.offset))
+                    existing.aliases = tuple(
+                        sorted(
+                            (
+                                ASTProcedureAlias(segment=seg, offset=off)
+                                for seg, off in combined
+                            ),
+                            key=lambda entry: (entry.segment, entry.offset),
+                        )
+                    )
+                    duplicate_aliases = {
+                        (origin.segment, origin.offset),
+                        (segment.index, procedure.entry_offset),
+                    }
+                    procedure.aliases = tuple(
+                        sorted(
+                            (
+                                ASTProcedureAlias(segment=seg, offset=off)
+                                for seg, off in duplicate_aliases
+                            ),
+                            key=lambda entry: (entry.segment, entry.offset),
+                        )
+                    )
+                updated_procs.append(procedure)
+            updated_segments.append(replace(segment, procedures=tuple(updated_procs)))
+        return updated_segments
+
     def _register_statement_effects(
         self,
         statement: ASTStatement,
@@ -672,6 +743,31 @@ class ASTBuilder:
                 self._register_effect_sequence(statement.abi.effects, accumulators)
         elif isinstance(statement, ASTReturn):
             self._register_effect_sequence(statement.effects, accumulators)
+        elif isinstance(statement, ASTIOWrite):
+            mask = None
+            if statement.mask is not None:
+                mask = self._bitfield(statement.mask, None)
+            effect = ASTIOEffect(
+                operation=ASTIOOperation.WRITE,
+                port=statement.port,
+                mask=mask,
+            )
+            accumulator = accumulators.setdefault(
+                "io.write",
+                _EffectSignatureAccumulator(
+                    name="io.write", address=_IO_EFFECT_ADDRESS.get(ASTIOOperation.WRITE, 0xF100)
+                ),
+            )
+            accumulator.register_io(effect)
+        elif isinstance(statement, ASTIORead):
+            effect = ASTIOEffect(operation=ASTIOOperation.READ, port=statement.port)
+            accumulator = accumulators.setdefault(
+                "io.read",
+                _EffectSignatureAccumulator(
+                    name="io.read", address=_IO_EFFECT_ADDRESS.get(ASTIOOperation.READ, 0xF100)
+                ),
+            )
+            accumulator.register_io(effect)
 
     def _register_effect_sequence(
         self,
@@ -933,7 +1029,9 @@ class ASTBuilder:
             return ("frame_channel", effect.channel, value_key)
         if isinstance(effect, ASTFrameProtocolEffect):
             masks = tuple(
-                (mask.width, mask.value, mask.alias) for mask in effect.masks
+                sorted(
+                    (mask.width, mask.value, mask.alias) for mask in effect.masks
+                )
             )
             return ("frame_protocol", masks, effect.teardown, effect.drops)
         if isinstance(effect, ASTIOEffect):
@@ -1171,15 +1269,15 @@ class ASTBuilder:
             if procedure is None:
                 continue
             procedures.append(procedure)
-        return self._deduplicate_procedures(procedures)
+        return self._deduplicate_procedures(segment.index, procedures)
 
     def _deduplicate_procedures(
-        self, procedures: Sequence[ASTProcedure]
+        self, segment_index: int, procedures: Sequence[ASTProcedure]
     ) -> List[ASTProcedure]:
         if not procedures:
             return []
         canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
-        alias_offsets: Dict[str, Set[int]] = defaultdict(set)
+        alias_offsets: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
         ordered: List[ASTProcedure] = []
         for procedure in procedures:
             key = self._procedure_identity(procedure)
@@ -1188,17 +1286,26 @@ class ASTBuilder:
                 canonical[key] = procedure
                 ordered.append(procedure)
                 if procedure.aliases:
-                    alias_offsets[procedure.name].update(procedure.aliases)
+                    alias_offsets[procedure.name].update(
+                        (alias.segment, alias.offset) for alias in procedure.aliases
+                    )
             else:
-                alias_offsets[existing.name].add(procedure.entry_offset)
+                alias_offsets[existing.name].add((segment_index, procedure.entry_offset))
                 if procedure.aliases:
-                    alias_offsets[existing.name].update(procedure.aliases)
+                    alias_offsets[existing.name].update(
+                        (alias.segment, alias.offset) for alias in procedure.aliases
+                    )
         for procedure in ordered:
             offsets = alias_offsets.get(procedure.name)
             if offsets:
-                combined = set(procedure.aliases)
+                combined = {(alias.segment, alias.offset) for alias in procedure.aliases}
                 combined.update(offsets)
-                procedure.aliases = tuple(sorted(combined))
+                procedure.aliases = tuple(
+                    sorted(
+                        (ASTProcedureAlias(segment=seg, offset=off) for seg, off in combined),
+                        key=lambda entry: (entry.segment, entry.offset),
+                    )
+                )
         return ordered
 
     def _procedure_identity(self, procedure: ASTProcedure) -> Tuple[Any, ...]:
@@ -1232,11 +1339,33 @@ class ASTBuilder:
                 for exit in procedure.exits
             )
         )
+        slot_key = tuple(
+            (
+                slot.index,
+                slot.required,
+                slot.type.family.value,
+                slot.type.width,
+                slot.type.sign.value if slot.type.sign else None,
+                slot.type.space,
+            )
+            for slot in procedure.result.slots
+        )
+        vararg_type = procedure.result.vararg_type
+        vararg_key = None
+        if vararg_type is not None:
+            vararg_key = (
+                vararg_type.family.value,
+                vararg_type.width,
+                vararg_type.sign.value if vararg_type.sign else None,
+                vararg_type.space,
+            )
         result_key = (
             procedure.result.kind.value,
             procedure.result.required_slots,
             procedure.result.optional_slots,
             procedure.result.varargs,
+            slot_key,
+            vararg_key,
         )
         return (tuple(block_keys), exit_keys, result_key)
 
@@ -1326,9 +1455,11 @@ class ASTBuilder:
             return ASTProcedureResult(ASTProcedureResultKind.VOID)
         total = len(payloads)
         presence: Dict[int, int] = defaultdict(int)
+        slot_types: Dict[int, Set[ASTSymbolType]] = defaultdict(set)
         for payload in payloads:
-            for index in range(len(payload.values)):
+            for index, value in enumerate(payload.values):
                 presence[index] += 1
+                slot_types[index].add(_classify_expression(value))
         required = tuple(
             sorted(index for index, count in presence.items() if count == total)
         )
@@ -1352,10 +1483,21 @@ class ASTBuilder:
             kind = ASTProcedureResultKind.FIXED
         else:
             kind = ASTProcedureResultKind.SPARSE
+        slots: List[ASTProcedureResultSlot] = []
+        for index in sorted(slot_types):
+            signature_type = self._select_signature_type(slot_types[index])
+            slots.append(
+                ASTProcedureResultSlot(
+                    index=index,
+                    type=signature_type,
+                    required=index in required,
+                )
+            )
         return ASTProcedureResult(
             kind=kind,
             required_slots=required,
             optional_slots=optional,
+            slots=tuple(slots),
             varargs=varargs,
         )
 
@@ -3267,11 +3409,13 @@ class ASTBuilder:
         effects.extend(self._policy_effects(policy))
 
         if policy.has_effects():
-            masks = tuple(
+            mask_list = [
                 self._bitfield(value, alias)
                 for value, alias in policy.masks
                 if value is not None
-            )
+            ]
+            mask_list.sort(key=lambda field: (field.width, field.value, field.alias or ""))
+            masks = tuple(mask_list)
             effects.append(
                 ASTFrameProtocolEffect(
                     masks=masks,

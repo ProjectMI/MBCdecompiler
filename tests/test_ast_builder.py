@@ -137,6 +137,8 @@ def test_ast_builder_splits_after_return_sequences() -> None:
     assert len(first.blocks) == 1
     assert first.result.kind == ASTProcedureResultKind.FIXED
     assert first.result.required_slots == (0,)
+    assert [slot.index for slot in first.result.slots] == [0]
+    assert first.result.slots[0].required
 
 
 def test_ast_builder_uses_postdominators_for_exits() -> None:
@@ -174,6 +176,8 @@ def test_ast_builder_uses_postdominators_for_exits() -> None:
     assert {block.start_offset for block in procedure.blocks} == {0x0200, 0x0210, 0x0220}
     assert procedure.result.kind == ASTProcedureResultKind.FIXED
     assert procedure.result.required_slots == (0,)
+    assert [slot.index for slot in procedure.result.slots] == [0]
+    assert procedure.result.slots[0].required
 
 
 def test_ast_builder_marks_sparse_procedure_results() -> None:
@@ -209,6 +213,8 @@ def test_ast_builder_marks_sparse_procedure_results() -> None:
     assert procedure.result.kind == ASTProcedureResultKind.SPARSE
     assert procedure.result.required_slots == (0,)
     assert procedure.result.optional_slots == (1,)
+    assert {slot.index for slot in procedure.result.slots if slot.required} == {0}
+    assert {slot.index for slot in procedure.result.slots if not slot.required} == {1}
     assert not procedure.result.varargs
 
 
@@ -305,7 +311,10 @@ def test_ast_builder_deduplicates_identical_procedures() -> None:
     procedures = ast_program.segments[0].procedures
     assert len(procedures) == 1
     procedure = procedures[0]
-    assert procedure.aliases == (0x1010,)
+    assert {(alias.segment, alias.offset) for alias in procedure.aliases} == {
+        (0, 0x1000),
+        (0, 0x1010),
+    }
     assert procedure.result.kind == ASTProcedureResultKind.VOID
 
 
@@ -965,8 +974,8 @@ def test_symbol_table_records_call_attributes() -> None:
     assert 0x3D30 in symbols
     signature = symbols[0x3D30]
     assert signature.name == "io.write"
-    assert signature.calling_conventions == ("tailcall",)
-    assert set(signature.attributes) == {"tail", "varargs"}
+    assert signature.calling_conventions == ("call",)
+    assert set(signature.attributes) == {"tail", "tailcall", "varargs"}
     assert signature.effects and signature.effects[0].startswith("io.write(")
     assert not signature.returns
     assert signature.arguments[0].name == "addr0"

@@ -1470,13 +1470,28 @@ class ASTProcedureResultKind(Enum):
 
 
 @dataclass(frozen=True)
+class ASTProcedureResultSlot:
+    """Typed description of a single returned value slot."""
+
+    index: int
+    type: ASTSymbolType
+    required: bool = True
+
+    def render(self) -> str:
+        flavour = "required" if self.required else "optional"
+        return f"{flavour}[{self.index}]={self.type.render()}"
+
+
+@dataclass(frozen=True)
 class ASTProcedureResult:
     """Summary of the result slots produced by a procedure."""
 
     kind: ASTProcedureResultKind
     required_slots: Tuple[int, ...] = ()
     optional_slots: Tuple[int, ...] = ()
+    slots: Tuple[ASTProcedureResultSlot, ...] = ()
     varargs: bool = False
+    vararg_type: Optional[ASTSymbolType] = None
 
     def render(self) -> str:
         parts: List[str] = [f"kind={self.kind.value}"]
@@ -1486,10 +1501,26 @@ class ASTProcedureResult:
         if self.optional_slots:
             optional = ", ".join(str(index) for index in self.optional_slots)
             parts.append(f"optional=[{optional}]")
+        if self.slots:
+            slot_desc = ", ".join(slot.render() for slot in self.slots)
+            parts.append(f"slots=[{slot_desc}]")
         if self.varargs:
             parts.append("varargs=true")
+        if self.vararg_type is not None:
+            parts.append(f"vararg_type={self.vararg_type.render()}")
         inner = ", ".join(parts)
         return f"result{{{inner}}}"
+
+
+@dataclass(frozen=True)
+class ASTProcedureAlias:
+    """Alias pointing at an equivalent procedure located elsewhere."""
+
+    segment: int
+    offset: int
+
+    def render(self) -> str:
+        return f"seg={self.segment} offset=0x{self.offset:04X}"
 
 
 @dataclass
@@ -1503,7 +1534,7 @@ class ASTProcedure:
     result: "ASTProcedureResult"
     successor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
     predecessor_map: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
-    aliases: Tuple[int, ...] = field(default_factory=tuple)
+    aliases: Tuple[ASTProcedureAlias, ...] = field(default_factory=tuple)
 
     @property
     def entry_offset(self) -> int:
@@ -1675,6 +1706,8 @@ __all__ = [
     "ASTExitPoint",
     "ASTProcedureResultKind",
     "ASTProcedureResult",
+    "ASTProcedureResultSlot",
+    "ASTProcedureAlias",
     "ASTProcedure",
     "ASTSwitchCase",
     "ASTDispatchHelper",
