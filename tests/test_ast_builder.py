@@ -47,6 +47,7 @@ from mbcdisasm.ir.model import (
     IRBankedLoad,
     IRCall,
     IRCallReturn,
+    IRDataMarker,
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
@@ -988,6 +989,101 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     assert signature.effects == tuple()
 
 
+def test_ast_builder_filters_literal_marker_comment() -> None:
+    block = IRBlock(
+        label="entry",
+        start_offset=0x1000,
+        nodes=(
+            IRDataMarker(mnemonic="literal_marker"),
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert not any("marker literal_marker" in stmt.render() for stmt in statements)
+
+
+def test_ast_builder_preserves_tail_prefix_on_tail_calls() -> None:
+    tail = IRTailCall(
+        call=IRCall(target=0x2222, args=(), symbol="helper_tail"),
+        returns=(),
+        varargs=False,
+    )
+    block = IRBlock(
+        label="entry",
+        start_offset=0x2000,
+        nodes=(tail,),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    tail_stmt = next(
+        statement
+        for block in ast_program.segments[0].procedures[0].blocks
+        for statement in block.statements
+        if isinstance(statement, ASTTailCall)
+    )
+
+    assert tail_stmt.call.tail
+    assert tail_stmt.render().startswith("tail call helper_tail")
+    if tail_stmt.abi is not None:
+        assert tail_stmt.abi.tail
+
+
+def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x40,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x2000,
+                nodes=(IRIf(condition="cond", then_target=0x2010, else_target=0x2020),),
+            ),
+            IRBlock(
+                label="then",
+                start_offset=0x2010,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="else",
+                start_offset=0x2020,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="tail",
+                start_offset=0x2030,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    for targets in procedure.successor_map.values():
+        assert "fallthrough" not in targets
+
+
 def test_symbol_table_records_call_attributes() -> None:
     call = IRCallReturn(
         target=0x3D30,
@@ -1246,5 +1342,5 @@ def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
     procedure = ast_program.segments[0].procedures[0]
     assert len(procedure.blocks) == 1
     block = procedure.blocks[0]
-    assert procedure.successor_map[block.label] == ("fallthrough",)
+    assert procedure.successor_map[block.label] == tuple()
     assert all(not isinstance(stmt, ASTJump) for stmt in block.statements[:-1])
