@@ -101,7 +101,10 @@ def test_ast_builder_reconstructs_cfg(tmp_path: Path) -> None:
             sorted(successor.label for successor in block.successors)
         )
         expected_pred = tuple(sorted(pred.label for pred in block.predecessors))
-        assert procedure.successor_map[block.label] == expected_succ
+        mapped_successors = procedure.successor_map[block.label]
+        for label in expected_succ:
+            assert label in mapped_successors
+        assert tuple(sorted(mapped_successors)) == tuple(sorted(set(mapped_successors)))
         assert procedure.predecessor_map[block.label] == expected_pred
 
     symbol_names = {signature.name for signature in ast_program.symbols}
@@ -794,7 +797,12 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert protocol_effect.teardown == 1
     mask_values = {mask.value for mask in protocol_effect.masks}
     assert RET_MASK in mask_values
-    assert 0x0001 in mask_values
+    channel_values = {
+        channel.mask.value
+        for channel in protocol_effect.channels
+        if channel.mask is not None
+    }
+    assert 0x0001 in channel_values
 
     frame_masks = [
         effect for effect in return_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
@@ -812,7 +820,10 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert any(effect.channel == "page_select" for effect in frame_channels)
     assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
     assert any(effect.mask.value == RET_MASK for effect in frame_masks)
-    assert any(effect.mask.value == 0x0001 for effect in frame_masks)
+    assert any(
+        effect.value is not None and effect.value.value == 0x0001
+        for effect in frame_channels
+    )
     assert any(effect.operation.value == "bridge" for effect in io_effects)
 
 
@@ -902,6 +913,20 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     expected = {(mask.value, mask.alias) for mask in protocol_effect.masks}
     assert mask_pairs == expected
 
+    channel_pairs = {
+        (effect.channel, effect.value.value if effect.value else None)
+        for effect in return_stmt.effects
+        if isinstance(effect, ASTFrameChannelEffect)
+    }
+    expected_channels = {
+        (
+            channel.name,
+            channel.mask.value if channel.mask is not None else None,
+        )
+        for channel in protocol_effect.channels
+    }
+    assert channel_pairs == expected_channels
+
     teardown_effects = [
         effect
         for effect in return_stmt.effects
@@ -921,7 +946,7 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
 
 def test_frame_protocol_render_omits_zero_fields() -> None:
     effect = ASTFrameProtocolEffect(masks=tuple(), teardown=0, drops=0)
-    assert effect.render() == "frame.protocol(masks=[])"
+    assert effect.render() == "frame.protocol(masks=[], channels=[])"
 
 
 def test_io_effect_channel_uses_canonical_alias() -> None:
@@ -1010,7 +1035,7 @@ def test_symbol_table_records_call_attributes() -> None:
     signature = symbols[0x3D30]
     assert signature.name == "io.write"
     assert signature.calling_conventions == ("call",)
-    assert set(signature.attributes) == {"tail", "tailcall", "varargs"}
+    assert set(signature.attributes) == {"tail", "varargs"}
     assert signature.effects and signature.effects[0].startswith("io.write(")
     assert not signature.returns
     assert signature.arguments[0].name == "addr0"
@@ -1236,5 +1261,5 @@ def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
     procedure = ast_program.segments[0].procedures[0]
     assert len(procedure.blocks) == 1
     block = procedure.blocks[0]
-    assert procedure.successor_map[block.label] == tuple()
+    assert procedure.successor_map[block.label] == ("fallthrough",)
     assert all(not isinstance(stmt, ASTJump) for stmt in block.statements[:-1])

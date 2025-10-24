@@ -180,6 +180,7 @@ from .model import (
     ASTAliasInfo,
     ASTAliasKind,
     ASTMemoryAddress,
+    ASTAddressOrigin,
     ASTAddressSpace,
     ASTAssign,
     ASTBitField,
@@ -214,6 +215,7 @@ from .model import (
     ASTFrameDropEffect,
     ASTFrameEffect,
     ASTFrameMaskEffect,
+    ASTFrameProtocolChannel,
     ASTFrameProtocolEffect,
     ASTFrameResetEffect,
     ASTFrameTeardownEffect,
@@ -308,29 +310,71 @@ class _PendingBlock:
 
 
 @dataclass
+class _MaskSummary:
+    value: int
+    alias: Optional[str] = None
+
+
+@dataclass
+class _ChannelSummary:
+    value: int
+
+
+@dataclass
 class _FramePolicySummary:
     """Aggregated frame policy derived from cleanup sequences."""
 
     teardown: int = 0
     drops: int = 0
-    masks: List[Tuple[int, Optional[str]]] = field(default_factory=list)
+    masks: Dict[str, _MaskSummary] = field(default_factory=dict)
+    channels: Dict[str, _ChannelSummary] = field(default_factory=dict)
 
-    def add_mask(self, value: Optional[int], alias: Optional[str]) -> None:
+    def add_mask(
+        self, value: Optional[int], alias: Optional[str], channel: Optional[str]
+    ) -> None:
         if value is None:
             return
-        entry = (value, alias)
-        if entry not in self.masks:
-            self.masks.append(entry)
+        if alias:
+            existing = self.masks.get(alias)
+            if existing is None:
+                self.masks[alias] = _MaskSummary(value=value, alias=alias)
+            else:
+                existing.value = value
+                existing.alias = alias
+            return
+        if channel:
+            existing_channel = self.channels.get(channel)
+            if existing_channel is None:
+                self.channels[channel] = _ChannelSummary(value=value)
+            else:
+                existing_channel.value = value
+            return
+        key = f"0x{value:04X}"
+        if value == RET_MASK:
+            existing_mask = self.masks.get(key)
+            if existing_mask is None:
+                self.masks[key] = _MaskSummary(value=value)
+            else:
+                existing_mask.value = value
+            return
+        existing_channel = self.channels.get(key)
+        if existing_channel is None:
+            self.channels[key] = _ChannelSummary(value=value)
+        else:
+            existing_channel.value = value
 
     def merge(self, other: "_FramePolicySummary") -> None:
         self.teardown += other.teardown
         self.drops += other.drops
-        for mask in other.masks:
-            if mask not in self.masks:
-                self.masks.append(mask)
+        for key, summary in other.masks.items():
+            if key not in self.masks:
+                self.masks[key] = _MaskSummary(value=summary.value, alias=summary.alias)
+        for name, summary in other.channels.items():
+            if name not in self.channels:
+                self.channels[name] = _ChannelSummary(value=summary.value)
 
     def has_effects(self) -> bool:
-        return bool(self.teardown or self.drops or self.masks)
+        return bool(self.teardown or self.drops or self.masks or self.channels)
 
 
 @dataclass
@@ -460,14 +504,16 @@ class _SignatureAccumulator:
         call: ASTCallExpr,
         returns: Sequence[ASTExpression],
         abi: Optional[ASTCallABI],
+        *,
         payload_varargs: bool = False,
+        tail_call: bool = False,
     ) -> None:
         if call.symbol:
             self.symbols.add(call.symbol)
         if call.varargs or payload_varargs:
             self.attributes.add("varargs")
-        if call.tail:
-            self.attributes.add("tailcall")
+        if tail_call:
+            self.attributes.add("tail")
         self.calling_conventions.add("call")
         for index, operand in enumerate(call.operands):
             expr = operand.to_expression()
@@ -898,6 +944,7 @@ class ASTBuilder:
                                 statement.payload.values,
                                 statement.abi,
                                 payload_varargs=statement.payload.varargs,
+                                tail_call=True,
                             )
         signatures: List[ASTSymbolSignature] = []
         for address, accumulator in accumulators.items():
@@ -977,6 +1024,27 @@ class ASTBuilder:
                     effects=effects,
                 )
             )
+        existing_addresses = {entry.address for entry in signatures}
+        for segment in segments:
+            for procedure in segment.procedures:
+                address = (segment.index << 16) | procedure.entry.offset
+                if address in existing_addresses:
+                    continue
+                canonical_name = self._canonical_symbol_name(
+                    address, {procedure.name}
+                )
+                signatures.append(
+                    ASTSymbolSignature(
+                        address=address,
+                        name=canonical_name,
+                        arguments=tuple(),
+                        returns=tuple(),
+                        calling_conventions=("call",),
+                        attributes=("defined",),
+                        effects=tuple(),
+                    )
+                )
+                existing_addresses.add(address)
         signatures.sort(key=lambda entry: (entry.name, entry.address))
         return tuple(signatures)
 
@@ -1102,7 +1170,18 @@ class ASTBuilder:
                     (mask.width, mask.value, mask.alias) for mask in effect.masks
                 )
             )
-            return ("frame_protocol", masks, effect.teardown, effect.drops)
+            channels = tuple(
+                sorted(
+                    (
+                        channel.name,
+                        channel.mask.width if channel.mask else 0,
+                        channel.mask.value if channel.mask else 0,
+                        channel.mask.alias if channel.mask else None,
+                    )
+                    for channel in effect.channels
+                )
+            )
+            return ("frame_protocol", masks, channels, effect.teardown, effect.drops)
         if isinstance(effect, ASTIOEffect):
             mask = None
             if effect.mask is not None:
@@ -1620,16 +1699,41 @@ class ASTBuilder:
             exit_points.append(
                 ASTExitPoint(label=block.label, offset=offset, reasons=reasons)
             )
-        successor_map: Dict[str, Tuple[str, ...]] = {
-            block.label: tuple(sorted(successor.label for successor in block.successors))
-            for block in simplified_blocks
-        }
+        successor_map: Dict[str, Tuple[str, ...]] = {}
+        for block in simplified_blocks:
+            entries: List[Tuple[int, str]] = []
+            seen: Set[str] = set()
+
+            def append(rank: int, label: str) -> None:
+                if label in seen:
+                    return
+                seen.add(label)
+                entries.append((rank, label))
+
+            for successor in block.successors:
+                append(0, successor.label)
+
+            analysis = self._current_analyses.get(block.start_offset)
+            if analysis is not None:
+                for target in analysis.successors:
+                    if target in block_lookup:
+                        continue
+                    hint = self._describe_branch_target(block.start_offset, target)
+                    append(1, hint)
+                fallthrough = analysis.fallthrough
+                if fallthrough is not None and fallthrough not in block_lookup:
+                    hint = self._describe_branch_target(block.start_offset, fallthrough)
+                    append(1, hint)
+
+            successor_map[block.label] = tuple(
+                label for _, label in sorted(entries, key=lambda item: (item[0], item[1]))
+            )
         predecessor_lists: Dict[str, Set[str]] = {
             block.label: set() for block in simplified_blocks
         }
         for block in simplified_blocks:
-            for successor in successor_map.get(block.label, ()):  # pragma: no branch
-                predecessor_lists.setdefault(successor, set()).add(block.label)
+            for successor in block.successors:  # pragma: no branch
+                predecessor_lists.setdefault(successor.label, set()).add(block.label)
         predecessor_map: Dict[str, Tuple[str, ...]] = {
             label: tuple(sorted(preds)) for label, preds in predecessor_lists.items()
         }
@@ -2156,14 +2260,14 @@ class ASTBuilder:
                     link.statement.then_branch = then_block
                 else:
                     link.statement.then_hint = self._describe_branch_target(
-                        link.origin_offset, link.then_target
+                        link.origin_offset, link.then_target, local=False
                     )
                 else_block = block_map.get(link.else_target)
                 if else_block is not None:
                     link.statement.else_branch = else_block
                 else:
                     link.statement.else_hint = self._describe_branch_target(
-                        link.origin_offset, link.else_target
+                        link.origin_offset, link.else_target, local=False
                     )
             for link in pending.jump_links:
                 target_block = block_map.get(link.target)
@@ -2172,7 +2276,7 @@ class ASTBuilder:
                     link.statement.target_offset = target_block.start_offset
                 else:
                     link.statement.hint = self._describe_branch_target(
-                        link.origin_offset, link.target
+                        link.origin_offset, link.target, local=False
                     )
                     link.statement.target_offset = link.target
             realised = block_map[pending.start_offset]
@@ -2397,6 +2501,14 @@ class ASTBuilder:
             ):
                 index += 1
             index += 1
+        for entry in collapsed:
+            if isinstance(entry, ASTCallStatement) and entry.call.tail:
+                entry.call = replace(entry.call, tail=False)
+            elif isinstance(entry, ASTTailCall):
+                if entry.call.tail:
+                    entry.call = replace(entry.call, tail=False)
+                if entry.abi is not None:
+                    entry.abi = self._strip_tail_flag(entry.abi)
         return collapsed
 
     def _simplify_dispatch_statement(
@@ -2411,11 +2523,13 @@ class ASTBuilder:
         if statement.default is not None:
             return [statement]
         if statement.call.tail:
+            call_expr = replace(statement.call, tail=False)
+            abi = self._strip_tail_flag(statement.abi)
             return [
                 ASTTailCall(
-                    call=statement.call,
+                    call=call_expr,
                     payload=ASTReturnPayload(values=tuple()),
-                    abi=statement.abi,
+                    abi=abi,
                 )
             ]
         return [ASTCallStatement(call=statement.call, abi=statement.abi)]
@@ -2885,6 +2999,8 @@ class ASTBuilder:
                 )
                 for index, name in enumerate(node.returns)
             )
+            call_expr = replace(call_expr, tail=False)
+            abi = self._strip_tail_flag(abi)
             statements.append(
                 ASTTailCall(
                     call=call_expr,
@@ -3080,7 +3196,7 @@ class ASTBuilder:
                 address = replace(address, offset=combined)
             else:
                 displacement = offset
-        origin = pointer
+        origin = self._build_address_origin(pointer, node.ref)
         return ASTMemoryLocation(
             address=address,
             origin=origin,
@@ -3103,7 +3219,7 @@ class ASTBuilder:
             displacement = None
         else:
             displacement = offset
-        origin: Optional[ASTExpression] = pointer
+        origin = self._build_address_origin(pointer, node.ref)
         return ASTMemoryLocation(
             address=address,
             origin=origin,
@@ -3130,6 +3246,44 @@ class ASTBuilder:
             width = default_width
         mask = (1 << width) - 1
         return ASTBitField(width=width, value=value & mask, alias=alias)
+
+    @staticmethod
+    def _canonical_mask_alias(alias: Optional[str]) -> Optional[str]:
+        if alias is None:
+            return None
+        text = str(alias).strip()
+        if not text:
+            return None
+        upper = text.upper()
+        if upper in _MASK_ALIASES or upper.endswith("_MASK"):
+            return upper
+        return None
+
+    def _mask_bitfield(self, value: int, alias: Optional[str]) -> ASTBitField:
+        canonical = self._canonical_mask_alias(alias)
+        return self._bitfield(value, canonical)
+
+    @staticmethod
+    def _strip_tail_flag(abi: Optional[ASTCallABI]) -> Optional[ASTCallABI]:
+        if abi is None or not abi.tail:
+            return abi
+        return replace(abi, tail=False)
+
+    def _build_address_origin(
+        self, pointer: Optional[ASTExpression], ref: Optional[MemRef]
+    ) -> Optional[ASTAddressOrigin]:
+        if pointer is None:
+            return None
+        label: Optional[str]
+        if isinstance(pointer, ASTIdentifier):
+            label = pointer.name
+        elif isinstance(pointer, ASTCallResult):
+            label = pointer.render()
+        else:
+            label = None
+        address = self._memref_address(ref)
+        space = address.kind if address.kind is not ASTAddressSpace.UNKNOWN else ASTAddressSpace.MEMORY
+        return ASTAddressOrigin(space=space, label=label)
 
     @staticmethod
     def _mnemonic_opcode(mnemonic: str) -> Optional[int]:
@@ -3250,7 +3404,7 @@ class ASTBuilder:
                 if operand is None:
                     return None
                 return ASTFrameMaskEffect(
-                    mask=self._bitfield(operand, alias), channel=channel
+                    mask=self._mask_bitfield(operand, alias), channel=channel
                 )
             if action == "reset":
                 bitfield = self._bitfield(operand, alias) if operand is not None else None
@@ -3435,14 +3589,21 @@ class ASTBuilder:
 
     def _policy_effects(self, policy: _FramePolicySummary) -> List[ASTEffect]:
         summary: List[ASTEffect] = []
-        for value, alias in policy.masks:
-            if value is None:
-                continue
+        for key in sorted(policy.masks):
+            mask_summary = policy.masks[key]
+            value = mask_summary.value
+            alias = mask_summary.alias
             channel = self._canonical_channel_alias(alias, value)
             summary.append(
                 ASTFrameMaskEffect(
-                    mask=self._bitfield(value, alias), channel=channel
+                    mask=self._mask_bitfield(value, alias), channel=channel
                 )
+            )
+        for name in sorted(policy.channels):
+            channel_summary = policy.channels[name]
+            bitfield = self._bitfield(channel_summary.value, None)
+            summary.append(
+                ASTFrameChannelEffect(channel=name, value=bitfield)
             )
         if policy.teardown:
             summary.append(ASTFrameTeardownEffect(pops=policy.teardown))
@@ -3473,7 +3634,11 @@ class ASTBuilder:
                 policy.drops += step.pops or 1
                 continue
             if kind == "frame.return_mask":
-                policy.add_mask(operand, alias)
+                mask_alias = self._canonical_mask_alias(alias)
+                channel_name = None
+                if mask_alias is None and operand != RET_MASK:
+                    channel_name = self._canonical_channel_alias(alias, operand)
+                policy.add_mask(operand, mask_alias, channel_name)
                 continue
             if kind == "frame.effect":
                 kind = self._classify_frame_effect_kind(step, operand, alias)
@@ -3484,7 +3649,11 @@ class ASTBuilder:
         for effect in abi_effects:
             if effect.kind == "return_mask":
                 alias = str(effect.alias) if effect.alias is not None else None
-                policy.add_mask(effect.operand, alias)
+                mask_alias = self._canonical_mask_alias(alias)
+                channel_name = None
+                if mask_alias is None and effect.operand != RET_MASK:
+                    channel_name = self._canonical_channel_alias(alias, effect.operand)
+                policy.add_mask(effect.operand, mask_alias, channel_name)
                 continue
             converted = self._effect_from_kind(
                 f"abi.{effect.kind}", effect.operand, str(effect.alias) if effect.alias else None
@@ -3496,15 +3665,23 @@ class ASTBuilder:
 
         if policy.has_effects():
             mask_list = [
-                self._bitfield(value, alias)
-                for value, alias in policy.masks
-                if value is not None
+                self._mask_bitfield(summary.value, summary.alias)
+                for key, summary in sorted(
+                    policy.masks.items(), key=lambda item: (item[1].value, item[0])
+                )
             ]
             mask_list.sort(key=lambda field: (field.width, field.value, field.alias or ""))
-            masks = tuple(mask_list)
+            channel_list = [
+                ASTFrameProtocolChannel(
+                    name=name,
+                    mask=self._bitfield(summary.value, None),
+                )
+                for name, summary in sorted(policy.channels.items())
+            ]
             effects.append(
                 ASTFrameProtocolEffect(
-                    masks=masks,
+                    masks=tuple(mask_list),
+                    channels=tuple(channel_list),
                     teardown=policy.teardown,
                     drops=policy.drops,
                 )
@@ -3651,8 +3828,10 @@ class ASTBuilder:
             return f"{prefix}{index}"
         return token
 
-    def _describe_branch_target(self, origin_offset: int, target_offset: int) -> str:
-        if target_offset in self._current_block_labels:
+    def _describe_branch_target(
+        self, origin_offset: int, target_offset: int, *, local: bool = False
+    ) -> str:
+        if local and target_offset in self._current_block_labels:
             return self._current_block_labels[target_offset]
         origin_analysis = self._current_analyses.get(origin_offset)
         if origin_analysis and origin_analysis.fallthrough == target_offset:
