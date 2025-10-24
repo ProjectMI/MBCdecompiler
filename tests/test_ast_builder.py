@@ -22,6 +22,7 @@ from mbcdisasm.ast import (
     ASTIntegerLiteral,
     ASTImmediateOperand,
     ASTJump,
+    ASTHelperEffect,
     ASTMemoryRead,
     ASTProcedure,
     ASTProcedureResult,
@@ -40,6 +41,7 @@ from mbcdisasm.ast.model import (
     ASTExitPoint,
     ASTExitReason,
     ASTProcedureResultSlot,
+    ASTHelperOperation,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -933,6 +935,36 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
 def test_frame_protocol_render_omits_zero_fields() -> None:
     effect = ASTFrameProtocolEffect(masks=tuple(), teardown=0, drops=0)
     assert effect.render() == "frame.protocol(masks=[], channels=[])"
+
+
+def test_helper_effect_deduplicates_symbol_less_entries() -> None:
+    builder = ASTBuilder()
+    symbol_effect = ASTHelperEffect(
+        operation=ASTHelperOperation.INVOKE, symbol="fmt.buffer_reset"
+    )
+    plain_effect = ASTHelperEffect(operation=ASTHelperOperation.INVOKE)
+
+    normalised = builder._normalise_effect_list((plain_effect, symbol_effect))
+
+    assert normalised == (symbol_effect,)
+
+
+def test_procedure_result_render_avoids_redundant_slot_summary() -> None:
+    slot = ASTProcedureResultSlot(
+        index=0,
+        type=ASTSymbolType(ASTSymbolTypeFamily.OPAQUE),
+        required=True,
+    )
+    result = ASTProcedureResult(
+        kind=ASTProcedureResultKind.FIXED,
+        required_slots=(0,),
+        slots=(slot,),
+    )
+
+    rendered = result.render()
+
+    assert "slots=[required[0]=" in rendered
+    assert "required=[0]" not in rendered
 
 
 def test_io_effect_channel_uses_canonical_alias() -> None:

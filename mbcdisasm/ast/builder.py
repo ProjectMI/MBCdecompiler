@@ -1215,6 +1215,38 @@ class ASTBuilder:
         if not effects and not ensure_protocol:
             return tuple()
         normalised: List[ASTEffect] = list(effects)
+        helper_symbols: Dict[
+            Tuple[ASTHelperOperation, Optional[int], Optional[Tuple[int, int, Optional[str]]]],
+            bool,
+        ] = {}
+
+        for effect in normalised:
+            if isinstance(effect, ASTHelperEffect) and effect.symbol:
+                mask_signature: Optional[Tuple[int, int, Optional[str]]] = None
+                if effect.mask is not None:
+                    mask_signature = (
+                        effect.mask.width,
+                        effect.mask.value,
+                        effect.mask.alias,
+                    )
+                helper_symbols[(effect.operation, effect.target, mask_signature)] = True
+
+        if helper_symbols:
+            filtered: List[ASTEffect] = []
+            for effect in normalised:
+                if isinstance(effect, ASTHelperEffect) and not effect.symbol:
+                    mask_signature = None
+                    if effect.mask is not None:
+                        mask_signature = (
+                            effect.mask.width,
+                            effect.mask.value,
+                            effect.mask.alias,
+                        )
+                    key = (effect.operation, effect.target, mask_signature)
+                    if helper_symbols.get(key):
+                        continue
+                filtered.append(effect)
+            normalised = filtered
         has_protocol = any(
             isinstance(effect, ASTFrameProtocolEffect) for effect in normalised
         )
@@ -3105,7 +3137,7 @@ class ASTBuilder:
             text = describe()
         else:
             text = repr(node)
-        if text.startswith("marker literal_marker"):
+        if "marker literal_marker" in text:
             return [], []
         return [ASTComment(text)], []
 
