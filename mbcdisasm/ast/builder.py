@@ -1215,6 +1215,7 @@ class ASTBuilder:
         if not effects and not ensure_protocol:
             return tuple()
         normalised: List[ASTEffect] = list(effects)
+        normalised = self._deduplicate_helper_invoke_effects(normalised)
         has_protocol = any(
             isinstance(effect, ASTFrameProtocolEffect) for effect in normalised
         )
@@ -1229,6 +1230,29 @@ class ASTBuilder:
                 unique[key] = effect
         ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
         return tuple(ordered)
+
+    @staticmethod
+    def _deduplicate_helper_invoke_effects(
+        effects: Sequence[ASTEffect],
+    ) -> List[ASTEffect]:
+        grouped: Dict[Tuple[Any, ...], List[ASTHelperEffect]] = defaultdict(list)
+        for effect in effects:
+            if isinstance(effect, ASTHelperEffect):
+                mask_key = None
+                if effect.mask is not None:
+                    mask_key = (
+                        effect.mask.width,
+                        effect.mask.value,
+                        effect.mask.alias,
+                    )
+                grouped[(effect.operation, effect.target, mask_key)].append(effect)
+        skip: Set[int] = set()
+        for helpers in grouped.values():
+            if any(helper.symbol for helper in helpers):
+                skip.update(id(helper) for helper in helpers if not helper.symbol)
+        if not skip:
+            return list(effects)
+        return [effect for effect in effects if id(effect) not in skip]
 
     @staticmethod
     def _deactivate_enum(info: _EnumInfo) -> None:
@@ -2386,6 +2410,7 @@ class ASTBuilder:
             )
             statements.extend(node_statements)
             branch_links.extend(node_links)
+        statements = self._sanitize_block_statements(statements)
         statements = self._collapse_dispatch_sequences(statements)
         terminator = self._ensure_block_terminator(analysis, statements, jump_links)
         if terminator is not None:
@@ -2508,6 +2533,16 @@ class ASTBuilder:
                 index += 1
             index += 1
         return collapsed
+
+    def _sanitize_block_statements(
+        self, statements: Sequence[ASTStatement]
+    ) -> List[ASTStatement]:
+        sanitized: List[ASTStatement] = []
+        for statement in statements:
+            if isinstance(statement, ASTComment) and "marker literal_marker" in statement.text:
+                continue
+            sanitized.append(statement)
+        return sanitized
 
     def _simplify_dispatch_statement(
         self, statement: ASTStatement
@@ -3795,6 +3830,9 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        stripped = token.strip()
+        if stripped.startswith("marker literal_marker"):
+            return ASTBooleanLiteral(False)
         if token in value_state:
             return value_state[token]
         if token in self._call_arg_values:

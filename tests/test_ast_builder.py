@@ -6,6 +6,7 @@ from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTAssign,
     ASTBlock,
+    ASTBooleanLiteral,
     ASTBranch,
     ASTBuilder,
     ASTCallABI,
@@ -1011,6 +1012,127 @@ def test_ast_builder_filters_literal_marker_comment() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     assert not any("marker literal_marker" in stmt.render() for stmt in statements)
+
+
+def test_ast_builder_replaces_literal_marker_tokens_with_boolean_literal() -> None:
+    entry_block = IRBlock(
+        label="entry",
+        start_offset=0x1000,
+        nodes=(
+            IRTestSetBranch(
+                var="bool0",
+                expr="marker literal_marker",
+                then_target=0x1002,
+                else_target=0x1004,
+            ),
+        ),
+    )
+    then_block = IRBlock(
+        label="block_then",
+        start_offset=0x1002,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="block_else",
+        start_offset=0x1004,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x20,
+        blocks=(entry_block, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    block = procedure.blocks[0]
+
+    assign = block.body[0]
+    assert isinstance(assign, ASTAssign)
+    assert isinstance(assign.value, ASTBooleanLiteral)
+    assert assign.value.value is False
+
+    branch = block.terminator
+    assert isinstance(branch, ASTBranch)
+    assert not isinstance(branch.condition, ASTBooleanLiteral)
+    assert "literal_marker" not in branch.condition.render()
+
+
+def test_ast_builder_sanitises_literal_marker_branch_condition() -> None:
+    entry_block = IRBlock(
+        label="entry",
+        start_offset=0x2000,
+        nodes=(
+            IRIf(
+                condition="marker literal_marker",
+                then_target=0x2004,
+                else_target=0x2008,
+            ),
+        ),
+    )
+    then_block = IRBlock(
+        label="block_then",
+        start_offset=0x2004,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="block_else",
+        start_offset=0x2008,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x20,
+        blocks=(entry_block, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    branch = procedure.blocks[0].terminator
+
+    assert isinstance(branch, ASTBranch)
+    assert isinstance(branch.condition, ASTBooleanLiteral)
+    assert branch.condition.value is False
+
+
+def test_ast_builder_deduplicates_helper_invoke_effects() -> None:
+    return_block = IRBlock(
+        label="entry",
+        start_offset=0x3000,
+        nodes=(
+            IRReturn(
+                values=(),
+                varargs=False,
+                cleanup=(
+                    IRStackEffect(mnemonic="call_helpers"),
+                    IRStackEffect(mnemonic="call_helpers", operand_alias="fmt.buffer_reset"),
+                ),
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x3000,
+        length=0x10,
+        blocks=(return_block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    terminator = procedure.blocks[0].terminator
+
+    assert isinstance(terminator, ASTReturn)
+    rendered = [effect.render() for effect in terminator.effects]
+    assert "helpers.invoke()" not in rendered
+    assert rendered.count("helpers.invoke(symbol=fmt.buffer_reset)") == 1
 
 
 def test_ast_builder_preserves_tail_prefix_on_tail_calls() -> None:
