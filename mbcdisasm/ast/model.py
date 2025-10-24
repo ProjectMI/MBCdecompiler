@@ -970,6 +970,17 @@ class ASTCallABI:
             )
             object.__setattr__(self, "effects", ordered_effects)
 
+    def is_empty(self) -> bool:
+        """Return ``True`` when the ABI carries no observable metadata."""
+
+        return (
+            not self.slots
+            and not self.returns
+            and not self.effects
+            and self.live_mask is None
+            and not self.tail
+        )
+
     def render(self) -> str:
         parts: List[str] = []
         if self.slots:
@@ -1219,7 +1230,10 @@ class ASTTailCall(ASTTerminator):
         call_repr = self.call.render()
         if call_repr.startswith("tail "):
             call_repr = call_repr[len("tail ") :]
-        result = f"tail {call_repr}"
+        prefix = "tail"
+        if (self.abi is None or self.abi.is_empty()) and not self.effects:
+            prefix = "return"
+        result = f"{prefix} {call_repr}"
         payload_repr = self.payload.render()
         if payload_repr != "()":
             result = f"{result} -> {payload_repr}"

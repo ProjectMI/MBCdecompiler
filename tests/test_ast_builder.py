@@ -8,6 +8,7 @@ from mbcdisasm.ast import (
     ASTBlock,
     ASTBranch,
     ASTBuilder,
+    ASTComment,
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallExpr,
@@ -54,6 +55,7 @@ from mbcdisasm.ir.model import (
     IRLoad,
     IRProgram,
     IRReturn,
+    IRDataMarker,
     IRSegment,
     IRSwitchDispatch,
     IRTestSetBranch,
@@ -874,6 +876,33 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
     assert any(effect.pops == protocol_effect.drops for effect in frame_drops)
 
+
+def test_ast_tailcall_without_metadata_renders_as_return() -> None:
+    tail_call = IRTailCall(
+        call=IRCall(target=0x1234, args=()),
+        returns=("ret0",),
+    )
+    block = IRBlock(label="tail_block", start_offset=0x2000, nodes=(tail_call,))
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert len(statements) == 1
+    tail_stmt = statements[0]
+    assert isinstance(tail_stmt, ASTTailCall)
+    assert tail_stmt.abi is None
+    assert tail_stmt.effects == ()
+    assert tail_stmt.render().startswith("return call ")
+
+
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(
         values=(),
@@ -942,6 +971,61 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     ]
     assert len(drop_effects) == 1
     assert drop_effects[0].pops == protocol_effect.drops
+
+
+def test_return_effects_use_return_channel_alias() -> None:
+    cleanup = (
+        IRStackEffect(mnemonic="op_29_10", operand=RET_MASK, operand_alias="RET_MASK"),
+        IRStackEffect(mnemonic="op_76_41", operand=RET_MASK, operand_alias="RET_MASK"),
+    )
+    return_node = IRReturn(values=(), cleanup=cleanup)
+    block = IRBlock(label="return_block", start_offset=0x3000, nodes=(return_node,))
+    segment = IRSegment(
+        index=0,
+        start=0x3000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    return_stmt = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(return_stmt, ASTReturn)
+
+    frame_masks = [
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
+    ]
+    assert frame_masks
+    assert all(effect.channel == "return" for effect in frame_masks)
+
+    io_bridges = [
+        effect
+        for effect in return_stmt.effects
+        if isinstance(effect, ASTIOEffect) and effect.operation.value == "bridge"
+    ]
+    assert io_bridges
+    assert all(effect.port == "return" for effect in io_bridges)
+
+
+def test_literal_marker_nodes_are_dropped() -> None:
+    marker = IRDataMarker(mnemonic="literal_marker")
+    ret = IRReturn(values=())
+    block = IRBlock(label="marker_block", start_offset=0x4000, nodes=(marker, ret))
+    segment = IRSegment(
+        index=0,
+        start=0x4000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert all(not isinstance(stmt, ASTComment) for stmt in statements)
+    assert any(isinstance(stmt, ASTReturn) for stmt in statements)
 
 
 def test_frame_protocol_render_omits_zero_fields() -> None:

@@ -43,6 +43,7 @@ from ..ir.model import (
     IRTailcallReturn,
     IRTerminator,
     IRAbiEffect,
+    IRDataMarker,
     IRStackEffect,
     MemRef,
     MemSpace,
@@ -3095,6 +3096,10 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRDataMarker):
+            if node.mnemonic == "literal_marker":
+                return [], []
+            return [ASTComment(node.describe())], []
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
@@ -3265,9 +3270,13 @@ class ASTBuilder:
 
     @staticmethod
     def _strip_tail_flag(abi: Optional[ASTCallABI]) -> Optional[ASTCallABI]:
-        if abi is None or not abi.tail:
-            return abi
-        return replace(abi, tail=False)
+        if abi is None:
+            return None
+        if abi.tail:
+            abi = replace(abi, tail=False)
+        if abi.is_empty():
+            return None
+        return abi
 
     def _build_address_origin(
         self, pointer: Optional[ASTExpression], ref: Optional[MemRef]
@@ -3299,7 +3308,14 @@ class ASTBuilder:
         alias: Optional[str], operand: Optional[int]
     ) -> Optional[str]:
         if alias:
+            mask_alias = ASTBuilder._canonical_mask_alias(alias)
+            if mask_alias == "RET_MASK":
+                return "return"
+            if mask_alias:
+                return mask_alias.lower()
             return str(alias)
+        if operand == RET_MASK:
+            return "return"
         if operand is not None and operand in IO_SLOT_ALIASES:
             return IO_PORT_NAME
         return None
@@ -3518,6 +3534,8 @@ class ASTBuilder:
         return_slots: List[ASTCallReturnSlot] = []
         for index, token in enumerate(return_tokens):
             kind = self._infer_kind(token)
+            if kind is SSAValueKind.UNKNOWN:
+                continue
             name = self._canonical_placeholder_name(token, index, kind)
             return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
         abi_effects = getattr(node, "abi_effects", ())
