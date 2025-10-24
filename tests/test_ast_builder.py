@@ -5,6 +5,7 @@ from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTAssign,
+    ASTComment,
     ASTBlock,
     ASTBranch,
     ASTBuilder,
@@ -49,6 +50,7 @@ from mbcdisasm.ir.model import (
     IRCallReturn,
     IRDispatchCase,
     IRDispatchIndex,
+    IRDataMarker,
     IRIf,
     IRIOWrite,
     IRLoad,
@@ -873,6 +875,116 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert any(effect.mask.value == RET_MASK for effect in frame_masks)
     assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
     assert any(effect.pops == protocol_effect.drops for effect in frame_drops)
+
+
+def test_tailcall_without_abi_metadata_prunes_placeholder() -> None:
+    tail_call = IRTailCall(
+        call=IRCall(target=0x4321, args=()),
+        returns=tuple(),
+        cleanup=tuple(),
+    )
+    block = IRBlock(label="tail_trim", start_offset=0x3000, nodes=(tail_call,))
+    segment = IRSegment(
+        index=0,
+        start=0x3000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    tail_stmt = next(statement for statement in statements if isinstance(statement, ASTTailCall))
+    assert tail_stmt.abi is None
+
+
+def test_tailcall_unknown_return_metadata_is_pruned() -> None:
+    tail_call = IRTailCall(
+        call=IRCall(target=0x6789, args=()),
+        returns=("value0",),
+        cleanup=tuple(),
+    )
+    block = IRBlock(label="tail_ret", start_offset=0x3100, nodes=(tail_call,))
+    segment = IRSegment(
+        index=0,
+        start=0x3100,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    tail_stmt = next(statement for statement in statements if isinstance(statement, ASTTailCall))
+    assert tail_stmt.abi is None
+
+
+def test_return_mask_channel_alias_is_normalised() -> None:
+    tail_call = IRTailCall(
+        call=IRCall(target=0x2468, args=()),
+        returns=tuple(),
+        cleanup=tuple(),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK"),),
+    )
+    block = IRBlock(label="tail_alias", start_offset=0x3200, nodes=(tail_call,))
+    segment = IRSegment(
+        index=0,
+        start=0x3200,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    tail_stmt = next(statement for statement in statements if isinstance(statement, ASTTailCall))
+    assert tail_stmt.abi is not None
+    frame_masks = [
+        effect for effect in tail_stmt.abi.effects if isinstance(effect, ASTFrameMaskEffect)
+    ]
+    assert any(effect.channel == "return" for effect in frame_masks)
+    assert any(effect.mask.value == RET_MASK for effect in frame_masks)
+
+
+def test_io_bridge_alias_for_return_channel() -> None:
+    builder = ASTBuilder()
+    effect = builder._effect_from_kind("io.bridge", RET_MASK, "RET_MASK")
+    assert isinstance(effect, ASTIOEffect)
+    assert effect.port == "return"
+
+
+def test_literal_marker_noise_is_suppressed() -> None:
+    block = IRBlock(
+        label="literal_block",
+        start_offset=0x3400,
+        nodes=(
+            IRDataMarker(mnemonic="literal_marker"),
+            IRReturn(values=tuple(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x3400,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert all(
+        not (isinstance(statement, ASTComment) and "marker literal_marker" in statement.text)
+        for statement in statements
+    )
+
 
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(

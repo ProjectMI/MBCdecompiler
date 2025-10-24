@@ -27,6 +27,7 @@ from ..ir.model import (
     IRIf,
     IRFlagCheck,
     IRDispatchCase,
+    IRDataMarker,
     IRBankedLoad,
     IRBankedStore,
     IRIndirectLoad,
@@ -3095,6 +3096,10 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRDataMarker):
+            if node.mnemonic == "literal_marker":
+                return [], []
+            return [ASTComment(node.describe())], []
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
@@ -3264,10 +3269,44 @@ class ASTBuilder:
         return self._bitfield(value, canonical)
 
     @staticmethod
+    def _returns_are_trivial(
+        slots: Sequence[ASTCallReturnSlot],
+    ) -> bool:
+        if not slots:
+            return False
+        for slot in slots:
+            if slot.kind is not SSAValueKind.UNKNOWN:
+                return False
+            default_name = f"value{slot.index}"
+            if slot.name is not None and slot.name != default_name:
+                return False
+        return True
+
+    @staticmethod
+    def _normalise_return_slots(
+        slots: Sequence[ASTCallReturnSlot],
+    ) -> Tuple[ASTCallReturnSlot, ...]:
+        if ASTBuilder._returns_are_trivial(slots):
+            return tuple()
+        return tuple(slots)
+
+    @staticmethod
     def _strip_tail_flag(abi: Optional[ASTCallABI]) -> Optional[ASTCallABI]:
-        if abi is None or not abi.tail:
-            return abi
-        return replace(abi, tail=False)
+        if abi is None:
+            return None
+        updated = abi
+        if abi.tail:
+            updated = replace(abi, tail=False)
+        if ASTBuilder._returns_are_trivial(updated.returns):
+            updated = replace(updated, returns=tuple())
+        if (
+            not updated.slots
+            and not updated.returns
+            and not updated.effects
+            and updated.live_mask is None
+        ):
+            return None
+        return updated
 
     def _build_address_origin(
         self, pointer: Optional[ASTExpression], ref: Optional[MemRef]
@@ -3299,9 +3338,17 @@ class ASTBuilder:
         alias: Optional[str], operand: Optional[int]
     ) -> Optional[str]:
         if alias:
-            return str(alias)
+            text = str(alias).strip()
+            if not text:
+                return None
+            upper = text.upper()
+            if upper == "RET_MASK":
+                return "return"
+            return text
         if operand is not None and operand in IO_SLOT_ALIASES:
             return IO_PORT_NAME
+        if operand == RET_MASK:
+            return "return"
         return None
 
     @staticmethod
@@ -3520,6 +3567,7 @@ class ASTBuilder:
             kind = self._infer_kind(token)
             name = self._canonical_placeholder_name(token, index, kind)
             return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
+        return_slots = self._normalise_return_slots(return_slots)
         abi_effects = getattr(node, "abi_effects", ())
         for spec in abi_effects:
             alias = str(spec.alias) if spec.alias is not None else None
@@ -3546,7 +3594,7 @@ class ASTBuilder:
         )
         return ASTCallABI(
             slots=tuple(slots),
-            returns=tuple(return_slots),
+            returns=return_slots,
             effects=normalised_effects,
             live_mask=mask_field,
             tail=tail_allowed,
