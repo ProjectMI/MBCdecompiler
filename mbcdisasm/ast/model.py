@@ -459,9 +459,12 @@ class ASTFrameProtocolEffect(ASTEffect):
 
     def render(self) -> str:
         mask_text = ", ".join(mask.render() for mask in self.masks)
-        parts = [f"masks=[{mask_text}]" if mask_text else "masks=[]"]
-        parts.append(f"teardown={self.teardown}")
-        parts.append(f"drops={self.drops}")
+        parts: List[str] = []
+        parts.append(f"masks=[{mask_text}]" if mask_text else "masks=[]")
+        if self.teardown:
+            parts.append(f"teardown={self.teardown}")
+        if self.drops:
+            parts.append(f"drops={self.drops}")
         inner = ", ".join(parts)
         return f"frame.protocol({inner})"
 

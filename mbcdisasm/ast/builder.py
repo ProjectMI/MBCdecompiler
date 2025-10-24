@@ -8,7 +8,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
-from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
+from ..constants import (
+    FANOUT_FLAGS_A,
+    FANOUT_FLAGS_B,
+    IO_PORT_NAME,
+    IO_SLOT,
+    IO_SLOT_ALIASES,
+    RET_MASK,
+)
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -601,6 +608,9 @@ class ASTBuilder:
             for proc in seg.procedures
             for block in proc.blocks
         )
+        symbol_table = self._synthesise_symbol_signatures(segments)
+        self._apply_signature_return_hints(segments, symbol_table)
+        self._refresh_procedure_maps(segments)
         symbol_table = self._synthesise_symbol_signatures(segments)
         return ASTProgram(
             segments=tuple(segments),
@@ -1299,6 +1309,146 @@ class ASTBuilder:
                     )
                 )
         return ordered
+
+    def _apply_signature_return_hints(
+        self,
+        segments: Sequence[ASTSegment],
+        signatures: Sequence[ASTSymbolSignature],
+    ) -> None:
+        returns_by_address: Dict[int, Tuple[ASTSignatureValue, ...]] = {
+            signature.address: signature.returns
+            for signature in signatures
+            if signature.returns
+        }
+        if not returns_by_address:
+            return
+        for segment in segments:
+            for procedure in segment.procedures:
+                for block in procedure.blocks:
+                    if block.body:
+                        updated_body: List[ASTStatement] = []
+                        changed = False
+                        for statement in block.body:
+                            new_statement = self._enrich_statement_returns(
+                                statement, returns_by_address
+                            )
+                            changed = changed or new_statement is not statement
+                            updated_body.append(new_statement)
+                        if changed:
+                            block.body = tuple(updated_body)
+                    terminator = block.terminator
+                    new_terminator = self._enrich_statement_returns(
+                        terminator, returns_by_address
+                    )
+                    if new_terminator is not terminator:
+                        block.terminator = new_terminator
+
+    def _refresh_procedure_maps(self, segments: Sequence[ASTSegment]) -> None:
+        for segment in segments:
+            for procedure in segment.procedures:
+                block_lookup = {block.label: block for block in procedure.blocks}
+                successor_map: Dict[str, Tuple[str, ...]] = {}
+                predecessor_sets: Dict[str, Set[str]] = {
+                    block.label: set() for block in procedure.blocks
+                }
+                for block in procedure.blocks:
+                    successors = tuple(
+                        sorted(block.successors, key=lambda entry: entry.start_offset)
+                    )
+                    block.successors = successors
+                    successor_labels = tuple(successor.label for successor in successors)
+                    successor_map[block.label] = successor_labels
+                    for successor in successors:
+                        predecessor_sets.setdefault(successor.label, set()).add(
+                            block.label
+                        )
+                for label, preds in predecessor_sets.items():
+                    sorted_preds = tuple(sorted(preds))
+                    procedure.predecessor_map[label] = sorted_preds
+                    block = block_lookup[label]
+                    block.predecessors = tuple(
+                        sorted(
+                            (block_lookup[pred] for pred in sorted_preds),
+                            key=lambda entry: entry.start_offset,
+                        )
+                    )
+                procedure.successor_map = successor_map
+
+    def _enrich_statement_returns(
+        self,
+        statement: ASTStatement,
+        returns_by_address: Mapping[int, Tuple[ASTSignatureValue, ...]],
+    ) -> ASTStatement:
+        if isinstance(statement, ASTCallStatement):
+            updated = self._ensure_statement_abi_returns(
+                statement.call, statement.abi, returns_by_address
+            )
+            if updated is statement.abi:
+                return statement
+            return replace(statement, abi=updated)
+        if isinstance(statement, ASTTailCall):
+            updated = self._ensure_statement_abi_returns(
+                statement.call, statement.abi, returns_by_address
+            )
+            if updated is statement.abi:
+                return statement
+            return replace(statement, abi=updated)
+        return statement
+
+    def _ensure_statement_abi_returns(
+        self,
+        call: ASTCallExpr,
+        abi: Optional[ASTCallABI],
+        returns_by_address: Mapping[int, Tuple[ASTSignatureValue, ...]],
+    ) -> Optional[ASTCallABI]:
+        hints = returns_by_address.get(call.target)
+        if not hints:
+            return abi
+        existing = abi or ASTCallABI(tail=call.tail)
+        current = {slot.index: slot for slot in existing.returns}
+        updated_slots: List[ASTCallReturnSlot] = []
+        changed = False
+        for index, hint in enumerate(hints):
+            desired_kind = self._return_kind_from_signature(hint.type)
+            desired_name = hint.name or f"{self._ret_prefix(desired_kind)}{index}"
+            slot = current.get(index)
+            if (
+                slot is None
+                or slot.kind is not desired_kind
+                or slot.name != desired_name
+            ):
+                slot = ASTCallReturnSlot(
+                    index=index, kind=desired_kind, name=desired_name
+                )
+                changed = True
+            updated_slots.append(slot)
+        if len(current) != len(updated_slots):
+            changed = True
+        if not changed:
+            return abi
+        return ASTCallABI(
+            slots=existing.slots,
+            returns=tuple(updated_slots),
+            effects=existing.effects,
+            live_mask=existing.live_mask,
+            tail=existing.tail or call.tail,
+        )
+
+    @staticmethod
+    def _return_kind_from_signature(signature: ASTSymbolType) -> SSAValueKind:
+        family = signature.family
+        if family is ASTSymbolTypeFamily.FLAG:
+            return SSAValueKind.BOOLEAN
+        if family is ASTSymbolTypeFamily.ADDRESS:
+            return SSAValueKind.POINTER
+        if family is ASTSymbolTypeFamily.TOKEN:
+            return SSAValueKind.IDENTIFIER
+        if family is ASTSymbolTypeFamily.VALUE:
+            width = signature.width or 16
+            if width <= 8:
+                return SSAValueKind.BYTE
+            return SSAValueKind.WORD
+        return SSAValueKind.UNKNOWN
 
     def _procedure_identity(self, procedure: ASTProcedure) -> Tuple[Any, ...]:
         label_map = {
@@ -3061,6 +3211,10 @@ class ASTBuilder:
         if value:
             width = max(default_width, ((value.bit_length() + 7) // 8) * 8)
         alias_key = alias.upper() if alias else ""
+        if alias_key == IO_PORT_NAME.upper():
+            if value in IO_SLOT_ALIASES or value == IO_SLOT:
+                value = IO_SLOT
+            width = max(width, 16)
         if alias_key in {"RET_MASK", "FANOUT_FLAGS", "FANOUT_FLAGS_A", "FANOUT_FLAGS_B"}:
             width = max(width, 16)
         if width == 0:
