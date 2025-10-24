@@ -447,20 +447,45 @@ class ASTFrameChannelEffect(ASTFrameEffect):
 
 
 @dataclass(frozen=True)
+class ASTFrameProtocolChannel:
+    """Named protocol channel captured during frame teardown."""
+
+    name: str
+    mask: Optional[ASTBitField] = None
+
+    def render(self) -> str:
+        if self.mask is None:
+            return self.name
+        return f"{self.name}({self.mask.render()})"
+
+
+@dataclass(frozen=True)
 class ASTFrameProtocolEffect(ASTEffect):
     """Summary of post-call frame protocol actions."""
 
     domain_order: ClassVar[int] = 0
     masks: Tuple[ASTBitField, ...]
+    channels: Tuple["ASTFrameProtocolChannel", ...] = ()
     teardown: int = 0
     drops: int = 0
 
     def order_key(self) -> Tuple[int, ...]:
-        return (self.domain_order, len(self.masks), self.teardown, self.drops)
+        return (
+            self.domain_order,
+            len(self.masks),
+            len(self.channels),
+            self.teardown,
+            self.drops,
+        )
 
     def render(self) -> str:
         mask_text = ", ".join(mask.render() for mask in self.masks)
         parts = [f"masks=[{mask_text}]" if mask_text else "masks=[]"]
+        if self.channels:
+            channel_text = ", ".join(channel.render() for channel in self.channels)
+            parts.append(f"channels=[{channel_text}]")
+        else:
+            parts.append("channels=[]")
         if self.teardown:
             parts.append(f"teardown={self.teardown}")
         if self.drops:
@@ -686,11 +711,33 @@ class ASTSafeCastExpr(ASTExpression):
 
 
 @dataclass(frozen=True)
+class ASTAddressOrigin:
+    """Normalised description of the originating address space."""
+
+    space: ASTAddressSpace
+    label: Optional[str] = None
+
+    def render(self) -> str:
+        mapping = {
+            ASTAddressSpace.FRAME: "stack",
+            ASTAddressSpace.GLOBAL: "global",
+            ASTAddressSpace.CONST: "const",
+            ASTAddressSpace.BANKED: "mem",
+            ASTAddressSpace.MEMORY: "mem",
+            ASTAddressSpace.IO: "io",
+        }
+        base = mapping.get(self.space, self.space.value)
+        if self.label:
+            return f"{base}({self.label})"
+        return base
+
+
+@dataclass(frozen=True)
 class ASTMemoryLocation:
     """Structured representation of an addressable location."""
 
     address: Optional[ASTMemoryAddress] = None
-    origin: Optional["ASTExpression"] = None
+    origin: Optional[ASTAddressOrigin] = None
     displacement: Optional["ASTExpression"] = None
     path: Tuple[ASTAccessPathElement, ...] = ()
     alias: ASTAliasInfo = field(default_factory=_default_alias)
@@ -1644,6 +1691,7 @@ __all__ = [
     "ASTIdentifier",
     "ASTSafeCastExpr",
     "ASTMemoryLocation",
+    "ASTAddressOrigin",
     "ASTMemoryAddress",
     "ASTAccessPathElement",
     "ASTFieldElement",
@@ -1678,6 +1726,7 @@ __all__ = [
     "ASTFrameTeardownEffect",
     "ASTFrameDropEffect",
     "ASTFrameChannelEffect",
+    "ASTFrameProtocolChannel",
     "ASTFrameProtocolEffect",
     "ASTHelperEffect",
     "ASTCallArgumentSlot",
