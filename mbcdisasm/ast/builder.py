@@ -21,6 +21,7 @@ from ..ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRDataMarker,
     IRFunctionPrologue,
     IRIORead,
     IRIOWrite,
@@ -726,7 +727,6 @@ class ASTBuilder:
         if not segments:
             return []
         canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
-        canonical_origin: Dict[Tuple[Any, ...], ASTProcedureAlias] = {}
         updated_segments: List[ASTSegment] = []
         assigned_aliases: Dict[Tuple[int, int], ASTProcedure] = {}
 
@@ -753,23 +753,30 @@ class ASTBuilder:
                 existing = canonical.get(key)
                 if existing is None:
                     canonical[key] = procedure
-                    canonical_origin[key] = alias_entry
                     alias_set = {
-                        (alias.segment, alias.offset) for alias in procedure.aliases
+                        (alias.segment, alias.offset)
+                        for alias in procedure.aliases
+                        if (alias.segment, alias.offset)
+                        != (segment.index, procedure.entry_offset)
                     }
-                    alias_set.add((alias_entry.segment, alias_entry.offset))
                     assign_aliases(procedure, alias_set)
+                    assigned_aliases[(alias_entry.segment, alias_entry.offset)] = procedure
                     updated_procs.append(procedure)
                     continue
 
-                origin = canonical_origin[key]
                 combined = {
-                    (alias.segment, alias.offset) for alias in existing.aliases
+                    (alias.segment, alias.offset)
+                    for alias in existing.aliases
+                    if (alias.segment, alias.offset)
+                    != (alias_entry.segment, alias_entry.offset)
                 }
-                combined.add((origin.segment, origin.offset))
                 combined.add((segment.index, procedure.entry_offset))
                 for alias in procedure.aliases:
-                    combined.add((alias.segment, alias.offset))
+                    if (alias.segment, alias.offset) != (
+                        segment.index,
+                        procedure.entry_offset,
+                    ):
+                        combined.add((alias.segment, alias.offset))
                 assign_aliases(existing, combined)
                 existing.result = self._merge_procedure_result(
                     existing.result, procedure.result
@@ -859,13 +866,10 @@ class ASTBuilder:
         elif isinstance(statement, ASTReturn):
             self._register_effect_sequence(statement.effects, accumulators)
         elif isinstance(statement, ASTIOWrite):
-            mask = None
-            if statement.mask is not None:
-                mask = self._bitfield(statement.mask, None)
             effect = ASTIOEffect(
                 operation=ASTIOOperation.WRITE,
                 port=statement.port,
-                mask=mask,
+                mask=statement.mask,
             )
             accumulator = accumulators.setdefault(
                 "io.write",
@@ -2532,7 +2536,12 @@ class ASTBuilder:
                     abi=abi,
                 )
             ]
-        return [ASTCallStatement(call=statement.call, abi=statement.abi)]
+        return [
+            ASTCallStatement(
+                call=statement.call,
+                abi=self._strip_tail_flag(statement.abi),
+            )
+        ]
 
     def _is_redundant_dispatch_followup(
         self, primary: ASTStatement, statement: ASTStatement
@@ -2851,6 +2860,9 @@ class ASTBuilder:
             for mnemonic, operand in node.steps:
                 self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
             return [], []
+        if isinstance(node, IRDataMarker):
+            if node.mnemonic == "literal_marker":
+                return [], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             location = self._build_slot_location(node.slot)
@@ -2867,7 +2879,10 @@ class ASTBuilder:
         if isinstance(node, IRIORead):
             return [ASTIORead(port=node.port)], []
         if isinstance(node, IRIOWrite):
-            return [ASTIOWrite(port=node.port, mask=node.mask)], []
+            mask_field = None
+            if node.mask is not None:
+                mask_field = self._bitfield(node.mask, None)
+            return [ASTIOWrite(port=node.port, mask=mask_field)], []
         if isinstance(node, IRBankedLoad):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None
@@ -3269,6 +3284,25 @@ class ASTBuilder:
             return abi
         return replace(abi, tail=False)
 
+    @staticmethod
+    def _refine_origin_space(
+        space: ASTAddressSpace, label: Optional[str]
+    ) -> ASTAddressSpace:
+        if label is None:
+            return space
+        text = label.strip().lower()
+        if not text:
+            return space
+        if text.startswith(("stack", "frame")) or text in {"sp", "fp"}:
+            return ASTAddressSpace.FRAME
+        if text.startswith("global"):
+            return ASTAddressSpace.GLOBAL
+        if text.startswith("const"):
+            return ASTAddressSpace.CONST
+        if text.startswith("io"):
+            return ASTAddressSpace.IO
+        return space
+
     def _build_address_origin(
         self, pointer: Optional[ASTExpression], ref: Optional[MemRef]
     ) -> Optional[ASTAddressOrigin]:
@@ -3283,7 +3317,8 @@ class ASTBuilder:
             label = None
         address = self._memref_address(ref)
         space = address.kind if address.kind is not ASTAddressSpace.UNKNOWN else ASTAddressSpace.MEMORY
-        return ASTAddressOrigin(space=space, label=label)
+        refined_space = self._refine_origin_space(space, label)
+        return ASTAddressOrigin(space=refined_space, label=label)
 
     @staticmethod
     def _mnemonic_opcode(mnemonic: str) -> Optional[int]:
@@ -3661,9 +3696,26 @@ class ASTBuilder:
             if converted:
                 effects.append(converted)
 
-        effects.extend(self._policy_effects(policy))
+        policy_effects = self._policy_effects(policy)
+        if not policy.has_effects():
+            effects.extend(policy_effects)
 
         if policy.has_effects():
+            mask_values = {summary.value for summary in policy.masks.values()}
+            channel_names = set(policy.channels)
+
+            def _is_protocol_duplicate(effect: ASTEffect) -> bool:
+                if isinstance(effect, ASTFrameMaskEffect):
+                    return effect.mask.value in mask_values
+                if isinstance(effect, ASTFrameTeardownEffect):
+                    return policy.teardown > 0
+                if isinstance(effect, ASTFrameDropEffect):
+                    return policy.drops > 0
+                if isinstance(effect, ASTFrameChannelEffect):
+                    return True
+                return False
+
+            effects = [effect for effect in effects if not _is_protocol_duplicate(effect)]
             mask_list = [
                 self._mask_bitfield(summary.value, summary.alias)
                 for key, summary in sorted(

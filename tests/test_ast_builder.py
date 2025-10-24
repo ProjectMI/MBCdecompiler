@@ -331,7 +331,6 @@ def test_ast_builder_deduplicates_identical_procedures() -> None:
     assert len(procedures) == 1
     procedure = procedures[0]
     assert {(alias.segment, alias.offset) for alias in procedure.aliases} == {
-        (0, 0x1000),
         (0, 0x1010),
     }
     assert procedure.result.kind == ASTProcedureResultKind.VOID
@@ -727,7 +726,7 @@ def test_ast_builder_deduplicates_enums_across_segments() -> None:
         (alias.segment, alias.offset)
         for alias in primary_segment.procedures[0].aliases
     }
-    assert aliases == {(0, 0x0100), (1, 0x0200)}
+    assert aliases == {(1, 0x0200)}
     assert primary_segment.enums and primary_segment.enums[0] is ast_program.enums[0]
     assert not secondary_segment.enums
     assert len(ast_program.enums) == 1
@@ -817,13 +816,9 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     ]
     io_effects = [effect for effect in return_stmt.effects if isinstance(effect, ASTIOEffect)]
 
-    assert any(effect.channel == "page_select" for effect in frame_channels)
-    assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
-    assert any(effect.mask.value == RET_MASK for effect in frame_masks)
-    assert any(
-        effect.value is not None and effect.value.value == 0x0001
-        for effect in frame_channels
-    )
+    assert not frame_masks
+    assert not frame_channels
+    assert not frame_teardowns
     assert any(effect.operation.value == "bridge" for effect in io_effects)
 
 
@@ -870,9 +865,9 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     frame_drops = [
         effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameDropEffect)
     ]
-    assert any(effect.mask.value == RET_MASK for effect in frame_masks)
-    assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
-    assert any(effect.pops == protocol_effect.drops for effect in frame_drops)
+    assert not frame_masks
+    assert not frame_teardowns
+    assert not frame_drops
 
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(
@@ -910,38 +905,28 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
         for effect in return_stmt.effects
         if isinstance(effect, ASTFrameMaskEffect)
     }
-    expected = {(mask.value, mask.alias) for mask in protocol_effect.masks}
-    assert mask_pairs == expected
+    assert not mask_pairs
 
     channel_pairs = {
         (effect.channel, effect.value.value if effect.value else None)
         for effect in return_stmt.effects
         if isinstance(effect, ASTFrameChannelEffect)
     }
-    expected_channels = {
-        (
-            channel.name,
-            channel.mask.value if channel.mask is not None else None,
-        )
-        for channel in protocol_effect.channels
-    }
-    assert channel_pairs == expected_channels
+    assert not channel_pairs
 
     teardown_effects = [
         effect
         for effect in return_stmt.effects
         if isinstance(effect, ASTFrameTeardownEffect)
     ]
-    assert len(teardown_effects) == 1
-    assert teardown_effects[0].pops == protocol_effect.teardown
+    assert not teardown_effects
 
     drop_effects = [
         effect
         for effect in return_stmt.effects
         if isinstance(effect, ASTFrameDropEffect)
     ]
-    assert len(drop_effects) == 1
-    assert drop_effects[0].pops == protocol_effect.drops
+    assert not drop_effects
 
 
 def test_frame_protocol_render_omits_zero_fields() -> None:
@@ -1178,7 +1163,7 @@ def test_identical_procedures_are_deduplicated() -> None:
         (alias.segment, alias.offset)
         for alias in first_segment.procedures[0].aliases
     }
-    assert aliases == {(0, 0x0100), (1, 0x0200)}
+    assert aliases == {(1, 0x0200)}
 
 
 

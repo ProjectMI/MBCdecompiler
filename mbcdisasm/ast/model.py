@@ -728,7 +728,7 @@ class ASTAddressOrigin:
         }
         base = mapping.get(self.space, self.space.value)
         if self.label:
-            return f"{base}({self.label})"
+            return f"{base}[label={self.label}]"
         return base
 
 
@@ -1152,12 +1152,12 @@ class ASTIOWrite(ASTStatement):
     """I/O write effect emitted by helper façades."""
 
     port: str
-    mask: int | None = None
+    mask: Optional[ASTBitField] = None
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.IO
 
     def render(self) -> str:
-        mask = "" if self.mask is None else f", mask=0x{self.mask:04X}"
+        mask = "" if self.mask is None else f", {self.mask.render()}"
         return f"io.write({self.port}{mask})"
 
 
