@@ -8,7 +8,14 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
-from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
+from ..constants import (
+    FANOUT_FLAGS_A,
+    FANOUT_FLAGS_B,
+    IO_PORT_NAME,
+    IO_SLOT,
+    IO_SLOT_ALIASES,
+    RET_MASK,
+)
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -601,6 +608,8 @@ class ASTBuilder:
             for proc in seg.procedures
             for block in proc.blocks
         )
+        preliminary_signatures = self._synthesise_symbol_signatures(segments)
+        self._align_call_returns(segments, preliminary_signatures)
         symbol_table = self._synthesise_symbol_signatures(segments)
         return ASTProgram(
             segments=tuple(segments),
@@ -675,49 +684,58 @@ class ASTBuilder:
             return []
         canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
         canonical_origin: Dict[Tuple[Any, ...], ASTProcedureAlias] = {}
+        alias_lookup: Dict[Tuple[int, int], ASTProcedure] = {}
         updated_segments: List[ASTSegment] = []
         for segment in segments:
             updated_procs: List[ASTProcedure] = []
             for procedure in segment.procedures:
                 key = self._procedure_identity(procedure)
                 alias_entry = ASTProcedureAlias(segment=segment.index, offset=procedure.entry_offset)
+                canonical_location = (segment.index, procedure.entry_offset)
+                filtered_aliases: List[ASTProcedureAlias] = []
+                for alias in procedure.aliases:
+                    location = (alias.segment, alias.offset)
+                    if location == canonical_location:
+                        continue
+                    owner = alias_lookup.get(location)
+                    if owner is not None and owner is not procedure:
+                        continue
+                    filtered_aliases.append(alias)
+                procedure.aliases = tuple(
+                    sorted(
+                        filtered_aliases,
+                        key=lambda entry: (entry.segment, entry.offset),
+                    )
+                )
                 existing = canonical.get(key)
                 if existing is None:
                     canonical[key] = procedure
                     canonical_origin[key] = alias_entry
-                    alias_set = {
-                        (alias.segment, alias.offset) for alias in procedure.aliases
-                    }
-                    alias_set.add((alias_entry.segment, alias_entry.offset))
-                    procedure.aliases = tuple(
-                        sorted(
-                            (
-                                ASTProcedureAlias(segment=seg, offset=off)
-                                for seg, off in alias_set
-                            ),
-                            key=lambda entry: (entry.segment, entry.offset),
-                        )
-                    )
+                    alias_lookup[canonical_location] = procedure
+                    for alias in procedure.aliases:
+                        alias_lookup[(alias.segment, alias.offset)] = procedure
                     updated_procs.append(procedure)
                     continue
 
                 origin = canonical_origin[key]
-                combined = {
+                alias_positions = {
                     (alias.segment, alias.offset) for alias in existing.aliases
                 }
-                combined.add((origin.segment, origin.offset))
-                combined.add((segment.index, procedure.entry_offset))
+                alias_positions.add((segment.index, procedure.entry_offset))
                 for alias in procedure.aliases:
-                    combined.add((alias.segment, alias.offset))
-                existing.aliases = tuple(
-                    sorted(
-                        (
-                            ASTProcedureAlias(segment=seg, offset=off)
-                            for seg, off in combined
-                        ),
-                        key=lambda entry: (entry.segment, entry.offset),
+                    alias_positions.add((alias.segment, alias.offset))
+                alias_positions.discard((origin.segment, origin.offset))
+                new_aliases: List[ASTProcedureAlias] = []
+                for seg_index, offset in sorted(alias_positions):
+                    location = (seg_index, offset)
+                    owner = alias_lookup.get(location)
+                    if owner is not None and owner is not existing:
+                        continue
+                    alias_lookup[location] = existing
+                    new_aliases.append(
+                        ASTProcedureAlias(segment=seg_index, offset=offset)
                     )
-                )
+                existing.aliases = tuple(new_aliases)
             updated_segments.append(replace(segment, procedures=tuple(updated_procs)))
         return updated_segments
 
@@ -1025,7 +1043,9 @@ class ASTBuilder:
                     (mask.width, mask.value, mask.alias) for mask in effect.masks
                 )
             )
-            return ("frame_protocol", masks, effect.teardown, effect.drops)
+            teardown = effect.teardown or None
+            drops = effect.drops or None
+            return ("frame_protocol", masks, teardown, drops)
         if isinstance(effect, ASTIOEffect):
             mask = None
             if effect.mask is not None:
@@ -1270,17 +1290,32 @@ class ASTBuilder:
             return []
         canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
         alias_offsets: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
+        alias_lookup: Dict[Tuple[int, int], str] = {}
         ordered: List[ASTProcedure] = []
         for procedure in procedures:
             key = self._procedure_identity(procedure)
+            canonical_loc = (segment_index, procedure.entry_offset)
+            procedure.aliases = tuple(
+                sorted(
+                    (
+                        alias
+                        for alias in procedure.aliases
+                        if (alias.segment, alias.offset) != canonical_loc
+                    ),
+                    key=lambda entry: (entry.segment, entry.offset),
+                )
+            )
             existing = canonical.get(key)
             if existing is None:
                 canonical[key] = procedure
                 ordered.append(procedure)
+                alias_lookup[canonical_loc] = procedure.name
                 if procedure.aliases:
                     alias_offsets[procedure.name].update(
                         (alias.segment, alias.offset) for alias in procedure.aliases
                     )
+                    for alias in procedure.aliases:
+                        alias_lookup[(alias.segment, alias.offset)] = procedure.name
             else:
                 alias_offsets[existing.name].add((segment_index, procedure.entry_offset))
                 if procedure.aliases:
@@ -1290,15 +1325,85 @@ class ASTBuilder:
         for procedure in ordered:
             offsets = alias_offsets.get(procedure.name)
             if offsets:
-                combined = {(alias.segment, alias.offset) for alias in procedure.aliases}
+                combined = {
+                    (alias.segment, alias.offset) for alias in procedure.aliases
+                }
                 combined.update(offsets)
-                procedure.aliases = tuple(
-                    sorted(
-                        (ASTProcedureAlias(segment=seg, offset=off) for seg, off in combined),
-                        key=lambda entry: (entry.segment, entry.offset),
-                    )
-                )
+                if (segment_index, procedure.entry_offset) in combined:
+                    combined.remove((segment_index, procedure.entry_offset))
+                aliases: List[ASTProcedureAlias] = []
+                for seg, off in sorted(combined):
+                    location = (seg, off)
+                    owner = alias_lookup.get(location)
+                    if owner is not None and owner != procedure.name:
+                        continue
+                    alias_lookup[location] = procedure.name
+                    aliases.append(ASTProcedureAlias(segment=seg, offset=off))
+                procedure.aliases = tuple(aliases)
         return ordered
+
+    @staticmethod
+    def _signature_kind_hint(signature_type: ASTSymbolType) -> SSAValueKind:
+        family = signature_type.family
+        if family is ASTSymbolTypeFamily.VALUE:
+            width = signature_type.width or 16
+            if width <= 8:
+                return SSAValueKind.BYTE
+            return SSAValueKind.WORD
+        if family is ASTSymbolTypeFamily.ADDRESS:
+            return SSAValueKind.POINTER
+        if family is ASTSymbolTypeFamily.FLAG:
+            return SSAValueKind.BOOLEAN
+        if family is ASTSymbolTypeFamily.TOKEN:
+            return SSAValueKind.IDENTIFIER
+        return SSAValueKind.UNKNOWN
+
+    def _synthetic_return_values(
+        self, returns: Sequence[ASTSignatureValue]
+    ) -> Tuple[ASTIdentifier, ...]:
+        placeholders: List[ASTIdentifier] = []
+        for entry in returns:
+            name = entry.name or f"result{entry.index}"
+            kind = self._signature_kind_hint(entry.type)
+            placeholders.append(ASTIdentifier(name, kind))
+        return tuple(placeholders)
+
+    def _align_call_returns(
+        self,
+        segments: Sequence[ASTSegment],
+        signatures: Sequence[ASTSymbolSignature],
+    ) -> None:
+        signature_map = {
+            entry.address: entry for entry in signatures if entry.returns
+        }
+        if not signature_map:
+            return
+        for segment in segments:
+            for procedure in segment.procedures:
+                changed = False
+                for block in procedure.blocks:
+                    for statement in block.body:
+                        if isinstance(statement, ASTCallStatement):
+                            signature = signature_map.get(statement.call.target)
+                            if signature and not statement.returns:
+                                statement.returns = self._synthetic_return_values(
+                                    signature.returns
+                                )
+                                changed = True
+                    terminator = block.terminator
+                    if isinstance(terminator, ASTTailCall):
+                        signature = signature_map.get(terminator.call.target)
+                        if signature and not terminator.payload.values:
+                            placeholders = self._synthetic_return_values(
+                                signature.returns
+                            )
+                            terminator.payload = ASTReturnPayload(
+                                values=placeholders,
+                                varargs=terminator.payload.varargs,
+                            )
+                            changed = True
+                if changed:
+                    procedure.result = self._infer_procedure_result(procedure.blocks)
 
     def _procedure_identity(self, procedure: ASTProcedure) -> Tuple[Any, ...]:
         label_map = {
@@ -3057,10 +3162,19 @@ class ASTBuilder:
 
     @staticmethod
     def _bitfield(value: int, alias: Optional[str], default_width: int = 16) -> ASTBitField:
+        alias_key = alias.upper() if alias else ""
+        if alias_key == IO_PORT_NAME.upper():
+            alias = IO_PORT_NAME
+            alias_key = alias.upper()
+            if value in IO_SLOT_ALIASES:
+                value = IO_SLOT
+        elif value in IO_SLOT_ALIASES:
+            alias = IO_PORT_NAME
+            alias_key = IO_PORT_NAME.upper()
+            value = IO_SLOT
         width = default_width
         if value:
             width = max(default_width, ((value.bit_length() + 7) // 8) * 8)
-        alias_key = alias.upper() if alias else ""
         if alias_key in {"RET_MASK", "FANOUT_FLAGS", "FANOUT_FLAGS_A", "FANOUT_FLAGS_B"}:
             width = max(width, 16)
         if width == 0:
@@ -3079,6 +3193,11 @@ class ASTBuilder:
 
     @staticmethod
     def _effect_channel(alias: Optional[str], operand: Optional[int]) -> str:
+        alias_key = alias.upper() if isinstance(alias, str) else ""
+        if alias_key == IO_PORT_NAME.upper():
+            return IO_PORT_NAME
+        if operand is not None and operand in IO_SLOT_ALIASES:
+            return IO_PORT_NAME
         if alias:
             return str(alias)
         if operand is not None:

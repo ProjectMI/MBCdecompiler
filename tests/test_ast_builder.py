@@ -314,7 +314,6 @@ def test_ast_builder_deduplicates_identical_procedures() -> None:
     assert len(procedures) == 1
     procedure = procedures[0]
     assert {(alias.segment, alias.offset) for alias in procedure.aliases} == {
-        (0, 0x1000),
         (0, 0x1010),
     }
     assert procedure.result.kind == ASTProcedureResultKind.VOID
@@ -710,7 +709,7 @@ def test_ast_builder_deduplicates_enums_across_segments() -> None:
         (alias.segment, alias.offset)
         for alias in primary_segment.procedures[0].aliases
     }
-    assert aliases == {(0, 0x0100), (1, 0x0200)}
+    assert aliases == {(1, 0x0200)}
     assert primary_segment.enums and primary_segment.enums[0] is ast_program.enums[0]
     assert not secondary_segment.enums
     assert len(ast_program.enums) == 1
@@ -1125,7 +1124,7 @@ def test_identical_procedures_are_deduplicated() -> None:
         (alias.segment, alias.offset)
         for alias in first_segment.procedures[0].aliases
     }
-    assert aliases == {(0, 0x0100), (1, 0x0200)}
+    assert aliases == {(1, 0x0200)}
 
 
 def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
