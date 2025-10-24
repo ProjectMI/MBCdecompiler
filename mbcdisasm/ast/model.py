@@ -1341,6 +1341,163 @@ class ASTComment(ASTStatement):
         return f"; {self.text}"
 
 
+@dataclass
+class ASTTableOperation:
+    """Single opcode participating in a table-oriented helper."""
+
+    mnemonic: str
+    opcode: Optional[int] = None
+    mode: Optional[int] = None
+    operand: Optional[int] = None
+    alias: Optional[str] = None
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.opcode is not None:
+            parts.append(f"opcode=0x{self.opcode:04X}")
+        else:
+            parts.append(f"mnemonic={self.mnemonic}")
+        if self.mode is not None:
+            parts.append(f"mode=0x{self.mode:02X}")
+        if self.alias:
+            parts.append(f"alias={self.alias}")
+        if self.operand is not None:
+            parts.append(f"operand={_format_operand(self.operand, self.alias)}")
+        return f"entry{{{', '.join(parts)}}}"
+
+
+@dataclass
+class ASTTablePatch(ASTStatement):
+    """Standalone table patch emission."""
+
+    category: Optional[str]
+    mode: Optional[int]
+    profile_kind: Optional[str]
+    operations: Tuple[ASTTableOperation, ...]
+    affixes: Tuple[ASTTableOperation, ...] = ()
+    notes: Tuple[str, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
+
+    def render(self) -> str:
+        fields: List[str] = []
+        if self.category:
+            fields.append(f"category={self.category}")
+        if self.mode is not None:
+            fields.append(f"mode=0x{self.mode:02X}")
+        if self.profile_kind:
+            fields.append(f"kind={self.profile_kind}")
+        rendered_ops = ", ".join(op.render() for op in self.operations)
+        fields.append(f"entries=[{rendered_ops}]")
+        if self.affixes:
+            extras = ", ".join(op.render() for op in self.affixes)
+            fields.append(f"extras=[{extras}]")
+        if self.notes:
+            fields.append(f"notes=[{', '.join(self.notes)}]")
+        return f"table.patch {' '.join(fields)}"
+
+
+@dataclass
+class ASTTableBuilderBegin(ASTStatement):
+    """Beginning of a table builder sequence."""
+
+    mode: Optional[int]
+    prologue: Tuple[ASTTableOperation, ...]
+    notes: Tuple[str, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.mode is not None:
+            details.append(f"mode=0x{self.mode:02X}")
+        if self.prologue:
+            rendered = ", ".join(op.render() for op in self.prologue)
+            details.append(f"prologue=[{rendered}]")
+        if self.notes:
+            details.append(f"notes=[{', '.join(self.notes)}]")
+        return f"table.begin {' '.join(details)}"
+
+
+@dataclass
+class ASTTableBuilderEmit(ASTStatement):
+    """Body of a table builder."""
+
+    category: Optional[str]
+    mode: Optional[int]
+    profile_kind: Optional[str]
+    operations: Tuple[ASTTableOperation, ...]
+    parameters: Tuple["ASTExpression", ...]
+    affixes: Tuple[ASTTableOperation, ...] = ()
+    notes: Tuple[str, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.category:
+            parts.append(f"category={self.category}")
+        if self.mode is not None:
+            parts.append(f"mode=0x{self.mode:02X}")
+        if self.profile_kind:
+            parts.append(f"kind={self.profile_kind}")
+        entries = ", ".join(op.render() for op in self.operations)
+        parts.append(f"entries=[{entries}]")
+        if self.parameters:
+            params = ", ".join(param.render() for param in self.parameters)
+            parts.append(f"params=[{params}]")
+        if self.affixes:
+            extras = ", ".join(op.render() for op in self.affixes)
+            parts.append(f"extras=[{extras}]")
+        if self.notes:
+            parts.append(f"notes=[{', '.join(self.notes)}]")
+        return f"table.emit {' '.join(parts)}"
+
+
+@dataclass(frozen=True)
+class ASTTableCheck(ASTExpression):
+    """Predicate referencing a table patch."""
+
+    category: Optional[str]
+    mode: Optional[int]
+    profile_kind: Optional[str]
+    operations: Tuple[ASTTableOperation, ...]
+    affixes: Tuple[ASTTableOperation, ...] = ()
+    notes: Tuple[str, ...] = ()
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.category:
+            parts.append(f"category={self.category}")
+        if self.mode is not None:
+            parts.append(f"mode=0x{self.mode:02X}")
+        if self.profile_kind:
+            parts.append(f"kind={self.profile_kind}")
+        entries = ", ".join(op.render() for op in self.operations)
+        parts.append(f"entries=[{entries}]")
+        if self.affixes:
+            extras = ", ".join(op.render() for op in self.affixes)
+            parts.append(f"extras=[{extras}]")
+        if self.notes:
+            parts.append(f"notes=[{', '.join(self.notes)}]")
+        return f"table.check {' '.join(parts)}"
+
+
+@dataclass(frozen=True)
+class ASTCleanupCall(ASTExpression):
+    """Predicate derived from ``cleanup_call`` helpers."""
+
+    effects: Tuple[ASTEffect, ...]
+    pops: int = 0
+
+    def render(self) -> str:
+        details: List[str] = []
+        if self.pops:
+            details.append(f"pop={self.pops}")
+        details.append(f"effects={_render_effects(self.effects)}")
+        return f"cleanup.check {' '.join(details)}"
+
+
 @dataclass(frozen=True)
 class ASTEnumMember:
     """Single member of an enum declaration."""

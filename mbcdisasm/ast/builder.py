@@ -42,9 +42,14 @@ from ..ir.model import (
     IRTestSetBranch,
     IRTailCall,
     IRTailcallReturn,
+    IRTailcallFrame,
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    IRTablePatch,
+    IRTableBuilderBegin,
+    IRTableBuilderEmit,
+    IRTableBuilderCommit,
     MemRef,
     MemSpace,
     SSAValueKind,
@@ -227,6 +232,12 @@ from .model import (
     ASTIOOperation,
     ASTIORead,
     ASTIOWrite,
+    ASTTableOperation,
+    ASTTablePatch,
+    ASTTableBuilderBegin,
+    ASTTableBuilderEmit,
+    ASTTableCheck,
+    ASTCleanupCall,
     ASTIdentifier,
     ASTBooleanLiteral,
     ASTIntegerLiteral,
@@ -2869,9 +2880,22 @@ class ASTBuilder:
             for mnemonic, operand in node.steps:
                 self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
             return [], []
+        if isinstance(node, IRTailcallFrame):
+            for mnemonic, operand in node.steps:
+                self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
+            return [], []
         if isinstance(node, IRDataMarker):
             if node.mnemonic == "literal_marker":
                 return [], []
+        if isinstance(node, IRTableBuilderBegin):
+            statement = self._build_table_builder_begin(node)
+            return [statement], []
+        if isinstance(node, IRTableBuilderEmit):
+            statement = self._build_table_builder_emit(node, value_state)
+            return [statement], []
+        if isinstance(node, IRTablePatch):
+            statement = self._build_table_patch_statement(node)
+            return [statement], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             location = self._build_slot_location(node.slot)
@@ -3044,6 +3068,23 @@ class ASTBuilder:
             return [], []
         if isinstance(node, IRTerminator):
             return [], []
+        if isinstance(node, IRTableBuilderCommit):
+            condition = self._resolve_expr(node.predicate, value_state)
+            then_target = self._resolve_target(node.then_target)
+            else_target = self._resolve_target(node.else_target)
+            branch = ASTBranch(
+                condition=condition,
+                then_offset=then_target,
+                else_offset=else_target,
+            )
+            return [branch], [
+                _BranchLink(
+                    statement=branch,
+                    then_target=then_target,
+                    else_target=else_target,
+                    origin_offset=origin_offset,
+                )
+            ]
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
             then_target = self._resolve_target(node.then_target)
@@ -3543,8 +3584,10 @@ class ASTBuilder:
                 deficit = slot_count - len(values)
                 start = len(values)
                 for index in range(start, start + deficit):
-                    placeholder = ASTValueOperand(
-                        token=f"slot_{index}", value=ASTUnknown(f"slot_{index}")
+                    placeholder = ASTStackOperand(
+                        token=f"slot_{index}",
+                        label=f"slot_{index}",
+                        value_kind=SSAValueKind.UNKNOWN,
                     )
                     values.append(placeholder)
             for index in range(slot_count):
@@ -3595,6 +3638,300 @@ class ASTBuilder:
             live_mask=mask_field,
             tail=tail_allowed,
         )
+
+    @staticmethod
+    def _split_comma(values: str) -> List[str]:
+        items: List[str] = []
+        current: List[str] = []
+        depth = 0
+        for char in values:
+            if char == "," and depth == 0:
+                entry = "".join(current).strip()
+                if entry:
+                    items.append(entry)
+                current = []
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")" and depth:
+                depth -= 1
+            current.append(char)
+        if current:
+            entry = "".join(current).strip()
+            if entry:
+                items.append(entry)
+        return items
+
+    @staticmethod
+    def _parse_named_value(text: str) -> Tuple[Optional[int], Optional[str]]:
+        value_text = text.strip()
+        if not value_text:
+            return None, None
+        alias: Optional[str] = None
+        numeric: Optional[int] = None
+        if value_text.endswith(")") and "(" in value_text:
+            head, tail = value_text.rsplit("(", 1)
+            alias = head.strip() or None
+            inner = tail[:-1].strip()
+            try:
+                numeric = int(inner, 16) if inner.lower().startswith("0x") else int(inner, 10)
+            except ValueError:
+                numeric = None
+            if alias and alias.upper().startswith("0X"):
+                # Alias is actually a numeric literal without decoration.
+                alias = None
+        else:
+            if value_text.lower().startswith("0x"):
+                try:
+                    numeric = int(value_text, 16)
+                except ValueError:
+                    numeric = None
+            else:
+                try:
+                    numeric = int(value_text, 10)
+                except ValueError:
+                    alias = value_text
+        return numeric, alias
+
+    def _parse_table_opcode(self, mnemonic: str) -> Tuple[Optional[int], Optional[int]]:
+        if not mnemonic.startswith("op_"):
+            return None, None
+        parts = mnemonic.split("_")
+        if len(parts) < 3:
+            return None, None
+        try:
+            high = int(parts[1], 16)
+            low = int(parts[2], 16)
+        except ValueError:
+            return None, None
+        return (high << 8) | low, low
+
+    def _build_table_operation_entry(
+        self, mnemonic: str, operand: Optional[int], alias: Optional[str] = None
+    ) -> ASTTableOperation:
+        opcode, mode = self._parse_table_opcode(mnemonic)
+        return ASTTableOperation(
+            mnemonic=mnemonic,
+            opcode=opcode,
+            mode=mode,
+            operand=operand,
+            alias=alias,
+        )
+
+    @staticmethod
+    def _normalise_table_category(category: Optional[str]) -> Optional[str]:
+        if not category:
+            return None
+        lowered = category.lower()
+        if lowered == "adaptive_table":
+            return "adaptive"
+        if lowered == "opcode_table":
+            return "opcode"
+        if lowered.endswith("_table"):
+            return category[:-6]
+        return category
+
+    def _classify_table_annotations(
+        self,
+        annotations: Sequence[str],
+        operations: Sequence[ASTTableOperation],
+        *,
+        mode_hint: Optional[int] = None,
+    ) -> Tuple[Optional[str], Optional[int], Optional[str], Tuple[ASTTableOperation, ...], Tuple[str, ...]]:
+        category: Optional[str] = None
+        profile_kind: Optional[str] = None
+        mode = mode_hint
+        affixes: List[ASTTableOperation] = []
+        notes: List[str] = []
+        for note in annotations:
+            stripped = note.strip()
+            if not stripped:
+                continue
+            lowered = stripped.lower()
+            if lowered in {"adaptive_table", "opcode_table"} or lowered.endswith("_table"):
+                category = self._normalise_table_category(stripped)
+                continue
+            if lowered.startswith("mode="):
+                value = stripped.split("=", 1)[1].strip()
+                try:
+                    mode = int(value, 16)
+                except ValueError:
+                    pass
+                continue
+            if lowered.startswith("kind="):
+                kind_value = stripped.split("=", 1)[1].strip()
+                if kind_value != "unknown":
+                    profile_kind = kind_value
+                continue
+            if stripped.startswith("op_"):
+                opcode, note_mode = self._parse_table_opcode(stripped)
+                affixes.append(
+                    ASTTableOperation(
+                        mnemonic=stripped,
+                        opcode=opcode,
+                        mode=note_mode,
+                    )
+                )
+                continue
+            notes.append(stripped)
+        if mode is None:
+            for entry in operations:
+                if entry.mode is not None:
+                    mode = entry.mode
+                    break
+        return category, mode, profile_kind, tuple(affixes), tuple(notes)
+
+    def _build_table_patch_statement(
+        self, node: IRTablePatch
+    ) -> ASTTablePatch:
+        operations = tuple(
+            self._build_table_operation_entry(mnemonic, operand)
+            for mnemonic, operand in node.operations
+        )
+        category, mode, profile_kind, affixes, notes = self._classify_table_annotations(
+            node.annotations, operations
+        )
+        return ASTTablePatch(
+            category=category,
+            mode=mode,
+            profile_kind=profile_kind,
+            operations=operations,
+            affixes=affixes,
+            notes=notes,
+        )
+
+    def _build_table_builder_begin(
+        self, node: IRTableBuilderBegin
+    ) -> ASTTableBuilderBegin:
+        prologue = tuple(
+            self._build_table_operation_entry(mnemonic, operand)
+            for mnemonic, operand in node.prologue
+        )
+        _, mode, _, affixes, notes = self._classify_table_annotations(
+            node.annotations, prologue, mode_hint=node.mode
+        )
+        if affixes:
+            notes = tuple(list(notes) + [op.render() for op in affixes])
+        return ASTTableBuilderBegin(mode=mode, prologue=prologue, notes=notes)
+
+    def _build_table_builder_emit(
+        self,
+        node: IRTableBuilderEmit,
+        value_state: Mapping[str, ASTExpression],
+    ) -> ASTTableBuilderEmit:
+        operations = tuple(
+            self._build_table_operation_entry(mnemonic, operand)
+            for mnemonic, operand in node.operations
+        )
+        params = tuple(self._resolve_expr(token, value_state) for token in node.parameters)
+        category, mode, profile_kind, affixes, notes = self._classify_table_annotations(
+            node.annotations, operations, mode_hint=node.mode
+        )
+        category = self._normalise_table_category(node.kind) or category
+        return ASTTableBuilderEmit(
+            category=category,
+            mode=mode,
+            profile_kind=profile_kind,
+            operations=operations,
+            parameters=params,
+            affixes=affixes,
+            notes=notes,
+        )
+
+    def _parse_cleanup_token(
+        self, token: str
+    ) -> Tuple[Tuple[IRStackEffect, ...], int]:
+        assert token.startswith("cleanup_call[")
+        head, sep, tail = token.partition("]")
+        body = head[len("cleanup_call[") :]
+        suffix = tail.strip()
+        steps: List[IRStackEffect] = []
+        if body:
+            for entry in self._split_comma(body):
+                if not entry:
+                    continue
+                entry = entry.strip()
+                if "(" not in entry:
+                    steps.append(IRStackEffect(mnemonic=entry))
+                    continue
+                mnemonic, rest = entry.split("(", 1)
+                fields = self._split_comma(rest.rstrip(")"))
+                pops = 0
+                operand = 0
+                alias: Optional[str] = None
+                role: Optional[str] = None
+                for field in fields:
+                    if not field:
+                        continue
+                    key, value = field.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    if key == "pop":
+                        try:
+                            pops = int(value, 16) if value.lower().startswith("0x") else int(value, 10)
+                        except ValueError:
+                            pops = 0
+                        continue
+                    parsed_value, parsed_alias = self._parse_named_value(value)
+                    if key == "operand":
+                        operand = parsed_value or 0
+                        alias = parsed_alias
+                    else:
+                        operand = parsed_value or operand
+                        alias = parsed_alias or alias
+                        role = key
+                steps.append(
+                    IRStackEffect(
+                        mnemonic=mnemonic.strip(),
+                        operand=operand,
+                        pops=pops,
+                        operand_role=role,
+                        operand_alias=alias,
+                    )
+                )
+        total_pops = sum(step.pops for step in steps)
+        if suffix.startswith("pop="):
+            try:
+                total_pops = int(suffix[4:], 16) if suffix[4:].lower().startswith("0x") else int(suffix[4:], 10)
+            except ValueError:
+                pass
+        return tuple(steps), total_pops
+
+    def _parse_table_expression(
+        self, token: str
+    ) -> Tuple[Optional[str], Optional[int], Optional[str], Tuple[ASTTableOperation, ...], Tuple[ASTTableOperation, ...], Tuple[str, ...]]:
+        assert token.startswith("table_patch[")
+        head, _, tail = token.partition("]")
+        body = head[len("table_patch[") :]
+        operations: List[ASTTableOperation] = []
+        if body:
+            for entry in self._split_comma(body):
+                mnemonic, operand, alias = self._parse_table_entry(entry)
+                operations.append(
+                    self._build_table_operation_entry(mnemonic, operand, alias)
+                )
+        annotations: List[str] = []
+        remainder = tail.strip()
+        if remainder.startswith(","):
+            remainder = remainder[1:].strip()
+        if remainder:
+            annotations = [item.strip() for item in remainder.split(",") if item.strip()]
+        category, mode, profile_kind, affixes, notes = self._classify_table_annotations(
+            annotations, operations
+        )
+        return category, mode, profile_kind, tuple(operations), affixes, notes
+
+    def _parse_table_entry(
+        self, entry: str
+    ) -> Tuple[str, Optional[int], Optional[str]]:
+        text = entry.strip()
+        if not text:
+            return "", None, None
+        if "(" not in text:
+            return text, None, None
+        mnemonic, rest = text.split("(", 1)
+        value, alias = self._parse_named_value(rest.rstrip(")"))
+        return mnemonic.strip(), value, alias
 
     def _build_return_identifier(self, name: str, index: int) -> ASTIdentifier:
         kind = self._infer_kind(name)
@@ -3813,12 +4150,32 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        if token.startswith("cleanup_call["):
+            steps, pops = self._parse_cleanup_token(token)
+            effects: List[ASTEffect] = []
+            for step in steps:
+                effects.extend(self._effects_from_call_step(step))
+            return ASTCleanupCall(effects=tuple(effects), pops=pops)
+        if token.startswith("table_patch["):
+            category, mode, profile_kind, operations, affixes, notes = self._parse_table_expression(token)
+            return ASTTableCheck(
+                category=category,
+                mode=mode,
+                profile_kind=profile_kind,
+                operations=operations,
+                affixes=affixes,
+                notes=notes,
+            )
         if token in value_state:
             return value_state[token]
         if token in self._call_arg_values:
             return self._call_arg_values[token]
         if token in self._expression_lookup:
             return self._expression_lookup[token]
+        if token.startswith("str(") and token.endswith(")"):
+            inner = token[4:-1].strip()
+            if inner:
+                return ASTIdentifier(inner, SSAValueKind.IDENTIFIER)
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
