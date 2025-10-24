@@ -1136,8 +1136,7 @@ class ASTBuilder:
             return f"helper_{masked:04X}"
         return f"proc_{masked:04X}"
 
-    @staticmethod
-    def _effect_identity(effect: ASTEffect) -> Tuple[Any, ...]:
+    def _effect_identity(self, effect: ASTEffect) -> Tuple[Any, ...]:
         if isinstance(effect, ASTFrameMaskEffect):
             return (
                 "frame_mask",
@@ -1196,13 +1195,7 @@ class ASTBuilder:
                 )
             return ("io", effect.operation, effect.port, mask)
         if isinstance(effect, ASTHelperEffect):
-            mask = None
-            if effect.mask is not None:
-                mask = (
-                    effect.mask.width,
-                    effect.mask.value,
-                    effect.mask.alias,
-                )
+            mask = self._helper_effect_mask_key(effect)
             return ("helper", effect.operation, effect.target, effect.symbol, mask)
         return ("effect", type(effect).__name__, effect.render())
 
@@ -1222,6 +1215,21 @@ class ASTBuilder:
             normalised.append(
                 ASTFrameProtocolEffect(masks=tuple(), teardown=0, drops=0)
             )
+        helper_symbolled: Set[Tuple[Any, ...]] = set()
+        for effect in normalised:
+            if isinstance(effect, ASTHelperEffect) and effect.symbol is not None:
+                helper_symbolled.add(self._helper_effect_base_key(effect))
+        if helper_symbolled:
+            filtered: List[ASTEffect] = []
+            for effect in normalised:
+                if (
+                    isinstance(effect, ASTHelperEffect)
+                    and effect.symbol is None
+                    and self._helper_effect_base_key(effect) in helper_symbolled
+                ):
+                    continue
+                filtered.append(effect)
+            normalised = filtered
         unique: Dict[Tuple[Any, ...], ASTEffect] = {}
         for effect in normalised:
             key = self._effect_identity(effect)
@@ -1229,6 +1237,15 @@ class ASTBuilder:
                 unique[key] = effect
         ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
         return tuple(ordered)
+
+    @staticmethod
+    def _helper_effect_mask_key(effect: ASTHelperEffect) -> Optional[Tuple[int, int, str | None]]:
+        if effect.mask is None:
+            return None
+        return (effect.mask.width, effect.mask.value, effect.mask.alias)
+
+    def _helper_effect_base_key(self, effect: ASTHelperEffect) -> Tuple[Any, ...]:
+        return (effect.operation, effect.target, self._helper_effect_mask_key(effect))
 
     @staticmethod
     def _deactivate_enum(info: _EnumInfo) -> None:
@@ -3105,6 +3122,7 @@ class ASTBuilder:
             text = describe()
         else:
             text = repr(node)
+        text = text.strip()
         if text.startswith("marker literal_marker"):
             return [], []
         return [ASTComment(text)], []
