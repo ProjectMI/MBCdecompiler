@@ -8,7 +8,13 @@ from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
-from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
+from ..constants import (
+    FANOUT_FLAGS_A,
+    FANOUT_FLAGS_B,
+    IO_PORT_NAME,
+    IO_SLOT_ALIASES,
+    RET_MASK,
+)
 from ..ir.model import (
     IRBlock,
     IRCall,
@@ -676,6 +682,23 @@ class ASTBuilder:
         canonical: Dict[Tuple[Any, ...], ASTProcedure] = {}
         canonical_origin: Dict[Tuple[Any, ...], ASTProcedureAlias] = {}
         updated_segments: List[ASTSegment] = []
+        assigned_aliases: Dict[Tuple[int, int], ASTProcedure] = {}
+
+        def assign_aliases(
+            procedure: ASTProcedure, aliases: Set[Tuple[int, int]]
+        ) -> None:
+            owned: List[Tuple[int, int]] = []
+            for segment_index, offset in sorted(aliases):
+                key = (segment_index, offset)
+                owner = assigned_aliases.get(key)
+                if owner is not None and owner is not procedure:
+                    continue
+                assigned_aliases[key] = procedure
+                owned.append(key)
+            procedure.aliases = tuple(
+                ASTProcedureAlias(segment=seg, offset=off) for seg, off in owned
+            )
+
         for segment in segments:
             updated_procs: List[ASTProcedure] = []
             for procedure in segment.procedures:
@@ -689,15 +712,7 @@ class ASTBuilder:
                         (alias.segment, alias.offset) for alias in procedure.aliases
                     }
                     alias_set.add((alias_entry.segment, alias_entry.offset))
-                    procedure.aliases = tuple(
-                        sorted(
-                            (
-                                ASTProcedureAlias(segment=seg, offset=off)
-                                for seg, off in alias_set
-                            ),
-                            key=lambda entry: (entry.segment, entry.offset),
-                        )
-                    )
+                    assign_aliases(procedure, alias_set)
                     updated_procs.append(procedure)
                     continue
 
@@ -709,17 +724,79 @@ class ASTBuilder:
                 combined.add((segment.index, procedure.entry_offset))
                 for alias in procedure.aliases:
                     combined.add((alias.segment, alias.offset))
-                existing.aliases = tuple(
-                    sorted(
-                        (
-                            ASTProcedureAlias(segment=seg, offset=off)
-                            for seg, off in combined
-                        ),
-                        key=lambda entry: (entry.segment, entry.offset),
-                    )
+                assign_aliases(existing, combined)
+                existing.result = self._merge_procedure_result(
+                    existing.result, procedure.result
                 )
             updated_segments.append(replace(segment, procedures=tuple(updated_procs)))
         return updated_segments
+
+    def _merge_procedure_result(
+        self, primary: ASTProcedureResult, incoming: ASTProcedureResult
+    ) -> ASTProcedureResult:
+        if primary == incoming:
+            return primary
+        trivial = (
+            incoming.kind is ASTProcedureResultKind.VOID
+            and not incoming.slots
+            and not incoming.required_slots
+            and not incoming.optional_slots
+            and not incoming.varargs
+            and incoming.vararg_type is None
+        )
+        if trivial:
+            return primary
+        if (
+            primary.kind is ASTProcedureResultKind.VOID
+            and not primary.slots
+            and not primary.required_slots
+            and not primary.optional_slots
+            and not primary.varargs
+            and primary.vararg_type is None
+        ):
+            return incoming
+        type_sets: Dict[int, Set[ASTSymbolType]] = defaultdict(set)
+        required = set(primary.required_slots) | set(incoming.required_slots)
+        optional = (set(primary.optional_slots) | set(incoming.optional_slots)) - required
+        for slot in primary.slots:
+            type_sets[slot.index].add(slot.type)
+        for slot in incoming.slots:
+            type_sets[slot.index].add(slot.type)
+        indices = set(type_sets)
+        slots: List[ASTProcedureResultSlot] = []
+        for index in sorted(indices):
+            signature_type = self._select_signature_type(type_sets[index])
+            slots.append(
+                ASTProcedureResultSlot(
+                    index=index, type=signature_type, required=index in required
+                )
+            )
+        varargs = primary.varargs or incoming.varargs
+        vararg_type = primary.vararg_type
+        if incoming.vararg_type is not None:
+            if vararg_type is None:
+                vararg_type = incoming.vararg_type
+            else:
+                vararg_type = self._select_signature_type(
+                    {vararg_type, incoming.vararg_type}
+                )
+        if varargs:
+            kind = ASTProcedureResultKind.VARIADIC
+        elif not slots:
+            kind = ASTProcedureResultKind.VOID
+        elif optional:
+            kind = ASTProcedureResultKind.SPARSE
+        else:
+            kind = ASTProcedureResultKind.FIXED
+        return ASTProcedureResult(
+            kind=kind,
+            required_slots=tuple(sorted(required)),
+            optional_slots=tuple(sorted(optional)),
+            slots=tuple(slots),
+            varargs=varargs,
+            vararg_type=vararg_type,
+        )
+
 
     def _register_statement_effects(
         self,
@@ -1287,6 +1364,9 @@ class ASTBuilder:
                     alias_offsets[existing.name].update(
                         (alias.segment, alias.offset) for alias in procedure.aliases
                     )
+                existing.result = self._merge_procedure_result(
+                    existing.result, procedure.result
+                )
         for procedure in ordered:
             offsets = alias_offsets.get(procedure.name)
             if offsets:
@@ -1331,35 +1411,7 @@ class ASTBuilder:
                 for exit in procedure.exits
             )
         )
-        slot_key = tuple(
-            (
-                slot.index,
-                slot.required,
-                slot.type.family.value,
-                slot.type.width,
-                slot.type.sign.value if slot.type.sign else None,
-                slot.type.space,
-            )
-            for slot in procedure.result.slots
-        )
-        vararg_type = procedure.result.vararg_type
-        vararg_key = None
-        if vararg_type is not None:
-            vararg_key = (
-                vararg_type.family.value,
-                vararg_type.width,
-                vararg_type.sign.value if vararg_type.sign else None,
-                vararg_type.space,
-            )
-        result_key = (
-            procedure.result.kind.value,
-            procedure.result.required_slots,
-            procedure.result.optional_slots,
-            procedure.result.varargs,
-            slot_key,
-            vararg_key,
-        )
-        return (tuple(block_keys), exit_keys, result_key)
+        return (tuple(block_keys), exit_keys)
 
     @staticmethod
     def _normalise_entry_reasons(reasons: Set[str]) -> Tuple[str, ...]:
@@ -1572,10 +1624,21 @@ class ASTBuilder:
             block.label: tuple(sorted(successor.label for successor in block.successors))
             for block in simplified_blocks
         }
-        predecessor_map: Dict[str, Tuple[str, ...]] = {
-            block.label: tuple(sorted(pred.label for pred in block.predecessors))
-            for block in simplified_blocks
+        predecessor_lists: Dict[str, Set[str]] = {
+            block.label: set() for block in simplified_blocks
         }
+        for block in simplified_blocks:
+            for successor in successor_map.get(block.label, ()):  # pragma: no branch
+                predecessor_lists.setdefault(successor, set()).add(block.label)
+        predecessor_map: Dict[str, Tuple[str, ...]] = {
+            label: tuple(sorted(preds)) for label, preds in predecessor_lists.items()
+        }
+        label_lookup = {block.label: block for block in simplified_blocks}
+        for label, predecessors in predecessor_map.items():
+            block = label_lookup.get(label)
+            if block is None:
+                continue
+            block.predecessors = tuple(label_lookup[name] for name in predecessors)
         result_summary = self._infer_procedure_result(simplified_blocks)
         return ASTProcedure(
             name=name,
@@ -3078,9 +3141,20 @@ class ASTBuilder:
             return None
 
     @staticmethod
-    def _effect_channel(alias: Optional[str], operand: Optional[int]) -> str:
+    def _canonical_channel_alias(
+        alias: Optional[str], operand: Optional[int]
+    ) -> Optional[str]:
         if alias:
             return str(alias)
+        if operand is not None and operand in IO_SLOT_ALIASES:
+            return IO_PORT_NAME
+        return None
+
+    @staticmethod
+    def _effect_channel(alias: Optional[str], operand: Optional[int]) -> str:
+        channel = ASTBuilder._canonical_channel_alias(alias, operand)
+        if channel:
+            return channel
         if operand is not None:
             return f"0x{operand:04X}"
         return "?"
@@ -3171,7 +3245,7 @@ class ASTBuilder:
             action = kind.split(".", 1)[1]
             if action == "protocol":
                 return None
-            channel = alias or None
+            channel = self._canonical_channel_alias(alias, operand)
             if action == "return_mask":
                 if operand is None:
                     return None
@@ -3235,8 +3309,9 @@ class ASTBuilder:
         if kind.startswith("abi."):
             action = kind.split(".", 1)[1]
             if action == "return_mask" and operand is not None:
+                channel = self._canonical_channel_alias(alias, operand)
                 return ASTFrameMaskEffect(
-                    mask=self._bitfield(operand, alias), channel=alias
+                    mask=self._bitfield(operand, alias), channel=channel
                 )
             symbol = alias or action
             return ASTHelperEffect(operation=ASTHelperOperation.INVOKE, symbol=symbol)
@@ -3363,9 +3438,10 @@ class ASTBuilder:
         for value, alias in policy.masks:
             if value is None:
                 continue
+            channel = self._canonical_channel_alias(alias, value)
             summary.append(
                 ASTFrameMaskEffect(
-                    mask=self._bitfield(value, alias), channel=alias
+                    mask=self._bitfield(value, alias), channel=channel
                 )
             )
         if policy.teardown:

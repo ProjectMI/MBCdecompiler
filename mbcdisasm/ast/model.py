@@ -191,7 +191,8 @@ def _format_operand(value: int, alias: Optional[str] = None) -> str:
         upper = alias_text.upper()
         if upper.startswith("0X"):
             alias_text = upper
-        if alias_text == hex_value:
+        canonical = OPERAND_ALIASES.get(value)
+        if alias_text == hex_value or alias_text == canonical:
             return alias_text
         return f"{alias_text}({hex_value})"
     return hex_value
@@ -460,8 +461,10 @@ class ASTFrameProtocolEffect(ASTEffect):
     def render(self) -> str:
         mask_text = ", ".join(mask.render() for mask in self.masks)
         parts = [f"masks=[{mask_text}]" if mask_text else "masks=[]"]
-        parts.append(f"teardown={self.teardown}")
-        parts.append(f"drops={self.drops}")
+        if self.teardown:
+            parts.append(f"teardown={self.teardown}")
+        if self.drops:
+            parts.append(f"drops={self.drops}")
         inner = ", ".join(parts)
         return f"frame.protocol({inner})"
 
