@@ -619,12 +619,12 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
     ]
     assert any(
         [step.mnemonic for step in node.steps]
-        == ["page_register", "op_5E_29", "op_F0_4B"]
+        == ["page_register", "frame.return_mask", "op_F0_4B"]
         for node in cleanup_nodes
     )
     cleanup_mnemonics = [step.mnemonic for step in contract_call.cleanup]
     assert cleanup_mnemonics and cleanup_mnemonics[0] == "stack_teardown"
-    assert "op_29_10" in cleanup_mnemonics
+    assert "frame.return_mask" in cleanup_mnemonics
     assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
@@ -713,7 +713,7 @@ def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
     assert tail_nodes
     tail_targets = {node.call.target for node in tail_nodes}
     assert tail_targets == {0x3D30, 0x3032}
-    assert any(node.cleanup and node.cleanup[0].mnemonic == "op_4C_00" for node in tail_nodes)
+    assert any(node.cleanup and node.cleanup[0].mnemonic == "frame.reset" for node in tail_nodes)
 
     assert not any(getattr(node, "target", 0) in {0x003D, 0x0072} for node in flattened if hasattr(node, "target"))
 
@@ -1036,7 +1036,7 @@ def test_normalizer_ignores_ascii_bridge_annotations() -> None:
     assert metrics.raw_remaining == 0
     cleanup_nodes = [node for node in ir_block.nodes if isinstance(node, IRCallCleanup)]
     assert cleanup_nodes and any(
-        step.mnemonic == "op_AA_00" for cleanup in cleanup_nodes for step in cleanup.steps
+        step.mnemonic == "frame.reset" for cleanup in cleanup_nodes for step in cleanup.steps
     )
     assert any(
         isinstance(node, (IRAsciiHeader, IRLiteralChunk)) for node in ir_block.nodes
@@ -1072,7 +1072,7 @@ def test_ascii_bridge_with_side_effect_operand_remains_raw() -> None:
 
     assert metrics.raw_remaining == 0
     cleanup = next(node for node in ir_block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_AA_00"]
+    assert [step.mnemonic for step in cleanup.steps] == ["io.step"]
 
 
 def test_stack_neutral_bridge_rejects_edge_positions() -> None:
@@ -1217,7 +1217,7 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
     ]
     assert len(tail_nodes) == 1
     tail_node = tail_nodes[0]
-    assert [step.mnemonic for step in tail_node.cleanup] == ["op_10_84", "op_3D_30"]
+    assert [step.mnemonic for step in tail_node.cleanup] == ["frame.reset", "io.step"]
 
     cleanup_nodes = [
         node
@@ -1227,7 +1227,7 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
         if isinstance(node, IRCallCleanup)
     ]
     assert cleanup_nodes
-    assert cleanup_nodes[0].steps and cleanup_nodes[0].steps[0].mnemonic == "op_3D_30"
+    assert cleanup_nodes[0].steps and cleanup_nodes[0].steps[0].mnemonic == "io.step"
 
     return_nodes = [
         node
@@ -1237,7 +1237,7 @@ def test_normalizer_handles_extended_io_variants(tmp_path: Path) -> None:
         if isinstance(node, IRReturn)
     ]
     assert return_nodes
-    assert [step.mnemonic for step in return_nodes[0].cleanup] == ["op_0C_09", "op_10_50"]
+    assert [step.mnemonic for step in return_nodes[0].cleanup] == ["frame.reset", "frame.reset"]
 def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -1259,10 +1259,10 @@ def test_normalizer_handles_mirrored_io_bridges(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_64_10"]
+    assert [step.mnemonic for step in cleanup.steps] == ["io.step", "io.step"]
 
     ret = next(node for node in block.nodes if isinstance(node, IRReturn))
-    assert [step.mnemonic for step in ret.cleanup] == ["op_F0_E8", "op_3D_30"]
+    assert [step.mnemonic for step in ret.cleanup] == ["frame.reset"]
 
     raw_mnemonics = {
         node.mnemonic for node in block.nodes if isinstance(node, IRRaw)
@@ -1292,7 +1292,7 @@ def test_call_signature_consumes_io_write_helpers(tmp_path: Path) -> None:
 
     ret = next(node for node in block.nodes if isinstance(node, IRReturn))
     cleanup_mnemonics = [step.mnemonic for step in ret.cleanup]
-    assert cleanup_mnemonics == ["op_D0_04", "call_helpers", "op_D0_06"]
+    assert cleanup_mnemonics == ["frame.reset", "call_helpers", "frame.reset"]
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D0_04", "op_D0_06"}
         for node in block.nodes
@@ -1315,7 +1315,7 @@ def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     assert len(block.nodes) == 1
     node = block.nodes[0]
     assert isinstance(node, IRCallCleanup)
-    assert [step.mnemonic for step in node.steps] == ["op_29_10"]
+    assert [step.mnemonic for step in node.steps] == ["frame.return_mask"]
     assert node.steps[0].operand == RET_MASK
 
 
@@ -1346,7 +1346,7 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert [step.mnemonic for step in call_return.cleanup] == [
         "call_helpers",
         "op_32_29",
-        "op_29_10",
+        "frame.return_mask",
         "stack_teardown",
     ]
     assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
@@ -1947,8 +1947,10 @@ def test_normalizer_collapses_f0_tailcall(tmp_path: Path) -> None:
 
     tail_node = next(node for node in block.nodes if isinstance(node, IRTailCall))
     cleanup_mnemonics = [step.mnemonic for step in tail_node.cleanup]
-    assert cleanup_mnemonics == ["op_F0_4B", "op_29_10"]
-    assert any(step.operand == RET_MASK for step in tail_node.cleanup if step.mnemonic == "op_29_10")
+    assert cleanup_mnemonics == ["op_F0_4B", "frame.return_mask"]
+    assert any(
+        step.operand == RET_MASK for step in tail_node.cleanup if step.mnemonic == "frame.return_mask"
+    )
     assert any(step.mnemonic == "op_F0_4B" for step in tail_node.cleanup)
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic == "op_F0_4B" for node in block.nodes
@@ -2004,7 +2006,7 @@ def test_normalizer_collapses_extended_tail_helpers(target: int) -> None:
         cleanup_mask = call_node.cleanup_mask
 
     mnemonics = {step.mnemonic for step in cleanup}
-    assert {"op_10_0E", "op_5E_29", "op_64_20"}.issubset(mnemonics)
+    assert {"frame.reset", "frame.return_mask"}.issubset(mnemonics)
     assert cleanup_mask in (None, RET_MASK)
 
     lingering = {
@@ -2090,7 +2092,7 @@ def test_normalizer_handles_io_mask_write(tmp_path: Path) -> None:
     block = program.segments[0].blocks[0]
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_3D_30"]
+    assert [step.mnemonic for step in cleanup.steps] == ["io.step"]
 
     io_write = next(node for node in block.nodes if isinstance(node, IRIOWrite))
     assert io_write.mask == 0x00FF
@@ -2389,7 +2391,8 @@ def test_normalizer_collapses_adaptive_unknown_tables() -> None:
     assert len(node.operations) == len(words)
     assert node.annotations[0] == "adaptive_table"
     assert f"mode=0x{words[0].mode:02X}" in node.annotations
-    assert any(note == "kind=unknown" for note in node.annotations)
+    assert any(note == "kind=table_patch" for note in node.annotations)
+    assert any(note.startswith("ops=") for note in node.annotations)
 
 
 def test_normalizer_builds_table_pipeline_nodes() -> None:
@@ -2516,7 +2519,7 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
     assert any(page.register == 0x06C8 for page in page_nodes)
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))
-    assert [step.mnemonic for step in cleanup.steps] == ["op_D4_06", "op_3D_30"]
+    assert [step.mnemonic for step in cleanup.steps] == ["frame.reset", "io.step"]
     assert not any(
         isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
         for node in block.nodes

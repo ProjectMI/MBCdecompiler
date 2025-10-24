@@ -3016,10 +3016,23 @@ class ASTBuilder:
                 len(call_expr.operands),
             )
             abi = self._build_call_abi(node, operands)
+            for index, name in enumerate(node.returns):
+                if not name:
+                    continue
+                current = value_state.get(name)
+                if isinstance(current, ASTUnknown):
+                    current = None
+                elif isinstance(current, ASTIdentifier) and current.name == name:
+                    current = None
+                if current is None:
+                    value_state[name] = ASTCallResult(call_expr, index)
             epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             resolved_returns = tuple(
                 self._canonicalise_return_expr(
-                    index, self._resolve_expr(name, value_state)
+                    index,
+                    self._resolve_tail_return_expr(
+                        name, index, call_expr, value_state
+                    ),
                 )
                 for index, name in enumerate(node.returns)
             )
@@ -3600,6 +3613,21 @@ class ASTBuilder:
         kind = self._infer_kind(name)
         canonical = self._canonical_placeholder_name(name, index, kind)
         return ASTIdentifier(canonical, kind)
+
+    def _resolve_tail_return_expr(
+        self,
+        name: str,
+        index: int,
+        call: ASTCallExpr,
+        value_state: Mapping[str, ASTExpression],
+    ) -> ASTExpression:
+        expr = self._resolve_expr(name, value_state)
+        if isinstance(expr, ASTUnknown):
+            return ASTCallResult(call, index)
+        if isinstance(expr, ASTIdentifier):
+            if expr.name == name and name not in value_state:
+                return ASTCallResult(call, index)
+        return expr
 
     def _canonicalise_return_expr(
         self, index: int, expr: ASTExpression

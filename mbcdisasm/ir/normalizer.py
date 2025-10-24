@@ -2859,7 +2859,8 @@ class IRNormalizer:
         if len(operations) < self._ADAPTIVE_TABLE_MIN_RUN:
             return None
 
-        return start, scan, tuple(operations), tuple(annotations)
+        summary = self._summarise_table_patch(operations, annotations)
+        return start, scan, tuple(operations), summary
 
     def _is_adaptive_table_seed(self, item: Union[RawInstruction, IRNode]) -> bool:
         if not isinstance(item, RawInstruction):
@@ -2935,7 +2936,12 @@ class IRNormalizer:
                         continue
                 break
 
-            items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
+            annotations = self._summarise_table_patch(operations)
+            items.replace_slice(
+                index,
+                scan,
+                [IRTablePatch(operations=tuple(operations), annotations=annotations)],
+            )
             index += 1
 
     def _pass_table_dispatch(self, items: _ItemList) -> None:
@@ -2964,6 +2970,85 @@ class IRNormalizer:
             )
             items.replace_slice(index, index + 1, [dispatch])
             index += 1
+
+    def _summarise_table_patch(
+        self,
+        operations: Sequence[Tuple[str, int]],
+        base_annotations: Sequence[str] = (),
+    ) -> Tuple[str, ...]:
+        annotations = list(base_annotations)
+        entries: List[str] = []
+        extras: List[str] = []
+        default_target: Optional[int] = None
+
+        for mnemonic, operand in operations:
+            if mnemonic.startswith("op_2C_"):
+                suffix = mnemonic.split("_")[-1]
+                try:
+                    key = int(suffix, 16)
+                except ValueError:
+                    key = None
+                target = operand & 0xFFFF
+                target_desc = self._format_table_target(target)
+                if key is not None:
+                    entries.append(f"0x{key:02X}->{target_desc}")
+                else:
+                    entries.append(target_desc)
+                continue
+            if mnemonic == "fanout":
+                default_target = operand & 0xFFFF
+                continue
+            extras.append(self._format_table_operation(mnemonic, operand))
+
+        inferred_kind: Optional[str]
+        if entries:
+            inferred_kind = "dispatch"
+        elif extras and all(item.startswith("stack_teardown") for item in extras):
+            inferred_kind = "cleanup"
+        elif extras:
+            inferred_kind = "table_patch"
+        elif default_target is not None:
+            inferred_kind = "dispatch"
+        else:
+            inferred_kind = "table_patch"
+
+        annotations = self._update_annotation(annotations, "kind", inferred_kind)
+        if entries:
+            annotations.append(f"entries=[{', '.join(entries)}]")
+        if default_target is not None:
+            annotations.append(f"default={self._format_table_target(default_target)}")
+        if extras:
+            annotations.append(f"ops=[{', '.join(extras)}]")
+        return tuple(annotations)
+
+    @staticmethod
+    def _format_table_operation(mnemonic: str, operand: int) -> str:
+        return f"{mnemonic}(0x{operand:04X})"
+
+    def _format_table_target(self, target: int) -> str:
+        symbol = self.knowledge.lookup_address(target)
+        if symbol:
+            return f"{symbol}(0x{target:04X})"
+        return f"0x{target:04X}"
+
+    @staticmethod
+    def _update_annotation(
+        annotations: Sequence[str], key: str, value: Optional[str]
+    ) -> List[str]:
+        if value is None:
+            return list(annotations)
+        prefix = f"{key}="
+        updated: List[str] = []
+        replaced = False
+        for note in annotations:
+            if note.startswith(prefix) and not replaced:
+                updated.append(f"{prefix}{value}")
+                replaced = True
+            else:
+                updated.append(note)
+        if not replaced:
+            updated.append(f"{prefix}{value}")
+        return updated
 
     def _pass_dispatch_wrappers(self, items: _ItemList) -> None:
         index = 0
@@ -5412,6 +5497,7 @@ class IRNormalizer:
             alias = self._helper_symbol(operand)
         else:
             alias = instruction.profile.operand_alias()
+        mnemonic = self._normalise_cleanup_mnemonic(mnemonic, operand, alias)
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
@@ -5419,6 +5505,46 @@ class IRNormalizer:
             operand_role=instruction.profile.operand_role(),
             operand_alias=alias,
         )
+
+    def _normalise_cleanup_mnemonic(
+        self, mnemonic: str, operand: int, alias: Optional[str]
+    ) -> str:
+        base = mnemonic
+        if base in {"stack_teardown", "call_helpers", "fanout", "page_register"}:
+            return base
+        if base.startswith("stack_teardown"):
+            return "stack_teardown"
+        alias_text = (str(alias).strip().lower() if alias else "")
+        operand_alias = OPERAND_ALIASES.get(operand)
+        if operand_alias and not alias_text:
+            alias_text = operand_alias.lower()
+        if alias_text in {"ret_mask", "retmask"} or operand == RET_MASK:
+            return "frame.return_mask"
+        if alias_text in {"fanout_flags", "fanout_flags_a", "fanout_flags_b"}:
+            return "frame.return_mask"
+        if alias_text == IO_PORT_NAME.lower():
+            return "io.step"
+        if alias_text.startswith("io."):
+            return "io.step"
+        if alias_text.startswith("fmt.") or alias_text.startswith("text."):
+            return "helpers.format"
+        if alias_text.startswith("page.") or operand == PAGE_REGISTER:
+            return "frame.page_select"
+        if alias_text.startswith("scheduler."):
+            return "frame.scheduler"
+        if alias_text.startswith("frame.protocol"):
+            return "frame.protocol"
+        if alias_text.startswith("frame."):
+            return "frame.write"
+        if alias_text.startswith("cleanup"):
+            return "frame.cleanup"
+        if alias_text.startswith("mask"):
+            return "frame.return_mask"
+        if alias_text and alias_text.endswith(".reset"):
+            return "frame.reset"
+        if operand == 0:
+            return "frame.reset"
+        return base
 
     @staticmethod
     def _coalesce_epilogue_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:
