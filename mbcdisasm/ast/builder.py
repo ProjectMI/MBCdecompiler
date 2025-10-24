@@ -685,7 +685,9 @@ class ASTBuilder:
                 if existing is None:
                     canonical[key] = procedure
                     canonical_origin[key] = alias_entry
-                    alias_set = {(alias.segment, alias.offset) for alias in procedure.aliases}
+                    alias_set = {
+                        (alias.segment, alias.offset) for alias in procedure.aliases
+                    }
                     alias_set.add((alias_entry.segment, alias_entry.offset))
                     procedure.aliases = tuple(
                         sorted(
@@ -696,36 +698,26 @@ class ASTBuilder:
                             key=lambda entry: (entry.segment, entry.offset),
                         )
                     )
-                else:
-                    origin = canonical_origin[key]
-                    combined = {(alias.segment, alias.offset) for alias in existing.aliases}
-                    combined.add((origin.segment, origin.offset))
-                    combined.add((segment.index, procedure.entry_offset))
-                    for alias in procedure.aliases:
-                        combined.add((alias.segment, alias.offset))
-                    existing.aliases = tuple(
-                        sorted(
-                            (
-                                ASTProcedureAlias(segment=seg, offset=off)
-                                for seg, off in combined
-                            ),
-                            key=lambda entry: (entry.segment, entry.offset),
-                        )
+                    updated_procs.append(procedure)
+                    continue
+
+                origin = canonical_origin[key]
+                combined = {
+                    (alias.segment, alias.offset) for alias in existing.aliases
+                }
+                combined.add((origin.segment, origin.offset))
+                combined.add((segment.index, procedure.entry_offset))
+                for alias in procedure.aliases:
+                    combined.add((alias.segment, alias.offset))
+                existing.aliases = tuple(
+                    sorted(
+                        (
+                            ASTProcedureAlias(segment=seg, offset=off)
+                            for seg, off in combined
+                        ),
+                        key=lambda entry: (entry.segment, entry.offset),
                     )
-                    duplicate_aliases = {
-                        (origin.segment, origin.offset),
-                        (segment.index, procedure.entry_offset),
-                    }
-                    procedure.aliases = tuple(
-                        sorted(
-                            (
-                                ASTProcedureAlias(segment=seg, offset=off)
-                                for seg, off in duplicate_aliases
-                            ),
-                            key=lambda entry: (entry.segment, entry.offset),
-                        )
-                    )
-                updated_procs.append(procedure)
+                )
             updated_segments.append(replace(segment, procedures=tuple(updated_procs)))
         return updated_segments
 
@@ -1810,7 +1802,25 @@ class ASTBuilder:
                     continue
                 if successor in successor.successors:
                     continue
-                block.statements = tuple(block.statements + successor.statements)
+                statements = list(block.statements)
+                if not statements:
+                    continue
+                terminator = statements[-1]
+                if not isinstance(terminator, ASTJump):
+                    continue
+                targets_successor = False
+                if terminator.target is successor:
+                    targets_successor = True
+                elif (
+                    terminator.target is None
+                    and terminator.target_offset == successor.start_offset
+                ):
+                    targets_successor = True
+                if not targets_successor:
+                    continue
+                statements.pop()
+                statements.extend(successor.statements)
+                block.statements = tuple(statements)
                 block.successors = successor.successors
                 for succ in successor.successors:
                     succ_key = id(succ)

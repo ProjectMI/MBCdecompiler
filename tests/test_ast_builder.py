@@ -19,6 +19,7 @@ from mbcdisasm.ast import (
     ASTIOEffect,
     ASTIntegerLiteral,
     ASTImmediateOperand,
+    ASTJump,
     ASTMemoryRead,
     ASTReturn,
     ASTSwitch,
@@ -35,6 +36,7 @@ from mbcdisasm.ir.model import (
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
+    IRIOWrite,
     IRLoad,
     IRProgram,
     IRReturn,
@@ -698,14 +700,19 @@ def test_ast_builder_deduplicates_enums_across_segments() -> None:
     builder = ASTBuilder()
     ast_program = builder.build(program)
 
-    first_switch = ast_program.segments[0].procedures[0].blocks[0].statements[0]
-    second_switch = ast_program.segments[1].procedures[0].blocks[0].statements[0]
+    primary_segment, secondary_segment = ast_program.segments
+    assert primary_segment.procedures
+    assert not secondary_segment.procedures
+    first_switch = primary_segment.procedures[0].blocks[0].statements[0]
     assert isinstance(first_switch, ASTSwitch)
-    assert isinstance(second_switch, ASTSwitch)
     assert first_switch.enum_name == "Helper7000"
-    assert second_switch.enum_name == "Helper7000"
-    assert ast_program.segments[0].enums and ast_program.segments[0].enums[0] is ast_program.enums[0]
-    assert not ast_program.segments[1].enums
+    aliases = {
+        (alias.segment, alias.offset)
+        for alias in primary_segment.procedures[0].aliases
+    }
+    assert aliases == {(0, 0x0100), (1, 0x0200)}
+    assert primary_segment.enums and primary_segment.enums[0] is ast_program.enums[0]
+    assert not secondary_segment.enums
     assert len(ast_program.enums) == 1
 
 
@@ -1079,3 +1086,75 @@ def test_banked_memory_locations_are_canonical() -> None:
     assert "base=0x0040" in rendered
     assert "offset=0x0010" in rendered
     assert "alias=region(bank_1230)" in rendered
+
+
+def test_identical_procedures_are_deduplicated() -> None:
+    block_a = IRBlock(
+        label="block_a",
+        start_offset=0x0100,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    block_b = IRBlock(
+        label="block_b",
+        start_offset=0x0200,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment_a = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x10,
+        blocks=(block_a,),
+        metrics=NormalizerMetrics(),
+    )
+    segment_b = IRSegment(
+        index=1,
+        start=0x0200,
+        length=0x10,
+        blocks=(block_b,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment_a, segment_b), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    first_segment, second_segment = ast_program.segments
+    assert len(first_segment.procedures) == 1
+    assert not second_segment.procedures
+    aliases = {
+        (alias.segment, alias.offset)
+        for alias in first_segment.procedures[0].aliases
+    }
+    assert aliases == {(0, 0x0100), (1, 0x0200)}
+
+
+def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
+    block_entry = IRBlock(
+        label="block_entry",
+        start_offset=0x0100,
+        nodes=(
+            IRIOWrite(mask=0xFFFF),
+        ),
+    )
+    block_return = IRBlock(
+        label="block_return",
+        start_offset=0x0110,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x20,
+        blocks=(block_entry, block_return),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedure = ast_program.segments[0].procedures[0]
+    assert len(procedure.blocks) == 1
+    block = procedure.blocks[0]
+    assert procedure.successor_map[block.label] == tuple()
+    assert all(not isinstance(stmt, ASTJump) for stmt in block.statements[:-1])
