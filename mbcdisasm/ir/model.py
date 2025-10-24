@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from ..constants import IO_PORT_NAME, OPERAND_ALIASES
 
@@ -95,6 +95,82 @@ def _render_ascii(data: bytes) -> str:
         else:
             printable.append(f"\\x{byte:02x}")
     return "".join(printable)
+
+
+_MNEMONIC_ALIASES: Dict[str, str] = {
+    "op_08_00": "helpers.dispatch",
+    "op_0B_00": "io.handshake",
+    "op_0B_E1": "io.handshake",
+    "op_10_08": "io.step",
+    "op_10_0A": "io.step",
+    "op_10_0E": "io.step",
+    "op_10_18": "io.step",
+    "op_10_3C": "io.step",
+    "op_10_69": "io.step",
+    "op_10_C5": "io.step",
+    "op_10_CC": "io.step",
+    "op_10_CD": "io.step",
+    "op_10_E3": "io.step",
+    "op_10_E5": "io.step",
+    "op_15_4A": "io.step",
+    "op_18_2A": "io.step",
+    "op_20_8C": "io.step",
+    "op_21_94": "io.step",
+    "op_21_AC": "io.step",
+    "op_28_6C": "io.step",
+    "op_29_10": "frame.mask",
+    "op_31_52": "frame.mask",
+    "op_32_29": "frame.mask",
+    "op_3A_01": "io.bridge",
+    "op_3E_4B": "io.bridge",
+    "op_4B_0B": "frame.mask",
+    "op_4B_45": "frame.mask",
+    "op_4B_CC": "frame.mask",
+    "op_4F_01": "frame.mask",
+    "op_4F_02": "frame.mask",
+    "op_4F_03": "frame.mask",
+    "op_52_05": "frame.mask",
+    "op_52_06": "io.handshake",
+    "op_5E_29": "frame.mask",
+    "op_6C_01": "frame.page_select",
+    "op_70_29": "frame.mask",
+    "op_72_23": "helpers.wrapper",
+    "op_72_4A": "frame.mask",
+    "op_76_41": "io.bridge",
+    "op_78_00": "io.step",
+    "op_89_01": "io.step",
+    "op_A0_03": "io.step",
+    "op_C0_00": "io.step",
+    "op_C3_01": "io.step",
+    "op_E1_4D": "io.bridge",
+    "op_E8_4B": "io.bridge",
+    "op_ED_4B": "io.bridge",
+    "op_F0_4B": "io.bridge",
+}
+
+
+def _format_mnemonic(mnemonic: str) -> str:
+    """Convert low-level mnemonic tokens into a readable presentation."""
+
+    alias = _MNEMONIC_ALIASES.get(mnemonic)
+    if alias is not None:
+        return alias
+    if mnemonic.startswith("stack_teardown_"):
+        return "stack.teardown"
+    if mnemonic.startswith("stack_shuffle"):
+        return mnemonic.replace("_", ".")
+    if mnemonic.startswith("op_"):
+        parts = mnemonic.split("_")
+        if len(parts) >= 3:
+            opcode, mode = parts[1], parts[2]
+            if len(opcode) == 2 and len(mode) == 2:
+                try:
+                    return f"instr[{int(opcode, 16):02X}:{int(mode, 16):02X}]"
+                except ValueError:
+                    pass
+            return f"instr[{opcode}:{mode}]"
+        return mnemonic.replace("op_", "instr[") + "]"
+    return mnemonic
 
 
 @dataclass(frozen=True)
@@ -273,10 +349,11 @@ class IRStackEffect:
                 details.append(f"{self.operand_role}={value}")
             else:
                 details.append(f"operand={value}")
+        name = _format_mnemonic(self.mnemonic)
         if not details:
-            return self.mnemonic
+            return name
         inner = ", ".join(details)
-        return f"{self.mnemonic}({inner})"
+        return f"{name}({inner})"
 
 
 @dataclass(frozen=True)
@@ -384,9 +461,10 @@ class IRDataMarker(IRNode):
     operand: int = 0
 
     def describe(self) -> str:
+        name = _format_mnemonic(self.mnemonic)
         if self.operand:
-            return f"marker {self.mnemonic}(operand=0x{self.operand:04X})"
-        return f"marker {self.mnemonic}"
+            return f"marker {name}(operand=0x{self.operand:04X})"
+        return f"marker {name}"
 
 
 @dataclass(frozen=True)
@@ -751,7 +829,10 @@ class IRCallPreparation(IRNode):
     steps: Tuple[Tuple[str, int], ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(
+            f"{_format_mnemonic(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.steps
+        )
         return f"prep_call_args[{rendered}]"
 
 
@@ -778,7 +859,10 @@ class IRTailcallFrame(IRNode):
     steps: Tuple[Tuple[str, int], ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(
+            f"{_format_mnemonic(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.steps
+        )
         return f"prep_tailcall[{rendered}]"
 
 
@@ -790,7 +874,10 @@ class IRTablePatch(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        rendered = ", ".join(
+            f"{_format_mnemonic(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.operations
+        )
         note = f"table_patch[{rendered}]"
         if self.annotations:
             note += " " + ", ".join(self.annotations)
@@ -872,7 +959,10 @@ class IRTableBuilderBegin(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        ops = ", ".join(
+            f"{_format_mnemonic(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.prologue
+        )
         details = f"mode=0x{self.mode:02X}"
         if ops:
             details += f" prologue=[{ops}]"
@@ -892,7 +982,10 @@ class IRTableBuilderEmit(IRNode):
     parameters: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        ops = ", ".join(
+            f"{_format_mnemonic(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.operations
+        )
         details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
         if self.parameters:
             params = ", ".join(self.parameters)
@@ -1133,7 +1226,8 @@ class IRConditionMask(IRNode):
 
     def describe(self) -> str:
         mask_repr = _format_operand(self.mask)
-        return f"condition_mask source={self.source} mask={mask_repr}"
+        source = _format_mnemonic(self.source)
+        return f"condition_mask source={source} mask={mask_repr}"
 
 
 @dataclass(frozen=True)
