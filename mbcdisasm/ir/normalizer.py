@@ -1510,7 +1510,8 @@ class IRNormalizer:
 
             mnemonic = item.mnemonic
             if mnemonic in {"call_dispatch", "tailcall_dispatch"}:
-                args, start = self._collect_call_arguments(items, index)
+                args, consumed = self._collect_call_arguments(items, index)
+                start = consumed[0] if consumed else index
                 target = item.operand
                 symbol = self._helper_symbol(target)
                 if mnemonic == "tailcall_dispatch":
@@ -1531,6 +1532,8 @@ class IRNormalizer:
                                 source = getattr(prior, "source", "")
                                 if source in {"op_00_52", "push_literal"} or prior.value == 0:
                                     start = literal_index
+                        if inline_target is not None:
+                            args = []
                 call = IRCall(
                     target=target,
                     args=tuple(args),
@@ -1540,8 +1543,13 @@ class IRNormalizer:
                 metrics.calls += 1
                 if call.tail:
                     metrics.tail_calls += 1
-                items.replace_slice(start, index + 1, [call])
-                index = start
+                items.replace_slice(index, index + 1, [call])
+                for pos in reversed(consumed):
+                    if pos < index:
+                        items.pop(pos)
+                        index -= 1
+                    else:
+                        items.pop(pos)
                 if call.tail:
                     self._collapse_tail_return(items, index, metrics)
                 continue
@@ -1653,32 +1661,41 @@ class IRNormalizer:
 
     def _collect_call_arguments(
         self, items: _ItemList, call_index: int
-    ) -> Tuple[List[str], int]:
+    ) -> Tuple[List[str], List[int]]:
         args: List[str] = []
-        start = call_index
         scan = call_index - 1
+        consumed: List[int] = []
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
                 name = self._ssa_value(candidate)
                 args.append(name or candidate.describe())
+                consumed.append(scan)
                 scan -= 1
                 continue
             if isinstance(candidate, IRStackDuplicate):
                 args.append(candidate.value)
+                consumed.append(scan)
                 scan -= 1
                 continue
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
                     args.append(self._describe_value(candidate))
+                    consumed.append(scan)
+                    scan -= 1
+                    continue
+                if (
+                    self._is_call_preparation_instruction(candidate)
+                    or candidate.mnemonic in CALL_PREPARATION_PREFIXES
+                ):
                     scan -= 1
                     continue
                 break
             else:
                 break
         args.reverse()
-        start = scan + 1
-        return args, start
+        consumed.sort()
+        return args, consumed
 
     def _extract_tail_dispatch_target(
         self, items: _ItemList, call_index: int

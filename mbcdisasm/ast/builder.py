@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
@@ -38,6 +38,7 @@ from ..ir.model import (
     IRReturn,
     IRSegment,
     IRStore,
+    IRTablePatch,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -3017,6 +3018,9 @@ class ASTBuilder:
             )
             abi = self._build_call_abi(node, operands)
             epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
+            for index, name in enumerate(node.returns):
+                value_state[name] = ASTCallResult(call_expr, index)
+                metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
             resolved_returns = tuple(
                 self._canonicalise_return_expr(
                     index, self._resolve_expr(name, value_state)
@@ -3037,10 +3041,15 @@ class ASTBuilder:
             effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             return [ASTReturn(payload=payload, effects=effects)], []
         if isinstance(node, IRCallCleanup):
+            summary = self._cleanup_summary(node)
+            if summary:
+                self._register_expression(node.describe(), summary)
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
             else:
                 self._pending_epilogue.extend(node.steps)
+            if summary:
+                return [ASTComment(summary.render())], []
             return [], []
         if isinstance(node, IRTerminator):
             return [], []
@@ -3117,6 +3126,11 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRTablePatch):
+            comment = self._format_table_patch(node)
+            summary_expr = ASTIdentifier(comment, SSAValueKind.UNKNOWN)
+            self._register_expression(node.describe(), summary_expr)
+            return [ASTComment(comment)], []
         describe = getattr(node, "describe", None)
         if callable(describe):
             text = describe()
@@ -3543,8 +3557,8 @@ class ASTBuilder:
                 deficit = slot_count - len(values)
                 start = len(values)
                 for index in range(start, start + deficit):
-                    placeholder = ASTValueOperand(
-                        token=f"slot_{index}", value=ASTUnknown(f"slot_{index}")
+                    placeholder = ASTStackOperand(
+                        token=f"slot_{index}", label=f"slot_{index}", value_kind=SSAValueKind.UNKNOWN
                     )
                     values.append(placeholder)
             for index in range(slot_count):
@@ -3787,6 +3801,17 @@ class ASTBuilder:
             return ASTValueOperand("", ASTUnknown(""))
         if token == "stack_top":
             return ASTStackOperand(token=token, label="stack_top")
+        if token.startswith("slot_"):
+            suffix = token[5:]
+            if suffix:
+                for base in (16, 10):
+                    try:
+                        int(suffix, base)
+                    except ValueError:
+                        continue
+                    else:
+                        return ASTStackOperand(token=token, label=token)
+                # Treat unknown suffixes as opaque identifiers.
         if token.startswith("slot(") and token.endswith(")"):
             try:
                 index = int(token[5:-1], 16)
@@ -3919,6 +3944,157 @@ class ASTBuilder:
             seen.add(target)
             target = redirects[target]
         return target
+
+    def _format_table_patch(self, table: IRTablePatch) -> str:
+        annotations = list(table.annotations)
+        base_type = "table_patch"
+        if "adaptive_table" in annotations:
+            base_type = "adaptive_table"
+            annotations.remove("adaptive_table")
+        elif "opcode_table" in annotations:
+            base_type = "opcode_table"
+            annotations.remove("opcode_table")
+        mode: Optional[str] = None
+        kind: Optional[str] = None
+        extras: List[str] = []
+        for note in annotations:
+            if note.startswith("mode="):
+                mode = note.split("=", 1)[1]
+                continue
+            if note.startswith("kind="):
+                kind_value = note.split("=", 1)[1]
+                if kind_value != "unknown":
+                    kind = kind_value
+                continue
+            extras.append(note)
+        operations_kind, op_summaries = self._summarise_table_operations(table.operations)
+        if kind is None:
+            if operations_kind is not None:
+                kind = operations_kind
+            elif base_type != "table_patch":
+                kind = base_type
+        parts = [f"type={base_type}"]
+        if mode:
+            parts.append(f"mode={mode}")
+        if kind:
+            parts.append(f"kind={kind}")
+        parts.append(f"entries={len(table.operations)}")
+        parts.extend(op_summaries)
+        if extras:
+            parts.append("extras=" + ",".join(extras))
+        return "table_patch{" + ", ".join(parts) + "}"
+
+    def _summarise_table_operations(
+        self, operations: Sequence[Tuple[str, int]]
+    ) -> Tuple[Optional[str], List[str]]:
+        cases: List[str] = []
+        default_target: Optional[int] = None
+        counts: Counter[str] = Counter()
+        for mnemonic, operand in operations:
+            if mnemonic == "fanout":
+                default_target = operand & 0xFFFF
+                continue
+            if mnemonic.startswith("op_2C_"):
+                suffix = mnemonic.split("_")[-1]
+                try:
+                    key = int(suffix, 16)
+                except ValueError:
+                    key = None
+                target = operand & 0xFFFF
+                if key is not None:
+                    cases.append(f"0x{key:02X}->0x{target:04X}")
+                else:
+                    cases.append(f"->0x{target:04X}")
+                continue
+            label = self._table_operation_label(mnemonic, operand)
+            counts[label] += 1
+        summaries: List[str] = []
+        derived_kind: Optional[str] = None
+        if cases:
+            derived_kind = "dispatch"
+            display = ", ".join(cases[:5])
+            if len(cases) > 5:
+                display += ", …"
+            summaries.append(f"cases=[{display}]")
+        if default_target is not None:
+            derived_kind = derived_kind or "dispatch"
+            summaries.append(f"default=0x{default_target:04X}")
+        if counts:
+            entries = [
+                f"{label}×{count}" if count > 1 else label
+                for label, count in sorted(counts.items())
+            ]
+            summaries.append("ops=" + ", ".join(entries))
+        return derived_kind, summaries
+
+    def _table_operation_label(self, mnemonic: str, operand: int) -> str:
+        if mnemonic == "reduce_pair":
+            return "reduce.pair"
+        if mnemonic.startswith("call_") or mnemonic.startswith("helper_"):
+            return mnemonic.replace("_", ".")
+        if mnemonic.startswith("stack_"):
+            return mnemonic.replace("_", ".")
+        if mnemonic.startswith("op_"):
+            opcode = self._mnemonic_opcode(mnemonic)
+            label = f"opcode[0x{opcode:02X}]" if opcode is not None else "opcode"
+            if opcode is not None:
+                parts = mnemonic.split("_")[2:]
+            else:
+                parts = mnemonic.split("_")[1:]
+            if parts:
+                label += "." + ".".join(parts)
+            return label
+        return mnemonic.replace("_", ".")
+
+    def _cleanup_summary(self, cleanup: IRCallCleanup) -> Optional[ASTExpression]:
+        rendered: List[str] = []
+        for step in cleanup.steps:
+            effects = self._effects_from_call_step(step)
+            if effects:
+                rendered.extend(effect.render() for effect in effects)
+                continue
+            fallback = self._cleanup_effect_label(step)
+            if fallback:
+                rendered.append(fallback)
+        if cleanup.pops:
+            rendered.append(f"stack.drop({cleanup.pops})")
+        if not rendered:
+            return None
+        counts = Counter(rendered)
+        seen: Set[str] = set()
+        summary_parts: List[str] = []
+        for entry in rendered:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            count = counts[entry]
+            summary_parts.append(f"{entry}×{count}" if count > 1 else entry)
+        label = "cleanup_call{" + ", ".join(summary_parts) + "}"
+        return ASTIdentifier(label, SSAValueKind.UNKNOWN)
+
+    def _cleanup_effect_label(self, step: IRStackEffect) -> str:
+        alias = str(step.operand_alias) if step.operand_alias is not None else None
+        operand = self._stack_effect_operand(step)
+        kind = self._classify_frame_effect_kind(step, operand, alias)
+        effect = self._effect_from_kind(kind, operand, alias, pops=step.pops)
+        if effect:
+            return effect.render()
+        opcode = self._mnemonic_opcode(step.mnemonic)
+        if opcode is not None:
+            label = f"opcode[0x{opcode:02X}]"
+            if alias:
+                label += f"({alias})"
+            elif operand:
+                label += f"(0x{operand & 0xFFFF:04X})"
+            return label
+        label = step.mnemonic.replace("_", ".")
+        if alias:
+            label += f"({alias})"
+        elif operand and step.mnemonic != "stack_teardown":
+            label += f"(0x{operand & 0xFFFF:04X})"
+        if step.pops:
+            label += f" pops={step.pops}"
+        return label
 
     @staticmethod
     def _is_hex_literal(value: str) -> bool:
