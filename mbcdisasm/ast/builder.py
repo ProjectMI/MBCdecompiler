@@ -512,8 +512,6 @@ class _SignatureAccumulator:
             self.symbols.add(call.symbol)
         if call.varargs or payload_varargs:
             self.attributes.add("varargs")
-        if tail_call:
-            self.attributes.add("tail")
         self.calling_conventions.add("call")
         for index, operand in enumerate(call.operands):
             expr = operand.to_expression()
@@ -529,8 +527,6 @@ class _SignatureAccumulator:
             if name:
                 self.return_names[index].add(name)
         if abi is not None:
-            if abi.tail:
-                self.attributes.add("tail")
             for effect in abi.effects:
                 self.effects.add(effect.render())
 
@@ -2083,6 +2079,17 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
+        then_hint = getattr(statement, "then_hint", None)
+        else_hint = getattr(statement, "else_hint", None)
+        if (
+            then_hint == "fallthrough"
+            and else_hint == "fallthrough"
+            and getattr(statement, "then_branch", None) is None
+            and getattr(statement, "else_branch", None) is None
+        ):
+            if fallthrough is None:
+                return ASTJump(hint="fallthrough")
+            return ASTJump(target_offset=fallthrough, hint="fallthrough")
         if (
             then_target is not None
             and else_target is not None
@@ -2144,7 +2151,7 @@ class ASTBuilder:
             except ValueError:
                 return ("invalidate", None)
             return ("literal", value)
-        if body.startswith("marker "):
+        if body.startswith("marker ") or body.startswith("literal_marker"):
             return ("marker", None)
         return ("invalidate", None)
 
@@ -2152,7 +2159,7 @@ class ASTBuilder:
     def _is_noise_statement(statement: ASTStatement) -> bool:
         if isinstance(statement, ASTComment):
             body = statement.text.strip()
-            prefixes = ("lit(", "marker ", "literal_block", "ascii(")
+            prefixes = ("lit(", "marker ", "literal_marker", "literal_block", "ascii(")
             return body.startswith(prefixes)
         return False
 
@@ -2381,6 +2388,7 @@ class ASTBuilder:
             statements.extend(node_statements)
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
+        statements = self._expand_tail_calls(statements)
         terminator = self._ensure_block_terminator(analysis, statements, jump_links)
         if terminator is not None:
             statements.append(terminator)
@@ -2608,6 +2616,8 @@ class ASTBuilder:
             if dispatch.helper is not None
             else None
         )
+        if call_expr and call_expr.tail:
+            call_expr = replace(call_expr, tail=False)
         switch = ASTSwitch(
             call=call_expr,
             cases=cases,
@@ -3095,7 +3105,47 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+        comment = getattr(node, "describe", lambda: repr(node))()
+        return [ASTComment(self._sanitize_comment_text(comment))], []
+
+    def _expand_tail_calls(self, statements: List[ASTStatement]) -> List[ASTStatement]:
+        expanded: List[ASTStatement] = []
+        for statement in statements:
+            if isinstance(statement, ASTTailCall):
+                payload = statement.payload
+                if payload.varargs:
+                    expanded.append(statement)
+                    continue
+                values = payload.values
+                call_expr = statement.call
+                if call_expr.tail:
+                    call_expr = replace(call_expr, tail=False)
+                abi = self._strip_tail_flag(statement.abi)
+                return_targets: List[ASTIdentifier] = []
+                if abi and abi.returns:
+                    for index, slot in enumerate(abi.returns):
+                        if index < len(values) and isinstance(values[index], ASTIdentifier):
+                            return_targets.append(values[index])
+                        else:
+                            return_targets.append(ASTIdentifier(slot.name, slot.kind))
+                elif all(isinstance(value, ASTIdentifier) for value in values):
+                    return_targets = list(values)  # type: ignore[arg-type]
+                expanded.append(
+                    ASTCallStatement(
+                        call=call_expr,
+                        returns=tuple(return_targets),
+                        abi=abi,
+                    )
+                )
+                expanded.append(
+                    ASTReturn(
+                        payload=ASTReturnPayload(values=tuple(values), varargs=payload.varargs),
+                        effects=statement.effects,
+                    )
+                )
+                continue
+            expanded.append(statement)
+        return expanded
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
@@ -3264,6 +3314,22 @@ class ASTBuilder:
         return self._bitfield(value, canonical)
 
     @staticmethod
+    def _sanitize_comment_text(text: str) -> str:
+        if "literal_marker" not in text:
+            return text
+        updated = text.replace("marker literal_marker", "literal_marker")
+        if updated.endswith(" literal_marker"):
+            updated = updated[: -len(" literal_marker")]
+        updated = updated.replace(" literal_marker ", " ")
+        return updated.strip()
+
+    @staticmethod
+    def _normalise_marker_token(token: str) -> str:
+        if token.startswith("marker "):
+            return token.split(" ", 1)[1]
+        return token
+
+    @staticmethod
     def _strip_tail_flag(abi: Optional[ASTCallABI]) -> Optional[ASTCallABI]:
         if abi is None or not abi.tail:
             return abi
@@ -3299,6 +3365,8 @@ class ASTBuilder:
         alias: Optional[str], operand: Optional[int]
     ) -> Optional[str]:
         if alias:
+            if ASTBuilder._canonical_mask_alias(alias):
+                return None
             return str(alias)
         if operand is not None and operand in IO_SLOT_ALIASES:
             return IO_PORT_NAME
@@ -3531,7 +3599,7 @@ class ASTBuilder:
                 converted = self._effect_from_kind(spec.kind, spec.operand, alias)
             if converted:
                 effects.append(converted)
-        tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
+        tail_allowed = False
         if (
             not slots
             and not effects
@@ -3708,7 +3776,7 @@ class ASTBuilder:
             target=target,
             operands=operands,
             symbol=symbol,
-            tail=tail,
+            tail=False,
             varargs=varargs,
         )
         for token, operand in zip(args, operands):
@@ -3752,16 +3820,22 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        token = self._normalise_marker_token(token)
+        result: ASTExpression | None = None
         if token in value_state:
-            return value_state[token]
-        if token in self._call_arg_values:
-            return self._call_arg_values[token]
-        if token in self._expression_lookup:
-            return self._expression_lookup[token]
+            result = value_state[token]
+        elif token in self._call_arg_values:
+            result = self._call_arg_values[token]
+        elif token in self._expression_lookup:
+            result = self._expression_lookup[token]
         if " & " in token:
             head, mask = token.rsplit(" & ", 1)
             if self._is_hex_literal(mask.strip()):
-                return self._resolve_expr(head.strip(), value_state)
+                result = self._resolve_expr(head.strip(), value_state)
+        if result is not None:
+            if isinstance(result, ASTCallExpr) and result.tail:
+                result = replace(result, tail=False)
+            return result
         if token.startswith("lit(") and token.endswith(")"):
             literal = token[4:-1]
             try:
@@ -3776,8 +3850,14 @@ class ASTBuilder:
                 return ASTUnknown(token)
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
-            return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
-        return ASTIdentifier(token, self._infer_kind(token))
+            result: ASTExpression = ASTMemoryRead(
+                location=location, value_kind=SSAValueKind.POINTER
+            )
+        else:
+            result = ASTIdentifier(token, self._infer_kind(token))
+        if isinstance(result, ASTCallExpr) and result.tail:
+            result = replace(result, tail=False)
+        return result
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:

@@ -850,11 +850,13 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     ast_program = ASTBuilder().build(program)
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
-    tail_stmt = next(statement for statement in statements if isinstance(statement, ASTTailCall))
-    assert tail_stmt.abi is not None
-    assert isinstance(tail_stmt.abi, ASTCallABI)
+    call_stmt = next(statement for statement in statements if isinstance(statement, ASTCallStatement))
+    return_stmt = next(statement for statement in statements if isinstance(statement, ASTReturn))
+
+    assert call_stmt.abi is not None
+    assert isinstance(call_stmt.abi, ASTCallABI)
     protocol_effect = next(
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameProtocolEffect)
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameProtocolEffect)
     )
     assert protocol_effect.teardown == 2
     assert protocol_effect.drops == 1
@@ -862,13 +864,13 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert RET_MASK in mask_values
 
     frame_masks = [
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameMaskEffect)
     ]
     frame_teardowns = [
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameTeardownEffect)
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameTeardownEffect)
     ]
     frame_drops = [
-        effect for effect in tail_stmt.effects if isinstance(effect, ASTFrameDropEffect)
+        effect for effect in return_stmt.effects if isinstance(effect, ASTFrameDropEffect)
     ]
     assert any(effect.mask.value == RET_MASK for effect in frame_masks)
     assert any(effect.pops == protocol_effect.teardown for effect in frame_teardowns)
@@ -1035,7 +1037,7 @@ def test_symbol_table_records_call_attributes() -> None:
     signature = symbols[0x3D30]
     assert signature.name == "io.write"
     assert signature.calling_conventions == ("call",)
-    assert set(signature.attributes) == {"tail", "varargs"}
+    assert set(signature.attributes) == {"varargs"}
     assert signature.effects and signature.effects[0].startswith("io.write(")
     assert not signature.returns
     assert signature.arguments[0].name == "addr0"
@@ -1098,7 +1100,7 @@ def test_testset_branch_desugars_into_assignment() -> None:
     procedure = ast_program.segments[0].procedures[0]
     statements = procedure.blocks[0].statements
     assert isinstance(statements[0], ASTAssign)
-    assert isinstance(statements[1], ASTBranch)
+    assert isinstance(statements[1], (ASTBranch, ASTJump))
 
 
 def test_banked_memory_locations_are_canonical() -> None:
