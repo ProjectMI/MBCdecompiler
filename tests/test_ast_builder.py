@@ -1,9 +1,11 @@
+from dataclasses import replace
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import RET_MASK
 from mbcdisasm.ast import (
     ASTAssign,
+    ASTBlock,
     ASTBranch,
     ASTBuilder,
     ASTCallABI,
@@ -21,11 +23,23 @@ from mbcdisasm.ast import (
     ASTImmediateOperand,
     ASTJump,
     ASTMemoryRead,
-    ASTReturn,
-    ASTSwitch,
-    ASTTailCall,
+    ASTProcedure,
+    ASTProcedureResult,
     ASTProcedureResultKind,
+    ASTReturn,
+    ASTReturnPayload,
+    ASTSegment,
+    ASTSwitch,
+    ASTSymbolType,
     ASTSymbolTypeFamily,
+    ASTTailCall,
+)
+from mbcdisasm.ast.model import (
+    ASTEntryPoint,
+    ASTEntryReason,
+    ASTExitPoint,
+    ASTExitReason,
+    ASTProcedureResultSlot,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -905,6 +919,20 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
     assert drop_effects[0].pops == protocol_effect.drops
 
 
+def test_frame_protocol_render_omits_zero_fields() -> None:
+    effect = ASTFrameProtocolEffect(masks=tuple(), teardown=0, drops=0)
+    assert effect.render() == "frame.protocol(masks=[])"
+
+
+def test_io_effect_channel_uses_canonical_alias() -> None:
+    builder = ASTBuilder()
+    effect = builder._effect_from_kind("io.write", 0x6901, None)
+    assert isinstance(effect, ASTIOEffect)
+    assert effect.port == "ChatOut"
+    assert effect.mask is not None
+    assert effect.mask.render() == "mask[16]=ChatOut"
+
+
 def test_symbol_table_synthesises_call_signatures() -> None:
     block = IRBlock(
         label="block_entry",
@@ -1128,6 +1156,58 @@ def test_identical_procedures_are_deduplicated() -> None:
     assert aliases == {(0, 0x0100), (1, 0x0200)}
 
 
+
+
+def test_canonicalisation_merges_procedure_results() -> None:
+    block = ASTBlock(
+        label="block0",
+        start_offset=0,
+        body=tuple(),
+        terminator=ASTReturn(payload=ASTReturnPayload(values=tuple()), effects=tuple()),
+    )
+    entry = ASTEntryPoint(
+        label="block0",
+        offset=0,
+        reasons=(ASTEntryReason(kind="component"),),
+    )
+    exit_point = ASTExitPoint(
+        label="block0",
+        offset=0,
+        reasons=(ASTExitReason(kind="return"),),
+    )
+    slot = ASTProcedureResultSlot(
+        index=0,
+        type=ASTSymbolType(ASTSymbolTypeFamily.OPAQUE),
+        required=True,
+    )
+    enriched_result = ASTProcedureResult(
+        kind=ASTProcedureResultKind.FIXED,
+        required_slots=(0,),
+        slots=(slot,),
+    )
+    void_result = ASTProcedureResult(ASTProcedureResultKind.VOID)
+    procedure = ASTProcedure(
+        name="proc_0000",
+        blocks=(block,),
+        entry=entry,
+        exits=(exit_point,),
+        result=enriched_result,
+        successor_map={"block0": tuple()},
+        predecessor_map={"block0": tuple()},
+        aliases=tuple(),
+    )
+    duplicate = replace(procedure, result=void_result)
+    segment_primary = ASTSegment(index=0, start=0, length=4, procedures=(procedure,))
+    segment_duplicate = ASTSegment(index=1, start=4, length=4, procedures=(duplicate,))
+
+    builder = ASTBuilder()
+    canonical = builder._canonicalise_segments([segment_primary, segment_duplicate])
+
+    first_segment, second_segment = canonical
+    assert first_segment.procedures and not second_segment.procedures
+    merged_result = first_segment.procedures[0].result
+    assert merged_result.kind is ASTProcedureResultKind.FIXED
+    assert merged_result.required_slots == (0,)
 def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
     block_entry = IRBlock(
         label="block_entry",
