@@ -282,6 +282,24 @@ class IRStackEffect:
         return f"{name}({inner})"
 
 
+def _stack_effect_from_pair(mnemonic: str, operand: int) -> IRStackEffect:
+    alias = OPERAND_ALIASES.get(operand)
+    alias_text = str(alias) if alias is not None else None
+    category = cleanup_category(mnemonic, operand, alias_text)
+    return IRStackEffect(
+        mnemonic=mnemonic,
+        operand=operand,
+        operand_alias=alias_text,
+        category=category,
+    )
+
+
+def _format_annotation(note: str) -> str:
+    if note.startswith("op_"):
+        return cleanup_category(note, None, None)
+    return note
+
+
 @dataclass(frozen=True)
 class IRAbiEffect(IRNode):
     """Side effect produced by the ABI helpers."""
@@ -370,12 +388,16 @@ class IRLiteralChunk(IRNode):
         if self.symbol:
             rendered = f"str({self.symbol})"
             if self.annotations:
-                rendered += " " + ", ".join(self.annotations)
+                rendered += " " + ", ".join(
+                    _format_annotation(annotation) for annotation in self.annotations
+                )
             return rendered
 
         note = f"ascii({_render_ascii(self.data)})"
         if self.annotations:
-            note += " " + ", ".join(self.annotations)
+            note += " " + ", ".join(
+                _format_annotation(annotation) for annotation in self.annotations
+            )
         return note
 
 
@@ -387,9 +409,13 @@ class IRDataMarker(IRNode):
     operand: int = 0
 
     def describe(self) -> str:
+        label = self.mnemonic
+        if label.startswith("op_"):
+            effect = _stack_effect_from_pair(label, self.operand)
+            label = effect.category or effect.mnemonic
         if self.operand:
-            return f"marker {self.mnemonic}(operand=0x{self.operand:04X})"
-        return f"marker {self.mnemonic}"
+            return f"marker {label}(operand=0x{self.operand:04X})"
+        return f"marker {label}"
 
 
 @dataclass(frozen=True)
@@ -754,7 +780,10 @@ class IRCallPreparation(IRNode):
     steps: Tuple[Tuple[str, int], ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(
+            _stack_effect_from_pair(mnemonic, operand).describe()
+            for mnemonic, operand in self.steps
+        )
         return f"prep_call_args[{rendered}]"
 
 
@@ -781,7 +810,10 @@ class IRTailcallFrame(IRNode):
     steps: Tuple[Tuple[str, int], ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(
+            _stack_effect_from_pair(mnemonic, operand).describe()
+            for mnemonic, operand in self.steps
+        )
         return f"prep_tailcall[{rendered}]"
 
 
@@ -793,22 +825,16 @@ class IRTablePatch(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        rendered_ops = []
-        for mnemonic, operand in self.operations:
-            alias = OPERAND_ALIASES.get(operand)
-            alias_text = str(alias) if alias is not None else None
-            category = cleanup_category(mnemonic, operand, alias_text)
-            effect = IRStackEffect(
-                mnemonic=mnemonic,
-                operand=operand,
-                operand_alias=alias_text,
-                category=category,
-            )
-            rendered_ops.append(effect.describe())
-        rendered = ", ".join(rendered_ops)
+        rendered = ", ".join(
+            _stack_effect_from_pair(mnemonic, operand).describe()
+            for mnemonic, operand in self.operations
+        )
         note = f"table_patch[{rendered}]"
         if self.annotations:
-            note += " " + ", ".join(self.annotations)
+            formatted = [
+                _format_annotation(annotation) for annotation in self.annotations
+            ]
+            note += " " + ", ".join(formatted)
         return note
 
 
@@ -887,12 +913,19 @@ class IRTableBuilderBegin(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        ops = ", ".join(
+            _stack_effect_from_pair(mnemonic, operand).describe()
+            for mnemonic, operand in self.prologue
+        )
         details = f"mode=0x{self.mode:02X}"
         if ops:
             details += f" prologue=[{ops}]"
         if self.annotations:
-            details += " " + ", ".join(self.annotations)
+            formatted = ", ".join(
+                _format_annotation(annotation) for annotation in self.annotations
+            )
+            if formatted:
+                details += " " + formatted
         return f"table_begin {details}"
 
 
@@ -907,12 +940,23 @@ class IRTableBuilderEmit(IRNode):
     parameters: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
-        details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
+        ops = ", ".join(
+            _stack_effect_from_pair(mnemonic, operand).describe()
+            for mnemonic, operand in self.operations
+        )
+        kind = self.kind
+        if kind.startswith("op_") and self.operations:
+            effect = _stack_effect_from_pair(*self.operations[0])
+            kind = effect.category or effect.mnemonic
+        details = [f"mode=0x{self.mode:02X}", f"kind={kind}", f"ops=[{ops}]"]
         if self.parameters:
             params = ", ".join(self.parameters)
             details.append(f"params=[{params}]")
-        extra = [note for note in self.annotations if note not in {self.kind, f"mode=0x{self.mode:02X}"}]
+        extra = [
+            _format_annotation(note)
+            for note in self.annotations
+            if note not in {self.kind, f"mode=0x{self.mode:02X}"}
+        ]
         if extra:
             details.extend(extra)
         return "table_emit " + " ".join(details)
