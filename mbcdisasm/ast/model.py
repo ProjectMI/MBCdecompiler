@@ -722,7 +722,7 @@ class ASTAddressOrigin:
             ASTAddressSpace.FRAME: "stack",
             ASTAddressSpace.GLOBAL: "global",
             ASTAddressSpace.CONST: "const",
-            ASTAddressSpace.BANKED: "mem",
+            ASTAddressSpace.BANKED: "banked",
             ASTAddressSpace.MEMORY: "mem",
             ASTAddressSpace.IO: "io",
         }
@@ -1152,13 +1152,14 @@ class ASTIOWrite(ASTStatement):
     """I/O write effect emitted by helper façades."""
 
     port: str
-    mask: int | None = None
+    mask: Optional[ASTBitField] = None
 
     effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.IO
 
     def render(self) -> str:
-        mask = "" if self.mask is None else f", mask=0x{self.mask:04X}"
-        return f"io.write({self.port}{mask})"
+        if self.mask is None:
+            return f"io.write({self.port})"
+        return f"io.write({self.port}, {self.mask.render()})"
 
 
 @dataclass

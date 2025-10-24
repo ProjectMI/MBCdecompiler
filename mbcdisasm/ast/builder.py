@@ -21,6 +21,7 @@ from ..ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRDataMarker,
     IRFunctionPrologue,
     IRIORead,
     IRIOWrite,
@@ -731,7 +732,9 @@ class ASTBuilder:
         assigned_aliases: Dict[Tuple[int, int], ASTProcedure] = {}
 
         def assign_aliases(
-            procedure: ASTProcedure, aliases: Set[Tuple[int, int]]
+            procedure: ASTProcedure,
+            aliases: Set[Tuple[int, int]],
+            home: Tuple[int, int],
         ) -> None:
             owned: List[Tuple[int, int]] = []
             for segment_index, offset in sorted(aliases):
@@ -740,6 +743,8 @@ class ASTBuilder:
                 if owner is not None and owner is not procedure:
                     continue
                 assigned_aliases[key] = procedure
+                if key == home:
+                    continue
                 owned.append(key)
             procedure.aliases = tuple(
                 ASTProcedureAlias(segment=seg, offset=off) for seg, off in owned
@@ -758,7 +763,7 @@ class ASTBuilder:
                         (alias.segment, alias.offset) for alias in procedure.aliases
                     }
                     alias_set.add((alias_entry.segment, alias_entry.offset))
-                    assign_aliases(procedure, alias_set)
+                    assign_aliases(procedure, alias_set, (alias_entry.segment, alias_entry.offset))
                     updated_procs.append(procedure)
                     continue
 
@@ -770,7 +775,7 @@ class ASTBuilder:
                 combined.add((segment.index, procedure.entry_offset))
                 for alias in procedure.aliases:
                     combined.add((alias.segment, alias.offset))
-                assign_aliases(existing, combined)
+                assign_aliases(existing, combined, (origin.segment, origin.offset))
                 existing.result = self._merge_procedure_result(
                     existing.result, procedure.result
                 )
@@ -859,13 +864,10 @@ class ASTBuilder:
         elif isinstance(statement, ASTReturn):
             self._register_effect_sequence(statement.effects, accumulators)
         elif isinstance(statement, ASTIOWrite):
-            mask = None
-            if statement.mask is not None:
-                mask = self._bitfield(statement.mask, None)
             effect = ASTIOEffect(
                 operation=ASTIOOperation.WRITE,
                 port=statement.port,
-                mask=mask,
+                mask=statement.mask,
             )
             accumulator = accumulators.setdefault(
                 "io.write",
@@ -1214,6 +1216,20 @@ class ASTBuilder:
         has_protocol = any(
             isinstance(effect, ASTFrameProtocolEffect) for effect in normalised
         )
+        if has_protocol:
+            normalised = [
+                effect
+                for effect in normalised
+                if not isinstance(
+                    effect,
+                    (
+                        ASTFrameMaskEffect,
+                        ASTFrameChannelEffect,
+                        ASTFrameTeardownEffect,
+                        ASTFrameDropEffect,
+                    ),
+                )
+            ]
         if ensure_protocol and not has_protocol:
             normalised.append(
                 ASTFrameProtocolEffect(masks=tuple(), teardown=0, drops=0)
@@ -2153,8 +2169,43 @@ class ASTBuilder:
         if isinstance(statement, ASTComment):
             body = statement.text.strip()
             prefixes = ("lit(", "marker ", "literal_block", "ascii(")
-            return body.startswith(prefixes)
+            if body.startswith(prefixes):
+                return True
+            if "literal_marker" in body:
+                return True
         return False
+
+    @staticmethod
+    def _is_literal_marker_token(token: Optional[str]) -> bool:
+        if not token:
+            return False
+        return token.startswith("marker ") and "literal_marker" in token
+
+    @staticmethod
+    def _is_literal_marker_expr(expr: ASTExpression) -> bool:
+        if isinstance(expr, ASTIdentifier):
+            return ASTBuilder._is_literal_marker_token(expr.name)
+        return False
+
+    @staticmethod
+    def _should_ignore_node(node: Any) -> bool:
+        if isinstance(node, IRDataMarker):
+            return True
+        annotations = getattr(node, "annotations", ())
+        if any("literal_marker" in str(note) for note in annotations):
+            return True
+        mnemonic = getattr(node, "mnemonic", "")
+        return mnemonic == "literal_marker"
+
+    @staticmethod
+    def _normalise_io_mask_text(text: str) -> str:
+        if "mask=" not in text:
+            return text
+        return re.sub(
+            r"mask=(0x[0-9A-Fa-f]+)",
+            lambda match: f"mask[16]={match.group(1)}",
+            text,
+        )
 
     def _replace_successor(self, block: ASTBlock, old: ASTBlock, new: ASTBlock) -> None:
         block.successors = tuple(new if succ is old else succ for succ in block.successors)
@@ -2502,8 +2553,11 @@ class ASTBuilder:
                 index += 1
             index += 1
         for entry in collapsed:
-            if isinstance(entry, ASTCallStatement) and entry.call.tail:
-                entry.call = replace(entry.call, tail=False)
+            if isinstance(entry, ASTCallStatement):
+                if entry.call.tail:
+                    entry.call = replace(entry.call, tail=False)
+                if entry.abi is not None:
+                    entry.abi = self._strip_tail_flag(entry.abi)
             elif isinstance(entry, ASTTailCall):
                 if entry.call.tail:
                     entry.call = replace(entry.call, tail=False)
@@ -2847,6 +2901,8 @@ class ASTBuilder:
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
     ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
+        if self._should_ignore_node(node):
+            return [], []
         if isinstance(node, IRCallPreparation):
             for mnemonic, operand in node.steps:
                 self._pending_call_frame.append(IRStackEffect(mnemonic=mnemonic, operand=operand))
@@ -2867,7 +2923,8 @@ class ASTBuilder:
         if isinstance(node, IRIORead):
             return [ASTIORead(port=node.port)], []
         if isinstance(node, IRIOWrite):
-            return [ASTIOWrite(port=node.port, mask=node.mask)], []
+            mask = self._bitfield(node.mask, None) if node.mask is not None else None
+            return [ASTIOWrite(port=node.port, mask=mask)], []
         if isinstance(node, IRBankedLoad):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None
@@ -3024,6 +3081,8 @@ class ASTBuilder:
             return [], []
         if isinstance(node, IRIf):
             condition = self._resolve_expr(node.condition, value_state)
+            if self._is_literal_marker_token(node.condition) or self._is_literal_marker_expr(condition):
+                condition = ASTBooleanLiteral(False)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
             branch = ASTBranch(
@@ -3040,7 +3099,12 @@ class ASTBuilder:
                 )
             ]
         if isinstance(node, IRTestSetBranch):
-            expr = self._resolve_expr(node.expr, value_state)
+            if self._is_literal_marker_token(node.expr):
+                expr = ASTBooleanLiteral(False)
+            else:
+                expr = self._resolve_expr(node.expr, value_state)
+                if self._is_literal_marker_expr(expr):
+                    expr = ASTBooleanLiteral(False)
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
             target = ASTIdentifier(node.var, self._infer_kind(node.var))
@@ -3095,7 +3159,10 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+        description = getattr(node, "describe", lambda: repr(node))()
+        if "literal_marker" in description:
+            return [], []
+        return [ASTComment(self._normalise_io_mask_text(description))], []
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
@@ -3283,6 +3350,27 @@ class ASTBuilder:
             label = None
         address = self._memref_address(ref)
         space = address.kind if address.kind is not ASTAddressSpace.UNKNOWN else ASTAddressSpace.MEMORY
+        if label:
+            lowered = label.lower()
+            if space is ASTAddressSpace.MEMORY:
+                if lowered.startswith("stack"):
+                    space = ASTAddressSpace.FRAME
+                elif lowered.startswith("global"):
+                    space = ASTAddressSpace.GLOBAL
+                elif lowered.startswith("const"):
+                    space = ASTAddressSpace.CONST
+                elif lowered.startswith("io"):
+                    space = ASTAddressSpace.IO
+            canonical_names = {
+                ASTAddressSpace.FRAME: "stack",
+                ASTAddressSpace.GLOBAL: "global",
+                ASTAddressSpace.CONST: "const",
+                ASTAddressSpace.BANKED: "banked",
+                ASTAddressSpace.MEMORY: "mem",
+                ASTAddressSpace.IO: "io",
+            }
+            if lowered == canonical_names.get(space, space.value):
+                label = None
         return ASTAddressOrigin(space=space, label=label)
 
     @staticmethod
@@ -3777,7 +3865,8 @@ class ASTBuilder:
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
-        return ASTIdentifier(token, self._infer_kind(token))
+        normalised = self._normalise_io_mask_text(token)
+        return ASTIdentifier(normalised, self._infer_kind(normalised))
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
