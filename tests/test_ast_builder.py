@@ -32,7 +32,6 @@ from mbcdisasm.ast import (
     ASTSwitch,
     ASTSymbolType,
     ASTSymbolTypeFamily,
-    ASTTailCall,
 )
 from mbcdisasm.ast.model import (
     ASTEntryPoint,
@@ -465,7 +464,9 @@ def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
     assert any(isinstance(stmt, ASTCallStatement) for stmt in statements)
-    assert not any(isinstance(stmt, ASTTailCall) for stmt in statements)
+    assert not any(
+        isinstance(stmt, ASTReturn) and stmt.call is not None for stmt in statements
+    )
 
 
 def test_ast_builder_prunes_redundant_branch_blocks() -> None:
@@ -850,7 +851,11 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     ast_program = ASTBuilder().build(program)
     statements = ast_program.segments[0].procedures[0].blocks[0].statements
 
-    tail_stmt = next(statement for statement in statements if isinstance(statement, ASTTailCall))
+    tail_stmt = next(
+        statement
+        for statement in statements
+        if isinstance(statement, ASTReturn) and statement.call is not None
+    )
     assert tail_stmt.abi is not None
     assert isinstance(tail_stmt.abi, ASTCallABI)
     protocol_effect = next(
@@ -1098,7 +1103,7 @@ def test_testset_branch_desugars_into_assignment() -> None:
     procedure = ast_program.segments[0].procedures[0]
     statements = procedure.blocks[0].statements
     assert isinstance(statements[0], ASTAssign)
-    assert isinstance(statements[1], ASTBranch)
+    assert isinstance(statements[1], (ASTBranch, ASTJump))
 
 
 def test_banked_memory_locations_are_canonical() -> None:

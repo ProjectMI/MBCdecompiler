@@ -22,7 +22,7 @@ CALL_SHUFFLE_STANDARD = 0x4B08
 
 
 OPERAND_ALIASES: Dict[int, str] = {
-    RET_MASK: "RET_MASK",
+    RET_MASK: "return_mask",
     IO_SLOT: "ChatOut",
     0x6901: "ChatOut",
     0x3069: "ChatOut",

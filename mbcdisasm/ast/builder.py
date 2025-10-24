@@ -24,6 +24,7 @@ from ..ir.model import (
     IRFunctionPrologue,
     IRIORead,
     IRIOWrite,
+    IRDataMarker,
     IRIf,
     IRFlagCheck,
     IRDispatchCase,
@@ -85,7 +86,7 @@ _MASK_STEP_MNEMONICS = {
 }
 
 _MASK_OPERANDS = {RET_MASK, FANOUT_FLAGS_A, FANOUT_FLAGS_B}
-_MASK_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
+_MASK_ALIASES = {"RET_MASK", "RETURN_MASK", "return_mask", "FANOUT_FLAGS"}
 
 _FRAME_DROP_MNEMONICS = {
     "op_01_0C",
@@ -251,7 +252,6 @@ from .model import (
     ASTSwitchCase,
     ASTDispatchHelper,
     ASTDispatchIndex,
-    ASTTailCall,
     ASTTestSet,
     ASTTupleExpr,
     ASTUnknown,
@@ -852,12 +852,10 @@ class ASTBuilder:
         if isinstance(statement, ASTCallStatement):
             if statement.abi is not None:
                 self._register_effect_sequence(statement.abi.effects, accumulators)
-        elif isinstance(statement, ASTTailCall):
+        elif isinstance(statement, ASTReturn):
             self._register_effect_sequence(statement.effects, accumulators)
             if statement.abi is not None:
                 self._register_effect_sequence(statement.abi.effects, accumulators)
-        elif isinstance(statement, ASTReturn):
-            self._register_effect_sequence(statement.effects, accumulators)
         elif isinstance(statement, ASTIOWrite):
             mask = None
             if statement.mask is not None:
@@ -934,7 +932,7 @@ class ASTBuilder:
                                 statement.returns,
                                 statement.abi,
                             )
-                        elif isinstance(statement, ASTTailCall):
+                        elif isinstance(statement, ASTReturn) and statement.call is not None:
                             accumulator = accumulators.setdefault(
                                 statement.call.target,
                                 _SignatureAccumulator(statement.call.target),
@@ -1572,8 +1570,6 @@ class ASTBuilder:
             terminator = block.terminator
             if isinstance(terminator, ASTReturn):
                 payloads.append(terminator.payload)
-            elif isinstance(terminator, ASTTailCall):
-                payloads.append(terminator.payload)
         if not payloads:
             return ASTProcedureResult(ASTProcedureResultKind.VOID)
         total = len(payloads)
@@ -1680,8 +1676,6 @@ class ASTBuilder:
                 reason: Optional[str] = None
                 if isinstance(terminator, ASTReturn):
                     reason = "return"
-                elif isinstance(terminator, ASTTailCall):
-                    reason = "tail_call"
                 elif isinstance(terminator, ASTJump):
                     reason = "jump"
                 elif isinstance(terminator, ASTSwitch):
@@ -1900,6 +1894,10 @@ class ASTBuilder:
                 statement
                 for statement in block.statements
                 if not self._is_noise_statement(statement)
+                and not (
+                    isinstance(statement, ASTAssign)
+                    and self._is_literal_marker_identifier(statement.value)
+                )
             )
             if filtered != block.statements:
                 block.statements = filtered
@@ -2067,15 +2065,29 @@ class ASTBuilder:
                 )
                 if updated is None:
                     continue
+                if (
+                    isinstance(statement, ASTBranch)
+                    and isinstance(updated, ASTJump)
+                    and not self._is_literal_marker_identifier(statement.condition)
+                ):
+                    updated = statement
                 statement = updated
             simplified.append(statement)
         block.statements = tuple(simplified)
+        terminator = block.terminator
+        if isinstance(terminator, BranchStatement):
+            updated = self._simplify_branch_statement(
+                terminator, block_order, fallthrough, allow_fallthrough=True
+            )
+            if updated is not None:
+                block.terminator = updated
 
     def _simplify_branch_statement(
         self,
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
+        allow_fallthrough: bool = False,
     ) -> Optional[ASTStatement]:
         then_target = self._ensure_branch_target(
             statement, "then", block_order, fallthrough
@@ -2083,6 +2095,17 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
+        if isinstance(statement, ASTBranch) and self._is_literal_marker_identifier(
+            statement.condition
+        ):
+            target_block = statement.else_branch
+            target_offset = statement.else_offset
+            if target_block is not None:
+                target_offset = target_block.start_offset
+            hint = statement.else_hint
+            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+        then_offset = getattr(statement, "then_offset", None)
+        else_offset = getattr(statement, "else_offset", None)
         if (
             then_target is not None
             and else_target is not None
@@ -2094,6 +2117,21 @@ class ASTBuilder:
                 target_offset = target_block.start_offset
             hint = statement.then_hint or statement.else_hint
             return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+        if then_target is None and else_target is None and then_offset == else_offset:
+            hint = statement.then_hint or statement.else_hint
+            return ASTJump(target_offset=then_offset, hint=hint)
+        then_hint = getattr(statement, "then_hint", None)
+        else_hint = getattr(statement, "else_hint", None)
+        if allow_fallthrough:
+            if then_target is None and else_target is None and then_hint == else_hint and then_hint:
+                return ASTJump(hint=then_hint)
+            if then_hint == "fallthrough" and else_hint == "fallthrough":
+                jump_offset = None
+                if isinstance(then_target, int):
+                    jump_offset = then_target
+                elif isinstance(else_target, int):
+                    jump_offset = else_target
+                return ASTJump(target_offset=jump_offset, hint="fallthrough")
         return statement
 
     def _ensure_branch_target(
@@ -2153,8 +2191,14 @@ class ASTBuilder:
         if isinstance(statement, ASTComment):
             body = statement.text.strip()
             prefixes = ("lit(", "marker ", "literal_block", "ascii(")
-            return body.startswith(prefixes)
+            if body.startswith(prefixes):
+                return True
+            return "literal_marker" in body
         return False
+
+    @staticmethod
+    def _is_literal_marker_identifier(expr: ASTExpression) -> bool:
+        return isinstance(expr, ASTIdentifier) and expr.name == "marker literal_marker"
 
     def _replace_successor(self, block: ASTBlock, old: ASTBlock, new: ASTBlock) -> None:
         block.successors = tuple(new if succ is old else succ for succ in block.successors)
@@ -2240,7 +2284,7 @@ class ASTBuilder:
 
     @staticmethod
     def _block_has_exit(block: ASTBlock) -> bool:
-        return isinstance(block.terminator, (ASTReturn, ASTTailCall))
+        return isinstance(block.terminator, ASTReturn)
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
@@ -2504,7 +2548,7 @@ class ASTBuilder:
         for entry in collapsed:
             if isinstance(entry, ASTCallStatement) and entry.call.tail:
                 entry.call = replace(entry.call, tail=False)
-            elif isinstance(entry, ASTTailCall):
+            elif isinstance(entry, ASTReturn) and entry.call is not None:
                 if entry.call.tail:
                     entry.call = replace(entry.call, tail=False)
                 if entry.abi is not None:
@@ -2526,9 +2570,9 @@ class ASTBuilder:
             call_expr = replace(statement.call, tail=False)
             abi = self._strip_tail_flag(statement.abi)
             return [
-                ASTTailCall(
-                    call=call_expr,
+                ASTReturn(
                     payload=ASTReturnPayload(values=tuple()),
+                    call=call_expr,
                     abi=abi,
                 )
             ]
@@ -2540,7 +2584,7 @@ class ASTBuilder:
         call_expr = self._extract_dispatch_call(primary)
         if call_expr is None:
             return False
-        if isinstance(statement, ASTTailCall):
+        if isinstance(statement, ASTReturn) and statement.call is not None:
             payload = statement.payload
             if payload.values or payload.varargs:
                 return False
@@ -2559,7 +2603,7 @@ class ASTBuilder:
             return statement.call
         if isinstance(statement, ASTCallStatement):
             return statement.call
-        if isinstance(statement, ASTTailCall):
+        if isinstance(statement, ASTReturn) and statement.call is not None:
             return statement.call
         return None
 
@@ -2584,6 +2628,10 @@ class ASTBuilder:
         value_state: Mapping[str, ASTExpression],
         abi: Optional[ASTCallABI] = None,
     ) -> ASTSwitch:
+        if call_expr is not None and call_expr.tail:
+            call_expr = replace(call_expr, tail=False)
+        if abi is not None:
+            abi = self._strip_tail_flag(abi)
         collapse_dispatch = self._should_collapse_dispatch(call_expr, dispatch)
         enum_info: _EnumInfo | None
         enum_name: str | None
@@ -2645,6 +2693,8 @@ class ASTBuilder:
         index_expr: ASTExpression | None = None
         if index_info.source:
             index_expr = self._resolve_expr(index_info.source, value_state)
+            if isinstance(index_expr, ASTCallExpr) and index_expr.tail:
+                index_expr = replace(index_expr, tail=False)
         return index_expr, index_info.mask, index_info.base
 
     def _classify_dispatch_kind(self, dispatch: IRSwitchDispatch) -> str | None:
@@ -3002,9 +3052,9 @@ class ASTBuilder:
             call_expr = replace(call_expr, tail=False)
             abi = self._strip_tail_flag(abi)
             statements.append(
-                ASTTailCall(
-                    call=call_expr,
+                ASTReturn(
                     payload=ASTReturnPayload(values=resolved_returns, varargs=node.varargs),
+                    call=call_expr,
                     abi=abi,
                     effects=epilogue_effects,
                 )
@@ -3095,6 +3145,8 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRDataMarker) and node.mnemonic == "literal_marker":
+            return [], []
         return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
 
     @staticmethod
@@ -3240,7 +3292,7 @@ class ASTBuilder:
         if value:
             width = max(default_width, ((value.bit_length() + 7) // 8) * 8)
         alias_key = alias.upper() if alias else ""
-        if alias_key in {"RET_MASK", "FANOUT_FLAGS", "FANOUT_FLAGS_A", "FANOUT_FLAGS_B"}:
+        if alias_key in {"RET_MASK", "RETURN_MASK", "FANOUT_FLAGS", "FANOUT_FLAGS_A", "FANOUT_FLAGS_B"}:
             width = max(width, 16)
         if width == 0:
             width = default_width
@@ -3255,6 +3307,8 @@ class ASTBuilder:
         if not text:
             return None
         upper = text.upper()
+        if upper in {"RET_MASK", "RETURN_MASK"} or text == "return_mask":
+            return "return_mask"
         if upper in _MASK_ALIASES or upper.endswith("_MASK"):
             return upper
         return None
@@ -3299,7 +3353,12 @@ class ASTBuilder:
         alias: Optional[str], operand: Optional[int]
     ) -> Optional[str]:
         if alias:
-            return str(alias)
+            text = str(alias)
+            if text.upper() in {"RET_MASK", "RETURN_MASK"}:
+                return "return"
+            return text
+        if operand == RET_MASK:
+            return "return"
         if operand is not None and operand in IO_SLOT_ALIASES:
             return IO_PORT_NAME
         return None

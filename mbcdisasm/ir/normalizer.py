@@ -407,7 +407,7 @@ STACK_NEUTRAL_CONTROL_KINDS = {
     InstructionKind.TAILCALL,
 }
 
-MASK_OPERAND_ALIASES = {"RET_MASK", "ChatOut", "FANOUT_FLAGS"}
+MASK_OPERAND_ALIASES = {"RET_MASK", "RETURN_MASK", "return_mask", "ChatOut", "FANOUT_FLAGS"}
 
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
@@ -5038,7 +5038,7 @@ class IRNormalizer:
     @staticmethod
     def _uses_ret_mask(instruction: RawInstruction) -> bool:
         alias = instruction.profile.operand_alias()
-        if alias == "RET_MASK":
+        if alias and alias.upper() in {"RET_MASK", "RETURN_MASK"}:
             return True
         return instruction.operand == RET_MASK
 

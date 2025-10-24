@@ -1192,22 +1192,7 @@ class ASTReturn(ASTTerminator):
     """Return from the current procedure."""
 
     payload: ASTReturnPayload
-    effects: Tuple[ASTEffect, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.effects:
-            self.effects = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
-
-    def render(self) -> str:
-        return f"return {self.payload.render()} effects={_render_effects(self.effects)}"
-
-
-@dataclass
-class ASTTailCall(ASTTerminator):
-    """Tail call used as a return."""
-
-    call: ASTCallExpr
-    payload: ASTReturnPayload = field(default_factory=ASTReturnPayload)
+    call: Optional[ASTCallExpr] = None
     abi: Optional[ASTCallABI] = None
     effects: Tuple[ASTEffect, ...] = ()
 
@@ -1216,13 +1201,14 @@ class ASTTailCall(ASTTerminator):
             self.effects = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
 
     def render(self) -> str:
-        call_repr = self.call.render()
-        if call_repr.startswith("tail "):
-            call_repr = call_repr[len("tail ") :]
-        result = f"tail {call_repr}"
-        payload_repr = self.payload.render()
-        if payload_repr != "()":
-            result = f"{result} -> {payload_repr}"
+        if self.call is not None:
+            call_repr = self.call.render()
+            result = f"return {call_repr}"
+            payload_repr = self.payload.render()
+            if payload_repr != "()":
+                result = f"{result} -> {payload_repr}"
+        else:
+            result = f"return {self.payload.render()}"
         if self.abi is not None:
             result = f"{result} {self.abi.render()}"
         return f"{result} effects={_render_effects(self.effects)}"
@@ -1740,7 +1726,6 @@ __all__ = [
     "ASTIORead",
     "ASTIOWrite",
     "ASTTerminator",
-    "ASTTailCall",
     "ASTJump",
     "ASTReturn",
     "ASTReturnPayload",
