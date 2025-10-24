@@ -1259,6 +1259,7 @@ class ASTBranch(ASTTerminator):
     else_hint: str | None = None
     then_offset: int | None = None
     else_offset: int | None = None
+    origin: str | None = None
 
     def render(self) -> str:
         condition = self.condition.render()
@@ -1323,6 +1324,13 @@ class ASTFunctionPrologue(ASTTerminator):
     def render(self) -> str:
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        if then_label == else_label:
+            if then_label == "fallthrough":
+                return f"prologue {self.var.render()} = {self.expr.render()}"
+            return (
+                f"prologue {self.var.render()} = {self.expr.render()} "
+                f"then {then_label}"
+            )
         return (
             f"prologue {self.var.render()} = {self.expr.render()} "
             f"then {then_label} else {else_label}"

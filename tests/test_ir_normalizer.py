@@ -2047,7 +2047,7 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
 
 def test_abi_effect_rendering_avoids_nested_aliases() -> None:
     effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
-    assert effect.describe() == "abi.return_mask value=RET_MASK(0x2910)"
+    assert effect.describe() == "abi.return_mask value=RET_MASK(return_mask(0x2910))"
 
 
 def test_normalizer_prunes_duplicate_testset_if(tmp_path: Path) -> None:

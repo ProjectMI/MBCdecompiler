@@ -2094,6 +2094,10 @@ class ASTBuilder:
                 target_offset = target_block.start_offset
             hint = statement.then_hint or statement.else_hint
             return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+        if isinstance(statement, ASTBranch):
+            if statement.then_branch is None and statement.else_branch is None:
+                if statement.then_hint == "fallthrough" and statement.else_hint == "fallthrough":
+                    return ASTJump(hint="fallthrough")
         return statement
 
     def _ensure_branch_target(
@@ -2155,6 +2159,23 @@ class ASTBuilder:
             prefixes = ("lit(", "marker ", "literal_block", "ascii(")
             return body.startswith(prefixes)
         return False
+
+    @staticmethod
+    def _sanitize_comment_text(text: str) -> Optional[str]:
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+        for pattern in (", literal_marker", "literal_marker,", " literal_marker"):
+            while pattern in cleaned:
+                cleaned = cleaned.replace(pattern, "")
+        if "literal_marker" in cleaned:
+            cleaned = cleaned.replace("literal_marker", "")
+        cleaned = " ".join(cleaned.split())
+        cleaned = cleaned.replace(" ,", ",")
+        cleaned = cleaned.strip(" ,")
+        if cleaned == "marker":
+            return None
+        return cleaned or None
 
     def _replace_successor(self, block: ASTBlock, old: ASTBlock, new: ASTBlock) -> None:
         block.successors = tuple(new if succ is old else succ for succ in block.successors)
@@ -2410,15 +2431,23 @@ class ASTBuilder:
             node.varargs if hasattr(node, "varargs") else False,
             value_state,
         )
+        if call_expr.tail:
+            call_expr = replace(call_expr, tail=False)
         self._register_expression(node.describe(), call_expr)
         metrics.call_sites += 1
         metrics.observe_call_args(
             sum(1 for operand in call_expr.operands if operand.is_resolved()),
             len(call_expr.operands),
         )
-        abi = self._build_call_abi(node, operands)
-        if getattr(node, "cleanup", tuple()):
-            self._pending_epilogue.extend(node.cleanup)
+        tail_call = bool(getattr(node, "tail", False))
+        cleanup_steps = getattr(node, "cleanup", tuple())
+        abi_effects = getattr(node, "abi_effects", tuple())
+        abi = self._build_call_abi(node, operands, allow_tail=False)
+        epilogue_effects: Tuple[ASTEffect, ...] = tuple()
+        if tail_call:
+            epilogue_effects = self._build_epilogue_effects(cleanup_steps, abi_effects)
+        elif cleanup_steps:
+            self._pending_epilogue.extend(cleanup_steps)
         pending_table = self._pop_dispatch_table(node.target, pending_tables)
         if pending_table is not None:
             target_index = pending_table.index
@@ -2431,6 +2460,13 @@ class ASTBuilder:
         pending_calls.append(
             _PendingDispatchCall(helper=node.target, index=index, call=call_expr, abi=abi)
         )
+        if tail_call:
+            statements.append(
+                ASTReturn(
+                    payload=ASTReturnPayload(),
+                    effects=epilogue_effects,
+                )
+            )
 
     def _handle_dispatch_table(
         self,
@@ -2491,13 +2527,16 @@ class ASTBuilder:
             replacements = self._simplify_dispatch_statement(current)
             for replacement in replacements:
                 collapsed.append(replacement)
+            anchor: ASTStatement | None = None
+            for replacement in reversed(replacements):
+                if isinstance(replacement, (ASTSwitch, ASTCallStatement)):
+                    anchor = replacement
+                    break
             if (
                 replacements
-                and isinstance(replacements[-1], (ASTSwitch, ASTCallStatement))
+                and anchor is not None
                 and index + 1 < len(statements)
-                and self._is_redundant_dispatch_followup(
-                    replacements[-1], statements[index + 1]
-                )
+                and self._is_redundant_dispatch_followup(anchor, statements[index + 1])
             ):
                 index += 1
             index += 1
@@ -2526,11 +2565,8 @@ class ASTBuilder:
             call_expr = replace(statement.call, tail=False)
             abi = self._strip_tail_flag(statement.abi)
             return [
-                ASTTailCall(
-                    call=call_expr,
-                    payload=ASTReturnPayload(values=tuple()),
-                    abi=abi,
-                )
+                ASTCallStatement(call=call_expr, abi=abi),
+                ASTReturn(payload=ASTReturnPayload(values=tuple())),
             ]
         return [ASTCallStatement(call=statement.call, abi=statement.abi)]
 
@@ -2957,8 +2993,15 @@ class ASTBuilder:
                 sum(1 for operand in call_expr.operands if operand.is_resolved()),
                 len(call_expr.operands),
             )
-            abi = self._build_call_abi(node, operands)
-            if node.cleanup:
+            abi = self._build_call_abi(node, operands, allow_tail=False)
+            if call_expr.tail:
+                call_expr = replace(call_expr, tail=False)
+            tail_call = bool(node.tail)
+            if tail_call:
+                epilogue_effects = self._build_epilogue_effects(
+                    node.cleanup, node.abi_effects
+                )
+            elif node.cleanup:
                 self._pending_epilogue.extend(node.cleanup)
             return_identifiers = []
             for index, name in enumerate(node.returns):
@@ -2973,6 +3016,17 @@ class ASTBuilder:
                     abi=abi,
                 )
             )
+            if tail_call:
+                payload_values = tuple(
+                    self._canonicalise_return_expr(
+                        index, value_state[name]
+                    )
+                    for index, name in enumerate(node.returns)
+                )
+                payload = ASTReturnPayload(values=payload_values, varargs=node.varargs)
+                statements.append(
+                    ASTReturn(payload=payload, effects=epilogue_effects)
+                )
             return statements, []
         if isinstance(node, IRTailCall):
             call_expr, operands = self._convert_call(
@@ -2991,24 +3045,64 @@ class ASTBuilder:
                 sum(1 for operand in call_expr.operands if operand.is_resolved()),
                 len(call_expr.operands),
             )
-            abi = self._build_call_abi(node, operands)
+            abi = self._build_call_abi(node, operands, allow_tail=False)
             epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
-            resolved_returns = tuple(
+            call_expr = replace(call_expr, tail=False)
+            abi = self._strip_tail_flag(abi)
+            return_identifiers: List[ASTIdentifier] = []
+            for index, name in enumerate(node.returns):
+                identifier = self._build_return_identifier(name, index)
+                value_state[name] = identifier
+                metrics.observe_values(int(not isinstance(identifier, ASTUnknown)))
+                return_identifiers.append(identifier)
+            statements.append(
+                ASTCallStatement(
+                    call=call_expr,
+                    returns=tuple(return_identifiers),
+                    abi=abi,
+                )
+            )
+            payload_values = tuple(
                 self._canonicalise_return_expr(
                     index, self._resolve_expr(name, value_state)
                 )
                 for index, name in enumerate(node.returns)
             )
-            call_expr = replace(call_expr, tail=False)
-            abi = self._strip_tail_flag(abi)
-            statements.append(
-                ASTTailCall(
-                    call=call_expr,
-                    payload=ASTReturnPayload(values=resolved_returns, varargs=node.varargs),
-                    abi=abi,
-                    effects=epilogue_effects,
-                )
+            return_stmt = ASTReturn(
+                payload=ASTReturnPayload(values=payload_values, varargs=node.varargs),
+                effects=epilogue_effects,
             )
+            statements.append(return_stmt)
+            return statements, []
+        if isinstance(node, IRTailcallReturn):
+            call_expr, operands = self._convert_call(
+                node.target,
+                node.args,
+                node.symbol,
+                True,
+                node.varargs,
+                value_state,
+            )
+            self._register_expression(node.describe(), call_expr)
+            statements = []
+            metrics.call_sites += 1
+            metrics.observe_call_args(
+                sum(1 for operand in call_expr.operands if operand.is_resolved()),
+                len(call_expr.operands),
+            )
+            abi = self._build_call_abi(node, operands, allow_tail=False)
+            epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
+            call_expr = replace(call_expr, tail=False)
+            statements.append(ASTCallStatement(call=call_expr, abi=abi))
+            payload_values = tuple(
+                self._canonicalise_return_expr(
+                    index,
+                    ASTCallResult(call_expr, index),
+                )
+                for index in range(node.returns)
+            )
+            payload = ASTReturnPayload(values=payload_values, varargs=node.varargs)
+            statements.append(ASTReturn(payload=payload, effects=epilogue_effects))
             return statements, []
         if isinstance(node, IRReturn):
             payload = self._build_return_payload(node, value_state)
@@ -3030,6 +3124,7 @@ class ASTBuilder:
                 condition=condition,
                 then_offset=then_target,
                 else_offset=else_target,
+                origin="if",
             )
             return [branch], [
                 _BranchLink(
@@ -3051,6 +3146,7 @@ class ASTBuilder:
                 condition=target,
                 then_offset=then_target,
                 else_offset=else_target,
+                origin="testset",
             )
             return [assignment, branch], [
                 _BranchLink(
@@ -3095,7 +3191,11 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+        raw_comment = getattr(node, "describe", lambda: repr(node))()
+        comment_text = self._sanitize_comment_text(raw_comment)
+        if not comment_text:
+            return [], []
+        return [ASTComment(comment_text)], []
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
@@ -3255,12 +3355,16 @@ class ASTBuilder:
         if not text:
             return None
         upper = text.upper()
+        if upper in {"RET_MASK", "RETURN_MASK"}:
+            return "return_mask"
         if upper in _MASK_ALIASES or upper.endswith("_MASK"):
             return upper
         return None
 
     def _mask_bitfield(self, value: int, alias: Optional[str]) -> ASTBitField:
         canonical = self._canonical_mask_alias(alias)
+        if canonical is None and value == RET_MASK:
+            canonical = "return_mask"
         return self._bitfield(value, canonical)
 
     @staticmethod
@@ -3299,7 +3403,12 @@ class ASTBuilder:
         alias: Optional[str], operand: Optional[int]
     ) -> Optional[str]:
         if alias:
-            return str(alias)
+            text = str(alias).strip()
+            if text.upper() == "RET_MASK":
+                return "return_mask"
+            return text
+        if operand == RET_MASK:
+            return "return_mask"
         if operand is not None and operand in IO_SLOT_ALIASES:
             return IO_PORT_NAME
         return None
@@ -3484,6 +3593,8 @@ class ASTBuilder:
         self,
         node: Any,
         arg_operands: Sequence[ASTCallOperand],
+        *,
+        allow_tail: bool = True,
     ) -> Optional[ASTCallABI]:
         steps = list(self._pending_call_frame)
         self._pending_call_frame.clear()
@@ -3513,8 +3624,10 @@ class ASTBuilder:
         live_mask = getattr(node, "cleanup_mask", None)
         mask_field = None
         if live_mask is not None:
-            mask_field = self._bitfield(live_mask, None)
+            mask_field = self._mask_bitfield(live_mask, None)
         return_tokens = getattr(node, "returns", ())
+        if isinstance(return_tokens, int):
+            return_tokens = tuple(f"ret{index}" for index in range(return_tokens))
         return_slots: List[ASTCallReturnSlot] = []
         for index, token in enumerate(return_tokens):
             kind = self._infer_kind(token)
@@ -3531,7 +3644,7 @@ class ASTBuilder:
                 converted = self._effect_from_kind(spec.kind, spec.operand, alias)
             if converted:
                 effects.append(converted)
-        tail_allowed = bool(getattr(node, "tail", False) or isinstance(node, IRTailCall))
+        tail_allowed = bool(getattr(node, "tail", False)) if allow_tail else False
         if (
             not slots
             and not effects
@@ -3777,6 +3890,11 @@ class ASTBuilder:
             slot = self._build_slot(index)
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
+        if token.startswith("marker "):
+            cleaned = token[len("marker ") :].strip()
+            if not cleaned:
+                return ASTUnknown(token)
+            return ASTIdentifier(cleaned, SSAValueKind.UNKNOWN)
         return ASTIdentifier(token, self._infer_kind(token))
 
     @staticmethod
