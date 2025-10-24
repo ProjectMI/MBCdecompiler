@@ -1723,11 +1723,13 @@ class ASTBuilder:
                     if target in block_lookup:
                         continue
                     hint = self._describe_branch_target(block.start_offset, target)
-                    append(1, hint)
+                    if hint != "fallthrough":
+                        append(1, hint)
                 fallthrough = analysis.fallthrough
                 if fallthrough is not None and fallthrough not in block_lookup:
                     hint = self._describe_branch_target(block.start_offset, fallthrough)
-                    append(1, hint)
+                    if hint != "fallthrough":
+                        append(1, hint)
 
             successor_map[block.label] = tuple(
                 label for _, label in sorted(entries, key=lambda item: (item[0], item[1]))
@@ -2505,14 +2507,6 @@ class ASTBuilder:
             ):
                 index += 1
             index += 1
-        for entry in collapsed:
-            if isinstance(entry, ASTCallStatement) and entry.call.tail:
-                entry.call = replace(entry.call, tail=False)
-            elif isinstance(entry, ASTTailCall):
-                if entry.call.tail:
-                    entry.call = replace(entry.call, tail=False)
-                if entry.abi is not None:
-                    entry.abi = self._strip_tail_flag(entry.abi)
         return collapsed
 
     def _simplify_dispatch_statement(
@@ -2527,19 +2521,17 @@ class ASTBuilder:
         if statement.default is not None:
             return [statement]
         if statement.call.tail:
-            call_expr = replace(statement.call, tail=False)
-            abi = self._strip_tail_flag(statement.abi)
             return [
                 ASTTailCall(
-                    call=call_expr,
+                    call=statement.call,
                     payload=ASTReturnPayload(values=tuple()),
-                    abi=abi,
+                    abi=statement.abi,
                 )
             ]
         return [
             ASTCallStatement(
                 call=statement.call,
-                abi=self._strip_tail_flag(statement.abi),
+                abi=statement.abi,
             )
         ]
 
@@ -3014,8 +3006,6 @@ class ASTBuilder:
                 )
                 for index, name in enumerate(node.returns)
             )
-            call_expr = replace(call_expr, tail=False)
-            abi = self._strip_tail_flag(abi)
             statements.append(
                 ASTTailCall(
                     call=call_expr,
@@ -3110,7 +3100,14 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
-        return [ASTComment(getattr(node, "describe", lambda: repr(node))())], []
+        describe = getattr(node, "describe", None)
+        if callable(describe):
+            text = describe()
+        else:
+            text = repr(node)
+        if text.startswith("marker literal_marker"):
+            return [], []
+        return [ASTComment(text)], []
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
@@ -3277,12 +3274,6 @@ class ASTBuilder:
     def _mask_bitfield(self, value: int, alias: Optional[str]) -> ASTBitField:
         canonical = self._canonical_mask_alias(alias)
         return self._bitfield(value, canonical)
-
-    @staticmethod
-    def _strip_tail_flag(abi: Optional[ASTCallABI]) -> Optional[ASTCallABI]:
-        if abi is None or not abi.tail:
-            return abi
-        return replace(abi, tail=False)
 
     @staticmethod
     def _refine_origin_space(
