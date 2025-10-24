@@ -23,6 +23,7 @@ from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
 from ..mbc import MbcContainer, Segment
+from .effect_aliases import cleanup_category
 from .model import (
     IRAsciiFinalize,
     IRAsciiHeader,
@@ -3892,6 +3893,7 @@ class IRNormalizer:
                     pops=pops,
                     operand_role=effect.operand_role,
                     operand_alias=effect.operand_alias,
+                    category="frame.teardown",
                 )
                 continue
             retained_cleanup.append(effect)
@@ -4328,10 +4330,13 @@ class IRNormalizer:
                         consumed += 1
                         continue
                     if isinstance(candidate, IRConditionMask):
+                        alias = OPERAND_ALIASES.get(candidate.mask)
                         effect = IRStackEffect(
                             mnemonic=candidate.source,
                             operand=candidate.mask,
                             operand_role="mask",
+                            operand_alias=str(alias) if alias is not None else None,
+                            category="frame.return_mask",
                         )
                         cleanup_steps.append(effect)
                         cleanup_mask = candidate.mask
@@ -4427,7 +4432,8 @@ class IRNormalizer:
             if isinstance(item, IRCallCleanup) and len(item.steps) == 1:
                 step = item.steps[0]
                 if step.mnemonic == "fanout" and step.operand == RET_MASK:
-                    node = IRConditionMask(source="fanout", mask=step.operand)
+                    source = step.category or "helpers.fanout"
+                    node = IRConditionMask(source=source, mask=step.operand)
                     items.replace_slice(index, index + 1, [node])
                     continue
             if isinstance(item, RawInstruction):
@@ -4438,11 +4444,27 @@ class IRNormalizer:
                 ):
                     branch = cast(IRIf, items[index + 1])
                     if getattr(branch, "condition", None) == "stack_top":
-                        node = IRConditionMask(source=item.mnemonic, mask=item.operand)
+                        alias = item.profile.operand_alias()
+                        alias_text = str(alias) if alias is not None else None
+                        source = cleanup_category(
+                            item.mnemonic,
+                            item.operand,
+                            alias_text,
+                            opcode=item.profile.opcode,
+                        )
+                        node = IRConditionMask(source=source, mask=item.operand)
                         items.replace_slice(index, index + 1, [node])
                         continue
                 if item.operand == RET_MASK and item.mnemonic in {"terminator", "op_29_10"}:
-                    node = IRConditionMask(source=item.mnemonic, mask=item.operand)
+                    alias = item.profile.operand_alias()
+                    alias_text = str(alias) if alias is not None else None
+                    source = cleanup_category(
+                        item.mnemonic,
+                        item.operand,
+                        alias_text,
+                        opcode=item.profile.opcode,
+                    )
+                    node = IRConditionMask(source=source, mask=item.operand)
                     items.replace_slice(index, index + 1, [node])
                     continue
             index += 1
@@ -4856,12 +4878,23 @@ class IRNormalizer:
                 if delta > 0:
                     pops = delta
 
+        alias_text = str(operand_alias) if operand_alias is not None else None
+        opcode = instruction.profile.opcode if instruction is not None else None
+        category = cleanup_category(
+            spec.mnemonic,
+            operand,
+            alias_text,
+            pops=pops,
+            opcode=opcode,
+        )
+
         return IRStackEffect(
             mnemonic=spec.mnemonic,
             operand=operand,
             pops=pops,
             operand_role=operand_role,
-            operand_alias=operand_alias,
+            operand_alias=alias_text,
+            category=category,
         )
 
     def _rebuild_call_node(
@@ -5397,6 +5430,7 @@ class IRNormalizer:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
         pops = 0
+        category: Optional[str] = None
         if mnemonic in CALL_HELPER_FACADE_MNEMONICS:
             mnemonic = "call_helpers"
         elif mnemonic in FANOUT_FACADE_MNEMONICS:
@@ -5407,17 +5441,28 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
+            category = "frame.teardown"
         alias: Optional[str]
         if mnemonic == "call_helpers":
             alias = self._helper_symbol(operand)
         else:
             alias = instruction.profile.operand_alias()
+        alias_text = str(alias) if alias is not None else None
+        if category is None:
+            category = cleanup_category(
+                mnemonic,
+                operand,
+                alias_text,
+                pops=pops,
+                opcode=instruction.profile.opcode,
+            )
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
             operand_role=instruction.profile.operand_role(),
-            operand_alias=alias,
+            operand_alias=alias_text,
+            category=category,
         )
 
     @staticmethod
@@ -5452,6 +5497,7 @@ class IRNormalizer:
                         pops=total_pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
+                        category="frame.teardown",
                     )
                 )
                 index = advance
@@ -5471,6 +5517,7 @@ class IRNormalizer:
                         pops=step.pops + next_step.pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
+                        category="frame.return_mask",
                     )
                 )
                 index += 2
@@ -5490,6 +5537,7 @@ class IRNormalizer:
                         pops=step.pops + next_step.pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
+                        category="frame.return_mask",
                     )
                 )
                 index += 2
@@ -5920,17 +5968,7 @@ class IRNormalizer:
         return None
 
     def _stack_effect_from_instruction(self, instruction: RawInstruction) -> IRStackEffect:
-        pops = 0
-        delta = instruction.event.delta
-        if delta < 0:
-            pops = -delta
-        return IRStackEffect(
-            mnemonic=instruction.mnemonic,
-            operand=instruction.operand,
-            pops=pops,
-            operand_role=instruction.profile.operand_role(),
-            operand_alias=instruction.profile.operand_alias(),
-        )
+        return self._call_cleanup_effect(instruction)
 
     def _pass_promote_push_literals(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0

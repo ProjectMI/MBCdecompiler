@@ -7,6 +7,7 @@ from enum import Enum, auto
 from typing import List, Optional, Tuple
 
 from ..constants import IO_PORT_NAME, OPERAND_ALIASES
+from .effect_aliases import cleanup_category
 
 
 class MemSpace(Enum):
@@ -251,14 +252,16 @@ class IRStackEffect:
     pops: int = 0
     operand_role: Optional[str] = None
     operand_alias: Optional[str] = None
+    category: Optional[str] = None
 
     def describe(self) -> str:
         details = []
+        name = self.category or self.mnemonic
         if self.pops:
             details.append(f"pop={self.pops}")
         include_operand = bool(self.operand_role or self.operand_alias)
         if not include_operand:
-            include_operand = bool(self.operand) or self.mnemonic not in {"stack_teardown"}
+            include_operand = bool(self.operand) or name not in {"frame.teardown", "stack_teardown"}
         if include_operand:
             hex_value = f"0x{self.operand:04X}"
             alias = self.operand_alias
@@ -274,9 +277,9 @@ class IRStackEffect:
             else:
                 details.append(f"operand={value}")
         if not details:
-            return self.mnemonic
+            return name
         inner = ", ".join(details)
-        return f"{self.mnemonic}({inner})"
+        return f"{name}({inner})"
 
 
 @dataclass(frozen=True)
@@ -790,7 +793,19 @@ class IRTablePatch(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        rendered_ops = []
+        for mnemonic, operand in self.operations:
+            alias = OPERAND_ALIASES.get(operand)
+            alias_text = str(alias) if alias is not None else None
+            category = cleanup_category(mnemonic, operand, alias_text)
+            effect = IRStackEffect(
+                mnemonic=mnemonic,
+                operand=operand,
+                operand_alias=alias_text,
+                category=category,
+            )
+            rendered_ops.append(effect.describe())
+        rendered = ", ".join(rendered_ops)
         note = f"table_patch[{rendered}]"
         if self.annotations:
             note += " " + ", ".join(self.annotations)

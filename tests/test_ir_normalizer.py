@@ -1127,10 +1127,10 @@ def test_raw_instruction_renders_operand_alias(tmp_path: Path) -> None:
     assert step.operand_role == "flags"
     assert step.operand_alias == "FANOUT_FLAGS"
     rendered = step.describe()
-    assert rendered == "fanout(flags=FANOUT_FLAGS(0x2C02))"
+    assert rendered == "helpers.fanout(flags=FANOUT_FLAGS(0x2C02))"
 
     cleanup_rendered = node.describe()
-    assert "fanout(flags=FANOUT_FLAGS(0x2C02))" in cleanup_rendered
+    assert "helpers.fanout(flags=FANOUT_FLAGS(0x2C02))" in cleanup_rendered
 
 
 def test_condition_mask_from_fanout(tmp_path: Path) -> None:
@@ -1149,7 +1149,7 @@ def test_condition_mask_from_fanout(tmp_path: Path) -> None:
     assert len(block.nodes) == 1
     node = block.nodes[0]
     assert isinstance(node, IRConditionMask)
-    assert node.source == "fanout"
+    assert node.source == "helpers.fanout"
     assert node.mask == RET_MASK
 
 
