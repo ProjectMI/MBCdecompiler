@@ -21,6 +21,7 @@ from ..ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRConditionMask,
     IRDataMarker,
     IRFunctionPrologue,
     IRIORead,
@@ -38,6 +39,7 @@ from ..ir.model import (
     IRReturn,
     IRSegment,
     IRStore,
+    IRTablePatch,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -66,6 +68,7 @@ _DIRECT_EPILOGUE_KIND_MAP = {
     "op_04_EC": "io.bridge",
     "op_2D_01": "frame.cleanup",
     "reduce_passthrough": "helpers.reduce",
+    "reduce_pair": "helpers.reduce",
 }
 
 _MASK_STEP_MNEMONICS = {
@@ -241,6 +244,7 @@ from .model import (
     ASTProcedureResultSlot,
     ASTProcedureAlias,
     ASTProgram,
+    ASTConditionMask,
     ASTReturn,
     ASTReturnPayload,
     ASTSegment,
@@ -250,6 +254,7 @@ from .model import (
     ASTTerminator,
     ASTSwitch,
     ASTSwitchCase,
+    ASTTablePatch,
     ASTDispatchHelper,
     ASTDispatchIndex,
     ASTTailCall,
@@ -2359,7 +2364,10 @@ class ASTBuilder:
             )
         # No recorded successors: synthesise a canonical return terminator.
         payload = ASTReturnPayload()
-        return ASTReturn(payload=payload, effects=tuple())
+        effects: Tuple[ASTEffect, ...] = tuple()
+        if self._pending_epilogue:
+            effects = self._build_epilogue_effects(tuple(), tuple())
+        return ASTReturn(payload=payload, effects=effects)
 
     def _convert_block(
         self,
@@ -2858,6 +2866,40 @@ class ASTBuilder:
                 return candidate
             index += 1
 
+    def _build_condition_mask(self, node: IRConditionMask) -> ASTConditionMask:
+        source = self._normalise_condition_source(node.source, node.mask)
+        mask_field = self._mask_bitfield(node.mask, None)
+        return ASTConditionMask(source=source, mask=mask_field)
+
+    def _build_table_patch(self, node: IRTablePatch) -> ASTTablePatch:
+        mode = self._extract_table_mode(node.annotations)
+        annotations = tuple(
+            note
+            for note in node.annotations
+            if note and not note.startswith("mode=") and note != "opcode_table"
+        )
+        cases: List[ASTSwitchCase] = []
+        default_target: Optional[int] = None
+        effects: List[ASTEffect] = []
+        for mnemonic, operand in node.operations:
+            if mnemonic.startswith("op_2C_"):
+                key = self._parse_table_case_key(mnemonic, len(cases))
+                target = operand & 0xFFFF
+                cases.append(ASTSwitchCase(key=key, target=target))
+                continue
+            if mnemonic == "fanout":
+                default_target = operand & 0xFFFF
+                continue
+            effects.extend(self._table_patch_effects(mnemonic, operand))
+        normalised_effects = self._normalise_effect_list(effects)
+        return ASTTablePatch(
+            mode=mode,
+            cases=tuple(cases),
+            effects=normalised_effects,
+            default=default_target,
+            annotations=annotations,
+        )
+
     def _convert_node(
         self,
         node,
@@ -3042,6 +3084,10 @@ class ASTBuilder:
             else:
                 self._pending_epilogue.extend(node.steps)
             return [], []
+        if isinstance(node, IRConditionMask):
+            return [self._build_condition_mask(node)], []
+        if isinstance(node, IRTablePatch):
+            return [self._build_table_patch(node)], []
         if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
@@ -3292,6 +3338,63 @@ class ASTBuilder:
     def _mask_bitfield(self, value: int, alias: Optional[str]) -> ASTBitField:
         canonical = self._canonical_mask_alias(alias)
         return self._bitfield(value, canonical)
+
+    def _normalise_condition_source(self, source: str, mask: int) -> str:
+        if not source:
+            return "?"
+        if source == "fanout":
+            return "helpers.fanout"
+        if source == "terminator":
+            return "terminator"
+        step = IRStackEffect(mnemonic=source, operand=mask)
+        kind = self._epilogue_step_kind(step)
+        if kind != "frame.effect":
+            return kind
+        if source.startswith("op_"):
+            try:
+                high, low = source[3:].split("_", 1)
+                opcode = int(f"{high}{low}", 16)
+            except (ValueError, IndexError):
+                return source
+            return f"opcode(0x{opcode:04X})"
+        return source
+
+    @staticmethod
+    def _extract_table_mode(annotations: Sequence[str]) -> Optional[int]:
+        for note in annotations:
+            if not note:
+                continue
+            if note.startswith("mode="):
+                try:
+                    return int(note.split("=", 1)[1], 16)
+                except ValueError:
+                    continue
+        return None
+
+    @staticmethod
+    def _parse_table_case_key(mnemonic: str, ordinal: int) -> int:
+        suffix = mnemonic.split("_")[-1]
+        try:
+            return int(suffix, 16)
+        except ValueError:
+            return ordinal
+
+    def _table_patch_effects(self, mnemonic: str, operand: int) -> Tuple[ASTEffect, ...]:
+        pops = 0
+        normalised = mnemonic
+        if mnemonic.startswith("stack_teardown_"):
+            suffix = mnemonic.rsplit("_", 1)[-1]
+            try:
+                pops = int(suffix, 10)
+            except ValueError:
+                pops = 0
+            normalised = "stack_teardown"
+        step = IRStackEffect(mnemonic=normalised, operand=operand, pops=pops)
+        kind = self._epilogue_step_kind(step)
+        effect = self._effect_from_kind(kind, operand, None, pops=pops)
+        if effect is None:
+            return tuple()
+        return (effect,)
 
     @staticmethod
     def _refine_origin_space(

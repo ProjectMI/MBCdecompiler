@@ -1162,6 +1162,19 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
+class ASTConditionMask(ASTStatement):
+    """Latch a condition mask emitted by helper scaffolding."""
+
+    source: str
+    mask: ASTBitField
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
+
+    def render(self) -> str:
+        return f"condition.mask(source={self.source}, {self.mask.render()})"
+
+
+@dataclass
 class ASTTerminator(ASTStatement):
     """Base class for normalised block terminators."""
 
@@ -1434,6 +1447,36 @@ class ASTSwitch(ASTStatement):
         if self.abi is not None:
             parts.append(f"abi={self.abi.render()}")
         return f"Switch{{{', '.join(parts)}}}"
+
+
+@dataclass
+class ASTTablePatch(ASTStatement):
+    """High level view of opcode table patch sequences."""
+
+    mode: Optional[int]
+    cases: Tuple[ASTSwitchCase, ...]
+    effects: Tuple[ASTEffect, ...] = ()
+    default: Optional[int] = None
+    annotations: Tuple[str, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.UNKNOWN
+
+    def render(self) -> str:
+        parts: List[str] = []
+        if self.mode is not None:
+            parts.append(f"mode=0x{self.mode:02X}")
+        if self.cases:
+            rendered_cases = ", ".join(case.render() for case in self.cases)
+            parts.append(f"cases=[{rendered_cases}]")
+        if self.default is not None:
+            parts.append(f"default=0x{self.default:04X}")
+        if self.effects:
+            parts.append(f"effects={_render_effects(self.effects)}")
+        if self.annotations:
+            joined = ", ".join(self.annotations)
+            parts.append(f"annotations=[{joined}]")
+        inner = ", ".join(parts)
+        return f"table.patch({inner})" if inner else "table.patch()"
 
 
 @dataclass
@@ -1740,6 +1783,7 @@ __all__ = [
     "ASTSymbolSignature",
     "ASTIORead",
     "ASTIOWrite",
+    "ASTConditionMask",
     "ASTTerminator",
     "ASTTailCall",
     "ASTJump",
@@ -1750,6 +1794,7 @@ __all__ = [
     "ASTFlagCheck",
     "ASTFunctionPrologue",
     "ASTComment",
+    "ASTTablePatch",
     "ASTEnumDecl",
     "ASTEnumMember",
     "ASTBlock",

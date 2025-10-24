@@ -8,6 +8,7 @@ from mbcdisasm.ast import (
     ASTBlock,
     ASTBranch,
     ASTBuilder,
+    ASTConditionMask,
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallExpr,
@@ -30,6 +31,7 @@ from mbcdisasm.ast import (
     ASTReturnPayload,
     ASTSegment,
     ASTSwitch,
+    ASTTablePatch,
     ASTSymbolType,
     ASTSymbolTypeFamily,
     ASTTailCall,
@@ -46,7 +48,9 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRBankedLoad,
     IRCall,
+    IRCallCleanup,
     IRCallReturn,
+    IRConditionMask,
     IRDataMarker,
     IRDispatchCase,
     IRDispatchIndex,
@@ -56,6 +60,7 @@ from mbcdisasm.ir.model import (
     IRProgram,
     IRReturn,
     IRSegment,
+    IRTablePatch,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -1344,3 +1349,99 @@ def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
     block = procedure.blocks[0]
     assert procedure.successor_map[block.label] == tuple()
     assert all(not isinstance(stmt, ASTJump) for stmt in block.statements[:-1])
+
+
+def test_condition_mask_converts_to_statement() -> None:
+    block = IRBlock(
+        label="block_mask",
+        start_offset=0x0500,
+        nodes=(IRConditionMask(source="op_29_10", mask=RET_MASK),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0500,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedure = ast_program.segments[0].procedures[0]
+    statement = procedure.blocks[0].statements[0]
+    assert isinstance(statement, ASTConditionMask)
+    assert statement.source == "frame.return_mask"
+    assert "op_" not in statement.render()
+
+
+def test_table_patch_normalises_operations() -> None:
+    table = IRTablePatch(
+        operations=(
+            ("op_2C_10", 0x6623),
+            ("call_helpers", 0x724A),
+            ("op_04_02", 0x0000),
+            ("fanout", 0x1234),
+        ),
+        annotations=("opcode_table", "mode=0x2C"),
+    )
+    block = IRBlock(
+        label="block_table",
+        start_offset=0x0600,
+        nodes=(table,),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0600,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedure = ast_program.segments[0].procedures[0]
+    statement = procedure.blocks[0].statements[0]
+    assert isinstance(statement, ASTTablePatch)
+    assert statement.mode == 0x2C
+    assert statement.cases and statement.cases[0].key == 0x10
+    assert statement.cases[0].target == 0x6623
+    assert statement.default == 0x1234
+    assert statement.effects
+    rendered = statement.render()
+    assert "op_" not in rendered
+    for effect in statement.effects:
+        assert "op_" not in effect.render()
+
+
+def test_cleanup_effects_flush_into_synth_return() -> None:
+    cleanup = IRCallCleanup(
+        steps=(IRStackEffect(mnemonic="call_helpers", operand=0x724A),)
+    )
+    block = IRBlock(
+        label="block_cleanup",
+        start_offset=0x0700,
+        nodes=(cleanup,),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0700,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    procedure = ast_program.segments[0].procedures[0]
+    statements = procedure.blocks[0].statements
+    assert len(statements) == 1
+    statement = statements[0]
+    assert isinstance(statement, ASTReturn)
+    assert statement.effects
+    assert "op_" not in statement.render()
