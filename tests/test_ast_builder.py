@@ -33,6 +33,9 @@ from mbcdisasm.ast import (
     ASTSymbolType,
     ASTSymbolTypeFamily,
     ASTTailCall,
+    ASTConditionMask,
+    ASTTablePatch,
+    ASTHelperEffect,
 )
 from mbcdisasm.ast.model import (
     ASTEntryPoint,
@@ -46,6 +49,7 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRBankedLoad,
     IRCall,
+    IRCallCleanup,
     IRCallReturn,
     IRDataMarker,
     IRDispatchCase,
@@ -56,6 +60,8 @@ from mbcdisasm.ir.model import (
     IRProgram,
     IRReturn,
     IRSegment,
+    IRConditionMask,
+    IRTablePatch,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -907,6 +913,95 @@ def test_ast_finally_summary_matches_frame_protocol() -> None:
         if isinstance(effect, ASTFrameMaskEffect)
     }
     assert not mask_pairs
+
+
+def test_ast_condition_mask_produces_structured_statement() -> None:
+    condition = IRConditionMask(source="op_29_10", mask=RET_MASK)
+    ret = IRReturn(values=(), varargs=False)
+    block = IRBlock(label="mask_block", start_offset=0x4000, nodes=(condition, ret))
+    segment = IRSegment(
+        index=0,
+        start=0x4000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    condition_stmt = next(
+        statement for statement in statements if isinstance(statement, ASTConditionMask)
+    )
+    assert "op_" not in condition_stmt.render()
+    assert condition_stmt.source == "opcode[0x2910]"
+    assert condition_stmt.mask.alias == "RET_MASK"
+
+
+def test_ast_table_patch_operations_are_normalised() -> None:
+    patch = IRTablePatch(
+        operations=(
+            ("op_2C_01", 0x6623),
+            ("fanout", 0x7700),
+            ("op_04_02", 0x0000),
+        ),
+        annotations=("mode=op_2C_01",),
+    )
+    ret = IRReturn(values=(), varargs=False)
+    block = IRBlock(label="table_block", start_offset=0x5000, nodes=(patch, ret))
+    segment = IRSegment(
+        index=0,
+        start=0x5000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    table_stmt = next(
+        statement for statement in statements if isinstance(statement, ASTTablePatch)
+    )
+    rendered = table_stmt.render()
+    assert "op_" not in rendered
+    assert table_stmt.annotations == ("mode=opcode[0x2C01]",)
+    kinds = [operation.kind for operation in table_stmt.operations]
+    assert kinds == ["case", "fanout", "opcode"]
+    assert table_stmt.operations[0].target == 0x6623
+    assert table_stmt.operations[1].target == 0x7700
+
+
+def test_ast_cleanup_effect_aliases_are_sanitised() -> None:
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(mnemonic="call_helpers", operand_alias="op_F0_4B"),
+        )
+    )
+    ret = IRReturn(values=(), varargs=False, cleanup=tuple())
+    block = IRBlock(label="cleanup_block", start_offset=0x6000, nodes=(cleanup, ret))
+    segment = IRSegment(
+        index=0,
+        start=0x6000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    return_stmt = next(
+        statement
+        for statement in ast_program.segments[0].procedures[0].blocks[0].statements
+        if isinstance(statement, ASTReturn)
+    )
+    effect = next(
+        effect for effect in return_stmt.effects if isinstance(effect, ASTHelperEffect)
+    )
+    assert effect.symbol == "opcode[0xF04B]"
+    assert "op_" not in effect.render()
 
     channel_pairs = {
         (effect.channel, effect.value.value if effect.value else None)

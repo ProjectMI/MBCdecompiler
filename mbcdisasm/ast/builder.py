@@ -21,6 +21,7 @@ from ..ir.model import (
     IRCallCleanup,
     IRCallPreparation,
     IRCallReturn,
+    IRConditionMask,
     IRDataMarker,
     IRFunctionPrologue,
     IRIORead,
@@ -38,6 +39,7 @@ from ..ir.model import (
     IRReturn,
     IRSegment,
     IRStore,
+    IRTablePatch,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
@@ -152,6 +154,7 @@ _IO_OPCODE_FALLBACK = {
 }
 
 _TRACE_TOKEN = re.compile(r"^(?P<label>[^@]+)@0x(?P<offset>[0-9A-Fa-f]+)$")
+_RAW_OPCODE_TOKEN = re.compile(r"op_([0-9A-Fa-f]{2})_([0-9A-Fa-f]{2})")
 _MASK_OPCODE_FALLBACK = {0x29, 0x31, 0x32, 0x4B, 0x4F, 0x52, 0x5E, 0x70, 0x72}
 _DROP_OPCODE_FALLBACK = {0x01, 0x2D}
 _BRIDGE_OPCODE_FALLBACK = {0x3A, 0x3E, 0x04, 0x4A, 0x4B, 0x76, 0xE1, 0xE8, 0xED, 0xF0}
@@ -212,6 +215,7 @@ from .model import (
     ASTExitPoint,
     ASTExitReason,
     ASTFlagCheck,
+    ASTConditionMask,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameEffect,
@@ -249,6 +253,8 @@ from .model import (
     ASTJump,
     ASTTerminator,
     ASTSwitch,
+    ASTTableOperation,
+    ASTTablePatch,
     ASTSwitchCase,
     ASTDispatchHelper,
     ASTDispatchIndex,
@@ -2621,11 +2627,10 @@ class ASTBuilder:
         index_info = ASTDispatchIndex(
             expression=index_expr, mask=index_mask, base=index_base
         )
-        helper_info = (
-            ASTDispatchHelper(address=dispatch.helper, symbol=dispatch.helper_symbol)
-            if dispatch.helper is not None
-            else None
-        )
+        helper_info = None
+        if dispatch.helper is not None:
+            helper_symbol = self._sanitize_text(dispatch.helper_symbol)
+            helper_info = ASTDispatchHelper(address=dispatch.helper, symbol=helper_symbol)
         switch = ASTSwitch(
             call=call_expr,
             cases=cases,
@@ -2685,7 +2690,7 @@ class ASTBuilder:
             ASTSwitchCase(
                 key=case.key,
                 target=case.target,
-                symbol=case.symbol,
+                symbol=self._sanitize_text(case.symbol),
             )
             for case in cases
         )
@@ -3117,6 +3122,10 @@ class ASTBuilder:
                     origin_offset=origin_offset,
                 )
             ]
+        if isinstance(node, IRConditionMask):
+            return self._convert_condition_mask(node), []
+        if isinstance(node, IRTablePatch):
+            return self._convert_table_patch(node), []
         describe = getattr(node, "describe", None)
         if callable(describe):
             text = describe()
@@ -3125,7 +3134,25 @@ class ASTBuilder:
         text = text.strip()
         if text.startswith("marker literal_marker"):
             return [], []
-        return [ASTComment(text)], []
+        sanitized = self._sanitize_text(text) or text
+        return [ASTComment(sanitized)], []
+
+    def _convert_condition_mask(self, node: IRConditionMask) -> List[ASTStatement]:
+        alias = self._condition_mask_alias(node.mask)
+        mask_field = self._mask_bitfield(node.mask, alias)
+        source = self._sanitize_text(node.source) or node.source
+        statement = ASTConditionMask(source=source, mask=mask_field)
+        return [statement]
+
+    def _convert_table_patch(self, node: IRTablePatch) -> List[ASTStatement]:
+        operations = tuple(
+            self._table_operation_from_entry(mnemonic, operand)
+            for mnemonic, operand in node.operations
+        )
+        annotations = tuple(
+            filter(None, (self._sanitize_text(note) for note in node.annotations))
+        )
+        return [ASTTablePatch(operations=operations, annotations=annotations)]
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:
@@ -3294,6 +3321,42 @@ class ASTBuilder:
         return self._bitfield(value, canonical)
 
     @staticmethod
+    def _condition_mask_alias(value: int) -> Optional[str]:
+        if value == RET_MASK:
+            return "RET_MASK"
+        if value == FANOUT_FLAGS_A:
+            return "FANOUT_FLAGS_A"
+        if value == FANOUT_FLAGS_B:
+            return "FANOUT_FLAGS_B"
+        return None
+
+    def _table_operation_from_entry(
+        self, mnemonic: str, operand: int
+    ) -> ASTTableOperation:
+        if mnemonic.startswith("op_2C_"):
+            suffix = mnemonic.split("_")[-1]
+            try:
+                key = int(suffix, 16)
+            except ValueError:
+                key = None
+            return ASTTableOperation(kind="case", key=key, target=operand & 0xFFFF)
+        if mnemonic == "fanout":
+            return ASTTableOperation(kind="fanout", target=operand & 0xFFFF)
+        if mnemonic.startswith("stack_teardown_"):
+            pops: Optional[int]
+            suffix = mnemonic.split("_")[-1]
+            try:
+                pops = int(suffix, 10)
+            except ValueError:
+                pops = None
+            return ASTTableOperation(kind="teardown", pops=pops)
+        opcode_value = self._mnemonic_word(mnemonic)
+        if opcode_value is not None:
+            return ASTTableOperation(kind="opcode", opcode=opcode_value, operand=operand)
+        clean_kind = (self._sanitize_text(mnemonic) or mnemonic).replace("_", ".")
+        return ASTTableOperation(kind=clean_kind, operand=operand)
+
+    @staticmethod
     def _refine_origin_space(
         space: ASTAddressSpace, label: Optional[str]
     ) -> ASTAddressSpace:
@@ -3339,6 +3402,26 @@ class ASTBuilder:
             return None
 
     @staticmethod
+    def _mnemonic_word(mnemonic: str) -> Optional[int]:
+        match = _RAW_OPCODE_TOKEN.fullmatch(mnemonic)
+        if not match:
+            return None
+        try:
+            return (int(match.group(1), 16) << 8) | int(match.group(2), 16)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _sanitize_text(text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+
+        def _replace(match: re.Match[str]) -> str:
+            return f"opcode[0x{match.group(1).upper()}{match.group(2).upper()}]"
+
+        return _RAW_OPCODE_TOKEN.sub(_replace, text)
+
+    @staticmethod
     def _canonical_channel_alias(
         alias: Optional[str], operand: Optional[int]
     ) -> Optional[str]:
@@ -3351,8 +3434,9 @@ class ASTBuilder:
     @staticmethod
     def _effect_channel(alias: Optional[str], operand: Optional[int]) -> str:
         channel = ASTBuilder._canonical_channel_alias(alias, operand)
-        if channel:
-            return channel
+        sanitized = ASTBuilder._sanitize_text(channel)
+        if sanitized:
+            return sanitized
         if operand is not None:
             return f"0x{operand:04X}"
         return "?"
@@ -3439,11 +3523,13 @@ class ASTBuilder:
         alias: Optional[str],
         pops: int = 0,
     ) -> Optional[ASTEffect]:
+        alias = self._sanitize_text(alias)
         if kind.startswith("frame."):
             action = kind.split(".", 1)[1]
             if action == "protocol":
                 return None
             channel = self._canonical_channel_alias(alias, operand)
+            channel = self._sanitize_text(channel)
             if action == "return_mask":
                 if operand is None:
                     return None
@@ -3765,10 +3851,11 @@ class ASTBuilder:
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTCallExpr, Tuple[ASTCallOperand, ...]]:
         operands = tuple(self._build_operand(arg, value_state) for arg in args)
+        sanitized_symbol = self._sanitize_text(symbol)
         call_expr = ASTCallExpr(
             target=target,
             operands=operands,
-            symbol=symbol,
+            symbol=sanitized_symbol,
             tail=tail,
             varargs=varargs,
         )

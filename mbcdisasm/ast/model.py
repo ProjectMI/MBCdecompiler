@@ -1308,6 +1308,19 @@ class ASTFlagCheck(ASTTerminator):
 
 
 @dataclass
+class ASTConditionMask(ASTStatement):
+    """Install a condition mask used by subsequent control flow."""
+
+    source: str
+    mask: ASTBitField
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        return f"condition.mask(source={self.source}, {self.mask.render()})"
+
+
+@dataclass
 class ASTFunctionPrologue(ASTTerminator):
     """Reconstructed function prologue sequence."""
 
@@ -1434,6 +1447,63 @@ class ASTSwitch(ASTStatement):
         if self.abi is not None:
             parts.append(f"abi={self.abi.render()}")
         return f"Switch{{{', '.join(parts)}}}"
+
+
+@dataclass(frozen=True)
+class ASTTableOperation:
+    """Single operation executed as part of a table patch."""
+
+    kind: str
+    key: Optional[int] = None
+    target: Optional[int] = None
+    opcode: Optional[int] = None
+    operand: Optional[int] = None
+    pops: Optional[int] = None
+
+    def render(self) -> str:
+        if self.kind == "case":
+            target_repr = "?"
+            if self.target is not None:
+                target_repr = f"0x{self.target:04X}"
+            if self.key is None:
+                return f"case -> {target_repr}"
+            return f"case[0x{self.key:02X}] -> {target_repr}"
+        if self.kind == "fanout":
+            target_repr = "?"
+            if self.target is not None:
+                target_repr = f"0x{self.target:04X}"
+            return f"fanout -> {target_repr}"
+        if self.kind == "teardown":
+            if self.pops is None:
+                return "teardown"
+            return f"teardown(pops={self.pops})"
+        if self.kind == "opcode" and self.opcode is not None:
+            text = f"opcode[0x{self.opcode:04X}]"
+            if self.operand is not None:
+                text += f" operand=0x{self.operand:04X}"
+            return text
+        text = self.kind
+        if self.operand is not None:
+            text += f" operand=0x{self.operand:04X}"
+        return text
+
+
+@dataclass
+class ASTTablePatch(ASTStatement):
+    """Direct table patch operation that could not be lifted into a dispatch."""
+
+    operations: Tuple[ASTTableOperation, ...]
+    annotations: Tuple[str, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        operations = ", ".join(operation.render() for operation in self.operations)
+        annotation_text = ""
+        if self.annotations:
+            rendered = ", ".join(self.annotations)
+            annotation_text = f" annotations=[{rendered}]"
+        return f"table.patch([{operations}]){annotation_text}"
 
 
 @dataclass
@@ -1748,6 +1818,7 @@ __all__ = [
     "ASTBranch",
     "ASTTestSet",
     "ASTFlagCheck",
+    "ASTConditionMask",
     "ASTFunctionPrologue",
     "ASTComment",
     "ASTEnumDecl",
@@ -1766,6 +1837,8 @@ __all__ = [
     "ASTDispatchHelper",
     "ASTDispatchIndex",
     "ASTSwitch",
+    "ASTTableOperation",
+    "ASTTablePatch",
     "ASTSegment",
     "ASTMetrics",
     "ASTProgram",
