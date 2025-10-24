@@ -1227,7 +1227,32 @@ class ASTBuilder:
             key = self._effect_identity(effect)
             if key not in unique:
                 unique[key] = effect
-        ordered = sorted(unique.values(), key=lambda eff: eff.order_key())
+
+        def _helper_key(effect: ASTHelperEffect) -> Tuple[Any, ...]:
+            mask = effect.mask
+            if mask is None:
+                mask_key: Tuple[Any, ...] | None = None
+            else:
+                mask_key = (mask.width, mask.value, mask.alias)
+            return (effect.operation, effect.target, mask_key)
+
+        helper_with_symbol = {
+            _helper_key(effect)
+            for effect in unique.values()
+            if isinstance(effect, ASTHelperEffect) and effect.symbol
+        }
+
+        filtered: List[ASTEffect] = []
+        for effect in unique.values():
+            if (
+                isinstance(effect, ASTHelperEffect)
+                and effect.symbol is None
+                and _helper_key(effect) in helper_with_symbol
+            ):
+                continue
+            filtered.append(effect)
+
+        ordered = sorted(filtered, key=lambda eff: eff.order_key())
         return tuple(ordered)
 
     @staticmethod
@@ -3105,7 +3130,7 @@ class ASTBuilder:
             text = describe()
         else:
             text = repr(node)
-        if text.startswith("marker literal_marker"):
+        if "marker literal_marker" in text:
             return [], []
         return [ASTComment(text)], []
 

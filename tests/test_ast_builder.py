@@ -1013,6 +1013,32 @@ def test_ast_builder_filters_literal_marker_comment() -> None:
     assert not any("marker literal_marker" in stmt.render() for stmt in statements)
 
 
+def test_ast_builder_deduplicates_helper_invocations() -> None:
+    return_node = IRReturn(
+        values=(),
+        varargs=False,
+        cleanup=(
+            IRStackEffect(mnemonic="call_helpers", operand_alias="fmt.buffer_reset"),
+            IRStackEffect(mnemonic="call_helpers"),
+        ),
+    )
+    block = IRBlock(label="entry", start_offset=0x1000, nodes=(return_node,))
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    return_stmt = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+
+    rendered_effects = [effect.render() for effect in return_stmt.effects]
+    assert rendered_effects == ["helpers.invoke(symbol=fmt.buffer_reset)"]
+
+
 def test_ast_builder_preserves_tail_prefix_on_tail_calls() -> None:
     tail = IRTailCall(
         call=IRCall(target=0x2222, args=(), symbol="helper_tail"),
@@ -1344,3 +1370,34 @@ def test_trivial_jumps_do_not_reference_removed_blocks() -> None:
     block = procedure.blocks[0]
     assert procedure.successor_map[block.label] == tuple()
     assert all(not isinstance(stmt, ASTJump) for stmt in block.statements[:-1])
+
+
+def test_procedure_result_render_omits_redundant_slot_indices() -> None:
+    result = ASTProcedureResult(
+        kind=ASTProcedureResultKind.FIXED,
+        required_slots=(0, 1),
+        optional_slots=(2,),
+        slots=(
+            ASTProcedureResultSlot(
+                index=0,
+                type=ASTSymbolType(ASTSymbolTypeFamily.OPAQUE),
+                required=True,
+            ),
+            ASTProcedureResultSlot(
+                index=1,
+                type=ASTSymbolType(ASTSymbolTypeFamily.OPAQUE),
+                required=True,
+            ),
+            ASTProcedureResultSlot(
+                index=2,
+                type=ASTSymbolType(ASTSymbolTypeFamily.OPAQUE),
+                required=False,
+            ),
+        ),
+    )
+
+    rendered = result.render()
+
+    assert "slots=[" in rendered
+    assert "required=[" not in rendered
+    assert "optional=[" not in rendered

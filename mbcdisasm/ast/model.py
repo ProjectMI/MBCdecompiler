@@ -1545,10 +1545,11 @@ class ASTProcedureResult:
 
     def render(self) -> str:
         parts: List[str] = [f"kind={self.kind.value}"]
-        if self.required_slots:
+        include_slot_summary = not self.slots
+        if include_slot_summary and self.required_slots:
             required = ", ".join(str(index) for index in self.required_slots)
             parts.append(f"required=[{required}]")
-        if self.optional_slots:
+        if include_slot_summary and self.optional_slots:
             optional = ", ".join(str(index) for index in self.optional_slots)
             parts.append(f"optional=[{optional}]")
         if self.slots:
