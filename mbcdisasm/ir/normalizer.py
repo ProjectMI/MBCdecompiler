@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, replace, fields, is_dataclass
 import string
-from typing import Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union, cast
 
 from ..constants import (
     CALL_SHUFFLE_STANDARD,
@@ -3812,13 +3812,7 @@ class IRNormalizer:
             cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
             mask = mask or item.cleanup_mask
 
-            returns = item.returns
-            values: Tuple[str, ...]
-            if isinstance(returns, tuple):
-                values = returns
-            else:
-                count = max(int(returns), 0)
-                values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+            values = self._normalise_return_tokens(item.returns)
             if item.varargs and not values:
                 values = ("ret*",)
 
@@ -3958,10 +3952,10 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [new_return])
             return
 
-        returns = 0
+        returns: Tuple[str, ...] = tuple()
         varargs = False
         if returns_node is not None:
-            returns = len(returns_node.values)
+            returns = tuple(returns_node.values)
             varargs = returns_node.varargs
 
         tailcall = IRTailcallReturn(
@@ -4017,7 +4011,7 @@ class IRNormalizer:
                     target=target,
                     args=args,
                     tail=getattr(node, "tail", False),
-                    returns=getattr(node, "returns", tuple()),
+                    returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     arity=arity,
@@ -4031,7 +4025,7 @@ class IRNormalizer:
                     target=target,
                     args=args,
                     tail=getattr(node, "tail", False),
-                    returns=getattr(node, "returns", tuple()),
+                    returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     arity=arity,
@@ -4054,7 +4048,7 @@ class IRNormalizer:
                 )
                 replacement = IRTailCall(
                     call=updated_call,
-                    returns=getattr(node, "returns", tuple()),
+                    returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     abi_effects=tuple(),
@@ -4063,7 +4057,7 @@ class IRNormalizer:
                 replacement = IRTailcallReturn(
                     target=target,
                     args=args,
-                    returns=getattr(node, "returns", 0),
+                    returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     tail=getattr(node, "tail", True),
@@ -4428,7 +4422,7 @@ class IRNormalizer:
                         node = IRTailcallReturn(
                             target=call.target,
                             args=call.args,
-                            returns=return_count,
+                            returns=tuple(return_node.values),
                             varargs=varargs,
                             cleanup=combined_cleanup,
                             tail=True,
@@ -4934,6 +4928,27 @@ class IRNormalizer:
             category=category,
         )
 
+    @staticmethod
+    def _normalise_return_tokens(value: Any) -> Tuple[str, ...]:
+        if isinstance(value, tuple):
+            return value
+        if isinstance(value, list):
+            return tuple(value)
+        if isinstance(value, int):
+            count = max(value, 0)
+            return tuple(f"ret{i}" for i in range(count))
+        return tuple()
+
+    @staticmethod
+    def _coerce_return_tokens(tokens: Sequence[str], count: int) -> Tuple[str, ...]:
+        if count <= 0:
+            return tuple()
+        trimmed = list(tokens[:count])
+        next_index = len(trimmed)
+        for index in range(next_index, count):
+            trimmed.append(f"ret{index}")
+        return tuple(trimmed)
+
     def _rebuild_call_node(
         self,
         node: CallLike,
@@ -4966,7 +4981,7 @@ class IRNormalizer:
             returns = node.returns
             if signature.returns is not None and not node.varargs:
                 count = max(signature.returns, 0)
-                returns = tuple(f"ret{i}" for i in range(count))
+                returns = self._coerce_return_tokens(returns, count)
             return IRCallReturn(
                 target=target,
                 args=node.args,
@@ -4985,7 +5000,7 @@ class IRNormalizer:
             returns = node.returns
             if signature.returns is not None and not node.varargs:
                 count = max(signature.returns, 0)
-                returns = tuple(f"ret{i}" for i in range(count)) if count else tuple()
+                returns = self._coerce_return_tokens(returns, count)
             updated_call = IRCall(
                 target=target,
                 args=node.args,
@@ -5008,7 +5023,8 @@ class IRNormalizer:
         if isinstance(node, IRTailcallReturn):
             returns = node.returns
             if signature.returns is not None and not node.varargs:
-                returns = max(signature.returns, 0)
+                count = max(signature.returns, 0)
+                returns = self._coerce_return_tokens(returns, count)
             return IRTailcallReturn(
                 target=target,
                 args=node.args,
@@ -5079,13 +5095,14 @@ class IRNormalizer:
         # IRTailcallReturn
         if node.varargs:
             return node
-        current = int(node.returns)
+        current = len(node.returns)
         target = min(expected, current) if expected else 0
         if target != current:
+            new_returns = node.returns[:target]
             updated = IRTailcallReturn(
                 target=node.target,
                 args=node.args,
-                returns=target,
+                returns=new_returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 tail=node.tail,

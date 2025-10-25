@@ -1142,7 +1142,7 @@ class IRTailcallReturn(IRNode):
 
     target: int
     args: Tuple[str, ...]
-    returns: int
+    returns: Tuple[str, ...] = field(default_factory=tuple)
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     tail: bool = True
@@ -1157,7 +1157,14 @@ class IRTailcallReturn(IRNode):
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         args = ", ".join(self.args)
-        details = [f"returns={self.returns}"]
+        if self.varargs and not self.returns:
+            returns_desc = "varargs"
+        elif not self.returns:
+            returns_desc = "0"
+        else:
+            rendered = ", ".join(self.returns)
+            returns_desc = f"[{rendered}]"
+        details = [f"returns={returns_desc}"]
         if self.varargs:
             details.append("varargs")
         if self.convention is not None:
