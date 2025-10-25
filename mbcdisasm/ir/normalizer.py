@@ -2973,7 +2973,12 @@ class IRNormalizer:
                         continue
                 break
 
-            items.replace_slice(index, scan, [IRTablePatch(operations=tuple(operations))])
+            table = IRTablePatch(operations=tuple(operations))
+            for position in range(index, scan):
+                source = items[position]
+                if isinstance(source, (RawInstruction, IRNode)):
+                    self._transfer_ssa(source, table)
+            items.replace_slice(index, scan, [table])
             index += 1
 
     def _pass_table_dispatch(self, items: _ItemList) -> None:
@@ -5853,10 +5858,16 @@ class IRNormalizer:
                 continue
 
             if item.profile.kind is InstructionKind.BRANCH:
+                then_target = self._branch_target(item)
+                else_target = self._fallthrough_target(item)
+                if then_target == else_target:
+                    self._ssa_bindings.pop(id(item), None)
+                    items.replace_slice(index, index + 1, [])
+                    continue
                 node = IRIf(
                     condition=self._describe_condition(items, index),
-                    then_target=self._branch_target(item),
-                    else_target=self._fallthrough_target(item),
+                    then_target=then_target,
+                    else_target=else_target,
                 )
                 items.replace_slice(index, index + 1, [node])
                 metrics.if_branches += 1
@@ -6163,7 +6174,17 @@ class IRNormalizer:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
-    def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
+    def _describe_condition(
+        self, items: _ItemList, index: int, *, skip_literals: bool = False
+    ) -> str:
+        sources = self._stack_sources(items, index, 1)
+        for name, source in sources:
+            if skip_literals and self._is_literal_condition_source(source):
+                continue
+            alias = self._condition_alias(name)
+            if alias:
+                return alias
+
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
@@ -6172,26 +6193,30 @@ class IRNormalizer:
                     if skip_literals and candidate.mnemonic == "push_literal":
                         mapped = self._ssa_value(candidate, raw=True)
                         if mapped is not None:
-                            self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                            return self._render_ssa(mapped)
+                            alias = self._condition_alias(mapped)
+                            if alias:
+                                return alias
                         scan -= 1
                         continue
                     mapped = self._ssa_value(candidate, raw=True)
                     if mapped is not None:
-                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                        return self._render_ssa(mapped)
+                        alias = self._condition_alias(mapped)
+                        if alias:
+                            return alias
                     return self._describe_value(candidate)
                 if skip_literals:
                     mapped = self._ssa_value(candidate, raw=True)
                     if mapped is not None:
-                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                        return self._render_ssa(mapped)
+                        alias = self._condition_alias(mapped)
+                        if alias:
+                            return alias
                     return self._describe_value(candidate)
             if isinstance(candidate, IRLiteral):
                 mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
+                    alias = self._condition_alias(mapped)
+                    if alias:
+                        return alias
                 if skip_literals:
                     scan -= 1
                     continue
@@ -6199,8 +6224,9 @@ class IRNormalizer:
             if isinstance(candidate, IRLiteralChunk):
                 mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
+                    alias = self._condition_alias(mapped)
+                    if alias:
+                        return alias
                 if skip_literals:
                     scan -= 1
                     continue
@@ -6208,8 +6234,9 @@ class IRNormalizer:
             if isinstance(candidate, IRStackDuplicate):
                 mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
+                    alias = self._condition_alias(mapped)
+                    if alias:
+                        return alias
                 return candidate.value
             if isinstance(candidate, IRNode):
                 if isinstance(candidate, IRCallCleanup):
@@ -6217,11 +6244,34 @@ class IRNormalizer:
                     continue
                 mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
-                return getattr(candidate, "describe", lambda: "expr()")()
+                    alias = self._condition_alias(mapped)
+                    if alias:
+                        return alias
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    return describe()
+                return "expr()"
             scan -= 1
         return "stack_top"
+
+    @staticmethod
+    def _is_literal_condition_source(source: Union[RawInstruction, IRNode]) -> bool:
+        if isinstance(source, RawInstruction):
+            profile = source.profile
+            if profile.kind is InstructionKind.LITERAL:
+                return True
+            if source.mnemonic == "push_literal":
+                return True
+            return False
+        return isinstance(source, (IRLiteral, IRLiteralChunk))
+
+    def _condition_alias(self, name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        alias = self._ssa_aliases.get(name)
+        if not alias or alias.startswith("ssa") or not alias.startswith("bool"):
+            self._promote_ssa_kind(name, SSAValueKind.BOOLEAN)
+        return self._render_ssa(name)
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
