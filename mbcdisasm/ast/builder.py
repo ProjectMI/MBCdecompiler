@@ -3374,13 +3374,7 @@ class ASTBuilder:
             if len(values) < slot_count and getattr(node, "tail", False):
                 slot_count = len(values)
             if len(values) < slot_count:
-                deficit = slot_count - len(values)
-                start = len(values)
-                for index in range(start, start + deficit):
-                    placeholder = ASTValueOperand(
-                        token=f"slot_{index}", value=ASTUnknown(f"slot_{index}")
-                    )
-                    values.append(placeholder)
+                slot_count = len(values)
             for index in range(slot_count):
                 operand = values[index]
                 slots.append(ASTCallArgumentSlot(index=index, operand=operand))
