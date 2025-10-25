@@ -2,7 +2,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from mbcdisasm import IRNormalizer
-from mbcdisasm.constants import RET_MASK
+from mbcdisasm.constants import PAGE_REGISTER, RET_MASK
 from mbcdisasm.ast import (
     ASTAssign,
     ASTBlock,
@@ -1219,6 +1219,82 @@ def test_banked_memory_locations_are_canonical() -> None:
     assert "base=0x0040" in rendered
     assert "offset=0x0010" in rendered
     assert "alias=region(bank_1230)" in rendered
+
+
+def test_banked_location_keeps_page_metadata_with_literal_register() -> None:
+    memref = MemRef(
+        region="bank_helper",
+        bank=0x2340,
+        base=0x0010,
+        page=0x02,
+        offset=0x0004,
+        page_alias="helper_page",
+    )
+    block = IRBlock(
+        label="block_load",
+        start_offset=0x0200,
+        nodes=(
+            IRBankedLoad(
+                ref=memref,
+                target="word0",
+                register=PAGE_REGISTER,
+                register_value=0x02,
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0200,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    assign = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(assign, ASTAssign)
+    location = assign.value.location
+
+    assert location.address is not None
+    assert location.address.page == 0x02
+    assert location.address.page_alias == "helper_page"
+    assert location.address.page_register == PAGE_REGISTER
+
+
+def test_banked_location_ignores_out_of_range_register_value() -> None:
+    memref = MemRef(region="bank_raw", bank=0x3450, page=0x10, offset=0x0006)
+    block = IRBlock(
+        label="block_load",
+        start_offset=0x0300,
+        nodes=(
+            IRBankedLoad(
+                ref=memref,
+                target="word0",
+                register=PAGE_REGISTER,
+                register_value=0x1234,
+            ),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0300,
+        length=0x04,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    assign = ast_program.segments[0].procedures[0].blocks[0].statements[0]
+    assert isinstance(assign, ASTAssign)
+    location = assign.value.location
+
+    assert location.address is not None
+    assert location.address.page == 0x10
+    assert location.address.page_register == PAGE_REGISTER
 
 
 def test_identical_procedures_are_deduplicated() -> None:

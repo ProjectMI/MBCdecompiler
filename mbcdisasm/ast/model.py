@@ -132,7 +132,8 @@ class ASTMemoryAddress:
         elif self.page is not None:
             parts.append(f"page=0x{self.page:02X}")
         if self.page_register is not None:
-            parts.append(f"page_reg=0x{self.page_register:04X}")
+            formatted = _format_operand(self.page_register)
+            parts.append(f"page_reg={formatted}")
         if self.base_register is not None:
             parts.append(f"base_reg=0x{self.base_register:04X}")
         if self.base_offset is not None:

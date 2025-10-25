@@ -3208,9 +3208,10 @@ class ASTBuilder:
         address = self._memref_address(node.ref)
         alias = self._memref_alias(node.ref)
         displacement: Optional[ASTExpression] = None
-        if node.register_value is not None:
-            address = replace(address, page=node.register_value, page_alias=None, page_register=None)
-        else:
+        page_value = node.register_value
+        if page_value is not None and 0 <= page_value <= 0xFF:
+            address = replace(address, page=page_value)
+        if node.register is not None:
             address = replace(address, page_register=node.register)
         if offset is not None:
             if isinstance(offset, ASTIntegerLiteral):

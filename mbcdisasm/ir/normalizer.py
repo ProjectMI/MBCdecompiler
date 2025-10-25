@@ -1383,7 +1383,7 @@ class IRNormalizer:
                     value_repr = source_node.describe()
                     literal_value = source_node.value & 0xFFFF
                 elif isinstance(source_node, IRLiteralChunk):
-                    value_repr = source_node.describe()
+                    value_repr = None
                 else:
                     value_repr = self._render_ssa(value_name)
             else:
@@ -5891,11 +5891,12 @@ class IRNormalizer:
                     base_alias = self._render_ssa(base_name)
                 pointer_alias = base_alias
                 if memref is not None and memref.bank is not None:
+                    page_value = memref.page if memref.page is not None else None
                     node = IRBankedLoad(
                         ref=memref,
                         target=target_alias,
                         register=PAGE_REGISTER,
-                        register_value=memref.bank,
+                        register_value=page_value,
                         pointer=pointer_alias if base_sources else None,
                     )
                 else:
@@ -5931,11 +5932,12 @@ class IRNormalizer:
                     base_alias = self._render_ssa(base_name)
                 pointer_alias = base_alias
                 if memref is not None and memref.bank is not None:
+                    page_value = memref.page if memref.page is not None else None
                     node = IRBankedStore(
                         ref=memref,
                         value=value_alias,
                         register=PAGE_REGISTER,
-                        register_value=memref.bank,
+                        register_value=page_value,
                         pointer=pointer_alias if base_sources else None,
                     )
                 else:

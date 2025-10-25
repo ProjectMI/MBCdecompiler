@@ -2476,7 +2476,32 @@ def test_normalizer_tracks_page_register_literal_for_memref(tmp_path: Path) -> N
 
     load_node = next(node for node in block.nodes if isinstance(node, IRBankedLoad))
     assert load_node.ref is not None
-    assert load_node.register_value == 0x4B10
+    assert load_node.register_value == 0xDC
+
+
+def test_normalizer_drops_string_page_register_values() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    literal = IRLiteralChunk(data=b"MODE", source="test", symbol="str_0000")
+    instruction = make_stack_neutral_instruction(4, "op_6C_01", operand=PAGE_REGISTER)
+    items = _ItemList([literal, instruction])
+
+    normalizer._ssa_bindings[id(literal)] = ("value0",)
+    normalizer._ssa_bindings[id(instruction)] = ("page0",)
+
+    normalizer._pass_page_registers(items)
+
+    assert len(items) == 2
+    node = items[1]
+    assert isinstance(node, IRPageRegister)
+    assert node.value is None
+    assert node.literal is None
+
+
+def test_page_register_alias_variants() -> None:
+    node = IRPageRegister(register=0x06C8, value="lit(0x6901)")
+    assert "PageSelect" in node.describe()
 
 
 def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
@@ -2512,7 +2537,7 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
     page_nodes = [node for node in block.nodes if isinstance(node, IRPageRegister)]
 
     assert load_node.ref is not None
-    assert load_node.register_value == 0x4B0C
+    assert load_node.register_value == 0xC8
     assert any(page.register == 0x06C8 for page in page_nodes)
 
     cleanup = next(node for node in block.nodes if isinstance(node, IRCallCleanup))

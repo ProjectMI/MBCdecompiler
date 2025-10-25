@@ -28,6 +28,7 @@ OPERAND_ALIASES: Dict[int, str] = {
     0x3069: "ChatOut",
     0x2961: "ChatOut",
     PAGE_REGISTER: "PageSelect",
+    0x06C8: "PageSelect",
     FANOUT_FLAGS_A: "FANOUT_FLAGS",
     FANOUT_FLAGS_B: "FANOUT_FLAGS",
     CALL_SHUFFLE_STANDARD: "CALL_SHUFFLE_STD",
