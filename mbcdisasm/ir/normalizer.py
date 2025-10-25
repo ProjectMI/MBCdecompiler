@@ -1658,6 +1658,27 @@ class IRNormalizer:
         args: List[str] = []
         start = call_index
         scan = call_index - 1
+        value_nodes = (
+            IRLoad,
+            IRIndirectLoad,
+            IRBankedLoad,
+            IRIORead,
+            IRCall,
+            IRCallReturn,
+            IRTailCall,
+            IRTailcallReturn,
+        )
+        skip_nodes = (
+            IRCallCleanup,
+            IRCallPreparation,
+            IRConditionMask,
+            IRDataMarker,
+            IRTablePatch,
+            IRAsciiHeader,
+            IRAsciiPreamble,
+            IRAsciiFinalize,
+            IRTailcallFrame,
+        )
         while scan >= 0:
             candidate = items[scan]
             if isinstance(candidate, (IRLiteral, IRLiteralChunk)):
@@ -1669,14 +1690,23 @@ class IRNormalizer:
                 args.append(candidate.value)
                 scan -= 1
                 continue
+            if isinstance(candidate, skip_nodes):
+                scan -= 1
+                continue
+            if isinstance(candidate, value_nodes):
+                name = self._ssa_value(candidate)
+                if name:
+                    args.append(name)
+                    scan -= 1
+                    continue
+                scan -= 1
+                continue
             if isinstance(candidate, RawInstruction):
                 if candidate.pushes_value():
                     args.append(self._describe_value(candidate))
                     scan -= 1
                     continue
-                break
-            else:
-                break
+            break
         args.reverse()
         start = scan + 1
         return args, start
@@ -2837,16 +2867,23 @@ class IRNormalizer:
             return None
         assert isinstance(seed, RawInstruction)
         mode = seed.profile.mode
-        kind = seed.profile.kind
+        seed_kind = seed.profile.kind
+        annotation_kind = seed_kind
+        if annotation_kind is InstructionKind.UNKNOWN:
+            annotation_kind = InstructionKind.TABLE_LOOKUP
         start = index
         scan = index
         operations: List[Tuple[str, int]] = []
-        annotations = ["adaptive_table", f"mode=0x{mode:02X}", f"kind={kind.name.lower()}"]
+        annotations = [
+            "adaptive_table",
+            f"mode=0x{mode:02X}",
+            f"kind={annotation_kind.name.lower()}",
+        ]
         seen_annotations = set(annotations)
 
         while scan < len(items):
             candidate = items[scan]
-            if not self._is_adaptive_table_body(candidate, mode, kind):
+            if not self._is_adaptive_table_body(candidate, mode, seed_kind):
                 break
             assert isinstance(candidate, RawInstruction)
             operations.append((candidate.mnemonic, candidate.operand))

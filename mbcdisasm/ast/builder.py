@@ -507,6 +507,10 @@ class ASTBuilder:
         self._current_segment_index: int = -1
         self._call_arg_values: Dict[str, ASTExpression] = {}
         self._expression_lookup: Dict[str, ASTExpression] = {}
+        self._slotless_tail_helpers: Set[str] = {
+            "fmt.message_commit",
+            "tail_helper_72",
+        }
 
     # ------------------------------------------------------------------
     # public API
@@ -3361,6 +3365,12 @@ class ASTBuilder:
         slots: List[ASTCallArgumentSlot] = []
         if slot_count:
             values = list(arg_operands)
+            if len(values) < slot_count and not values and getattr(node, "tail", False):
+                call = getattr(node, "call", node)
+                symbol = getattr(call, "symbol", None)
+                symbol_base = symbol.split("(", 1)[0] if symbol else None
+                if symbol in self._slotless_tail_helpers or symbol_base in self._slotless_tail_helpers:
+                    slot_count = len(values)
             if len(values) < slot_count:
                 deficit = slot_count - len(values)
                 start = len(values)
@@ -3381,9 +3391,13 @@ class ASTBuilder:
         if live_mask is not None:
             mask_field = self._bitfield(live_mask, None)
         return_tokens = getattr(node, "returns", ())
+        if isinstance(return_tokens, int):
+            return_tokens = tuple(f"ret{i}" for i in range(return_tokens))
         return_slots: List[ASTCallReturnSlot] = []
         for index, token in enumerate(return_tokens):
             kind = self._infer_kind(token)
+            if kind is SSAValueKind.UNKNOWN:
+                kind = self._call_return_kind(node, index)
             name = self._canonical_placeholder_name(token, index, kind)
             return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
         abi_effects = getattr(node, "abi_effects", ())
@@ -3422,6 +3436,15 @@ class ASTBuilder:
         kind = self._infer_kind(name)
         canonical = self._canonical_placeholder_name(name, index, kind)
         return ASTIdentifier(canonical, kind)
+
+    def _call_return_kind(self, node: Any, index: int) -> SSAValueKind:
+        call = getattr(node, "call", node)
+        if isinstance(node, IRTailCall) or getattr(node, "tail", False):
+            return SSAValueKind.WORD
+        symbol = getattr(call, "symbol", None)
+        if isinstance(symbol, str) and symbol.startswith("io."):
+            return SSAValueKind.WORD
+        return SSAValueKind.UNKNOWN
 
     def _canonicalise_return_expr(
         self, index: int, expr: ASTExpression

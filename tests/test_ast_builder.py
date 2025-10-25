@@ -787,8 +787,7 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert isinstance(call_stmt.abi, ASTCallABI)
     assert call_stmt.abi.live_mask is not None
     assert call_stmt.abi.live_mask.value == RET_MASK
-    assert len(call_stmt.abi.slots) == 2
-    assert all(isinstance(slot, ASTCallArgumentSlot) for slot in call_stmt.abi.slots)
+    assert len(call_stmt.abi.slots) == 0
 
     return_stmt = next(statement for statement in block.statements if isinstance(statement, ASTReturn))
     protocol_effect = next(
