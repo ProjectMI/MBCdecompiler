@@ -23,7 +23,7 @@ def iter_script_pairs(root: Path) -> Iterable[tuple[Path, Path]]:
 
 PATTERNS: tuple[tuple[str, str], ...] = (
     ("returns=[ret[0]=value0:unknown", "Unknown return value slot"),
-    ("slots=[arg[0]=value(", "Value operand in first argument slot"),
+    ("value(?(", "Value operand in first argument slot"),
     ("op_", "Operations with op_ prefix"),
 )
 
