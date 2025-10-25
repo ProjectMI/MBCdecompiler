@@ -50,6 +50,7 @@ from ..ir.model import (
     IRTailcallReturn,
     IRTerminator,
     IRAbiEffect,
+    IRStackDrop,
     IRStackEffect,
     MemRef,
     MemSpace,
@@ -1481,6 +1482,13 @@ class ASTBuilder:
                     terminator.target_offset = target_block.start_offset
                     terminator.hint = None
                 add(target_block)
+                if terminator.hint == "fallthrough":
+                    fallthrough = analysis.fallthrough if analysis else None
+                    if fallthrough is not None:
+                        terminator.target_offset = fallthrough
+                    else:
+                        terminator.target_offset = terminator.target_offset or 0
+                    terminator.hint = None
             elif isinstance(
                 terminator,
                 (ASTBranch, ASTTestSet, ASTFlagCheck, ASTFunctionPrologue),
@@ -1949,6 +1957,8 @@ class ASTBuilder:
                 statements.pop()
                 statements.extend(successor.statements)
                 block.statements = tuple(statements)
+                block.label = successor.label
+                block.start_offset = successor.start_offset
                 block.successors = successor.successors
                 for succ in successor.successors:
                     succ_key = id(succ)
@@ -2033,8 +2043,17 @@ class ASTBuilder:
                 if updated is None:
                     continue
                 statement = updated
+            if isinstance(statement, ASTJump):
+                updated_jump = self._simplify_jump_statement(
+                    statement, block_order, fallthrough
+                )
+                if updated_jump is None:
+                    continue
+                statement = updated_jump
             simplified.append(statement)
-        block.statements = tuple(simplified)
+        if simplified:
+            block.statements = tuple(simplified)
+            self._update_block_successors(block, block_order)
 
     def _simplify_branch_statement(
         self,
@@ -2048,6 +2067,40 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
+        literal = self._branch_condition_literal(statement)
+        if literal is not None:
+            prefix = "then" if literal else "else"
+            destination = self._branch_destination(
+                statement, prefix, block_order, fallthrough
+            )
+            jump = self._build_jump_from_destination(
+                destination, block_order, fallthrough
+            )
+            if jump is not None:
+                return jump
+            return statement
+        then_destination = self._branch_destination(
+            statement, "then", block_order, fallthrough
+        )
+        else_destination = self._branch_destination(
+            statement, "else", block_order, fallthrough
+        )
+        if (
+            isinstance(statement, ASTBranch)
+            and self._is_fallthrough_destination(then_destination, fallthrough)
+            and self._is_fallthrough_destination(else_destination, fallthrough)
+        ):
+            jump = self._build_jump_from_destination(
+                then_destination, block_order, fallthrough
+            )
+            if jump is not None:
+                return jump
+            jump = self._build_jump_from_destination(
+                else_destination, block_order, fallthrough
+            )
+            if jump is not None:
+                return jump
+            return statement
         if (
             then_target is not None
             and else_target is not None
@@ -2060,6 +2113,166 @@ class ASTBuilder:
             hint = statement.then_hint or statement.else_hint
             return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
         return statement
+
+    def _simplify_jump_statement(
+        self,
+        statement: ASTJump,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> Optional[ASTJump]:
+        target = statement.target
+        if target is not None:
+            return statement
+        if statement.target_offset is not None:
+            resolved = self._find_block_by_offset(block_order, statement.target_offset)
+            if resolved is not None:
+                statement.target = resolved
+                statement.target_offset = resolved.start_offset
+                statement.hint = None
+            return statement
+        if statement.hint == "fallthrough":
+            if fallthrough is None:
+                statement.target_offset = statement.target_offset or 0
+                statement.hint = None
+                return statement
+            resolved = self._find_block_by_offset(block_order, fallthrough)
+            if resolved is not None:
+                statement.target = resolved
+                statement.target_offset = resolved.start_offset
+                statement.hint = None
+            else:
+                statement.target_offset = fallthrough
+                statement.hint = None
+            return statement
+        return statement
+
+    @staticmethod
+    def _branch_condition_literal(statement: BranchStatement) -> Optional[bool]:
+        if not isinstance(statement, ASTBranch):
+            return None
+        condition = statement.condition
+        if isinstance(condition, ASTBooleanLiteral):
+            return condition.value
+        return None
+
+    def _branch_destination(
+        self,
+        statement: BranchStatement,
+        prefix: str,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> Tuple[Optional[ASTBlock], Optional[int], Optional[str]]:
+        branch_attr = f"{prefix}_branch"
+        offset_attr = f"{prefix}_offset"
+        hint_attr = f"{prefix}_hint"
+        branch = getattr(statement, branch_attr, None)
+        offset = getattr(statement, offset_attr, None)
+        hint = getattr(statement, hint_attr, None)
+        if branch is not None:
+            return branch, branch.start_offset, None
+        if offset is None and hint == "fallthrough":
+            offset = fallthrough
+        target_block = self._find_block_by_offset(block_order, offset)
+        if target_block is not None:
+            setattr(statement, branch_attr, target_block)
+            setattr(statement, offset_attr, target_block.start_offset)
+            setattr(statement, hint_attr, None)
+            return target_block, target_block.start_offset, None
+        return None, offset, hint
+
+    @staticmethod
+    def _is_fallthrough_destination(
+        destination: Tuple[Optional[ASTBlock], Optional[int], Optional[str]],
+        fallthrough: Optional[int],
+    ) -> bool:
+        block, offset, hint = destination
+        if fallthrough is not None:
+            if block is not None and block.start_offset == fallthrough:
+                return True
+            if offset is not None and offset == fallthrough:
+                return True
+            return hint == "fallthrough"
+        return False
+
+    def _build_jump_from_destination(
+        self,
+        destination: Tuple[Optional[ASTBlock], Optional[int], Optional[str]],
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> Optional[ASTJump]:
+        block, offset, hint = destination
+        if block is not None:
+            return ASTJump(target=block, target_offset=block.start_offset)
+        if offset is not None:
+            resolved = self._find_block_by_offset(block_order, offset)
+            if resolved is not None:
+                return ASTJump(target=resolved, target_offset=resolved.start_offset)
+            return ASTJump(target=None, target_offset=offset)
+        if hint == "fallthrough" and fallthrough is not None:
+            resolved = self._find_block_by_offset(block_order, fallthrough)
+            if resolved is not None:
+                return ASTJump(target=resolved, target_offset=resolved.start_offset)
+            return ASTJump(target=None, target_offset=fallthrough)
+        if hint and hint != "fallthrough":
+            return ASTJump(target=None, hint=hint)
+        return None
+
+    def _update_block_successors(
+        self, block: ASTBlock, block_order: Sequence[ASTBlock]
+    ) -> None:
+        terminator = block.terminator
+        successors: List[ASTBlock] = []
+        if isinstance(terminator, ASTJump):
+            target = terminator.target
+            if target is None and terminator.target_offset is not None:
+                target = self._find_block_by_offset(block_order, terminator.target_offset)
+                if target is not None:
+                    terminator.target = target
+                    terminator.target_offset = target.start_offset
+                    terminator.hint = None
+            if target is None and terminator.hint == "fallthrough":
+                analysis = self._current_analyses.get(block.start_offset)
+                fallthrough = analysis.fallthrough if analysis else None
+                if fallthrough is not None:
+                    target = self._find_block_by_offset(block_order, fallthrough)
+                    if target is not None:
+                        terminator.target = target
+                        terminator.target_offset = target.start_offset
+                        terminator.hint = None
+            if target is not None:
+                successors.append(target)
+        elif isinstance(terminator, BranchStatement):
+            for prefix in ("then", "else"):
+                branch = getattr(terminator, f"{prefix}_branch")
+                offset = getattr(terminator, f"{prefix}_offset")
+                hint = getattr(terminator, f"{prefix}_hint")
+                target = branch
+                if target is None and offset is not None:
+                    target = self._find_block_by_offset(block_order, offset)
+                    if target is not None:
+                        setattr(terminator, f"{prefix}_branch", target)
+                        setattr(terminator, f"{prefix}_offset", target.start_offset)
+                        setattr(terminator, f"{prefix}_hint", None)
+                elif target is None and hint == "fallthrough":
+                    analysis = self._current_analyses.get(block.start_offset)
+                    fallthrough = analysis.fallthrough if analysis else None
+                    if fallthrough is not None:
+                        target = self._find_block_by_offset(block_order, fallthrough)
+                        if target is not None:
+                            setattr(terminator, f"{prefix}_branch", target)
+                            setattr(terminator, f"{prefix}_offset", target.start_offset)
+                            setattr(terminator, f"{prefix}_hint", None)
+                if target is not None:
+                    successors.append(target)
+        seen: Set[int] = set()
+        ordered: List[ASTBlock] = []
+        for successor in successors:
+            key = id(successor)
+            if key not in seen:
+                ordered.append(successor)
+                seen.add(key)
+        if ordered:
+            block.successors = tuple(ordered)
 
     def _ensure_branch_target(
         self,
@@ -2869,6 +3082,8 @@ class ASTBuilder:
         if isinstance(node, IRDataMarker):
             if node.mnemonic == "literal_marker":
                 return [], []
+        if isinstance(node, IRStackDrop):
+            return [], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             location = self._build_slot_location(node.slot)
@@ -3402,7 +3617,7 @@ class ASTBuilder:
             if action == "teardown":
                 return ASTFrameTeardownEffect(pops=pops or 0)
             if action == "drop":
-                return ASTFrameDropEffect(pops=pops or 0)
+                return None
             if action == "page_select":
                 bitfield = self._bitfield(operand, alias) if operand is not None else None
                 return ASTFrameChannelEffect(channel="page_select", value=bitfield)
@@ -3790,6 +4005,12 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        token = self._strip_branch_annotations(token)
+        if token.startswith("drop"):
+            remainder = token[len("drop") :].strip()
+            if remainder:
+                return self._resolve_expr(remainder, value_state)
+            return ASTBooleanLiteral(True)
         if token in value_state:
             return value_state[token]
         if token in self._call_arg_values:
@@ -3846,6 +4067,8 @@ class ASTBuilder:
         if body.startswith("ascii_finalize"):
             return prelude, ASTBooleanLiteral(True)
         if body.startswith("io.write("):
+            return prelude, ASTBooleanLiteral(True)
+        if body.startswith("drop"):
             return prelude, ASTBooleanLiteral(True)
         if body == "stack_top":
             assignment, identifier = self._materialise_stack_top_predicate(
@@ -3949,7 +4172,9 @@ class ASTBuilder:
         if entry_reasons:
             joined = ",".join(entry_reasons) or "unspecified"
             return f"entry({joined})"
-        return "fallthrough"
+        if target_offset is None:
+            return "?"
+        return f"0x{target_offset:04X}"
 
     def _format_exit_hint(self, exit_reasons: Tuple[str, ...]) -> str:
         if not exit_reasons:
