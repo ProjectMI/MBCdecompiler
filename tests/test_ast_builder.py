@@ -22,6 +22,7 @@ from mbcdisasm.ast import (
     ASTIntegerLiteral,
     ASTImmediateOperand,
     ASTJump,
+    ASTComment,
     ASTMemoryRead,
     ASTProcedure,
     ASTProcedureResult,
@@ -62,6 +63,7 @@ from mbcdisasm.ir.model import (
     IRTestSetBranch,
     IRTailCall,
     IRStackEffect,
+    IRStackDrop,
     IRSlot,
     IRFunctionPrologue,
     MemRef,
@@ -927,6 +929,37 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert not frame_teardowns
     assert not frame_drops
 
+
+def test_ast_builder_omits_stack_drop_comments() -> None:
+    block = IRBlock(
+        label="entry",
+        start_offset=0x1000,
+        nodes=(
+            IRStackDrop(value="stack_top"),
+            IRReturn(values=(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert all(
+        not (
+            isinstance(statement, ASTComment)
+            and statement.text.strip().startswith("drop ")
+        )
+        for statement in statements
+    )
+
+
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(
         values=(),
@@ -999,6 +1032,66 @@ def test_io_effect_channel_uses_canonical_alias() -> None:
     assert effect.port == "ChatOut"
     assert effect.mask is not None
     assert effect.mask.render() == "mask[16]=ChatOut"
+
+
+def test_ast_branch_constant_true_normalises_to_jump() -> None:
+    entry = IRBlock(
+        label="entry",
+        start_offset=0x1000,
+        nodes=(IRIf(condition="bool(true)", then_target=0x1010, else_target=0x1020),),
+    )
+    then_block = IRBlock(
+        label="then",
+        start_offset=0x1010,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="else",
+        start_offset=0x1020,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x40,
+        blocks=(entry, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = next(
+        block for block in procedure.blocks if block.start_offset == 0x1000
+    )
+    assert isinstance(entry_block.terminator, ASTJump)
+    assert entry_block.terminator.target is not None
+    assert entry_block.terminator.target.start_offset == 0x1010
+    rendered = [statement.render() for statement in entry_block.statements]
+    assert all("if bool(true)" not in text for text in rendered)
+
+
+def test_ast_jump_fallthrough_renders_as_fallthrough() -> None:
+    block = IRBlock(
+        label="entry",
+        start_offset=0x2000,
+        nodes=(IRIf(condition="bool(true)", then_target=0x2010, else_target=0x2010),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x20,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = procedure.blocks[0]
+
+    assert isinstance(entry_block.terminator, ASTJump)
+    assert entry_block.terminator.render() == "fallthrough"
 
 
 def test_symbol_table_synthesises_call_signatures() -> None:

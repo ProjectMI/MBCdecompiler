@@ -51,6 +51,7 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    IRStackDrop,
     MemRef,
     MemSpace,
     SSAValueKind,
@@ -1883,7 +1884,7 @@ class ASTBuilder:
         while changed:
             changed = False
             for block in list(block_order):
-                if block.body:
+                if block.body and not self._can_remove_with_body(block):
                     continue
                 if not isinstance(block.terminator, ASTJump):
                     continue
@@ -1980,6 +1981,23 @@ class ASTBuilder:
 
         return tuple(block_order)
 
+    def _can_remove_with_body(self, block: ASTBlock) -> bool:
+        if not block.body:
+            return True
+        return all(self._is_stack_top_assignment(statement) for statement in block.body)
+
+    @staticmethod
+    def _is_stack_top_assignment(statement: ASTStatement) -> bool:
+        if not isinstance(statement, ASTAssign):
+            return False
+        target = statement.target
+        value = statement.value
+        if not isinstance(target, ASTIdentifier):
+            return False
+        if not target.name.startswith("id_stack_top_"):
+            return False
+        return isinstance(value, ASTIdentifier) and value.name == "stack_top"
+
     def _simplify_stack_branches(self, block: ASTBlock) -> None:
         stack: List[Tuple[str, int | None]] = []
         for statement in list(block.statements):
@@ -2033,6 +2051,12 @@ class ASTBuilder:
                 if updated is None:
                     continue
                 statement = updated
+                if isinstance(statement, BranchStatement):
+                    statement = self._normalise_branch_control(
+                        statement, fallthrough
+                    )
+            if isinstance(statement, ASTJump):
+                statement = self._normalise_jump_statement(statement, fallthrough)
             simplified.append(statement)
         block.statements = tuple(simplified)
 
@@ -2060,6 +2084,106 @@ class ASTBuilder:
             hint = statement.then_hint or statement.else_hint
             return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
         return statement
+
+    def _normalise_branch_control(
+        self, statement: BranchStatement, fallthrough: Optional[int]
+    ) -> ASTStatement:
+        if isinstance(statement, ASTBranch):
+            condition = statement.condition
+            truthy: Optional[bool] = None
+            if isinstance(condition, ASTBooleanLiteral):
+                truthy = condition.value
+            elif isinstance(condition, ASTIdentifier):
+                name = condition.name.strip().lower()
+                if name == "bool(true)":
+                    truthy = True
+                elif name == "bool(false)":
+                    truthy = False
+            if truthy is not None:
+                return self._branch_constant_jump(statement, truthy, fallthrough)
+            if self._branch_targets_fallthrough(statement, fallthrough):
+                return self._fallthrough_jump(fallthrough)
+        return statement
+
+    def _branch_constant_jump(
+        self, branch: ASTBranch, truthy: bool, fallthrough: Optional[int]
+    ) -> ASTJump:
+        prefix = "then" if truthy else "else"
+        block, offset, hint = self._branch_destination(branch, prefix, fallthrough)
+        jump = ASTJump(target=block, target_offset=offset, hint=hint)
+        return self._normalise_jump_statement(jump, fallthrough)
+
+    def _branch_destination(
+        self,
+        statement: ASTBranch,
+        prefix: str,
+        fallthrough: Optional[int],
+    ) -> Tuple[Optional[ASTBlock], Optional[int], Optional[str]]:
+        branch_attr = f"{prefix}_branch"
+        offset_attr = f"{prefix}_offset"
+        hint_attr = f"{prefix}_hint"
+        block = getattr(statement, branch_attr, None)
+        offset = getattr(statement, offset_attr, None)
+        hint = getattr(statement, hint_attr, None)
+        if block is not None:
+            offset = block.start_offset
+            hint = None
+        elif hint == "fallthrough" and offset is None:
+            offset = fallthrough
+        return block, offset, hint
+
+    def _branch_targets_fallthrough(
+        self, statement: ASTBranch, fallthrough: Optional[int]
+    ) -> bool:
+        then_block, then_offset, then_hint = self._branch_destination(
+            statement, "then", fallthrough
+        )
+        else_block, else_offset, else_hint = self._branch_destination(
+            statement, "else", fallthrough
+        )
+        return (
+            self._destination_is_fallthrough(
+                then_block, then_offset, then_hint, fallthrough
+            )
+            and self._destination_is_fallthrough(
+                else_block, else_offset, else_hint, fallthrough
+            )
+        )
+
+    @staticmethod
+    def _destination_is_fallthrough(
+        block: Optional[ASTBlock],
+        offset: Optional[int],
+        hint: Optional[str],
+        fallthrough: Optional[int],
+    ) -> bool:
+        if block is not None:
+            return fallthrough is not None and block.start_offset == fallthrough
+        if offset is not None:
+            if fallthrough is None:
+                return False
+            return offset == fallthrough
+        return fallthrough is not None and hint == "fallthrough"
+
+    def _fallthrough_jump(self, fallthrough: Optional[int]) -> ASTJump:
+        jump = ASTJump(target=None, target_offset=fallthrough, hint="fallthrough")
+        return self._normalise_jump_statement(jump, fallthrough)
+
+    def _normalise_jump_statement(
+        self, jump: ASTJump, fallthrough: Optional[int]
+    ) -> ASTJump:
+        target = jump.target
+        if target is not None:
+            jump.target_offset = target.start_offset
+            jump.hint = None
+            return jump
+        if jump.target_offset is None and fallthrough is not None:
+            jump.target_offset = fallthrough
+        if fallthrough is not None and jump.target_offset == fallthrough:
+            jump.hint = "fallthrough"
+        elif jump.hint == "fallthrough" and fallthrough is not None:
+            jump.target_offset = fallthrough
+        return jump
 
     def _ensure_branch_target(
         self,
@@ -2869,6 +2993,8 @@ class ASTBuilder:
         if isinstance(node, IRDataMarker):
             if node.mnemonic == "literal_marker":
                 return [], []
+        if isinstance(node, IRStackDrop):
+            return [], []
         if isinstance(node, IRLoad):
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             location = self._build_slot_location(node.slot)

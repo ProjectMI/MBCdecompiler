@@ -1238,6 +1238,8 @@ class ASTJump(ASTTerminator):
     hint: str | None = None
 
     def render(self) -> str:
+        if self.hint == "fallthrough" and self.target is None:
+            return "fallthrough"
         if self.target is not None:
             destination = self.target.label
         elif self.hint is not None:
