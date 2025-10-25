@@ -3084,7 +3084,9 @@ class ASTBuilder:
             ]
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
-            expr = self._resolve_expr(node.expr, value_state)
+            prelude, expr = self._normalise_branch_condition(
+                node.expr, value_state, metrics
+            )
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
             statement = ASTFunctionPrologue(
@@ -3093,7 +3095,8 @@ class ASTBuilder:
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [statement], [
+            statements = [*prelude, statement]
+            return statements, [
                 _BranchLink(
                     statement=statement,
                     then_target=then_target,

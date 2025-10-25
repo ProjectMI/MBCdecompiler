@@ -33,6 +33,8 @@ from mbcdisasm.ast import (
     ASTSymbolType,
     ASTSymbolTypeFamily,
     ASTTailCall,
+    ASTFunctionPrologue,
+    ASTIdentifier,
 )
 from mbcdisasm.ast.model import (
     ASTEntryPoint,
@@ -61,6 +63,7 @@ from mbcdisasm.ir.model import (
     IRTailCall,
     IRStackEffect,
     IRSlot,
+    IRFunctionPrologue,
     MemRef,
     MemSpace,
     NormalizerMetrics,
@@ -501,6 +504,61 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
         for block in procedure.blocks
         for statement in block.statements
     )
+
+
+def test_ast_builder_normalises_prologue_stack_top_condition() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x0600,
+        length=0x40,
+        blocks=(
+            IRBlock(
+                label="block_entry",
+                start_offset=0x0600,
+                nodes=(
+                    IRFunctionPrologue(
+                        var="slot(0004)",
+                        expr="stack_top",
+                        then_target=0x0610,
+                        else_target=0x0620,
+                    ),
+                ),
+            ),
+            IRBlock(
+                label="block_then",
+                start_offset=0x0610,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="block_else",
+                start_offset=0x0620,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    segment_ast = ast_program.segments[0]
+    procedure = segment_ast.procedures[0]
+    entry_block = next(block for block in procedure.blocks if block.start_offset == 0x0600)
+
+    assert len(entry_block.statements) >= 2
+    assign_stmt = entry_block.statements[0]
+    prologue_stmt = entry_block.statements[1]
+
+    assert isinstance(assign_stmt, ASTAssign)
+    assert isinstance(assign_stmt.target, ASTIdentifier)
+    assert assign_stmt.target.name.startswith("id_stack_top_")
+    assert isinstance(assign_stmt.value, ASTIdentifier)
+    assert assign_stmt.value.name == "stack_top"
+
+    assert isinstance(prologue_stmt, ASTFunctionPrologue)
+    assert isinstance(prologue_stmt.expr, ASTIdentifier)
+    assert prologue_stmt.expr.name == assign_stmt.target.name
 
 
 def test_ast_builder_drops_empty_procedures() -> None:
