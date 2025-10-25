@@ -6212,7 +6212,18 @@ class IRNormalizer:
                     return self._render_ssa(mapped)
                 return candidate.value
             if isinstance(candidate, IRNode):
-                if isinstance(candidate, IRCallCleanup):
+                if isinstance(
+                    candidate,
+                    (
+                        IRCallCleanup,
+                        IRCallPreparation,
+                        IRDataMarker,
+                        IRAsciiFinalize,
+                        IRSwitchDispatch,
+                        IRIOWrite,
+                        IRIORead,
+                    ),
+                ):
                     scan -= 1
                     continue
                 mapped = self._ssa_value(candidate, raw=True)

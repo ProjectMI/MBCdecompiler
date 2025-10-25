@@ -2043,17 +2043,33 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
-        if (
+        same_target = (
             then_target is not None
             and else_target is not None
             and then_target == else_target
-        ):
+        )
+        same_branch = (
+            statement.then_branch is not None
+            and statement.then_branch is statement.else_branch
+        )
+        shared_hint = (
+            statement.then_hint is not None
+            and statement.then_hint == statement.else_hint
+            and statement.then_branch is None
+            and statement.else_branch is None
+            and then_target is None
+            and else_target is None
+        )
+        if same_target or same_branch or shared_hint:
             target_block = statement.then_branch or statement.else_branch
-            target_offset = statement.then_offset or statement.else_offset
+            target_offset = then_target or else_target
             if target_block is not None:
                 target_offset = target_block.start_offset
-            hint = statement.then_hint or statement.else_hint
-            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+            elif target_offset is None:
+                target_offset = statement.then_offset or statement.else_offset
+            hint = statement.then_hint if statement.then_hint else statement.else_hint
+            jump_hint = None if target_block is not None else hint
+            return ASTJump(target=target_block, target_offset=target_offset, hint=jump_hint)
         return statement
 
     def _ensure_branch_target(
@@ -2868,7 +2884,8 @@ class ASTBuilder:
             target = ASTIdentifier(node.target, self._infer_kind(node.target))
             location = self._build_slot_location(node.slot)
             expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
-            value_state[node.target] = expr
+            value_state[node.target] = target
+            self._register_expression(node.target, expr)
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(True)
             return [ASTAssign(target=target, value=expr)], []
@@ -2876,6 +2893,7 @@ class ASTBuilder:
             location = self._build_slot_location(node.slot)
             value_expr = self._resolve_expr(node.value, value_state)
             metrics.observe_store(not isinstance(value_expr, ASTUnknown))
+            value_state[self._slot_token(node.slot)] = value_expr
             return [ASTMemoryWrite(location=location, value=value_expr)], []
         if isinstance(node, IRIORead):
             return [ASTIORead(port=node.port)], []
@@ -2895,14 +2913,16 @@ class ASTBuilder:
             )
             location = self._build_banked_location(node, pointer_expr, offset_expr)
             expr = ASTMemoryRead(location=location, value_kind=SSAValueKind.WORD)
-            value_state[node.target] = expr
+            target = ASTIdentifier(node.target, self._infer_kind(node.target))
+            value_state[node.target] = target
+            self._register_expression(node.target, expr)
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             pointer_known = pointer_expr is None or not isinstance(pointer_expr, ASTUnknown)
             offset_known = offset_expr is None or not isinstance(offset_expr, ASTUnknown)
             metrics.observe_load(pointer_known and offset_known)
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=target,
                     value=expr,
                 )
             ], []
@@ -2933,14 +2953,16 @@ class ASTBuilder:
             expr = ASTMemoryRead(
                 location=location, value_kind=self._infer_indirect_kind(pointer)
             )
-            value_state[node.target] = expr
+            target = ASTIdentifier(node.target, self._infer_kind(node.target))
+            value_state[node.target] = target
+            self._register_expression(node.target, expr)
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             metrics.observe_load(
                 not isinstance(pointer, ASTUnknown) and not isinstance(offset_expr, ASTUnknown)
             )
             return [
                 ASTAssign(
-                    target=ASTIdentifier(node.target, self._infer_kind(node.target)),
+                    target=target,
                     value=expr,
                 )
             ], []
@@ -3058,11 +3080,18 @@ class ASTBuilder:
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
             target = ASTIdentifier(node.var, self._infer_kind(node.var))
-            value_state[node.var] = target
+            value_state[node.var] = expr
+            self._register_expression(node.var, expr)
             metrics.observe_values(int(not isinstance(expr, ASTUnknown)))
             assignment = ASTAssign(target=target, value=expr)
+            condition_expr = (
+                expr
+                if not isinstance(expr, ASTUnknown)
+                and expr.kind() is SSAValueKind.BOOLEAN
+                else target
+            )
             branch = ASTBranch(
-                condition=target,
+                condition=condition_expr,
                 then_offset=then_target,
                 else_offset=else_target,
             )
@@ -3141,6 +3170,10 @@ class ASTBuilder:
             address=self._slot_address(slot),
             alias=self._slot_alias(slot),
         )
+
+    @staticmethod
+    def _slot_token(slot: IRSlot) -> str:
+        return f"slot(0x{slot.index:04X})"
 
     @staticmethod
     def _build_offset_literal(value: int) -> ASTIntegerLiteral:
