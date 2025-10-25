@@ -499,6 +499,7 @@ class ASTBuilder:
         self._current_redirects: Mapping[int, int] = {}
         self._pending_call_frame: List[IRStackEffect] = []
         self._pending_epilogue: List[IRStackEffect] = []
+        self._stack_predicate_counter: int = 0
         self._enum_infos: Dict[str, _EnumInfo] = {}
         self._enum_order: List[str] = []
         self._enum_name_usage: Dict[str, str] = {}
@@ -2012,7 +2013,11 @@ class ASTBuilder:
 
     @staticmethod
     def _is_stack_top_expr(expr: ASTExpression) -> bool:
-        return isinstance(expr, ASTIdentifier) and expr.name == "stack_top"
+        if not isinstance(expr, ASTIdentifier):
+            return False
+        if expr.name == "stack_top":
+            return True
+        return expr.name.startswith("id_stack_top_")
 
     def _simplify_branch_targets(
         self, block: ASTBlock, block_order: Sequence[ASTBlock]
@@ -3037,7 +3042,9 @@ class ASTBuilder:
         if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
-            condition = self._resolve_expr(node.condition, value_state)
+            prelude, condition = self._normalise_branch_condition(
+                node.condition, value_state, metrics
+            )
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
             branch = ASTBranch(
@@ -3045,7 +3052,8 @@ class ASTBuilder:
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [branch], [
+            statements = [*prelude, branch]
+            return statements, [
                 _BranchLink(
                     statement=branch,
                     then_target=then_target,
@@ -3805,6 +3813,74 @@ class ASTBuilder:
             location = self._build_slot_location(slot)
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
         return ASTIdentifier(token, self._infer_kind(token))
+
+    def _normalise_branch_condition(
+        self,
+        token: Optional[str],
+        value_state: MutableMapping[str, ASTExpression],
+        metrics: ASTMetrics,
+    ) -> Tuple[List[ASTStatement], ASTExpression]:
+        if not token:
+            return [], ASTBooleanLiteral(True)
+        body = self._strip_branch_annotations(token)
+        if not body:
+            return [], ASTBooleanLiteral(True)
+        prelude: List[ASTStatement] = []
+        if body.startswith("marker"):
+            remainder = body[len("marker") :].strip()
+            if not remainder:
+                return [], ASTBooleanLiteral(True)
+            nested_prelude, expr = self._normalise_branch_condition(
+                remainder, value_state, metrics
+            )
+            prelude.extend(nested_prelude)
+            return prelude, expr
+        if body.startswith("prep_call_args["):
+            prelude.append(ASTComment(body))
+            return prelude, ASTBooleanLiteral(True)
+        if body.startswith("table_patch["):
+            return prelude, ASTBooleanLiteral(True)
+        if body.startswith("ascii_finalize"):
+            return prelude, ASTBooleanLiteral(True)
+        if body.startswith("io.write("):
+            return prelude, ASTBooleanLiteral(True)
+        if body == "stack_top":
+            assignment, identifier = self._materialise_stack_top_predicate(
+                value_state, metrics
+            )
+            prelude.extend(assignment)
+            return prelude, identifier
+        if body.startswith("str(") or body.startswith("ascii("):
+            return prelude, ASTBooleanLiteral(True)
+        expr = self._resolve_expr(body, value_state)
+        return prelude, expr
+
+    @staticmethod
+    def _strip_branch_annotations(token: str) -> str:
+        body = token.strip()
+        while True:
+            stripped = body.rstrip()
+            if stripped.endswith("literal_marker"):
+                stripped = stripped[: stripped.rfind("literal_marker")]
+                stripped = stripped.rstrip(", ")
+                body = stripped
+                continue
+            break
+        return body.strip()
+
+    def _materialise_stack_top_predicate(
+        self,
+        value_state: MutableMapping[str, ASTExpression],
+        metrics: ASTMetrics,
+    ) -> Tuple[List[ASTStatement], ASTIdentifier]:
+        name = f"id_stack_top_{self._stack_predicate_counter}"
+        self._stack_predicate_counter += 1
+        target = ASTIdentifier(name, SSAValueKind.IDENTIFIER)
+        value = ASTIdentifier("stack_top", SSAValueKind.UNKNOWN)
+        metrics.observe_values(0)
+        assignment = ASTAssign(target=target, value=value)
+        value_state[name] = target
+        return [assignment], target
 
     @staticmethod
     def _build_slot(index: int) -> IRSlot:
