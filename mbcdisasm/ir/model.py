@@ -4,10 +4,33 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
+
+import re
 
 from ..constants import IO_PORT_NAME, OPERAND_ALIASES
 from .effect_aliases import cleanup_category
+
+
+_OPCODE_NAME = re.compile(r"^op_([0-9A-F]{2})_([0-9A-F]{2})$")
+
+
+def _format_opcode_alias(mnemonic: str) -> str:
+    """Return a stable alias for raw ``op_XX_YY`` mnemonics."""
+
+    match = _OPCODE_NAME.match(mnemonic)
+    if not match:
+        return mnemonic
+    opcode, mode = match.groups()
+    return f"opcode.{opcode}:{mode}"
+
+
+def _format_annotations(notes: Sequence[str]) -> Tuple[str, ...]:
+    """Normalise annotation payloads for human readable rendering."""
+
+    if not notes:
+        return tuple()
+    return tuple(_format_opcode_alias(note) for note in notes)
 
 
 class MemSpace(Enum):
@@ -369,13 +392,15 @@ class IRLiteralChunk(IRNode):
     def describe(self) -> str:
         if self.symbol:
             rendered = f"str({self.symbol})"
-            if self.annotations:
-                rendered += " " + ", ".join(self.annotations)
+            notes = _format_annotations(self.annotations)
+            if notes:
+                rendered += " " + ", ".join(notes)
             return rendered
 
         note = f"ascii({_render_ascii(self.data)})"
-        if self.annotations:
-            note += " " + ", ".join(self.annotations)
+        notes = _format_annotations(self.annotations)
+        if notes:
+            note += " " + ", ".join(notes)
         return note
 
 
@@ -387,9 +412,10 @@ class IRDataMarker(IRNode):
     operand: int = 0
 
     def describe(self) -> str:
+        mnemonic = _format_opcode_alias(self.mnemonic)
         if self.operand:
-            return f"marker {self.mnemonic}(operand=0x{self.operand:04X})"
-        return f"marker {self.mnemonic}"
+            return f"marker {mnemonic}(operand=0x{self.operand:04X})"
+        return f"marker {mnemonic}"
 
 
 @dataclass(frozen=True)
@@ -467,8 +493,9 @@ class IRLiteralBlock(IRNode):
                 f" 0x{self.reducer_operand:04X}" if self.reducer_operand is not None else ""
             )
             base += f" via {self.reducer}{operand}"
-        if self.annotations:
-            base += " " + ", ".join(self.annotations)
+        notes = _format_annotations(self.annotations)
+        if notes:
+            base += " " + ", ".join(notes)
         return base
 
 
@@ -754,7 +781,10 @@ class IRCallPreparation(IRNode):
     steps: Tuple[Tuple[str, int], ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(
+            f"{_format_opcode_alias(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.steps
+        )
         return f"prep_call_args[{rendered}]"
 
 
@@ -781,7 +811,10 @@ class IRTailcallFrame(IRNode):
     steps: Tuple[Tuple[str, int], ...]
 
     def describe(self) -> str:
-        rendered = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.steps)
+        rendered = ", ".join(
+            f"{_format_opcode_alias(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.steps
+        )
         return f"prep_tailcall[{rendered}]"
 
 
@@ -807,8 +840,9 @@ class IRTablePatch(IRNode):
             rendered_ops.append(effect.describe())
         rendered = ", ".join(rendered_ops)
         note = f"table_patch[{rendered}]"
-        if self.annotations:
-            note += " " + ", ".join(self.annotations)
+        notes = _format_annotations(self.annotations)
+        if notes:
+            note += " " + ", ".join(notes)
         return note
 
 
@@ -887,12 +921,16 @@ class IRTableBuilderBegin(IRNode):
     annotations: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.prologue)
+        ops = ", ".join(
+            f"{_format_opcode_alias(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.prologue
+        )
         details = f"mode=0x{self.mode:02X}"
         if ops:
             details += f" prologue=[{ops}]"
-        if self.annotations:
-            details += " " + ", ".join(self.annotations)
+        notes = _format_annotations(self.annotations)
+        if notes:
+            details += " " + ", ".join(notes)
         return f"table_begin {details}"
 
 
@@ -907,12 +945,20 @@ class IRTableBuilderEmit(IRNode):
     parameters: Tuple[str, ...] = field(default_factory=tuple)
 
     def describe(self) -> str:
-        ops = ", ".join(f"{mnemonic}(0x{operand:04X})" for mnemonic, operand in self.operations)
+        ops = ", ".join(
+            f"{_format_opcode_alias(mnemonic)}(0x{operand:04X})"
+            for mnemonic, operand in self.operations
+        )
         details = [f"mode=0x{self.mode:02X}", f"kind={self.kind}", f"ops=[{ops}]"]
         if self.parameters:
             params = ", ".join(self.parameters)
             details.append(f"params=[{params}]")
-        extra = [note for note in self.annotations if note not in {self.kind, f"mode=0x{self.mode:02X}"}]
+        extra_notes = [
+            note
+            for note in self.annotations
+            if note not in {self.kind, f"mode=0x{self.mode:02X}"}
+        ]
+        extra = _format_annotations(extra_notes)
         if extra:
             details.extend(extra)
         return "table_emit " + " ".join(details)
@@ -1045,8 +1091,9 @@ class IRRaw(IRNode):
 
     def describe(self) -> str:
         note = ""
-        if self.annotations:
-            note = " " + ", ".join(self.annotations)
+        notes = _format_annotations(self.annotations)
+        if notes:
+            note = " " + ", ".join(notes)
         hex_value = f"0x{self.operand:04X}"
         alias = self.operand_alias
         if alias:
