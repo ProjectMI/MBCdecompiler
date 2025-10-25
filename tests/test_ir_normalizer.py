@@ -16,6 +16,7 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRAsciiFinalize,
     IRAsciiHeader,
+    IRDataMarker,
     IRLiteral,
     IRLiteralChunk,
     IRLoad,
@@ -1485,6 +1486,79 @@ def test_normalizer_lifts_branch_predicate_from_call(tmp_path: Path) -> None:
     assert call.predicate.expr == branch.expr
     assert call.predicate.then_target == branch.then_target
     assert call.predicate.else_target == branch.else_target
+
+
+def test_normalizer_converts_branch_side_effect_to_true() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    prep = IRCallPreparation(steps=(("frame.write", 0x1234),))
+    branch = IRIf(
+        condition="prep_call_args[frame.write(operand=0x1234)]",
+        then_target=0x10,
+        else_target=0x20,
+    )
+    items = _ItemList([prep, branch])
+
+    normalizer._pass_normalize_branch_conditions(items)
+
+    updated = items[1]
+    assert isinstance(updated, IRIf)
+    assert updated.condition == "true"
+
+
+def test_normalizer_materializes_stack_top_condition() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    branch = IRIf(condition="stack_top", then_target=0x10, else_target=0x20)
+    items = _ItemList([branch])
+
+    normalizer._pass_normalize_branch_conditions(items)
+
+    updated = items[0]
+    assert isinstance(updated, IRIf)
+    assert updated.condition.startswith("bool")
+
+
+def test_normalizer_folds_string_condition_to_true() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    chunk = IRLiteralChunk(data=b"abc", source="ascii", symbol="str_dummy")
+    branch = IRIf(condition=chunk.describe(), then_target=0x10, else_target=0x20)
+    items = _ItemList([chunk, branch])
+
+    normalizer._pass_normalize_branch_conditions(items)
+
+    updated = items[1]
+    assert isinstance(updated, IRIf)
+    assert updated.condition == "true"
+
+
+def test_normalizer_drops_marker_wrapper_from_branch() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    marker = IRDataMarker(mnemonic="literal_marker")
+    branch = IRIf(condition="marker literal_marker", then_target=0x10, else_target=0x20)
+    items = _ItemList([marker, branch])
+
+    normalizer._pass_normalize_branch_conditions(items)
+
+    updated = items[1]
+    assert isinstance(updated, IRIf)
+    assert updated.condition == "true"
+
+
+def test_normalizer_converts_testset_side_effect_to_true() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    io_write = IRIOWrite(port="ChatOut", mask=0x2910)
+    branch = IRTestSetBranch(
+        var="slot(0x100D)",
+        expr="io.write(port=ChatOut, mask=0x2910)",
+        then_target=0x10,
+        else_target=0x20,
+    )
+    items = _ItemList([io_write, branch])
+
+    normalizer._pass_normalize_branch_conditions(items)
+
+    updated = items[1]
+    assert isinstance(updated, IRTestSetBranch)
+    assert updated.expr == "true"
 
 
 def test_normalizer_emits_if_for_testset_mode_33(tmp_path: Path) -> None:

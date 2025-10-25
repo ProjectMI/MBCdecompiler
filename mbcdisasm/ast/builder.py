@@ -3779,6 +3779,10 @@ class ASTBuilder:
     def _resolve_expr(self, token: Optional[str], value_state: Mapping[str, ASTExpression]) -> ASTExpression:
         if not token:
             return ASTUnknown("")
+        if token == "true":
+            return ASTBooleanLiteral(True)
+        if token == "false":
+            return ASTBooleanLiteral(False)
         if token in value_state:
             return value_state[token]
         if token in self._call_arg_values:

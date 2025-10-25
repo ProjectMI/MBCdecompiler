@@ -210,6 +210,16 @@ TAILCALL_HELPERS = {
 ASCII_HELPER_IDS = {0xF172, 0x7223, 0x3D30}
 
 
+BRANCH_SIDE_EFFECT_NODE_TYPES = (
+    IRCallPreparation,
+    IRTablePatch,
+    IRAsciiFinalize,
+    IRIOWrite,
+)
+
+BRANCH_ANNOTATION_NODE_TYPES = (IRDataMarker,)
+
+
 CALL_HELPER_ALIASES = {
     0x0000: "fmt.buffer_reset",
     0x0020: "fmt.helper_0020",
@@ -1068,6 +1078,7 @@ class IRNormalizer:
         self._pass_assign_ssa_names(items)
         self._pass_testset_branches(items, metrics)
         self._pass_branches(items, metrics)
+        self._pass_normalize_branch_conditions(items)
         self._pass_table_builders(items)
         self._pass_flag_checks(items)
         self._pass_function_prologues(items)
@@ -5863,6 +5874,169 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_normalize_branch_conditions(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRIf):
+                condition = self._normalize_branch_token(items, index, item)
+                if condition != item.condition:
+                    updated = IRIf(
+                        condition=condition,
+                        then_target=item.then_target,
+                        else_target=item.else_target,
+                    )
+                    self._transfer_ssa(item, updated)
+                    items.replace_slice(index, index + 1, [updated])
+                index += 1
+                continue
+
+            if isinstance(item, IRTestSetBranch):
+                expr = self._normalize_branch_token(items, index, item)
+                var = self._normalize_branch_variable(item.var, item)
+                if expr != item.expr or var != item.var:
+                    updated = IRTestSetBranch(
+                        var=var,
+                        expr=expr,
+                        then_target=item.then_target,
+                        else_target=item.else_target,
+                    )
+                    self._transfer_ssa(item, updated)
+                    items.replace_slice(index, index + 1, [updated])
+                index += 1
+                continue
+
+            index += 1
+
+    def _normalize_branch_variable(self, token: str, branch: IRTestSetBranch) -> str:
+        stripped = self._strip_branch_annotations(token)
+        if stripped == "stack_top":
+            return self._materialize_stack_top_alias(branch)
+        return stripped
+
+    def _normalize_branch_token(
+        self, items: _ItemList, index: int, branch: Union[IRIf, IRTestSetBranch]
+    ) -> str:
+        if isinstance(branch, IRIf):
+            fallback = branch.condition
+        else:
+            fallback = branch.expr
+
+        token, source = self._extract_branch_predicate(items, index)
+        if token is None:
+            token = fallback
+            source = None
+        if token is None or token == "":
+            return "true"
+        stripped = self._strip_branch_annotations(token)
+        if stripped == "":
+            return "true"
+        return self._finalize_branch_token(stripped, source, branch)
+
+    def _extract_branch_predicate(
+        self, items: _ItemList, index: int
+    ) -> Tuple[Optional[str], Optional[Union[RawInstruction, IRNode]]]:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, RawInstruction):
+                if candidate.pushes_value():
+                    mapped = self._ssa_value(candidate, raw=True)
+                    if mapped is not None:
+                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                        return self._render_ssa(mapped), candidate
+                    return self._describe_value(candidate), candidate
+                mapped = self._ssa_value(candidate, raw=True)
+                if mapped is not None:
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped), candidate
+                return self._describe_value(candidate), candidate
+
+            if isinstance(candidate, IRLiteral):
+                mapped = self._ssa_value(candidate, raw=True)
+                if mapped is not None:
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped), candidate
+                return candidate.describe(), candidate
+
+            if isinstance(candidate, IRLiteralChunk):
+                mapped = self._ssa_value(candidate, raw=True)
+                if mapped is not None:
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped), candidate
+                return candidate.describe(), candidate
+
+            if isinstance(candidate, IRStackDuplicate):
+                mapped = self._ssa_value(candidate, raw=True)
+                if mapped is not None:
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped), candidate
+                return candidate.value, candidate
+
+            if isinstance(candidate, IRNode):
+                if isinstance(candidate, IRCallCleanup):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, BRANCH_SIDE_EFFECT_NODE_TYPES):
+                    scan -= 1
+                    continue
+                if isinstance(candidate, BRANCH_ANNOTATION_NODE_TYPES):
+                    scan -= 1
+                    continue
+                mapped = self._ssa_value(candidate, raw=True)
+                if mapped is not None:
+                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
+                    return self._render_ssa(mapped), candidate
+                describe = getattr(candidate, "describe", None)
+                if callable(describe):
+                    return describe(), candidate
+            scan -= 1
+
+        return None, None
+
+    @staticmethod
+    def _strip_branch_annotations(token: str) -> str:
+        if " literal_marker" in token:
+            token = token.split(" literal_marker", 1)[0]
+        return token.strip()
+
+    def _finalize_branch_token(
+        self,
+        token: str,
+        source: Optional[Union[RawInstruction, IRNode]],
+        branch: Union[IRIf, IRTestSetBranch],
+    ) -> str:
+        if (
+            token.startswith("prep_call_args[")
+            or token.startswith("table_patch[")
+            or token.startswith("ascii_finalize")
+            or token.startswith("io.write(")
+            or token.startswith("marker ")
+            or token == "marker"
+        ):
+            return "true"
+        if token == "stack_top":
+            return self._materialize_stack_top_alias(branch)
+        if token.startswith("str(") or token.startswith("ascii("):
+            return "true" if self._string_predicate_truthy(source) else "false"
+        return token
+
+    def _string_predicate_truthy(
+        self, source: Optional[Union[RawInstruction, IRNode]]
+    ) -> bool:
+        if isinstance(source, IRLiteralChunk):
+            return bool(source.data)
+        if isinstance(source, IRLiteral):
+            return bool(source.value)
+        return True
+
+    def _materialize_stack_top_alias(
+        self, branch: Union[IRIf, IRTestSetBranch]
+    ) -> str:
+        raw_name = f"branch_stack_top_{id(branch)}"
+        self._set_ssa_kind(raw_name, SSAValueKind.BOOLEAN)
+        return self._render_ssa(raw_name)
 
     def _pass_indirect_access(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
