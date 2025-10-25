@@ -3371,6 +3371,8 @@ class ASTBuilder:
                 symbol_base = symbol.split("(", 1)[0] if symbol else None
                 if symbol in self._slotless_tail_helpers or symbol_base in self._slotless_tail_helpers:
                     slot_count = len(values)
+            if len(values) < slot_count and getattr(node, "tail", False):
+                slot_count = len(values)
             if len(values) < slot_count:
                 deficit = slot_count - len(values)
                 start = len(values)
@@ -3398,7 +3400,14 @@ class ASTBuilder:
             kind = self._infer_kind(token)
             if kind is SSAValueKind.UNKNOWN:
                 kind = self._call_return_kind(node, index)
-            name = self._canonical_placeholder_name(token, index, kind)
+            if kind is SSAValueKind.UNKNOWN:
+                kind = SSAValueKind.WORD
+            canonical_token = token
+            if token.startswith("value"):
+                if kind is SSAValueKind.UNKNOWN:
+                    kind = SSAValueKind.WORD
+                canonical_token = f"ret{index}"
+            name = self._canonical_placeholder_name(canonical_token, index, kind)
             return_slots.append(ASTCallReturnSlot(index=index, kind=kind, name=name))
         abi_effects = getattr(node, "abi_effects", ())
         for spec in abi_effects:
@@ -3450,10 +3459,18 @@ class ASTBuilder:
         self, index: int, expr: ASTExpression
     ) -> ASTExpression:
         if isinstance(expr, ASTIdentifier):
+            name = expr.name
             kind = expr.kind()
-            canonical = self._canonical_placeholder_name(expr.name, index, kind)
-            if canonical != expr.name:
-                return ASTIdentifier(canonical, kind)
+            if name.startswith("value"):
+                if kind is SSAValueKind.UNKNOWN:
+                    kind = SSAValueKind.WORD
+                canonical = self._canonical_placeholder_name(f"ret{index}", index, kind)
+                if canonical != name or kind != expr.kind():
+                    return ASTIdentifier(canonical, kind)
+            else:
+                canonical = self._canonical_placeholder_name(name, index, kind)
+                if canonical != name or kind != expr.kind():
+                    return ASTIdentifier(canonical, kind)
         if isinstance(expr, ASTUnknown):
             token = expr.token
             if token and token.startswith("ret"):
