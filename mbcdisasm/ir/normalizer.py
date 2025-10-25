@@ -584,6 +584,19 @@ class IRNormalizer:
         SSAValueKind.BOOLEAN: "bool",
         SSAValueKind.IDENTIFIER: "id",
     }
+    _CONDITION_SKIP_NODE_TYPES = (
+        IRCallCleanup,
+        IRCallPreparation,
+        IRTablePatch,
+        IRAsciiFinalize,
+        IRIOWrite,
+        IRDataMarker,
+        IRStackDrop,
+        IRSwitchDispatch,
+        IRTableBuilderBegin,
+        IRTableBuilderEmit,
+        IRTableBuilderCommit,
+    )
     _OPCODE_TABLE_MIN_RUN = 4
     _OPCODE_TABLE_MAX_AFFIX = 2
     _OPCODE_TABLE_MODES = {
@@ -6163,65 +6176,99 @@ class IRNormalizer:
             return f"lit(0x{operand:04X})"
         return instruction.describe_source()
 
+    def _condition_alias_from_ssa(self, name: Optional[str]) -> Optional[str]:
+        if not name:
+            return None
+        kind = self._ssa_types.get(name)
+        if kind in {SSAValueKind.POINTER, SSAValueKind.PAGE_REGISTER, SSAValueKind.IO}:
+            return None
+        if kind is SSAValueKind.IDENTIFIER:
+            return self._render_ssa(name)
+        self._promote_ssa_kind(name, SSAValueKind.BOOLEAN)
+        return self._render_ssa(name)
+
+    @staticmethod
+    def _sanitize_condition_token(token: str) -> Optional[str]:
+        if not token:
+            return None
+        stripped = token.strip()
+        lowered = stripped.lower()
+        if stripped.startswith("lit("):
+            return f"addr{stripped[3:]}"
+        if (
+            lowered.startswith("bool")
+            or lowered.startswith("id")
+            or lowered.startswith("addr")
+            or stripped.startswith("slot(")
+        ):
+            return stripped
+        return None
+
+    def _condition_token(
+        self,
+        candidate: Union[RawInstruction, IRNode],
+        skip_literals: bool,
+    ) -> Optional[str]:
+        if isinstance(candidate, RawInstruction):
+            if candidate.pushes_value():
+                if skip_literals and candidate.mnemonic == "push_literal":
+                    return None
+                mapped = self._ssa_value(candidate, raw=True)
+                alias = self._condition_alias_from_ssa(mapped)
+                if alias:
+                    return alias
+                return self._sanitize_condition_token(self._describe_value(candidate))
+            if skip_literals:
+                mapped = self._ssa_value(candidate, raw=True)
+                alias = self._condition_alias_from_ssa(mapped)
+                if alias:
+                    return alias
+                return self._sanitize_condition_token(self._describe_value(candidate))
+            return None
+
+        if isinstance(candidate, IRLiteral):
+            if skip_literals:
+                return None
+            mapped = self._ssa_value(candidate, raw=True)
+            alias = self._condition_alias_from_ssa(mapped)
+            if alias:
+                return alias
+            return self._sanitize_condition_token(candidate.describe())
+
+        if isinstance(candidate, IRLiteralChunk):
+            return None
+
+        if isinstance(candidate, IRStackDuplicate):
+            mapped = self._ssa_value(candidate, raw=True)
+            alias = self._condition_alias_from_ssa(mapped)
+            if alias:
+                return alias
+            return self._sanitize_condition_token(candidate.value)
+
+        if isinstance(candidate, IRNode):
+            if isinstance(candidate, self._CONDITION_SKIP_NODE_TYPES):
+                return None
+            mapped = self._ssa_value(candidate, raw=True)
+            alias = self._condition_alias_from_ssa(mapped)
+            if alias:
+                return alias
+            describe = getattr(candidate, "describe", None)
+            if callable(describe):
+                return self._sanitize_condition_token(describe())
+        return None
+
     def _describe_condition(self, items: _ItemList, index: int, *, skip_literals: bool = False) -> str:
         scan = index - 1
         while scan >= 0:
             candidate = items[scan]
-            if isinstance(candidate, RawInstruction):
-                if candidate.pushes_value():
-                    if skip_literals and candidate.mnemonic == "push_literal":
-                        mapped = self._ssa_value(candidate, raw=True)
-                        if mapped is not None:
-                            self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                            return self._render_ssa(mapped)
-                        scan -= 1
-                        continue
-                    mapped = self._ssa_value(candidate, raw=True)
-                    if mapped is not None:
-                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                        return self._render_ssa(mapped)
-                    return self._describe_value(candidate)
-                if skip_literals:
-                    mapped = self._ssa_value(candidate, raw=True)
-                    if mapped is not None:
-                        self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                        return self._render_ssa(mapped)
-                    return self._describe_value(candidate)
-            if isinstance(candidate, IRLiteral):
-                mapped = self._ssa_value(candidate, raw=True)
-                if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
-                if skip_literals:
-                    scan -= 1
-                    continue
-                return candidate.describe()
-            if isinstance(candidate, IRLiteralChunk):
-                mapped = self._ssa_value(candidate, raw=True)
-                if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
-                if skip_literals:
-                    scan -= 1
-                    continue
-                return candidate.describe()
-            if isinstance(candidate, IRStackDuplicate):
-                mapped = self._ssa_value(candidate, raw=True)
-                if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
-                return candidate.value
-            if isinstance(candidate, IRNode):
-                if isinstance(candidate, IRCallCleanup):
-                    scan -= 1
-                    continue
-                mapped = self._ssa_value(candidate, raw=True)
-                if mapped is not None:
-                    self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
-                    return self._render_ssa(mapped)
-                return getattr(candidate, "describe", lambda: "expr()")()
+            token = self._condition_token(candidate, skip_literals)
+            if token is not None:
+                return token
             scan -= 1
-        return "stack_top"
+
+        raw_name = f"branch_condition_{id(items[index]) if 0 <= index < len(items) else id(self)}"
+        self._promote_ssa_kind(raw_name, SSAValueKind.BOOLEAN)
+        return self._render_ssa(raw_name)
 
     @staticmethod
     def _branch_target(instruction: RawInstruction) -> int:
