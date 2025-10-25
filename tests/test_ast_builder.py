@@ -366,7 +366,7 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     call_stmt = statements[0]
     assert isinstance(call_stmt, ASTCallStatement)
     assert call_stmt.call.target == 0x5555
-    assert call_stmt.call.symbol is None
+    assert call_stmt.call.symbol == "proc_5555"
     enums = ast_program.segments[0].enums
     assert not enums
     assert not ast_program.enums
@@ -974,7 +974,7 @@ def test_symbol_table_synthesises_call_signatures() -> None:
     symbols = {entry.address: entry for entry in ast_program.symbols}
     assert 0x6601 in symbols
     signature = symbols[0x6601]
-    assert signature.name == "helper_6601"
+    assert signature.name == "proc_6601"
     assert tuple(value.type.family for value in signature.arguments) == (
         ASTSymbolTypeFamily.ADDRESS,
     )

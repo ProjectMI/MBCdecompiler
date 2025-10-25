@@ -507,6 +507,7 @@ class ASTBuilder:
         self._current_segment_index: int = -1
         self._call_arg_values: Dict[str, ASTExpression] = {}
         self._expression_lookup: Dict[str, ASTExpression] = {}
+        self._procedure_name_map: Dict[int, str] = {}
         self._slotless_tail_helpers: Set[str] = {
             "fmt.message_commit",
             "tail_helper_72",
@@ -521,6 +522,7 @@ class ASTBuilder:
         self._enum_name_usage = {}
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._procedure_name_map = {}
         segments: List[ASTSegment] = []
         segment_enum_keys: List[Tuple[str, ...]] = []
         metrics = ASTMetrics()
@@ -530,6 +532,7 @@ class ASTBuilder:
             segment_enum_keys.append(enum_keys)
         segments, program_enums = self._finalise_enums(segments, segment_enum_keys)
         segments = self._canonicalise_segments(segments)
+        self._apply_call_symbols(segments)
         metrics.procedure_count = sum(len(seg.procedures) for seg in segments)
         metrics.block_count = sum(len(proc.blocks) for seg in segments for proc in seg.procedures)
         metrics.edge_count = sum(
@@ -667,6 +670,44 @@ class ASTBuilder:
                 )
             updated_segments.append(replace(segment, procedures=tuple(updated_procs)))
         return updated_segments
+
+    def _apply_call_symbols(self, segments: Sequence[ASTSegment]) -> None:
+        for segment in segments:
+            for procedure in segment.procedures:
+                offsets = {procedure.entry_offset}
+                offsets.update(alias.offset for alias in procedure.aliases)
+                for offset in offsets:
+                    self._procedure_name_map[offset] = procedure.name
+                for block in procedure.blocks:
+                    statements = list(block.statements)
+                    changed = False
+                    for index, statement in enumerate(statements):
+                        if isinstance(statement, ASTCallStatement):
+                            call = statement.call
+                            if not call.symbol:
+                                symbol = self._procedure_name_map.get(call.target)
+                                if symbol is None and 0 <= call.target <= 0xFFFF:
+                                    symbol = self._register_procedure_name(call.target)
+                                if symbol:
+                                    statements[index] = replace(
+                                        statement,
+                                        call=replace(call, symbol=symbol),
+                                    )
+                                    changed = True
+                        elif isinstance(statement, ASTTailCall):
+                            call = statement.call
+                            if not call.symbol:
+                                symbol = self._procedure_name_map.get(call.target)
+                                if symbol is None and 0 <= call.target <= 0xFFFF:
+                                    symbol = self._register_procedure_name(call.target)
+                                if symbol:
+                                    statements[index] = replace(
+                                        statement,
+                                        call=replace(call, symbol=symbol),
+                                    )
+                                    changed = True
+                    if changed:
+                        block.statements = tuple(statements)
 
     def _merge_procedure_result(
         self, primary: ASTProcedureResult, incoming: ASTProcedureResult
@@ -915,10 +956,10 @@ class ASTBuilder:
         existing_addresses = {entry.address for entry in signatures}
         for segment in segments:
             for procedure in segment.procedures:
-                address = (segment.index << 16) | procedure.entry.offset
+                address = procedure.entry.offset
                 if address in existing_addresses:
                     continue
-                canonical_name = self._canonical_symbol_name(
+                canonical_name = procedure.name or self._canonical_symbol_name(
                     address, {procedure.name}
                 )
                 signatures.append(
@@ -1275,6 +1316,7 @@ class ASTBuilder:
         for entry in sorted(entry_reasons):
             if entry not in analyses:
                 continue
+            self._register_procedure_name(entry)
             reachable = self._collect_entry_blocks(entry, analyses, entry_reasons, assigned)
             if not reachable:
                 continue
@@ -1294,6 +1336,7 @@ class ASTBuilder:
         for offset in sorted(analyses):
             if offset in assigned:
                 continue
+            self._register_procedure_name(offset)
             reachable = self._collect_component(offset, analyses, assigned)
             if not reachable:
                 continue
@@ -1312,7 +1355,7 @@ class ASTBuilder:
         for index, entry in enumerate(order):
             accumulator = accumulators[entry]
             pending_blocks = [accumulator.blocks[offset] for offset in sorted(accumulator.blocks)]
-            name = f"proc_{accumulator.entry_offset:04X}"
+            name = self._register_procedure_name(accumulator.entry_offset)
             procedure = self._finalise_procedure(
                 name=name,
                 entry_offset=accumulator.entry_offset,
@@ -1363,6 +1406,13 @@ class ASTBuilder:
                     )
                 )
         return ordered
+
+    def _register_procedure_name(self, offset: int) -> str:
+        name = self._procedure_name_map.get(offset)
+        if name is None:
+            name = f"proc_{offset & 0xFFFF:04X}"
+            self._procedure_name_map[offset] = name
+        return name
 
     def _procedure_identity(self, procedure: ASTProcedure) -> Tuple[Any, ...]:
         label_map = {
@@ -1811,6 +1861,9 @@ class ASTBuilder:
             if filtered != block.statements:
                 block.statements = filtered
 
+        for block in block_order:
+            self._prune_tailcall_followups(block)
+
         predecessors: Dict[int, Set[int]] = {block_id: set() for block_id in id_map}
         for block in block_order:
             deduped: List[ASTBlock] = []
@@ -2063,6 +2116,15 @@ class ASTBuilder:
             return body.startswith(prefixes)
         return False
 
+    @staticmethod
+    def _prune_tailcall_followups(block: ASTBlock) -> None:
+        statements = list(block.statements)
+        for index, statement in enumerate(statements):
+            if isinstance(statement, ASTTailCall):
+                if index + 1 < len(statements):
+                    block.statements = tuple(statements[: index + 1])
+                return
+
     def _replace_successor(self, block: ASTBlock, old: ASTBlock, new: ASTBlock) -> None:
         block.successors = tuple(new if succ is old else succ for succ in block.successors)
         for statement in block.statements:
@@ -2259,8 +2321,10 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
-        for node in block.nodes:
+        nodes = block.nodes
+        for index, node in enumerate(nodes):
             if isinstance(node, IRCall):
+                tail_terminator = self._call_is_tail_terminator(block, index, node)
                 self._handle_dispatch_call(
                     node,
                     value_state,
@@ -2268,6 +2332,7 @@ class ASTBuilder:
                     statements,
                     pending_calls,
                     pending_tables,
+                    tail_terminator=tail_terminator,
                 )
                 continue
             if isinstance(node, IRSwitchDispatch):
@@ -2300,6 +2365,35 @@ class ASTBuilder:
             jump_links=jump_links,
         )
 
+    def _call_is_tail_terminator(
+        self, block: IRBlock, index: int, node: IRCall
+    ) -> bool:
+        if not node.tail or getattr(node, "predicate", None) is not None:
+            return False
+        for follower in block.nodes[index + 1 :]:
+            if isinstance(follower, (IRReturn, IRCallReturn, IRTailCall)):
+                return False
+            if isinstance(follower, IRSwitchDispatch):
+                if self._dispatch_helper_matches(node.target, follower):
+                    return False
+                continue
+            if isinstance(
+                follower,
+                (
+                    IRIf,
+                    IRTestSetBranch,
+                    IRFunctionPrologue,
+                    IRFlagCheck,
+                ),
+            ):
+                return False
+            if isinstance(follower, IRCallCleanup):
+                continue
+            if isinstance(follower, IRDataMarker):
+                continue
+            return True
+        return True
+
     def _handle_dispatch_call(
         self,
         node: IRCall,
@@ -2308,7 +2402,9 @@ class ASTBuilder:
         statements: List[ASTStatement],
         pending_calls: List[_PendingDispatchCall],
         pending_tables: List[_PendingDispatchTable],
-    ) -> None:
+        *,
+        tail_terminator: bool = False,
+    ) -> bool:
         call_expr, operands = self._convert_call(
             node.target,
             node.args,
@@ -2332,12 +2428,24 @@ class ASTBuilder:
             statements[target_index] = self._build_dispatch_switch(
                 call_expr, pending_table.dispatch, value_state, abi=abi
             )
-            return
+            return False
+        if tail_terminator:
+            epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
+            statements.append(
+                ASTTailCall(
+                    call=call_expr,
+                    payload=ASTReturnPayload(),
+                    abi=abi,
+                    effects=epilogue_effects,
+                )
+            )
+            return True
         index = len(statements)
         statements.append(ASTCallStatement(call=call_expr, abi=abi))
         pending_calls.append(
             _PendingDispatchCall(helper=node.target, index=index, call=call_expr, abi=abi)
         )
+        return False
 
     def _handle_dispatch_table(
         self,
@@ -3621,10 +3729,11 @@ class ASTBuilder:
         value_state: Mapping[str, ASTExpression],
     ) -> Tuple[ASTCallExpr, Tuple[ASTCallOperand, ...]]:
         operands = tuple(self._build_operand(arg, value_state) for arg in args)
+        resolved_symbol = symbol or self._procedure_name_map.get(target)
         call_expr = ASTCallExpr(
             target=target,
             operands=operands,
-            symbol=symbol,
+            symbol=resolved_symbol,
             tail=tail,
             varargs=varargs,
         )
