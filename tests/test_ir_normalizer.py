@@ -2389,7 +2389,7 @@ def test_normalizer_collapses_adaptive_unknown_tables() -> None:
     assert len(node.operations) == len(words)
     assert node.annotations[0] == "adaptive_table"
     assert f"mode=0x{words[0].mode:02X}" in node.annotations
-    assert any(note == "kind=unknown" for note in node.annotations)
+    assert any(note == "kind=table_lookup" for note in node.annotations)
 
 
 def test_normalizer_builds_table_pipeline_nodes() -> None:
