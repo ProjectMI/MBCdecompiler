@@ -512,6 +512,7 @@ class ASTBuilder:
             "fmt.message_commit",
             "tail_helper_72",
         }
+        self._synthetic_name_counters: Dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # public API
@@ -3037,7 +3038,9 @@ class ASTBuilder:
         if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
-            condition = self._resolve_expr(node.condition, value_state)
+            prefix_statements, condition = self._normalise_branch_condition(
+                node.condition, value_state
+            )
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
             branch = ASTBranch(
@@ -3045,7 +3048,8 @@ class ASTBuilder:
                 then_offset=then_target,
                 else_offset=else_target,
             )
-            return [branch], [
+            statements = prefix_statements + [branch]
+            return statements, [
                 _BranchLink(
                     statement=branch,
                     then_target=then_target,
@@ -3886,6 +3890,88 @@ class ASTBuilder:
             target = redirects[target]
         return target
 
+    def _allocate_identifier(
+        self, base: str, kind: SSAValueKind = SSAValueKind.UNKNOWN
+    ) -> ASTIdentifier:
+        index = self._synthetic_name_counters.get(base, 0)
+        self._synthetic_name_counters[base] = index + 1
+        name = f"{base}{index}"
+        return ASTIdentifier(name, kind)
+
+    @staticmethod
+    def _split_branch_components(token: str) -> List[str]:
+        components: List[str] = []
+        current: List[str] = []
+        depth = 0
+        for char in token:
+            if char in "([":
+                depth += 1
+            elif char in ")]":
+                depth = max(0, depth - 1)
+            if depth == 0 and char in {" ", ","}:
+                if current:
+                    part = "".join(current).strip()
+                    if part:
+                        components.append(part)
+                    current = []
+                continue
+            current.append(char)
+        if current:
+            part = "".join(current).strip()
+            if part:
+                components.append(part)
+        return components
+
+    @staticmethod
+    def _is_side_effect_component(component: str) -> bool:
+        prefixes = (
+            "prep_call_args[",
+            "table_patch[",
+            "ascii_finalize",
+            "io.write(",
+        )
+        if component.startswith(prefixes):
+            return True
+        lowered = component.lower()
+        return lowered.startswith("ascii(") or lowered.startswith("str(")
+
+    def _normalise_branch_condition(
+        self,
+        token: str,
+        value_state: MutableMapping[str, ASTExpression],
+    ) -> Tuple[List[ASTStatement], ASTExpression]:
+        components = self._split_branch_components(token)
+        predicates: List[ASTExpression] = []
+        stack_expr: ASTExpression | None = None
+        for component in components:
+            if not component:
+                continue
+            if component == "marker" or component.startswith("marker "):
+                continue
+            if self._is_side_effect_component(component):
+                continue
+            expr = self._resolve_expr(component, value_state)
+            if isinstance(expr, ASTIdentifier) and expr.name == "stack_top":
+                stack_expr = expr
+                continue
+            predicates.append(expr)
+
+        if predicates:
+            condition = predicates[-1]
+        elif stack_expr is not None:
+            condition = stack_expr
+        else:
+            condition = ASTBooleanLiteral(True)
+
+        prefix_statements: List[ASTStatement] = []
+        if isinstance(condition, ASTIdentifier) and condition.name == "stack_top":
+            temp = self._allocate_identifier("id_cond_", SSAValueKind.BOOLEAN)
+            prefix_statements.append(ASTAssign(target=temp, value=condition))
+            value_state[temp.name] = temp
+            condition = temp
+
+        return prefix_statements, condition
+
     @staticmethod
     def _is_hex_literal(value: str) -> bool:
         try:
@@ -3909,6 +3995,7 @@ class ASTBuilder:
         self._current_segment_index = -1
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._synthetic_name_counters = {}
 
 
 __all__ = ["ASTBuilder"]

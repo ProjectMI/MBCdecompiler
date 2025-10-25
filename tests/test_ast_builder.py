@@ -1,11 +1,13 @@
 from dataclasses import replace
 from pathlib import Path
+from typing import Tuple
 
 from mbcdisasm import IRNormalizer
 from mbcdisasm.constants import PAGE_REGISTER, RET_MASK
 from mbcdisasm.ast import (
     ASTAssign,
     ASTBlock,
+    ASTBooleanLiteral,
     ASTBranch,
     ASTBuilder,
     ASTCallABI,
@@ -39,7 +41,9 @@ from mbcdisasm.ast.model import (
     ASTEntryReason,
     ASTExitPoint,
     ASTExitReason,
+    ASTIdentifier,
     ASTProcedureResultSlot,
+    ASTStatement,
 )
 from mbcdisasm.ir.model import (
     IRBlock,
@@ -64,6 +68,7 @@ from mbcdisasm.ir.model import (
     MemRef,
     MemSpace,
     NormalizerMetrics,
+    SSAValueKind,
 )
 
 from tests.test_ir_normalizer import build_container
@@ -495,12 +500,101 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
     segment_ast = ast_program.segments[0]
     assert len(segment_ast.procedures) == 1
     procedure = segment_ast.procedures[0]
-    assert {block.start_offset for block in procedure.blocks} == {0x0410}
-    assert all(
-        not isinstance(statement, ASTBranch)
-        for block in procedure.blocks
-        for statement in block.statements
+    assert {block.start_offset for block in procedure.blocks} == {0x0400}
+    block = procedure.blocks[0]
+    assert any(isinstance(statement, ASTAssign) for statement in block.statements)
+    assert any(isinstance(statement, ASTReturn) for statement in block.statements)
+    assert all(not isinstance(statement, ASTBranch) for statement in block.statements)
+
+
+def _build_branch_statements(condition: str) -> Tuple[ASTStatement, ...]:
+    branch_block = IRBlock(
+        label="block_branch",
+        start_offset=0x0100,
+        nodes=(
+            IRIf(
+                condition=condition,
+                then_target=0x0200,
+                else_target=0x0210,
+            ),
+        ),
     )
+    then_block = IRBlock(
+        label="block_then",
+        start_offset=0x0200,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="block_else",
+        start_offset=0x0210,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0100,
+        length=0x40,
+        blocks=(branch_block, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    return procedure.blocks[0].statements
+
+
+def test_ast_builder_materializes_stack_top_condition() -> None:
+    statements = _build_branch_statements("stack_top")
+
+    assert len(statements) == 2
+    assign, branch = statements
+    assert isinstance(assign, ASTAssign)
+    assert isinstance(branch, ASTBranch)
+    assert isinstance(assign.value, ASTIdentifier)
+    assert assign.value.name == "stack_top"
+    assert isinstance(branch.condition, ASTIdentifier)
+    assert branch.condition.name.startswith("id_cond_")
+    assert branch.condition.kind() is SSAValueKind.BOOLEAN
+
+
+def test_ast_builder_hoists_call_prep_side_effect_from_branch_condition() -> None:
+    statements = _build_branch_statements(
+        "prep_call_args[frame.write(operand=0x2810)]"
+    )
+
+    assert len(statements) == 1
+    branch = statements[0]
+    assert isinstance(branch, ASTBranch)
+    assert isinstance(branch.condition, ASTBooleanLiteral)
+    assert branch.condition.value is True
+
+
+def test_ast_builder_strips_marker_wrapper_from_branch_condition() -> None:
+    statements = _build_branch_statements("marker literal_marker")
+
+    assert len(statements) == 1
+    branch = statements[0]
+    assert isinstance(branch.condition, ASTIdentifier)
+    assert branch.condition.name == "literal_marker"
+
+
+def test_ast_builder_discards_string_literal_components_from_condition() -> None:
+    statements = _build_branch_statements("str(str_2095) literal_marker")
+
+    assert len(statements) == 1
+    branch = statements[0]
+    assert isinstance(branch.condition, ASTIdentifier)
+    assert branch.condition.name == "literal_marker"
+
+
+def test_ast_builder_treats_io_write_condition_as_unconditional() -> None:
+    statements = _build_branch_statements("io.write(port=ChatOut)")
+
+    assert len(statements) == 1
+    branch = statements[0]
+    assert isinstance(branch.condition, ASTBooleanLiteral)
+    assert branch.condition.value is True
 
 
 def test_ast_builder_drops_empty_procedures() -> None:
