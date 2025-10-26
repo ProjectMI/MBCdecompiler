@@ -83,6 +83,7 @@ from .model import (
     ASTTraceOperand,
     ASTValueOperand,
     ASTComment,
+    ASTCleanupCall,
     ASTEffect,
     ASTEnumDecl,
     ASTEnumMember,
@@ -513,6 +514,7 @@ class ASTBuilder:
             "fmt.message_commit",
             "tail_helper_72",
         }
+        self._active_block_analysis: Optional[_BlockAnalysis] = None
 
     # ------------------------------------------------------------------
     # public API
@@ -2077,6 +2079,15 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
+        then_hint = getattr(statement, "then_hint", None)
+        else_hint = getattr(statement, "else_hint", None)
+        if (
+            then_target is None
+            and else_target is None
+            and then_hint == "fallthrough"
+            and else_hint == "fallthrough"
+        ):
+            return ASTJump(hint="fallthrough")
         if (
             then_target is not None
             and else_target is not None
@@ -2088,6 +2099,32 @@ class ASTBuilder:
                 target_offset = target_block.start_offset
             hint = statement.then_hint or statement.else_hint
             return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+        if isinstance(statement, ASTBranch) and isinstance(
+            statement.condition, ASTBooleanLiteral
+        ):
+            literal = statement.condition.value
+            target_block = statement.then_branch if literal else statement.else_branch
+            target_offset = statement.then_offset if literal else statement.else_offset
+            hint = statement.then_hint if literal else statement.else_hint
+            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+        if isinstance(statement, ASTBranch) and isinstance(
+            statement.condition, ASTIdentifier
+        ):
+            if statement.condition.name.startswith("cleanup_call["):
+                options = [
+                    (statement.then_branch, statement.then_hint, statement.then_offset),
+                    (statement.else_branch, statement.else_hint, statement.else_offset),
+                ]
+                chosen = None
+                for branch, hint, offset in options:
+                    if hint != "fallthrough" and (branch is not None or offset is not None):
+                        chosen = (branch, hint, offset)
+                        break
+                if chosen is None:
+                    branch, hint, offset = options[-1]
+                else:
+                    branch, hint, offset = chosen
+                return ASTJump(target=branch, target_offset=offset, hint=hint)
         return statement
 
     def _ensure_branch_target(
@@ -2355,6 +2392,7 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
+        self._active_block_analysis = analysis
         nodes = block.nodes
         for index, node in enumerate(nodes):
             if isinstance(node, IRTailCall):
@@ -2405,6 +2443,7 @@ class ASTBuilder:
         terminator = self._ensure_block_terminator(analysis, statements, jump_links)
         if terminator is not None:
             statements.append(terminator)
+        self._active_block_analysis = None
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
@@ -3134,10 +3173,20 @@ class ASTBuilder:
                 self._pending_call_frame.extend(node.steps)
             else:
                 self._pending_epilogue.extend(node.steps)
-            return [], []
+            return [ASTCleanupCall(node.describe())], []
         if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
+            cleanup_text = self._cleanup_branch_text(node.condition)
+            if cleanup_text is not None:
+                cleanup_result = self._convert_cleanup_branch(
+                    cleanup_text,
+                    node.then_target,
+                    node.else_target,
+                    origin_offset,
+                )
+                if cleanup_result is not None:
+                    return cleanup_result
             prelude, condition = self._normalise_branch_condition(
                 node.condition, value_state, metrics
             )
@@ -3180,6 +3229,15 @@ class ASTBuilder:
             ]
         if isinstance(node, IRFunctionPrologue):
             var_expr = self._resolve_expr(node.var, value_state)
+            cleanup_text = self._cleanup_branch_text(node.expr)
+            if cleanup_text is not None:
+                return self._convert_cleanup_prologue(
+                    var_expr,
+                    cleanup_text,
+                    node.then_target,
+                    node.else_target,
+                    origin_offset,
+                )
             prelude, expr = self._normalise_branch_condition(
                 node.expr, value_state, metrics
             )
@@ -3913,6 +3971,100 @@ class ASTBuilder:
             return ASTMemoryRead(location=location, value_kind=SSAValueKind.POINTER)
         return ASTIdentifier(token, self._infer_kind(token))
 
+    def _cleanup_branch_text(self, token: Optional[str]) -> Optional[str]:
+        if not token:
+            return None
+        body = self._strip_branch_annotations(token)
+        if body.startswith("cleanup_call["):
+            return body
+        return None
+
+    @staticmethod
+    def _is_fallthrough_target(target: Optional[int]) -> bool:
+        return target is None or target == 0
+
+    def _convert_cleanup_branch(
+        self,
+        text: str,
+        then_target: int,
+        else_target: int,
+        origin_offset: int,
+    ) -> Optional[Tuple[List[ASTStatement], List[_JumpLink]]]:
+        then_fallthrough = self._is_fallthrough_target(then_target)
+        else_fallthrough = self._is_fallthrough_target(else_target)
+        statements: List[ASTStatement] = [ASTCleanupCall(text)]
+        analysis = self._active_block_analysis
+        if then_fallthrough and else_fallthrough:
+            fallthrough_offset = analysis.fallthrough if analysis else None
+            jump = ASTJump(target_offset=fallthrough_offset, hint="fallthrough")
+            statements.append(jump)
+            return statements, []
+        if then_fallthrough == else_fallthrough:
+            if analysis and len(analysis.successors) == 1:
+                successor = analysis.successors[0]
+                resolved_successor = self._resolve_target(successor)
+                fallthrough_offset = analysis.fallthrough
+                if fallthrough_offset is not None and resolved_successor == fallthrough_offset:
+                    jump = ASTJump(target_offset=fallthrough_offset, hint="fallthrough")
+                    statements.append(jump)
+                    return statements, []
+                jump = ASTJump(target_offset=resolved_successor)
+                return statements + [jump], [
+                    _JumpLink(
+                        statement=jump,
+                        target=resolved_successor,
+                        origin_offset=origin_offset,
+                    )
+                ]
+            return None
+        jump_links: List[_JumpLink] = []
+        target_raw = else_target if then_fallthrough else then_target
+        resolved = self._resolve_target(target_raw)
+        fallthrough_offset = analysis.fallthrough if analysis else None
+        if self._is_fallthrough_target(target_raw) or (
+            fallthrough_offset is not None and resolved == fallthrough_offset
+        ):
+            jump = ASTJump(target_offset=fallthrough_offset, hint="fallthrough")
+            statements.append(jump)
+            return statements, []
+        jump = ASTJump(target_offset=resolved)
+        jump_links.append(
+            _JumpLink(statement=jump, target=resolved, origin_offset=origin_offset)
+        )
+        statements.append(jump)
+        return statements, jump_links
+
+    def _convert_cleanup_prologue(
+        self,
+        var_expr: ASTExpression,
+        text: str,
+        then_target: int,
+        else_target: int,
+        origin_offset: int,
+    ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
+        then_fallthrough = self._is_fallthrough_target(then_target)
+        else_fallthrough = self._is_fallthrough_target(else_target)
+        resolved_then = self._resolve_target(then_target)
+        resolved_else = self._resolve_target(else_target)
+        statement = ASTFunctionPrologue(
+            var=var_expr,
+            expr=ASTBooleanLiteral(True),
+            then_offset=resolved_then,
+            else_offset=resolved_else,
+            then_hint="fallthrough" if then_fallthrough else None,
+            else_hint="fallthrough" if else_fallthrough else None,
+            effects=(text,),
+            unconditional=True,
+        )
+        return [statement], [
+            _BranchLink(
+                statement=statement,
+                then_target=resolved_then,
+                else_target=resolved_else,
+                origin_offset=origin_offset,
+            )
+        ]
+
     def _normalise_branch_condition(
         self,
         token: Optional[str],
@@ -4084,6 +4236,7 @@ class ASTBuilder:
         self._current_segment_index = -1
         self._call_arg_values = {}
         self._expression_lookup = {}
+        self._active_block_analysis = None
 
 
 __all__ = ["ASTBuilder"]

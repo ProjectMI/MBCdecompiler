@@ -1196,6 +1196,27 @@ def test_trivial_branch_exit_without_successors_is_classified_as_jump() -> None:
     assert builder._classify_exit_reason(block) == "jump"
 
 
+def test_fallthrough_branch_without_successors_rewrites_to_jump() -> None:
+    builder = ASTBuilder()
+    branch = ASTBranch(
+        condition=ASTIdentifier("flag"),
+        then_hint="fallthrough",
+        else_hint="fallthrough",
+    )
+    block = ASTBlock(
+        label="dead_end",
+        start_offset=0x5000,
+        body=tuple(),
+        terminator=branch,
+        successors=tuple(),
+    )
+
+    builder._simplify_branch_targets(block, tuple())
+
+    assert isinstance(block.terminator, ASTJump)
+    assert block.terminator.hint == "fallthrough"
+
+
 def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
     segment = IRSegment(
         index=0,

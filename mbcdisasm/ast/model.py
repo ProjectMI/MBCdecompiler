@@ -1163,6 +1163,18 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
+class ASTCleanupCall(ASTStatement):
+    """Explicit side-effect emitted by the call cleanup helpers."""
+
+    text: str
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        return self.text
+
+
+@dataclass
 class ASTTerminator(ASTStatement):
     """Base class for normalised block terminators."""
 
@@ -1320,12 +1332,31 @@ class ASTFunctionPrologue(ASTTerminator):
     else_hint: str | None = None
     then_offset: int | None = None
     else_offset: int | None = None
+    effects: Tuple[str, ...] = ()
+    unconditional: bool = False
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        var_repr = self.var.render()
+        effect_suffix = ""
+        if self.effects:
+            effect_suffix = " effects=[" + ", ".join(self.effects) + "]"
+
+        def _label(branch: "ASTBlock | None", hint: str | None) -> str:
+            if branch is not None:
+                return branch.label
+            if hint:
+                return hint
+            return "?"
+
+        if self.unconditional:
+            labels = [_label(self.then_branch, self.then_hint), _label(self.else_branch, self.else_hint)]
+            continuation = next((label for label in labels if label != "fallthrough"), "fallthrough")
+            return f"prologue {var_repr}{effect_suffix} continue {continuation}"
+
+        then_label = _label(self.then_branch, self.then_hint)
+        else_label = _label(self.else_branch, self.else_hint)
         return (
-            f"prologue {self.var.render()} = {self.expr.render()} "
+            f"prologue {var_repr} = {self.expr.render()}{effect_suffix} "
             f"then {then_label} else {else_label}"
         )
 
