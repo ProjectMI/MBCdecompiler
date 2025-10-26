@@ -2357,8 +2357,23 @@ class ASTBuilder:
         self._pending_epilogue.clear()
         nodes = block.nodes
         for index, node in enumerate(nodes):
+            if isinstance(node, IRTailCall):
+                tail_terminator = self._call_is_tail_terminator(
+                    block, index, node, analysis.successors
+                )
+                if not tail_terminator:
+                    self._handle_tail_call_as_call(
+                        node,
+                        value_state,
+                        metrics,
+                        statements,
+                        pending_calls,
+                    )
+                    continue
             if isinstance(node, IRCall):
-                tail_terminator = self._call_is_tail_terminator(block, index, node)
+                tail_terminator = self._call_is_tail_terminator(
+                    block, index, node, analysis.successors
+                )
                 self._handle_dispatch_call(
                     node,
                     value_state,
@@ -2400,7 +2415,11 @@ class ASTBuilder:
         )
 
     def _call_is_tail_terminator(
-        self, block: IRBlock, index: int, node: IRCall
+        self,
+        block: IRBlock,
+        index: int,
+        node: IRCall | IRTailCall,
+        successors: Sequence[int] | None = None,
     ) -> bool:
         if not node.tail or getattr(node, "predicate", None) is not None:
             return False
@@ -2426,7 +2445,54 @@ class ASTBuilder:
             if isinstance(follower, IRDataMarker):
                 continue
             return False
+        if successors:
+            return False
         return True
+
+    def _handle_tail_call_as_call(
+        self,
+        node: IRTailCall,
+        value_state: MutableMapping[str, ASTExpression],
+        metrics: ASTMetrics,
+        statements: List[ASTStatement],
+        pending_calls: List[_PendingDispatchCall],
+    ) -> None:
+        call_node = replace(node.call, tail=False, abi_effects=node.abi_effects)
+        call_expr, operands = self._convert_call(
+            call_node.target,
+            call_node.args,
+            call_node.symbol,
+            False,
+            node.varargs,
+            value_state,
+        )
+        self._register_expression(call_node.describe(), call_expr)
+        self._register_expression(node.describe(), call_expr)
+        metrics.call_sites += 1
+        metrics.observe_call_args(
+            sum(1 for operand in call_expr.operands if operand.is_resolved()),
+            len(call_expr.operands),
+        )
+        abi = self._build_call_abi(call_node, operands)
+        if call_node.cleanup:
+            self._pending_epilogue.extend(call_node.cleanup)
+        if node.cleanup:
+            self._pending_epilogue.extend(node.cleanup)
+        return_identifiers: List[ASTIdentifier] = []
+        for index, name in enumerate(node.returns):
+            identifier = self._build_return_identifier(name, index)
+            value_state[name] = ASTCallResult(call_expr, index)
+            metrics.observe_values(int(not isinstance(value_state[name], ASTUnknown)))
+            return_identifiers.append(identifier)
+        statement = ASTCallStatement(
+            call=call_expr,
+            returns=tuple(return_identifiers),
+            abi=abi,
+        )
+        statements.append(statement)
+        pending_calls.append(
+            _PendingDispatchCall(helper=call_node.target, index=len(statements) - 1, call=call_expr, abi=abi)
+        )
 
     def _handle_dispatch_call(
         self,
@@ -2439,11 +2505,12 @@ class ASTBuilder:
         *,
         tail_terminator: bool = False,
     ) -> bool:
+        tail_flag = node.tail and tail_terminator
         call_expr, operands = self._convert_call(
             node.target,
             node.args,
             node.symbol,
-            node.tail,
+            tail_flag,
             node.varargs if hasattr(node, "varargs") else False,
             value_state,
         )
