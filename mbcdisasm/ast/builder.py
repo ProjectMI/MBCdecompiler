@@ -74,6 +74,7 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTCleanupCall,
     ASTImmediateOperand,
     ASTSignatureValue,
     ASTStackOperand,
@@ -126,6 +127,7 @@ from .model import (
     ASTSegment,
     ASTStatement,
     ASTFunctionPrologue,
+    ASTPrologueEffect,
     ASTJump,
     ASTTerminator,
     ASTSwitch,
@@ -791,6 +793,11 @@ class ASTBuilder:
                 self._register_effect_sequence(statement.abi.effects, accumulators)
         elif isinstance(statement, ASTReturn):
             self._register_effect_sequence(statement.effects, accumulators)
+        elif isinstance(statement, ASTCleanupCall):
+            self._register_cleanup_description(statement.description, accumulators)
+        elif isinstance(statement, ASTPrologueEffect):
+            for description in statement.effects:
+                self._register_cleanup_description(description, accumulators)
         elif isinstance(statement, ASTIOWrite):
             effect = ASTIOEffect(
                 operation=ASTIOOperation.WRITE,
@@ -834,6 +841,106 @@ class ASTBuilder:
                     name, _EffectSignatureAccumulator(name=name, address=address)
                 )
                 accumulator.register_io(effect)
+
+    def _register_cleanup_description(
+        self, description: str, accumulators: Dict[str, _EffectSignatureAccumulator]
+    ) -> None:
+        if not description:
+            return
+        inner = description
+        if description.startswith("cleanup_call[") and "]" in description:
+            inner = description[len("cleanup_call[") : description.rfind("]")]
+        for entry in self._split_cleanup_entries(inner):
+            if not entry:
+                continue
+            name, args_text = self._split_cleanup_entry(entry)
+            if name.startswith("helpers."):
+                op_name = name.split(".", 1)[1]
+                try:
+                    helper_op = ASTHelperOperation(op_name)
+                except ValueError:
+                    continue
+                params = self._parse_cleanup_params(args_text)
+                target = self._parse_int(params.get("operand"))
+                effect = ASTHelperEffect(operation=helper_op, target=target)
+                accumulator = accumulators.setdefault(
+                    f"helpers.{helper_op.value}",
+                    _EffectSignatureAccumulator(
+                        name=f"helpers.{helper_op.value}",
+                        address=_HELPER_EFFECT_ADDRESS.get(helper_op, 0xF000),
+                    ),
+                )
+                accumulator.register_helper(effect)
+            elif name.startswith("io."):
+                op_name = name.split(".", 1)[1]
+                try:
+                    io_op = ASTIOOperation(op_name)
+                except ValueError:
+                    continue
+                params = self._parse_cleanup_params(args_text)
+                port = params.get("port") or params.get("operand") or ""
+                effect = ASTIOEffect(operation=io_op, port=port)
+                accumulator = accumulators.setdefault(
+                    f"io.{io_op.value}",
+                    _EffectSignatureAccumulator(
+                        name=f"io.{io_op.value}",
+                        address=_IO_EFFECT_ADDRESS.get(io_op, 0xF100),
+                    ),
+                )
+                accumulator.register_io(effect)
+
+    @staticmethod
+    def _split_cleanup_entry(entry: str) -> Tuple[str, str]:
+        entry = entry.strip()
+        if not entry:
+            return "", ""
+        if "(" not in entry or not entry.endswith(")"):
+            return entry, ""
+        name, remainder = entry.split("(", 1)
+        return name.strip(), remainder[:-1]
+
+    @staticmethod
+    def _split_cleanup_entries(inner: str) -> List[str]:
+        entries: List[str] = []
+        depth = 0
+        start = 0
+        for index, char in enumerate(inner):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth > 0:
+                    depth -= 1
+            elif char == "," and depth == 0:
+                entries.append(inner[start:index].strip())
+                start = index + 1
+        remainder = inner[start:].strip()
+        if remainder:
+            entries.append(remainder)
+        return entries
+
+    @classmethod
+    def _parse_cleanup_params(cls, args_text: str) -> Dict[str, str]:
+        params: Dict[str, str] = {}
+        if not args_text:
+            return params
+        for part in cls._split_cleanup_entries(args_text):
+            if "=" not in part:
+                continue
+            key, value = part.split("=", 1)
+            params[key.strip()] = value.strip()
+        return params
+
+    @staticmethod
+    def _parse_int(value: Optional[str]) -> Optional[int]:
+        if value is None:
+            return None
+        text = value.strip()
+        try:
+            if text.lower().startswith("0x"):
+                return int(text, 16)
+            return int(text, 10)
+        except ValueError:
+            return None
 
     def _effect_parameter_order(
         self, name: str, accumulator: _EffectSignatureAccumulator
@@ -2071,6 +2178,13 @@ class ASTBuilder:
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
     ) -> Optional[ASTStatement]:
+        if isinstance(statement, ASTBranch) and isinstance(
+            statement.condition, ASTBooleanLiteral
+        ):
+            prefer_then = statement.condition.value
+            prefix = "then" if prefer_then else "else"
+            self._ensure_branch_target(statement, prefix, block_order, fallthrough)
+            return self._branch_to_jump(statement, prefer_then)
         then_target = self._ensure_branch_target(
             statement, "then", block_order, fallthrough
         )
@@ -2089,6 +2203,18 @@ class ASTBuilder:
             hint = statement.then_hint or statement.else_hint
             return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
         return statement
+
+    @staticmethod
+    def _branch_to_jump(statement: BranchStatement, prefer_then: bool) -> ASTJump:
+        if prefer_then:
+            target_block = getattr(statement, "then_branch", None)
+            target_offset = getattr(statement, "then_offset", None)
+            hint = getattr(statement, "then_hint", None)
+        else:
+            target_block = getattr(statement, "else_branch", None)
+            target_offset = getattr(statement, "else_offset", None)
+            hint = getattr(statement, "else_hint", None)
+        return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
 
     def _ensure_branch_target(
         self,
@@ -2400,6 +2526,13 @@ class ASTBuilder:
                 metrics,
             )
             statements.extend(node_statements)
+            for statement in node_statements:
+                if (
+                    isinstance(statement, ASTPrologueEffect)
+                    and statement.successor_offset is not None
+                ):
+                    analysis.successors = (statement.successor_offset,)
+                    analysis.fallthrough = statement.successor_offset
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
         terminator = self._ensure_block_terminator(analysis, statements, jump_links)
@@ -3134,7 +3267,7 @@ class ASTBuilder:
                 self._pending_call_frame.extend(node.steps)
             else:
                 self._pending_epilogue.extend(node.steps)
-            return [], []
+            return [ASTCleanupCall(node.describe())], []
         if isinstance(node, IRTerminator):
             return [], []
         if isinstance(node, IRIf):
@@ -3185,6 +3318,21 @@ class ASTBuilder:
             )
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
+            cleanup_entries = [
+                stmt for stmt in prelude if isinstance(stmt, ASTCleanupCall)
+            ]
+            if cleanup_entries:
+                prelude = [
+                    stmt for stmt in prelude if not isinstance(stmt, ASTCleanupCall)
+                ]
+                effects = tuple(entry.description for entry in cleanup_entries)
+                statements = [
+                    *prelude,
+                    ASTPrologueEffect(
+                        target=var_expr, effects=effects, successor_offset=else_target
+                    ),
+                ]
+                return statements, []
             statement = ASTFunctionPrologue(
                 var=var_expr,
                 expr=expr,
@@ -3942,6 +4090,9 @@ class ASTBuilder:
         if body.startswith("ascii_finalize"):
             return prelude, ASTBooleanLiteral(True)
         if body.startswith("io.write("):
+            return prelude, ASTBooleanLiteral(True)
+        if body.startswith("cleanup_call["):
+            prelude.append(ASTCleanupCall(body))
             return prelude, ASTBooleanLiteral(True)
         if body == "stack_top":
             assignment, identifier = self._materialise_stack_top_predicate(

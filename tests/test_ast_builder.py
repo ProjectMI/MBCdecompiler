@@ -35,6 +35,8 @@ from mbcdisasm.ast import (
     ASTTailCall,
     ASTFunctionPrologue,
     ASTIdentifier,
+    ASTCleanupCall,
+    ASTPrologueEffect,
 )
 from mbcdisasm.ast.model import (
     ASTEntryPoint,
@@ -559,6 +561,83 @@ def test_ast_builder_normalises_prologue_stack_top_condition() -> None:
     assert isinstance(prologue_stmt, ASTFunctionPrologue)
     assert isinstance(prologue_stmt.expr, ASTIdentifier)
     assert prologue_stmt.expr.name == assign_stmt.target.name
+
+
+def test_cleanup_call_branch_becomes_jump() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x20,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x1000,
+                nodes=(
+                    IRIf(
+                        condition="cleanup_call[helpers.invoke(operand=0x1234)]",
+                        then_target=0x1004,
+                        else_target=0x1004,
+                    ),
+                ),
+            ),
+            IRBlock(
+                label="target",
+                start_offset=0x1004,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    block = ast_program.segments[0].procedures[0].blocks[0]
+    assert block.body
+    cleanup_stmt = block.body[0]
+    assert isinstance(cleanup_stmt, ASTCleanupCall)
+    assert cleanup_stmt.render().startswith("cleanup_call[")
+    assert not any(isinstance(stmt, ASTBranch) for stmt in block.statements)
+
+
+def test_cleanup_prologue_emits_effect_statement() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x20,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x2000,
+                nodes=(
+                    IRFunctionPrologue(
+                        var="slot(0004)",
+                        expr="cleanup_call[frame.reset(operand=0x0000)]",
+                        then_target=0x2004,
+                        else_target=0x2004,
+                    ),
+                ),
+            ),
+            IRBlock(
+                label="body",
+                start_offset=0x2004,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    block = ast_program.segments[0].procedures[0].blocks[0]
+    assert block.body
+    prologue_stmt = block.body[0]
+    assert isinstance(prologue_stmt, ASTPrologueEffect)
+    assert prologue_stmt.effects == ("cleanup_call[frame.reset(operand=0x0000)]",)
+    assert not any(isinstance(stmt, ASTFunctionPrologue) for stmt in block.statements)
 
 
 def test_ast_builder_drops_empty_procedures() -> None:

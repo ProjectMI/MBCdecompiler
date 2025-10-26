@@ -1163,6 +1163,18 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
+class ASTCleanupCall(ASTStatement):
+    """Standalone representation of helper-based cleanup sequences."""
+
+    description: str
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        return self.description
+
+
+@dataclass
 class ASTTerminator(ASTStatement):
     """Base class for normalised block terminators."""
 
@@ -1328,6 +1340,21 @@ class ASTFunctionPrologue(ASTTerminator):
             f"prologue {self.var.render()} = {self.expr.render()} "
             f"then {then_label} else {else_label}"
         )
+
+
+@dataclass
+class ASTPrologueEffect(ASTStatement):
+    """Frame-oriented cleanup that precedes the canonical prologue."""
+
+    target: ASTExpression
+    effects: Tuple[str, ...] = ()
+    successor_offset: Optional[int] = None
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        details = f" effects=[{', '.join(self.effects)}]" if self.effects else ""
+        return f"prologue {self.target.render()}{details}"
 
 
 @dataclass
@@ -1741,6 +1768,7 @@ __all__ = [
     "ASTSymbolSignature",
     "ASTIORead",
     "ASTIOWrite",
+    "ASTCleanupCall",
     "ASTTerminator",
     "ASTTailCall",
     "ASTJump",
@@ -1750,6 +1778,7 @@ __all__ = [
     "ASTTestSet",
     "ASTFlagCheck",
     "ASTFunctionPrologue",
+    "ASTPrologueEffect",
     "ASTComment",
     "ASTEnumDecl",
     "ASTEnumMember",
