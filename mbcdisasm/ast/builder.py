@@ -1632,24 +1632,7 @@ class ASTBuilder:
                     ASTExitReason(kind=reason) for reason in analysis.exit_reasons
                 )
             else:
-                terminator = block.terminator
-                reason: Optional[str] = None
-                if isinstance(terminator, ASTReturn):
-                    reason = "return"
-                elif isinstance(terminator, ASTTailCall):
-                    reason = "tail_call"
-                elif isinstance(terminator, ASTJump):
-                    reason = "jump"
-                elif isinstance(terminator, ASTSwitch):
-                    reason = "switch"
-                elif isinstance(terminator, ASTBranch):
-                    reason = "branch"
-                elif isinstance(terminator, ASTTestSet):
-                    reason = "testset"
-                elif isinstance(terminator, ASTFlagCheck):
-                    reason = "flag_check"
-                elif isinstance(terminator, ASTFunctionPrologue):
-                    reason = "prologue"
+                reason = self._classify_exit_reason(block)
                 if reason:
                     reasons = (ASTExitReason(kind=reason),)
             exit_points.append(
@@ -1712,6 +1695,52 @@ class ASTBuilder:
             result=result_summary,
             aliases=tuple(),
         )
+
+    def _classify_exit_reason(self, block: ASTBlock) -> Optional[str]:
+        terminator = block.terminator
+        if isinstance(terminator, ASTReturn):
+            return "return"
+        if isinstance(terminator, ASTTailCall):
+            return "tail_call"
+        if isinstance(terminator, ASTJump):
+            return "jump"
+        if isinstance(terminator, ASTSwitch):
+            return "switch"
+        if isinstance(terminator, ASTBranch):
+            return self._classify_branch_exit(block, terminator, "branch")
+        if isinstance(terminator, ASTTestSet):
+            return self._classify_branch_exit(block, terminator, "testset")
+        if isinstance(terminator, ASTFlagCheck):
+            return self._classify_branch_exit(block, terminator, "flag_check")
+        if isinstance(terminator, ASTFunctionPrologue):
+            return self._classify_branch_exit(block, terminator, "prologue")
+        return None
+
+    def _classify_branch_exit(
+        self,
+        block: ASTBlock,
+        statement: BranchStatement,
+        default: str,
+    ) -> Optional[str]:
+        if block.successors:
+            return default
+        if self._branch_statement_is_trivial(statement):
+            return None
+        return default
+
+    @staticmethod
+    def _branch_statement_is_trivial(statement: BranchStatement) -> bool:
+        if statement.then_branch is not None or statement.else_branch is not None:
+            return False
+        hints = [statement.then_hint, statement.else_hint]
+        non_null_hints = [hint for hint in hints if hint is not None]
+        if non_null_hints:
+            return all(hint == "fallthrough" for hint in non_null_hints)
+        offsets = {statement.then_offset, statement.else_offset}
+        offsets.discard(None)
+        if offsets:
+            return False
+        return True
 
     def _collect_entry_blocks(
         self,
