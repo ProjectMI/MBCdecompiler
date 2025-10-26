@@ -6212,9 +6212,6 @@ class IRNormalizer:
                     return self._render_ssa(mapped)
                 return candidate.value
             if isinstance(candidate, IRNode):
-                if isinstance(candidate, IRCallCleanup):
-                    scan -= 1
-                    continue
                 mapped = self._ssa_value(candidate, raw=True)
                 if mapped is not None:
                     self._promote_ssa_kind(mapped, SSAValueKind.BOOLEAN)
