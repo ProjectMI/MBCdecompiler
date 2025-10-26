@@ -2214,7 +2214,12 @@ class ASTBuilder:
 
     @staticmethod
     def _block_has_exit(block: ASTBlock) -> bool:
-        return isinstance(block.terminator, (ASTReturn, ASTTailCall))
+        terminator = block.terminator
+        if isinstance(terminator, ASTReturn):
+            return True
+        if isinstance(terminator, ASTTailCall):
+            return not block.successors
+        return False
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
@@ -2281,6 +2286,7 @@ class ASTBuilder:
         analysis: _BlockAnalysis,
         statements: List[ASTStatement],
         jump_links: List[_JumpLink],
+        successors: Tuple[int, ...],
     ) -> Optional[ASTTerminator]:
         if statements:
             for index in range(len(statements) - 1, -1, -1):
@@ -2289,8 +2295,8 @@ class ASTBuilder:
                     if index != len(statements) - 1:
                         del statements[index + 1 :]
                     return None
-        if analysis.successors:
-            targets = analysis.successors
+        if successors:
+            targets = successors
             unique_targets = tuple(sorted({*targets}))
             if len(unique_targets) == 1:
                 target = unique_targets[0]
@@ -2358,17 +2364,68 @@ class ASTBuilder:
             statements.extend(node_statements)
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
-        terminator = self._ensure_block_terminator(analysis, statements, jump_links)
+        successors = list(analysis.successors)
+        successors = list(
+            self._simplify_block_terminator(
+                analysis,
+                statements,
+                branch_links,
+                jump_links,
+                tuple(successors),
+            )
+        )
+        terminator = self._ensure_block_terminator(
+            analysis, statements, jump_links, tuple(successors)
+        )
         if terminator is not None:
             statements.append(terminator)
         return _PendingBlock(
             label=block.label,
             start_offset=block.start_offset,
             statements=statements,
-            successors=analysis.successors,
+            successors=tuple(successors),
             branch_links=branch_links,
             jump_links=jump_links,
         )
+
+    def _simplify_block_terminator(
+        self,
+        analysis: _BlockAnalysis,
+        statements: List[ASTStatement],
+        branch_links: List[_BranchLink],
+        jump_links: List[_JumpLink],
+        successors: Tuple[int, ...],
+    ) -> Tuple[int, ...]:
+        if not statements:
+            return successors
+        terminator = statements[-1]
+        if not isinstance(terminator, BranchStatement):
+            return successors
+        link: Optional[_BranchLink] = None
+        for candidate in reversed(branch_links):
+            if candidate.statement is terminator:
+                link = candidate
+                break
+        if link is None:
+            return successors
+        chosen: Optional[int] = None
+        if link.then_target == link.else_target:
+            chosen = link.then_target
+        if chosen is None:
+            return successors
+        jump = ASTJump(target_offset=chosen)
+        statements[-1] = jump
+        jump_links.append(
+            _JumpLink(
+                statement=jump,
+                target=chosen,
+                origin_offset=analysis.block.start_offset,
+            )
+        )
+        branch_links.remove(link)
+        updated = tuple(sorted({chosen}))
+        analysis.successors = updated
+        return updated
 
     def _call_is_tail_terminator(
         self, block: IRBlock, index: int, node: IRCall
@@ -3949,7 +4006,7 @@ class ASTBuilder:
         if entry_reasons:
             joined = ",".join(entry_reasons) or "unspecified"
             return f"entry({joined})"
-        return "fallthrough"
+        return f"0x{target_offset:04X}"
 
     def _format_exit_hint(self, exit_reasons: Tuple[str, ...]) -> str:
         if not exit_reasons:
