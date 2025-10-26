@@ -1725,7 +1725,7 @@ class ASTBuilder:
         if block.successors:
             return default
         if self._branch_statement_is_trivial(statement):
-            return None
+            return "jump"
         return default
 
     @staticmethod
@@ -1738,9 +1738,9 @@ class ASTBuilder:
             return all(hint == "fallthrough" for hint in non_null_hints)
         offsets = {statement.then_offset, statement.else_offset}
         offsets.discard(None)
-        if offsets:
-            return False
-        return True
+        if not offsets:
+            return True
+        return len(offsets) == 1
 
     def _collect_entry_blocks(
         self,
