@@ -3880,7 +3880,7 @@ class ASTBuilder:
         self._stack_predicate_counter += 1
         target = ASTIdentifier(name, SSAValueKind.IDENTIFIER)
         value = ASTIdentifier("stack_top", SSAValueKind.UNKNOWN)
-        metrics.observe_values(0)
+        metrics.observe_values(int(not isinstance(value, ASTUnknown)))
         assignment = ASTAssign(target=target, value=value)
         value_state[name] = target
         return [assignment], target
