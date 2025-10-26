@@ -1195,10 +1195,12 @@ class ASTBuilder:
                 if isinstance(node, IRReturn):
                     exit_reasons.append("return")
                     successors.clear()
+                    fallthrough = None
                     break
                 if isinstance(node, (IRTailCall, IRTailcallReturn)):
                     exit_reasons.append("tail_call")
                     successors.clear()
+                    fallthrough = None
                     break
                 if isinstance(node, IRIf):
                     successors.update({node.then_target, node.else_target})

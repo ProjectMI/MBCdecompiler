@@ -1104,6 +1104,49 @@ def test_ast_builder_preserves_tail_prefix_on_tail_calls() -> None:
         assert tail_stmt.abi.tail
 
 
+def test_ast_builder_does_not_link_tailcall_fallthrough() -> None:
+    entry_block = IRBlock(
+        label="block_entry",
+        start_offset=0x1000,
+        nodes=(IRIf(condition="cond0", then_target=0x1010, else_target=0x1020),),
+    )
+    tail_block = IRBlock(
+        label="block_tail",
+        start_offset=0x1010,
+        nodes=(
+            IRTailCall(
+                call=IRCall(target=0x3000, args=(), symbol="tail_target"),
+                returns=(),
+                varargs=False,
+            ),
+        ),
+    )
+    follow_block = IRBlock(
+        label="block_follow",
+        start_offset=0x1020,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x40,
+        blocks=(entry_block, tail_block, follow_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    ast_tail_block = next(
+        block for block in procedure.blocks if block.start_offset == tail_block.start_offset
+    )
+
+    assert ast_tail_block.successors == tuple()
+    tail_exit = next(exit for exit in procedure.exits if exit.offset == tail_block.start_offset)
+    assert {reason.kind for reason in tail_exit.reasons} == {"tail_call"}
+    assert procedure.successor_map[ast_tail_block.label] == tuple()
+
+
 def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
     segment = IRSegment(
         index=0,
