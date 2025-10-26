@@ -1141,6 +1141,111 @@ def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
         assert "fallthrough" not in targets
 
 
+def test_ast_builder_flattens_always_true_branch_to_jump() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x40,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x2000,
+                nodes=(IRIf(condition="", then_target=0x2030, else_target=0x2010),),
+            ),
+            IRBlock(
+                label="fallthrough",
+                start_offset=0x2010,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="target",
+                start_offset=0x2030,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = next(
+        block for block in procedure.blocks if block.start_offset == 0x2000
+    )
+
+    assert isinstance(entry_block.terminator, ASTJump)
+    assert entry_block.terminator.target is not None
+    assert entry_block.terminator.target.start_offset == 0x2030
+    assert "bool(true)" not in entry_block.terminator.render()
+
+
+def test_ast_builder_flattens_true_fallthrough_branch() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x2100,
+        length=0x50,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x2100,
+                nodes=(IRIf(condition="", then_target=0x0000, else_target=0x2140),),
+            ),
+            IRBlock(
+                label="fallthrough",
+                start_offset=0x2110,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="other",
+                start_offset=0x2140,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    rendered_statements = [
+        stmt.render() for block in procedure.blocks for stmt in block.statements
+    ]
+
+    assert not any("if bool(true)" in text for text in rendered_statements)
+    assert not any(text == "jump fallthrough" for text in rendered_statements)
+
+
+def test_ast_builder_flattens_double_fallthrough_branch() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x2200,
+        length=0x30,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x2200,
+                nodes=(IRIf(condition="", then_target=0x0000, else_target=0x0000),),
+            ),
+            IRBlock(
+                label="next",
+                start_offset=0x2210,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = procedure.blocks[0]
+
+    assert isinstance(entry_block.terminator, ASTJump)
+    rendered = entry_block.terminator.render()
+    assert rendered.startswith("jump")
+    assert "fallthrough" not in rendered
+
+
 def test_symbol_table_records_call_attributes() -> None:
     call = IRCallReturn(
         target=0x3D30,

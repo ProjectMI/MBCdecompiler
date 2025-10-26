@@ -160,6 +160,16 @@ BranchStatement = ASTBranch | ASTTestSet | ASTFlagCheck | ASTFunctionPrologue
 
 
 @dataclass
+class _BranchTargetInfo:
+    """Resolved destination details for a branch arm."""
+
+    block: Optional[ASTBlock]
+    offset: Optional[int]
+    hint: Optional[str]
+    is_fallthrough: bool = False
+
+
+@dataclass
 class _JumpLink:
     """Pending control-flow link for an unconditional jump."""
 
@@ -2033,6 +2043,8 @@ class ASTBuilder:
                 if updated is None:
                     continue
                 statement = updated
+            if isinstance(statement, ASTJump):
+                statement = self._normalise_jump(statement, block_order, fallthrough)
             simplified.append(statement)
         block.statements = tuple(simplified)
 
@@ -2048,17 +2060,24 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
+        then_info = self._branch_target_info(statement, "then", block_order, fallthrough)
+        else_info = self._branch_target_info(statement, "else", block_order, fallthrough)
+
+        if isinstance(statement, ASTBranch):
+            if isinstance(statement.condition, ASTBooleanLiteral):
+                selected = then_info if statement.condition.value else else_info
+                return self._build_jump_for_target(selected, block_order, fallthrough)
+            if then_info.is_fallthrough and else_info.is_fallthrough:
+                preferred = self._prefer_branch_target(then_info, else_info)
+                return self._build_jump_for_target(preferred, block_order, fallthrough)
+
         if (
             then_target is not None
             and else_target is not None
             and then_target == else_target
         ):
-            target_block = statement.then_branch or statement.else_branch
-            target_offset = statement.then_offset or statement.else_offset
-            if target_block is not None:
-                target_offset = target_block.start_offset
-            hint = statement.then_hint or statement.else_hint
-            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+            preferred = self._prefer_branch_target(then_info, else_info)
+            return self._build_jump_for_target(preferred, block_order, fallthrough)
         return statement
 
     def _ensure_branch_target(
@@ -2087,6 +2106,137 @@ class ASTBuilder:
             return target_block.start_offset
         setattr(statement, offset_attr, offset)
         return offset
+
+    @staticmethod
+    def _prefer_branch_target(
+        lhs: _BranchTargetInfo, rhs: _BranchTargetInfo
+    ) -> _BranchTargetInfo:
+        if lhs.block is not None or lhs.offset is not None:
+            return lhs
+        if rhs.block is not None or rhs.offset is not None:
+            return rhs
+        return lhs
+
+    def _branch_target_info(
+        self,
+        statement: BranchStatement,
+        prefix: str,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> _BranchTargetInfo:
+        branch_attr = f"{prefix}_branch"
+        hint_attr = f"{prefix}_hint"
+        offset_attr = f"{prefix}_offset"
+        branch = getattr(statement, branch_attr)
+        hint = getattr(statement, hint_attr)
+        offset = getattr(statement, offset_attr)
+
+        if branch is not None:
+            offset = branch.start_offset
+            is_fallthrough = fallthrough is not None and offset == fallthrough
+            return _BranchTargetInfo(branch, offset, None, is_fallthrough)
+
+        candidate = self._find_block_by_offset(block_order, offset)
+        if candidate is not None:
+            is_fallthrough = fallthrough is not None and candidate.start_offset == fallthrough
+            return _BranchTargetInfo(candidate, candidate.start_offset, None, is_fallthrough)
+
+        if hint == "fallthrough" and fallthrough is None:
+            hint = "exit"
+            setattr(statement, hint_attr, hint)
+
+        is_fallthrough = hint == "fallthrough"
+        if offset is not None and fallthrough is not None and offset == fallthrough:
+            is_fallthrough = True
+        elif (
+            offset == 0
+            and fallthrough is not None
+            and self._find_block_by_offset(block_order, fallthrough) is not None
+        ):
+            offset = fallthrough
+            is_fallthrough = True
+
+        return _BranchTargetInfo(None, offset, hint, is_fallthrough)
+
+    def _build_jump_for_target(
+        self,
+        target: _BranchTargetInfo,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> ASTJump:
+        hint = target.hint
+        dest_block = target.block
+        dest_offset = target.offset
+
+        if target.is_fallthrough and fallthrough is not None:
+            dest_offset = fallthrough
+            resolved = self._find_block_by_offset(block_order, fallthrough)
+            if resolved is not None:
+                dest_block = resolved
+            hint = None
+
+        if dest_block is None and dest_offset is not None:
+            resolved = self._find_block_by_offset(block_order, dest_offset)
+            if resolved is not None:
+                dest_block = resolved
+                hint = None
+
+        if dest_block is not None:
+            return ASTJump(
+                target=dest_block,
+                target_offset=dest_block.start_offset,
+                hint=None,
+            )
+
+        if dest_offset is None and fallthrough is not None:
+            dest_offset = fallthrough
+            resolved = self._find_block_by_offset(block_order, dest_offset)
+            if resolved is not None:
+                return ASTJump(
+                    target=resolved,
+                    target_offset=resolved.start_offset,
+                    hint=None,
+                )
+
+        if dest_offset is not None:
+            clean_hint = None if hint == "fallthrough" else hint
+            return ASTJump(target=None, target_offset=dest_offset, hint=clean_hint)
+
+        return ASTJump(target=None, target_offset=None, hint=None if hint == "fallthrough" else hint)
+
+    def _normalise_jump(
+        self,
+        jump: ASTJump,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> ASTJump:
+        if jump.target is not None:
+            jump.target_offset = jump.target.start_offset
+            if jump.hint == "fallthrough":
+                jump.hint = None
+            return jump
+
+        if jump.hint == "fallthrough":
+            if fallthrough is not None:
+                resolved = self._find_block_by_offset(block_order, fallthrough)
+                if resolved is not None:
+                    jump.target = resolved
+                    jump.target_offset = resolved.start_offset
+                elif jump.target_offset is None:
+                    jump.target_offset = fallthrough
+            jump.hint = None
+            return jump
+
+        if (
+            fallthrough is not None
+            and jump.target_offset is not None
+            and jump.target_offset == fallthrough
+        ):
+            resolved = self._find_block_by_offset(block_order, fallthrough)
+            if resolved is not None:
+                jump.target = resolved
+                jump.target_offset = resolved.start_offset
+        return jump
 
     @staticmethod
     def _find_block_by_offset(
@@ -2252,7 +2402,8 @@ class ASTBuilder:
                     link.statement.hint = self._describe_branch_target(
                         link.origin_offset, link.target, local=False
                     )
-                    link.statement.target_offset = link.target
+                    if link.statement.target_offset is None:
+                        link.statement.target_offset = link.target
             realised = block_map[pending.start_offset]
             body, terminator = self._split_block_statements(pending.statements)
             realised.body = body
@@ -3949,7 +4100,9 @@ class ASTBuilder:
         if entry_reasons:
             joined = ",".join(entry_reasons) or "unspecified"
             return f"entry({joined})"
-        return "fallthrough"
+        if target_offset is None:
+            return "exit"
+        return f"0x{target_offset:04X}"
 
     def _format_exit_hint(self, exit_reasons: Tuple[str, ...]) -> str:
         if not exit_reasons:
