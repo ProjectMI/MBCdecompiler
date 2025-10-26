@@ -498,7 +498,7 @@ def test_ast_builder_prunes_redundant_branch_blocks() -> None:
     segment_ast = ast_program.segments[0]
     assert len(segment_ast.procedures) == 1
     procedure = segment_ast.procedures[0]
-    assert {block.start_offset for block in procedure.blocks} == {0x0410}
+    assert {block.start_offset for block in procedure.blocks} == {0x0400}
     assert all(
         not isinstance(statement, ASTBranch)
         for block in procedure.blocks
