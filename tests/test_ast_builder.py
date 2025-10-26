@@ -1141,6 +1141,77 @@ def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
         assert "fallthrough" not in targets
 
 
+def test_ast_builder_converts_trivial_true_branch_to_jump() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x40,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x2000,
+                nodes=(IRIf(condition="", then_target=0x2010, else_target=0x2020),),
+            ),
+            IRBlock(
+                label="then",
+                start_offset=0x2010,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+            IRBlock(
+                label="else",
+                start_offset=0x2020,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = next(block for block in procedure.blocks if block.start_offset == 0x2000)
+
+    assert isinstance(entry_block.terminator, ASTJump)
+    jump = entry_block.terminator
+    assert jump.target is not None
+    assert jump.target.start_offset == 0x2010
+    assert jump.hint is None
+    assert "fallthrough" not in jump.render()
+
+
+def test_ast_builder_merges_identical_fallthrough_targets() -> None:
+    segment = IRSegment(
+        index=0,
+        start=0x3000,
+        length=0x30,
+        blocks=(
+            IRBlock(
+                label="entry",
+                start_offset=0x3000,
+                nodes=(IRIf(condition="bool0", then_target=0x3010, else_target=0x3010),),
+            ),
+            IRBlock(
+                label="follow",
+                start_offset=0x3010,
+                nodes=(IRReturn(values=(), varargs=False),),
+            ),
+        ),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+
+    statements = [
+        statement
+        for block in procedure.blocks
+        for statement in block.statements
+    ]
+    renders = [statement.render() for statement in statements]
+    assert all("fallthrough" not in text for text in renders)
+    assert not any(isinstance(statement, ASTBranch) for statement in statements)
+
 def test_symbol_table_records_call_attributes() -> None:
     call = IRCallReturn(
         target=0x3D30,
