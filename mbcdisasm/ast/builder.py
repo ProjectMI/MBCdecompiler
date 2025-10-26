@@ -1191,12 +1191,21 @@ class ASTBuilder:
             successors: Set[int] = set()
             exit_reasons: List[str] = []
             fallthrough = offsets[idx + 1] if idx + 1 < len(offsets) else None
-            for node in reversed(block.nodes):
+            for node_index in range(len(block.nodes) - 1, -1, -1):
+                node = block.nodes[node_index]
                 if isinstance(node, IRReturn):
                     exit_reasons.append("return")
                     successors.clear()
                     break
                 if isinstance(node, (IRTailCall, IRTailcallReturn)):
+                    exit_reasons.append("tail_call")
+                    successors.clear()
+                    break
+                if (
+                    isinstance(node, IRCall)
+                    and node.tail
+                    and self._call_is_tail_terminator(block, node_index, node)
+                ):
                     exit_reasons.append("tail_call")
                     successors.clear()
                     break
@@ -1502,7 +1511,7 @@ class ASTBuilder:
                 for target_offset in analysis.successors:
                     candidate = offset_map.get(target_offset)
                     add(candidate)
-                if analysis.fallthrough is not None:
+                if analysis.fallthrough is not None and not analysis.exit_reasons:
                     candidate = offset_map.get(analysis.fallthrough)
                     add(candidate)
             block.successors = tuple(
@@ -1628,15 +1637,15 @@ class ASTBuilder:
             analysis = self._current_analyses.get(offset)
             reasons: Tuple[ASTExitReason, ...] = ()
             if analysis and analysis.exit_reasons:
-                reasons = tuple(
-                    ASTExitReason(kind=reason) for reason in analysis.exit_reasons
-                )
+                filtered = self._filter_exit_reasons(analysis.exit_reasons, block)
+                if filtered:
+                    reasons = tuple(ASTExitReason(kind=reason) for reason in filtered)
             else:
                 terminator = block.terminator
                 reason: Optional[str] = None
-                if isinstance(terminator, ASTReturn):
+                if isinstance(terminator, ASTReturn) and not block.successors:
                     reason = "return"
-                elif isinstance(terminator, ASTTailCall):
+                elif isinstance(terminator, ASTTailCall) and not block.successors:
                     reason = "tail_call"
                 elif isinstance(terminator, ASTJump):
                     reason = "jump"
@@ -2028,7 +2037,7 @@ class ASTBuilder:
         for statement in block.statements:
             if isinstance(statement, BranchStatement):
                 updated = self._simplify_branch_statement(
-                    statement, block_order, fallthrough
+                    statement, block_order, fallthrough, analysis
                 )
                 if updated is None:
                     continue
@@ -2041,6 +2050,7 @@ class ASTBuilder:
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
+        analysis: Optional[_BlockAnalysis],
     ) -> Optional[ASTStatement]:
         then_target = self._ensure_branch_target(
             statement, "then", block_order, fallthrough
@@ -2048,11 +2058,17 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
-        if (
-            then_target is not None
-            and else_target is not None
-            and then_target == else_target
-        ):
+        then_identity = self._branch_target_identity(statement, "then")
+        else_identity = self._branch_target_identity(statement, "else")
+        if then_identity is not None and then_identity == else_identity:
+            if analysis and len(set(analysis.successors)) > 1:
+                return statement
+            if (
+                then_identity[0] == "hint"
+                and then_identity[1] == "fallthrough"
+                and (analysis is None or analysis.fallthrough is None)
+            ):
+                return statement
             target_block = statement.then_branch or statement.else_branch
             target_offset = statement.then_offset or statement.else_offset
             if target_block is not None:
@@ -2087,6 +2103,24 @@ class ASTBuilder:
             return target_block.start_offset
         setattr(statement, offset_attr, offset)
         return offset
+
+    @staticmethod
+    def _branch_target_identity(
+        statement: BranchStatement, prefix: str
+    ) -> Optional[Tuple[str, object]]:
+        branch_attr = f"{prefix}_branch"
+        hint_attr = f"{prefix}_hint"
+        offset_attr = f"{prefix}_offset"
+        branch = getattr(statement, branch_attr)
+        if branch is not None:
+            return ("label", branch.label)
+        hint = getattr(statement, hint_attr)
+        if hint is not None:
+            return ("hint", hint)
+        offset = getattr(statement, offset_attr)
+        if offset is not None:
+            return ("offset", offset)
+        return None
 
     @staticmethod
     def _find_block_by_offset(
@@ -2214,7 +2248,23 @@ class ASTBuilder:
 
     @staticmethod
     def _block_has_exit(block: ASTBlock) -> bool:
+        if block.successors:
+            return False
         return isinstance(block.terminator, (ASTReturn, ASTTailCall))
+
+    @staticmethod
+    def _filter_exit_reasons(
+        exit_reasons: Sequence[str], block: ASTBlock
+    ) -> Tuple[str, ...]:
+        if not exit_reasons:
+            return tuple()
+        if not block.successors:
+            return tuple(exit_reasons)
+        return tuple(
+            reason
+            for reason in exit_reasons
+            if reason not in {"return", "tail_call"}
+        )
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
