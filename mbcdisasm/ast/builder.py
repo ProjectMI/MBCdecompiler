@@ -74,6 +74,7 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTCleanupCall,
     ASTImmediateOperand,
     ASTSignatureValue,
     ASTStackOperand,
@@ -179,6 +180,15 @@ class _BranchLink:
 
 
 @dataclass
+class _ContinuationLink:
+    """Pending link for a prologue that unconditionally continues."""
+
+    statement: ASTFunctionPrologue
+    target: int
+    origin_offset: int
+
+
+@dataclass
 class _PendingBlock:
     """Block with unresolved successor references."""
 
@@ -188,6 +198,7 @@ class _PendingBlock:
     successors: Tuple[int, ...]
     branch_links: List[_BranchLink]
     jump_links: List[_JumpLink]
+    continuation_links: List[_ContinuationLink]
 
 
 @dataclass
@@ -2272,6 +2283,16 @@ class ASTBuilder:
                     link.statement.else_hint = self._describe_branch_target(
                         link.origin_offset, link.else_target, local=False
                     )
+            for link in pending.continuation_links:
+                target_block = block_map.get(link.target)
+                if target_block is not None:
+                    link.statement.continuation = target_block
+                    link.statement.continuation_offset = target_block.start_offset
+                else:
+                    link.statement.continuation_hint = self._describe_branch_target(
+                        link.origin_offset, link.target, local=False
+                    )
+                    link.statement.continuation_offset = link.target
             for link in pending.jump_links:
                 target_block = block_map.get(link.target)
                 if target_block is not None:
@@ -2351,6 +2372,7 @@ class ASTBuilder:
         statements: List[ASTStatement] = []
         branch_links: List[_BranchLink] = []
         jump_links: List[_JumpLink] = []
+        continuation_links: List[_ContinuationLink] = []
         pending_calls: List[_PendingDispatchCall] = []
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
@@ -2398,6 +2420,9 @@ class ASTBuilder:
                 block.start_offset,
                 value_state,
                 metrics,
+                analysis,
+                jump_links,
+                continuation_links,
             )
             statements.extend(node_statements)
             branch_links.extend(node_links)
@@ -2412,6 +2437,7 @@ class ASTBuilder:
             successors=analysis.successors,
             branch_links=branch_links,
             jump_links=jump_links,
+            continuation_links=continuation_links,
         )
 
     def _call_is_tail_terminator(
@@ -2957,6 +2983,9 @@ class ASTBuilder:
         origin_offset: int,
         value_state: MutableMapping[str, ASTExpression],
         metrics: ASTMetrics,
+        analysis: _BlockAnalysis,
+        jump_links: List[_JumpLink],
+        continuation_links: List[_ContinuationLink],
     ) -> Tuple[List[ASTStatement], List[_BranchLink]]:
         if isinstance(node, IRCallPreparation):
             for mnemonic, operand in node.steps:
@@ -3143,6 +3172,39 @@ class ASTBuilder:
             )
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
+            rendered_condition = condition.render()
+            if rendered_condition.startswith("cleanup_call[") and (
+                then_target not in self._current_block_labels
+            ):
+                statements = [*prelude, ASTCleanupCall(rendered_condition)]
+                jump = ASTJump(target_offset=else_target)
+                statements.append(jump)
+                jump_links.append(
+                    _JumpLink(
+                        statement=jump,
+                        target=else_target,
+                        origin_offset=origin_offset,
+                    )
+                )
+                return statements, []
+            if isinstance(condition, ASTBooleanLiteral) and condition.value:
+                local_successor = any(
+                    target in self._current_block_labels
+                    and not self._current_entry_reasons.get(target)
+                    for target in analysis.successors
+                )
+                if not local_successor and analysis.fallthrough == else_target:
+                    statements = [*prelude]
+                    jump = ASTJump(target_offset=else_target)
+                    statements.append(jump)
+                    jump_links.append(
+                        _JumpLink(
+                            statement=jump,
+                            target=else_target,
+                            origin_offset=origin_offset,
+                        )
+                    )
+                    return statements, []
             branch = ASTBranch(
                 condition=condition,
                 then_offset=then_target,
@@ -3185,6 +3247,23 @@ class ASTBuilder:
             )
             then_target = self._resolve_target(node.then_target)
             else_target = self._resolve_target(node.else_target)
+            rendered = expr.render()
+            if rendered.startswith("cleanup_call["):
+                statement = ASTFunctionPrologue(
+                    var=var_expr,
+                    expr=ASTBooleanLiteral(True),
+                    cleanup_effect=rendered,
+                )
+                statement.continuation_offset = else_target
+                statements = [*prelude, statement]
+                continuation_links.append(
+                    _ContinuationLink(
+                        statement=statement,
+                        target=else_target,
+                        origin_offset=origin_offset,
+                    )
+                )
+                return statements, []
             statement = ASTFunctionPrologue(
                 var=var_expr,
                 expr=expr,

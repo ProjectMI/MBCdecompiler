@@ -1309,6 +1309,18 @@ class ASTFlagCheck(ASTTerminator):
 
 
 @dataclass
+class ASTCleanupCall(ASTStatement):
+    """Standalone call-frame cleanup effect that influences control flow."""
+
+    description: str
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        return self.description
+
+
+@dataclass
 class ASTFunctionPrologue(ASTTerminator):
     """Reconstructed function prologue sequence."""
 
@@ -1320,8 +1332,26 @@ class ASTFunctionPrologue(ASTTerminator):
     else_hint: str | None = None
     then_offset: int | None = None
     else_offset: int | None = None
+    cleanup_effect: str | None = None
+    continuation: "ASTBlock | None" = None
+    continuation_hint: str | None = None
+    continuation_offset: int | None = None
 
     def render(self) -> str:
+        if self.cleanup_effect is not None:
+            target: str
+            if self.continuation is not None:
+                target = self.continuation.label
+            elif self.continuation_hint is not None:
+                target = self.continuation_hint
+            elif self.continuation_offset is not None:
+                target = f"0x{self.continuation_offset:04X}"
+            else:
+                target = "?"
+            return (
+                f"prologue {self.var.render()} effects=[{self.cleanup_effect}] "
+                f"-> {target}"
+            )
         then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
         else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
         return (
@@ -1720,6 +1750,7 @@ __all__ = [
     "ASTStatement",
     "ASTAssign",
     "ASTMemoryWrite",
+    "ASTCleanupCall",
     "ASTIOEffect",
     "ASTFrameEffect",
     "ASTFrameMaskEffect",
