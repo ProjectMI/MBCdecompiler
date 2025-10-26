@@ -53,6 +53,7 @@ from mbcdisasm.ir.model import (
     IRDispatchCase,
     IRDispatchIndex,
     IRIf,
+    IRLiteralChunk,
     IRIOWrite,
     IRLoad,
     IRProgram,
@@ -1141,6 +1142,69 @@ def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
         assert "fallthrough" not in targets
 
 
+def test_ast_builder_collapses_fallthrough_branch_exit_to_jump() -> None:
+    block = IRBlock(
+        label="exit",
+        start_offset=0x2000,
+        nodes=(IRIf(condition="cond", then_target=0x3000, else_target=0x4000),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x2000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    procedure = ASTBuilder().build(program).segments[0].procedures[0]
+    terminator = procedure.blocks[0].terminator
+
+    assert isinstance(terminator, ASTJump)
+    assert terminator.render() == "jump fallthrough"
+    assert [reason.kind for reason in procedure.exits[0].reasons] == ["jump"]
+
+
+def test_ast_builder_ignores_tailcall_exit_with_successor() -> None:
+    entry = IRBlock(
+        label="entry",
+        start_offset=0x1000,
+        nodes=(
+            IRCall(target=0x2000, args=(), tail=True),
+            IRLiteralChunk(data=b"tail", source="chunk"),
+            IRIf(condition="flag", then_target=0x1010, else_target=0x1020),
+        ),
+    )
+    then_block = IRBlock(
+        label="then",
+        start_offset=0x1010,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    else_block = IRBlock(
+        label="else",
+        start_offset=0x1020,
+        nodes=(IRReturn(values=(), varargs=False),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x40,
+        blocks=(entry, then_block, else_block),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    procedure = ASTBuilder().build(program).segments[0].procedures[0]
+    entry_block = procedure.blocks[0]
+
+    assert isinstance(entry_block.terminator, ASTTailCall)
+    exit_map = {exit.label: [reason.kind for reason in exit.reasons] for exit in procedure.exits}
+    assert "entry" not in exit_map
+    assert exit_map.get("then") == ["return"]
+    assert exit_map.get("else") == ["return"]
+    assert set(procedure.successor_map[entry_block.label]) == {"then", "else"}
+
+
 def test_symbol_table_records_call_attributes() -> None:
     call = IRCallReturn(
         target=0x3D30,
@@ -1236,7 +1300,7 @@ def test_testset_branch_desugars_into_assignment() -> None:
     procedure = ast_program.segments[0].procedures[0]
     statements = procedure.blocks[0].statements
     assert isinstance(statements[0], ASTAssign)
-    assert isinstance(statements[1], ASTBranch)
+    assert isinstance(statements[1], (ASTBranch, ASTJump))
 
 
 def test_banked_memory_locations_are_canonical() -> None:

@@ -1502,7 +1502,10 @@ class ASTBuilder:
                 for target_offset in analysis.successors:
                     candidate = offset_map.get(target_offset)
                     add(candidate)
-                if analysis.fallthrough is not None:
+                allow_fallthrough = not isinstance(
+                    terminator, (ASTReturn, ASTTailCall)
+                )
+                if allow_fallthrough and analysis.fallthrough is not None:
                     candidate = offset_map.get(analysis.fallthrough)
                     add(candidate)
             block.successors = tuple(
@@ -2048,17 +2051,35 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
-        if (
-            then_target is not None
-            and else_target is not None
-            and then_target == else_target
-        ):
-            target_block = statement.then_branch or statement.else_branch
-            target_offset = statement.then_offset or statement.else_offset
-            if target_block is not None:
-                target_offset = target_block.start_offset
-            hint = statement.then_hint or statement.else_hint
-            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+        if isinstance(statement, ASTBranch):
+            then_identity = self._branch_target_identity(
+                statement, "then", fallthrough
+            )
+            else_identity = self._branch_target_identity(
+                statement, "else", fallthrough
+            )
+            if then_identity is not None and then_identity == else_identity:
+                target_block = statement.then_branch or statement.else_branch
+                target_offset = statement.then_offset or statement.else_offset
+                hint = statement.then_hint or statement.else_hint
+                if target_block is not None:
+                    target_offset = target_block.start_offset
+                    hint = None
+                elif hint == "fallthrough":
+                    if fallthrough is not None:
+                        target_block = self._find_block_by_offset(
+                            block_order, fallthrough
+                        )
+                        if target_block is not None:
+                            target_offset = target_block.start_offset
+                            hint = None
+                        else:
+                            target_offset = fallthrough
+                    else:
+                        target_offset = None
+                return ASTJump(
+                    target=target_block, target_offset=target_offset, hint=hint
+                )
         return statement
 
     def _ensure_branch_target(
@@ -2087,6 +2108,28 @@ class ASTBuilder:
             return target_block.start_offset
         setattr(statement, offset_attr, offset)
         return offset
+
+    @staticmethod
+    def _branch_target_identity(
+        statement: BranchStatement,
+        prefix: str,
+        fallthrough: Optional[int],
+    ) -> Optional[Tuple[str, int | str | None]]:
+        branch_attr = f"{prefix}_branch"
+        hint_attr = f"{prefix}_hint"
+        offset_attr = f"{prefix}_offset"
+        branch = getattr(statement, branch_attr)
+        if branch is not None:
+            return ("block", branch.start_offset)
+        hint = getattr(statement, hint_attr)
+        if hint == "fallthrough":
+            return ("fallthrough", fallthrough)
+        offset = getattr(statement, offset_attr)
+        if offset is not None:
+            return ("offset", offset)
+        if hint is not None:
+            return ("hint", hint)
+        return None
 
     @staticmethod
     def _find_block_by_offset(
@@ -2214,7 +2257,9 @@ class ASTBuilder:
 
     @staticmethod
     def _block_has_exit(block: ASTBlock) -> bool:
-        return isinstance(block.terminator, (ASTReturn, ASTTailCall))
+        if not isinstance(block.terminator, (ASTReturn, ASTTailCall)):
+            return False
+        return not block.successors
 
     def _realise_blocks(self, blocks: Sequence[_PendingBlock]) -> Tuple[ASTBlock, ...]:
         block_map: Dict[int, ASTBlock] = {
