@@ -1852,6 +1852,16 @@ class ASTBuilder:
         for block in list(block_order):
             self._simplify_branch_targets(block, block_order)
             self._simplify_stack_branches(block)
+            if block.statements:
+                terminator = block.statements[-1]
+                if isinstance(terminator, ASTJump) and terminator.hint == "fallthrough":
+                    analysis = self._current_analyses.get(block.start_offset)
+                    exit_hint = None
+                    if analysis:
+                        exit_text = self._format_exit_hint(analysis.exit_reasons)
+                        if exit_text:
+                            exit_hint = f"exit({exit_text})"
+                    terminator.hint = exit_hint
 
         for block in block_order:
             filtered = tuple(
@@ -2024,11 +2034,16 @@ class ASTBuilder:
     ) -> None:
         analysis = self._current_analyses.get(block.start_offset)
         fallthrough = analysis.fallthrough if analysis else None
+        exit_hint = None
+        if analysis:
+            exit_text = self._format_exit_hint(analysis.exit_reasons)
+            if exit_text:
+                exit_hint = f"exit({exit_text})"
         simplified: List[ASTStatement] = []
         for statement in block.statements:
             if isinstance(statement, BranchStatement):
                 updated = self._simplify_branch_statement(
-                    statement, block_order, fallthrough
+                    statement, block_order, fallthrough, exit_hint
                 )
                 if updated is None:
                     continue
@@ -2041,6 +2056,7 @@ class ASTBuilder:
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
+        exit_hint: Optional[str],
     ) -> Optional[ASTStatement]:
         then_target = self._ensure_branch_target(
             statement, "then", block_order, fallthrough
@@ -2048,18 +2064,84 @@ class ASTBuilder:
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
-        if (
+
+        if isinstance(statement, ASTBranch) and isinstance(
+            statement.condition, ASTBooleanLiteral
+        ):
+            return self._collapse_boolean_branch(
+                statement,
+                then_target,
+                else_target,
+                exit_hint,
+            )
+
+        same_target = (
             then_target is not None
             and else_target is not None
             and then_target == else_target
-        ):
+        )
+        fallthrough_only = (
+            getattr(statement, "then_hint", None) == "fallthrough"
+            and getattr(statement, "else_hint", None) == "fallthrough"
+            and getattr(statement, "then_branch", None) is None
+            and getattr(statement, "else_branch", None) is None
+        )
+        if fallthrough_only:
+            replacement = exit_hint or "exit"
+            if hasattr(statement, "then_hint"):
+                setattr(statement, "then_hint", replacement)
+            if hasattr(statement, "else_hint"):
+                setattr(statement, "else_hint", replacement)
+            return statement
+
+        if same_target:
             target_block = statement.then_branch or statement.else_branch
-            target_offset = statement.then_offset or statement.else_offset
-            if target_block is not None:
-                target_offset = target_block.start_offset
+            target_offset = then_target or statement.then_offset or statement.else_offset
             hint = statement.then_hint or statement.else_hint
-            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+            return self._build_jump_statement(
+                target_block, target_offset, hint, exit_hint
+            )
         return statement
+
+    def _collapse_boolean_branch(
+        self,
+        statement: ASTBranch,
+        then_target: Optional[int],
+        else_target: Optional[int],
+        exit_hint: Optional[str],
+    ) -> Optional[ASTStatement]:
+        if statement.condition.value:
+            target_block = statement.then_branch
+            target_offset = then_target or statement.then_offset
+            hint = statement.then_hint
+        else:
+            target_block = statement.else_branch
+            target_offset = else_target or statement.else_offset
+            hint = statement.else_hint
+        return self._build_jump_statement(
+            target_block, target_offset, hint, exit_hint
+        )
+
+    @staticmethod
+    def _build_jump_statement(
+        target_block: Optional[ASTBlock],
+        target_offset: Optional[int],
+        hint: Optional[str],
+        default_hint: Optional[str],
+    ) -> Optional[ASTJump]:
+        if target_block is not None:
+            target_offset = target_block.start_offset
+        if target_offset is None:
+            if hint == "fallthrough":
+                hint = None
+            if hint is not None:
+                return ASTJump(target=None, target_offset=None, hint=hint)
+            if default_hint is None:
+                default_hint = "exit"
+            return ASTJump(target=None, target_offset=None, hint=default_hint)
+        if hint == "fallthrough":
+            hint = None
+        return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
 
     def _ensure_branch_target(
         self,
@@ -2249,9 +2331,16 @@ class ASTBuilder:
                     link.statement.target = target_block
                     link.statement.target_offset = target_block.start_offset
                 else:
-                    link.statement.hint = self._describe_branch_target(
+                    hint = self._describe_branch_target(
                         link.origin_offset, link.target, local=False
                     )
+                    if hint == "fallthrough":
+                        analysis = self._current_analyses.get(link.origin_offset)
+                        if analysis:
+                            exit_text = self._format_exit_hint(analysis.exit_reasons)
+                            if exit_text:
+                                hint = f"exit({exit_text})"
+                    link.statement.hint = hint
                     link.statement.target_offset = link.target
             realised = block_map[pending.start_offset]
             body, terminator = self._split_block_statements(pending.statements)
