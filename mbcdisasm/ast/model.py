@@ -1137,6 +1137,22 @@ class ASTCallStatement(ASTStatement):
 
 
 @dataclass
+class ASTCleanupStatement(ASTStatement):
+    """Side-effecting cleanup operation emitted outside of terminators."""
+
+    effects: Tuple[ASTEffect, ...] = ()
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def __post_init__(self) -> None:
+        if self.effects:
+            self.effects = tuple(sorted(self.effects, key=lambda eff: eff.order_key()))
+
+    def render(self) -> str:
+        return f"cleanup effects={_render_effects(self.effects)}"
+
+
+@dataclass
 class ASTIORead(ASTStatement):
     """I/O read effect emitted by helper façades."""
 
@@ -1735,6 +1751,7 @@ __all__ = [
     "ASTCallReturnSlot",
     "ASTCallABI",
     "ASTCallStatement",
+    "ASTCleanupStatement",
     "ASTSymbolTypeFamily",
     "ASTSymbolType",
     "ASTSignatureValue",

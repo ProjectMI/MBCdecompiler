@@ -12,15 +12,18 @@ from mbcdisasm.ast import (
     ASTCallArgumentSlot,
     ASTCallExpr,
     ASTCallStatement,
+    ASTCleanupStatement,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameResetEffect,
     ASTFrameMaskEffect,
     ASTFrameProtocolEffect,
     ASTFrameTeardownEffect,
+    ASTHelperEffect,
     ASTIOEffect,
     ASTIntegerLiteral,
     ASTImmediateOperand,
+    ASTBooleanLiteral,
     ASTJump,
     ASTMemoryRead,
     ASTProcedure,
@@ -48,6 +51,7 @@ from mbcdisasm.ir.model import (
     IRAbiEffect,
     IRBankedLoad,
     IRCall,
+    IRCallCleanup,
     IRCallReturn,
     IRDataMarker,
     IRDispatchCase,
@@ -840,6 +844,16 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     procedure = segment.procedures[0]
     block = procedure.blocks[0]
 
+    cleanup_stmt = next(
+        statement
+        for statement in block.statements
+        if isinstance(statement, ASTCleanupStatement)
+    )
+    cleanup_io_effects = [
+        effect for effect in cleanup_stmt.effects if isinstance(effect, ASTIOEffect)
+    ]
+    assert any(effect.operation.value == "bridge" for effect in cleanup_io_effects)
+
     call_stmt = next(statement for statement in block.statements if isinstance(statement, ASTCallStatement))
     assert call_stmt.abi is not None
     assert isinstance(call_stmt.abi, ASTCallABI)
@@ -877,7 +891,7 @@ def test_ast_builder_emits_call_frame_and_finally(tmp_path: Path) -> None:
     assert not frame_masks
     assert not frame_channels
     assert not frame_teardowns
-    assert any(effect.operation.value == "bridge" for effect in io_effects)
+    assert not io_effects
 
 
 def test_ast_tailcall_emits_protocol_and_finally() -> None:
@@ -926,6 +940,84 @@ def test_ast_tailcall_emits_protocol_and_finally() -> None:
     assert not frame_masks
     assert not frame_teardowns
     assert not frame_drops
+
+
+def test_ast_builder_emits_cleanup_statement_before_branch() -> None:
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="call_helpers",
+                operand=0x1234,
+                operand_alias="helpers.cleanup_stub",
+            ),
+        )
+    )
+    branch = IRIf(
+        condition="cleanup_call[helpers.cleanup_stub]",
+        then_target=0x1002,
+        else_target=0x1004,
+    )
+    entry_block = IRBlock(label="entry", start_offset=0x1000, nodes=(cleanup, branch))
+    then_return = IRReturn(values=tuple(), varargs=False)
+    else_return = IRReturn(values=tuple(), varargs=False)
+    then_block = IRBlock(label="then", start_offset=0x1002, nodes=(then_return,))
+    else_block = IRBlock(label="else", start_offset=0x1004, nodes=(else_return,))
+    metrics = NormalizerMetrics()
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(entry_block, then_block, else_block),
+        metrics=metrics,
+    )
+    program = IRProgram(segments=(segment,), metrics=metrics)
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    block = procedure.blocks[0]
+
+    assert block.body, "expected cleanup statement before branch"
+    cleanup_stmt = block.body[0]
+    assert isinstance(cleanup_stmt, ASTCleanupStatement)
+    assert cleanup_stmt.effects, "cleanup statement should expose effects"
+    assert any(isinstance(effect, ASTHelperEffect) for effect in cleanup_stmt.effects)
+
+    assert isinstance(block.terminator, ASTBranch)
+    condition = block.terminator.condition
+    assert isinstance(condition, ASTBooleanLiteral)
+    assert condition.value is True
+
+
+def test_ast_builder_flushes_cleanup_before_default_return() -> None:
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="op_10_0E",
+                operand=0,
+                operand_alias="frame.cleanup",
+            ),
+        )
+    )
+    block = IRBlock(label="entry", start_offset=0x1000, nodes=(cleanup,))
+    metrics = NormalizerMetrics()
+    segment = IRSegment(
+        index=0,
+        start=0x1000,
+        length=0x10,
+        blocks=(block,),
+        metrics=metrics,
+    )
+    program = IRProgram(segments=(segment,), metrics=metrics)
+
+    ast_program = ASTBuilder().build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    entry_block = procedure.blocks[0]
+
+    assert entry_block.body, "cleanup should appear as a statement"
+    cleanup_stmt = entry_block.body[0]
+    assert isinstance(cleanup_stmt, ASTCleanupStatement)
+    assert cleanup_stmt.effects
+    assert isinstance(entry_block.terminator, ASTReturn)
 
 def test_ast_finally_summary_matches_frame_protocol() -> None:
     return_node = IRReturn(

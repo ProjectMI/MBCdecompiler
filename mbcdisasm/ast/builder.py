@@ -74,6 +74,7 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTCleanupStatement,
     ASTImmediateOperand,
     ASTSignatureValue,
     ASTStackOperand,
@@ -499,6 +500,7 @@ class ASTBuilder:
         self._current_redirects: Mapping[int, int] = {}
         self._pending_call_frame: List[IRStackEffect] = []
         self._pending_epilogue: List[IRStackEffect] = []
+        self._pending_cleanup: List[IRStackEffect] = []
         self._stack_predicate_counter: int = 0
         self._enum_infos: Dict[str, _EnumInfo] = {}
         self._enum_order: List[str] = []
@@ -790,6 +792,8 @@ class ASTBuilder:
             if statement.abi is not None:
                 self._register_effect_sequence(statement.abi.effects, accumulators)
         elif isinstance(statement, ASTReturn):
+            self._register_effect_sequence(statement.effects, accumulators)
+        elif isinstance(statement, ASTCleanupStatement):
             self._register_effect_sequence(statement.effects, accumulators)
         elif isinstance(statement, ASTIOWrite):
             effect = ASTIOEffect(
@@ -2355,13 +2359,21 @@ class ASTBuilder:
         pending_tables: List[_PendingDispatchTable] = []
         self._pending_call_frame.clear()
         self._pending_epilogue.clear()
+        self._pending_cleanup = []
         nodes = block.nodes
         for index, node in enumerate(nodes):
+            if isinstance(node, IRCallCleanup):
+                if any(step.mnemonic == "stack_shuffle" for step in node.steps):
+                    self._pending_call_frame.extend(node.steps)
+                else:
+                    self._pending_cleanup.extend(node.steps)
+                continue
             if isinstance(node, IRTailCall):
                 tail_terminator = self._call_is_tail_terminator(
                     block, index, node, analysis.successors
                 )
                 if not tail_terminator:
+                    self._flush_pending_cleanup(statements)
                     self._handle_tail_call_as_call(
                         node,
                         value_state,
@@ -2370,10 +2382,13 @@ class ASTBuilder:
                         pending_calls,
                     )
                     continue
-            if isinstance(node, IRCall):
+                self._consume_pending_cleanup()
+            elif isinstance(node, IRCall):
                 tail_terminator = self._call_is_tail_terminator(
                     block, index, node, analysis.successors
                 )
+                if not tail_terminator:
+                    self._flush_pending_cleanup(statements)
                 self._handle_dispatch_call(
                     node,
                     value_state,
@@ -2384,7 +2399,8 @@ class ASTBuilder:
                     tail_terminator=tail_terminator,
                 )
                 continue
-            if isinstance(node, IRSwitchDispatch):
+            elif isinstance(node, IRSwitchDispatch):
+                self._flush_pending_cleanup(statements)
                 self._handle_dispatch_table(
                     node,
                     value_state,
@@ -2393,6 +2409,10 @@ class ASTBuilder:
                     pending_tables,
                 )
                 continue
+            elif isinstance(node, IRReturn):
+                self._consume_pending_cleanup()
+            else:
+                self._flush_pending_cleanup(statements)
             node_statements, node_links = self._convert_node(
                 node,
                 block.start_offset,
@@ -2402,6 +2422,7 @@ class ASTBuilder:
             statements.extend(node_statements)
             branch_links.extend(node_links)
         statements = self._collapse_dispatch_sequences(statements)
+        self._flush_pending_cleanup(statements)
         terminator = self._ensure_block_terminator(analysis, statements, jump_links)
         if terminator is not None:
             statements.append(terminator)
@@ -2531,6 +2552,7 @@ class ASTBuilder:
             )
             return False
         if tail_terminator:
+            self._consume_pending_cleanup()
             epilogue_effects = self._build_epilogue_effects(node.cleanup, node.abi_effects)
             statements.append(
                 ASTTailCall(
@@ -3133,7 +3155,7 @@ class ASTBuilder:
             if any(step.mnemonic == "stack_shuffle" for step in node.steps):
                 self._pending_call_frame.extend(node.steps)
             else:
-                self._pending_epilogue.extend(node.steps)
+                self._pending_cleanup.extend(node.steps)
             return [], []
         if isinstance(node, IRTerminator):
             return [], []
@@ -3827,6 +3849,23 @@ class ASTBuilder:
             effects, ensure_protocol=ensure_protocol
         )
 
+    def _flush_pending_cleanup(self, statements: List[ASTStatement]) -> None:
+        if not self._pending_cleanup:
+            return
+        saved_epilogue = self._pending_epilogue
+        self._pending_epilogue = list(self._pending_cleanup)
+        effects = self._build_epilogue_effects(tuple(), tuple())
+        self._pending_epilogue = saved_epilogue
+        self._pending_cleanup = []
+        if effects:
+            statements.append(ASTCleanupStatement(effects=effects))
+
+    def _consume_pending_cleanup(self) -> None:
+        if not self._pending_cleanup:
+            return
+        self._pending_epilogue.extend(self._pending_cleanup)
+        self._pending_cleanup = []
+
     def _convert_call(
         self,
         target: int,
@@ -3925,6 +3964,11 @@ class ASTBuilder:
         if not body:
             return [], ASTBooleanLiteral(True)
         prelude: List[ASTStatement] = []
+        normalised = body.strip()
+        if normalised.startswith("cleanup_call") or (
+            normalised.startswith("bool(") and "cleanup_call" in normalised
+        ):
+            return prelude, ASTBooleanLiteral(True)
         if body.startswith("marker"):
             remainder = body[len("marker") :].strip()
             if not remainder:
@@ -4079,6 +4123,7 @@ class ASTBuilder:
         self._current_redirects = {}
         self._pending_call_frame = []
         self._pending_epilogue = []
+        self._pending_cleanup = []
         self._segment_declared_enum_keys = []
         self._segment_declared_enum_set = set()
         self._current_segment_index = -1
