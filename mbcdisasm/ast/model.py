@@ -1250,6 +1250,23 @@ class ASTJump(ASTTerminator):
 
 
 @dataclass
+class ASTFallthrough(ASTTerminator):
+    """Implicit control-flow transfer to the fallthrough block."""
+
+    target: "ASTBlock | None" = None
+    target_offset: int | None = None
+
+    def render(self) -> str:
+        if self.target is not None:
+            destination = self.target.label
+        elif self.target_offset is not None:
+            destination = f"0x{self.target_offset:04X}"
+        else:
+            destination = "?"
+        return f"fallthrough {destination}"
+
+
+@dataclass
 class ASTBranch(ASTTerminator):
     """Generic conditional branch with CFG links."""
 
@@ -1744,6 +1761,7 @@ __all__ = [
     "ASTTerminator",
     "ASTTailCall",
     "ASTJump",
+    "ASTFallthrough",
     "ASTReturn",
     "ASTReturnPayload",
     "ASTBranch",

@@ -127,6 +127,7 @@ from .model import (
     ASTStatement,
     ASTFunctionPrologue,
     ASTJump,
+    ASTFallthrough,
     ASTTerminator,
     ASTSwitch,
     ASTSwitchCase,
@@ -1474,12 +1475,13 @@ class ASTBuilder:
                 if candidate is not None and candidate not in successors:
                     successors.append(candidate)
 
-            if isinstance(terminator, ASTJump):
+            if isinstance(terminator, (ASTJump, ASTFallthrough)):
                 target_block = resolve(terminator.target, terminator.target_offset)
                 if target_block is not None:
                     terminator.target = target_block
                     terminator.target_offset = target_block.start_offset
-                    terminator.hint = None
+                    if isinstance(terminator, ASTJump):
+                        terminator.hint = None
                 add(target_block)
             elif isinstance(
                 terminator,
@@ -1640,6 +1642,8 @@ class ASTBuilder:
                     reason = "tail_call"
                 elif isinstance(terminator, ASTJump):
                     reason = "jump"
+                elif isinstance(terminator, ASTFallthrough):
+                    reason = "fallthrough"
                 elif isinstance(terminator, ASTSwitch):
                     reason = "switch"
                 elif isinstance(terminator, ASTBranch):
@@ -1885,7 +1889,7 @@ class ASTBuilder:
             for block in list(block_order):
                 if block.body:
                     continue
-                if not isinstance(block.terminator, ASTJump):
+                if not isinstance(block.terminator, (ASTJump, ASTFallthrough)):
                     continue
                 if len(block.successors) != 1:
                     continue
@@ -1934,7 +1938,7 @@ class ASTBuilder:
                 if not statements:
                     continue
                 terminator = statements[-1]
-                if not isinstance(terminator, ASTJump):
+                if not isinstance(terminator, (ASTJump, ASTFallthrough)):
                     continue
                 targets_successor = False
                 if terminator.target is successor:
@@ -2025,29 +2029,63 @@ class ASTBuilder:
         analysis = self._current_analyses.get(block.start_offset)
         fallthrough = analysis.fallthrough if analysis else None
         simplified: List[ASTStatement] = []
+        override_successors: Optional[Tuple[ASTBlock, ...]] = None
         for statement in block.statements:
             if isinstance(statement, BranchStatement):
-                updated = self._simplify_branch_statement(
+                updated, successors = self._simplify_branch_statement(
                     statement, block_order, fallthrough
                 )
+                if successors is not None:
+                    override_successors = successors
                 if updated is None:
                     continue
                 statement = updated
             simplified.append(statement)
         block.statements = tuple(simplified)
+        if override_successors is not None:
+            block.successors = override_successors
 
     def _simplify_branch_statement(
         self,
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
-    ) -> Optional[ASTStatement]:
+    ) -> Tuple[Optional[ASTStatement], Optional[Tuple[ASTBlock, ...]]]:
         then_target = self._ensure_branch_target(
             statement, "then", block_order, fallthrough
         )
         else_target = self._ensure_branch_target(
             statement, "else", block_order, fallthrough
         )
+        def build_unconditional(
+            target_block: Optional[ASTBlock],
+            target_offset: Optional[int],
+            hint: Optional[str],
+        ) -> Tuple[ASTStatement, Tuple[ASTBlock, ...]]:
+            resolved_offset = target_offset
+            if target_block is not None:
+                resolved_offset = target_block.start_offset
+            successors = (target_block,) if target_block is not None else tuple()
+            if (
+                resolved_offset is not None
+                and fallthrough is not None
+                and resolved_offset == fallthrough
+            ):
+                return (
+                    ASTFallthrough(
+                        target=target_block, target_offset=resolved_offset
+                    ),
+                    successors,
+                )
+            return (
+                ASTJump(
+                    target=target_block,
+                    target_offset=resolved_offset,
+                    hint=hint,
+                ),
+                successors,
+            )
+
         if (
             then_target is not None
             and else_target is not None
@@ -2055,11 +2093,17 @@ class ASTBuilder:
         ):
             target_block = statement.then_branch or statement.else_branch
             target_offset = statement.then_offset or statement.else_offset
-            if target_block is not None:
-                target_offset = target_block.start_offset
             hint = statement.then_hint or statement.else_hint
-            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
-        return statement
+            return build_unconditional(target_block, target_offset, hint)
+        if isinstance(statement, ASTBranch) and isinstance(
+            statement.condition, ASTBooleanLiteral
+        ):
+            value = statement.condition.value
+            target_block = statement.then_branch if value else statement.else_branch
+            target_offset = statement.then_offset if value else statement.else_offset
+            hint = statement.then_hint if value else statement.else_hint
+            return build_unconditional(target_block, target_offset, hint)
+        return (statement, None)
 
     def _ensure_branch_target(
         self,
@@ -2140,10 +2184,11 @@ class ASTBuilder:
                 if statement.else_branch is old:
                     statement.else_branch = new
                     statement.else_hint = None
-            elif isinstance(statement, ASTJump):
+            elif isinstance(statement, (ASTJump, ASTFallthrough)):
                 if statement.target is old:
                     statement.target = new
-                    statement.hint = None
+                    if isinstance(statement, ASTJump):
+                        statement.hint = None
                     statement.target_offset = new.start_offset
 
     def _compute_exit_offsets_from_ast(self, blocks: Sequence[ASTBlock]) -> Tuple[int, ...]:
