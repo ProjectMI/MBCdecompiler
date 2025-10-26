@@ -1178,6 +1178,24 @@ def test_tailcall_node_with_followup_branch_is_demoted_from_exit() -> None:
     assert {reason.kind for reason in exit_point.reasons} == {"return"}
 
 
+def test_trivial_branch_exit_without_successors_is_classified_as_jump() -> None:
+    builder = ASTBuilder()
+    branch = ASTBranch(
+        condition=ASTIdentifier("flag"),
+        then_offset=0x6000,
+        else_offset=0x6000,
+    )
+    block = ASTBlock(
+        label="entry",
+        start_offset=0x5000,
+        body=tuple(),
+        terminator=branch,
+        successors=tuple(),
+    )
+
+    assert builder._classify_exit_reason(block) == "jump"
+
+
 def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
     segment = IRSegment(
         index=0,
