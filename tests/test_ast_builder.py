@@ -12,15 +12,18 @@ from mbcdisasm.ast import (
     ASTCallArgumentSlot,
     ASTCallExpr,
     ASTCallStatement,
+    ASTDrop,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameResetEffect,
     ASTFrameMaskEffect,
     ASTFrameProtocolEffect,
     ASTFrameTeardownEffect,
+    ASTFunctionPrologue,
     ASTIOEffect,
-    ASTIntegerLiteral,
+    ASTIdentifier,
     ASTImmediateOperand,
+    ASTIntegerLiteral,
     ASTJump,
     ASTMemoryRead,
     ASTProcedure,
@@ -33,8 +36,6 @@ from mbcdisasm.ast import (
     ASTSymbolType,
     ASTSymbolTypeFamily,
     ASTTailCall,
-    ASTFunctionPrologue,
-    ASTIdentifier,
 )
 from mbcdisasm.ast.model import (
     ASTEntryPoint,
@@ -52,18 +53,19 @@ from mbcdisasm.ir.model import (
     IRDataMarker,
     IRDispatchCase,
     IRDispatchIndex,
+    IRFunctionPrologue,
     IRIf,
     IRIOWrite,
     IRLoad,
     IRProgram,
     IRReturn,
     IRSegment,
+    IRStackDrop,
+    IRStackEffect,
     IRSwitchDispatch,
     IRTestSetBranch,
     IRTailCall,
-    IRStackEffect,
     IRSlot,
-    IRFunctionPrologue,
     MemRef,
     MemSpace,
     NormalizerMetrics,
@@ -469,6 +471,67 @@ def test_ast_builder_drops_redundant_tailcall_after_switch() -> None:
 
     assert any(isinstance(stmt, ASTCallStatement) for stmt in statements)
     assert not any(isinstance(stmt, ASTTailCall) for stmt in statements)
+
+
+def test_ast_builder_materialises_stack_drop_statement() -> None:
+    block = IRBlock(
+        label="drop_block",
+        start_offset=0x0320,
+        nodes=(
+            IRStackDrop(value="word0"),
+            IRReturn(values=tuple(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0320,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert statements
+    drop_stmt = statements[0]
+    assert isinstance(drop_stmt, ASTDrop)
+    assert drop_stmt.render() == "drop word0"
+    assert isinstance(drop_stmt.value, ASTIdentifier)
+    assert drop_stmt.value.name == "word0"
+    assert drop_stmt.raw == "word0"
+
+
+def test_ast_builder_preserves_complex_stack_drop_tokens() -> None:
+    drop_value = "cleanup_call[frame.write(operand=0x0100)]"
+    block = IRBlock(
+        label="drop_block",
+        start_offset=0x0330,
+        nodes=(
+            IRStackDrop(value=drop_value),
+            IRReturn(values=tuple(), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0330,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    drop_stmt = statements[0]
+    assert isinstance(drop_stmt, ASTDrop)
+    assert drop_stmt.value is None
+    assert drop_stmt.raw == drop_value
+    assert drop_stmt.render() == f"drop {drop_value}"
 
 
 def test_ast_builder_prunes_redundant_branch_blocks() -> None:

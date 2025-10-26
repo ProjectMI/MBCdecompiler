@@ -39,6 +39,7 @@ from ..ir.model import (
     IRIndirectLoad,
     IRIndirectStore,
     IRLoad,
+    IRStackDrop,
     IRSlot,
     IRProgram,
     IRReturn,
@@ -57,6 +58,7 @@ from ..ir.model import (
 )
 
 _TRACE_TOKEN = re.compile(r"^(?P<label>[^@]+)@0x(?P<offset>[0-9A-Fa-f]+)$")
+_DROP_VALUE_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 from .model import (
     ASTAliasInfo,
     ASTAliasKind,
@@ -107,6 +109,7 @@ from .model import (
     ASTIOOperation,
     ASTIORead,
     ASTIOWrite,
+    ASTDrop,
     ASTIdentifier,
     ASTBooleanLiteral,
     ASTIntegerLiteral,
@@ -2889,6 +2892,9 @@ class ASTBuilder:
             if node.mask is not None:
                 mask_field = self._bitfield(node.mask, None)
             return [ASTIOWrite(port=node.port, mask=mask_field)], []
+        if isinstance(node, IRStackDrop):
+            drop_statement = self._build_stack_drop(node.value, value_state)
+            return [drop_statement], []
         if isinstance(node, IRBankedLoad):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None
@@ -3129,6 +3135,15 @@ class ASTBuilder:
         if text.startswith("marker literal_marker"):
             return [], []
         return [ASTComment(text)], []
+
+    def _build_stack_drop(
+        self, token: Optional[str], value_state: Mapping[str, ASTExpression]
+    ) -> ASTDrop:
+        value_text = token.strip() if token else ""
+        if value_text and _DROP_VALUE_TOKEN.match(value_text):
+            expr = self._resolve_expr(value_text, value_state)
+            return ASTDrop(value=expr, raw=value_text)
+        return ASTDrop(raw=value_text or None)
 
     @staticmethod
     def _slot_address(slot: IRSlot) -> ASTMemoryAddress:

@@ -1163,6 +1163,23 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
+class ASTDrop(ASTStatement):
+    """Explicitly discard the value at the top of the VM stack."""
+
+    value: Optional[ASTExpression] = None
+    raw: Optional[str] = None
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.MUTABLE
+
+    def render(self) -> str:
+        if self.value is not None:
+            return f"drop {self.value.render()}"
+        if self.raw:
+            return f"drop {self.raw}"
+        return "drop"
+
+
+@dataclass
 class ASTTerminator(ASTStatement):
     """Base class for normalised block terminators."""
 
