@@ -51,6 +51,7 @@ from ..ir.model import (
     IRTerminator,
     IRAbiEffect,
     IRStackEffect,
+    IRStackDrop,
     MemRef,
     MemSpace,
     SSAValueKind,
@@ -74,6 +75,7 @@ from .model import (
     ASTCallExpr,
     ASTCallResult,
     ASTCallStatement,
+    ASTDrop,
     ASTImmediateOperand,
     ASTSignatureValue,
     ASTStackOperand,
@@ -2889,6 +2891,10 @@ class ASTBuilder:
             if node.mask is not None:
                 mask_field = self._bitfield(node.mask, None)
             return [ASTIOWrite(port=node.port, mask=mask_field)], []
+        if isinstance(node, IRStackDrop):
+            value_expr = self._resolve_expr(node.value, value_state)
+            metrics.observe_values(int(not isinstance(value_expr, ASTUnknown)))
+            return [ASTDrop(value=value_expr)], []
         if isinstance(node, IRBankedLoad):
             pointer_expr = (
                 self._resolve_expr(node.pointer, value_state) if node.pointer else None

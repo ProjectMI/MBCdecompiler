@@ -11,7 +11,9 @@ from mbcdisasm.ast import (
     ASTCallABI,
     ASTCallArgumentSlot,
     ASTCallExpr,
+    ASTCallResult,
     ASTCallStatement,
+    ASTDrop,
     ASTFrameChannelEffect,
     ASTFrameDropEffect,
     ASTFrameResetEffect,
@@ -54,6 +56,7 @@ from mbcdisasm.ir.model import (
     IRDispatchIndex,
     IRIf,
     IRIOWrite,
+    IRStackDrop,
     IRLoad,
     IRProgram,
     IRReturn,
@@ -373,6 +376,38 @@ def test_ast_builder_converts_dispatch_with_leading_call() -> None:
     enums = ast_program.segments[0].enums
     assert not enums
     assert not ast_program.enums
+
+
+def test_ast_builder_converts_stack_drop_to_statement() -> None:
+    call = IRCallReturn(
+        target=0x1234,
+        args=tuple(),
+        tail=False,
+        returns=("ret0",),
+        varargs=False,
+    )
+    block = IRBlock(
+        label="block_drop",
+        start_offset=0x0210,
+        nodes=(call, IRStackDrop(value="ret0"), IRReturn(values=(), varargs=False)),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x0210,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    ast_program = ASTBuilder().build(program)
+    statements = ast_program.segments[0].procedures[0].blocks[0].statements
+
+    assert isinstance(statements[0], ASTCallStatement)
+    drop_stmt = statements[1]
+    assert isinstance(drop_stmt, ASTDrop)
+    assert isinstance(drop_stmt.value, ASTCallResult)
+    assert drop_stmt.value.call.target == statements[0].call.target
 
 
 def test_ast_builder_simplifies_single_case_dispatch_to_call() -> None:

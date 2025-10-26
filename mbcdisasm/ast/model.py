@@ -1163,6 +1163,18 @@ class ASTIOWrite(ASTStatement):
 
 
 @dataclass
+class ASTDrop(ASTStatement):
+    """Discard a transient value produced by a previous expression."""
+
+    value: ASTExpression
+
+    effect_category: ClassVar[ASTEffectCategory] = ASTEffectCategory.PURE
+
+    def render(self) -> str:
+        return f"drop {self.value.render()}"
+
+
+@dataclass
 class ASTTerminator(ASTStatement):
     """Base class for normalised block terminators."""
 
@@ -1735,6 +1747,7 @@ __all__ = [
     "ASTCallReturnSlot",
     "ASTCallABI",
     "ASTCallStatement",
+    "ASTDrop",
     "ASTSymbolTypeFamily",
     "ASTSymbolType",
     "ASTSignatureValue",
