@@ -2425,7 +2425,7 @@ class ASTBuilder:
                 continue
             if isinstance(follower, IRDataMarker):
                 continue
-            return True
+            return False
         return True
 
     def _handle_dispatch_call(

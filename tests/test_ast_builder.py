@@ -1104,6 +1104,39 @@ def test_ast_builder_preserves_tail_prefix_on_tail_calls() -> None:
         assert tail_stmt.abi.tail
 
 
+def test_tail_call_followed_by_logic_is_not_promoted_to_terminator() -> None:
+    call = IRCall(target=0x3333, args=(), tail=True)
+    load = IRLoad(slot=IRSlot(space=MemSpace.FRAME, index=0), target="value0")
+    block = IRBlock(
+        label="entry",
+        start_offset=0x3000,
+        nodes=(
+            call,
+            load,
+            IRReturn(values=("value0",), varargs=False),
+        ),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0x3000,
+        length=0x10,
+        blocks=(block,),
+        metrics=NormalizerMetrics(),
+    )
+    program = IRProgram(segments=(segment,), metrics=NormalizerMetrics())
+
+    builder = ASTBuilder()
+    assert not builder._call_is_tail_terminator(block, 0, call)
+
+    ast_program = builder.build(program)
+    procedure = ast_program.segments[0].procedures[0]
+    ast_block = procedure.blocks[0]
+
+    assert not any(isinstance(stmt, ASTTailCall) for stmt in ast_block.statements)
+    assert isinstance(ast_block.terminator, ASTReturn)
+    assert isinstance(ast_block.statements[0], ASTCallStatement)
+
+
 def test_ast_builder_suppresses_fallthrough_hint_in_successor_map() -> None:
     segment = IRSegment(
         index=0,
