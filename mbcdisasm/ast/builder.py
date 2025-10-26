@@ -2028,65 +2028,185 @@ class ASTBuilder:
         for statement in block.statements:
             if isinstance(statement, BranchStatement):
                 updated = self._simplify_branch_statement(
-                    statement, block_order, fallthrough
+                    block, statement, block_order, fallthrough
                 )
                 if updated is None:
                     continue
                 statement = updated
+                if isinstance(statement, ASTJump):
+                    self._normalise_jump_target(
+                        block, statement, block_order, fallthrough
+                    )
+            elif isinstance(statement, ASTJump):
+                self._normalise_jump_target(block, statement, block_order, fallthrough)
             simplified.append(statement)
         block.statements = tuple(simplified)
 
     def _simplify_branch_statement(
         self,
+        block: ASTBlock,
         statement: BranchStatement,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
     ) -> Optional[ASTStatement]:
-        then_target = self._ensure_branch_target(
-            statement, "then", block_order, fallthrough
+        then_info = self._resolve_branch_target(
+            block, statement, "then", block_order, fallthrough
         )
-        else_target = self._ensure_branch_target(
-            statement, "else", block_order, fallthrough
+        else_info = self._resolve_branch_target(
+            block, statement, "else", block_order, fallthrough
         )
-        if (
-            then_target is not None
-            and else_target is not None
-            and then_target == else_target
-        ):
-            target_block = statement.then_branch or statement.else_branch
-            target_offset = statement.then_offset or statement.else_offset
-            if target_block is not None:
-                target_offset = target_block.start_offset
-            hint = statement.then_hint or statement.else_hint
-            return ASTJump(target=target_block, target_offset=target_offset, hint=hint)
+
+        if self._branch_targets_equivalent(then_info, else_info):
+            if self._target_info_known(then_info):
+                jump = self._build_jump_from_info(then_info)
+                self._update_block_successors_for_jump(block, jump)
+                return jump
+            return statement
+
+        if isinstance(statement, ASTBranch):
+            condition = statement.condition
+            if isinstance(condition, ASTBooleanLiteral):
+                selected = then_info if condition.value else else_info
+                if self._target_info_known(selected):
+                    jump = self._build_jump_from_info(selected)
+                    self._update_block_successors_for_jump(block, jump)
+                    return jump
+
         return statement
 
-    def _ensure_branch_target(
+    def _resolve_branch_target(
         self,
+        block: ASTBlock,
         statement: BranchStatement,
         prefix: str,
         block_order: Sequence[ASTBlock],
         fallthrough: Optional[int],
-    ) -> Optional[int]:
+    ) -> Tuple[Optional[ASTBlock], Optional[int], Optional[str]]:
         branch_attr = f"{prefix}_branch"
         hint_attr = f"{prefix}_hint"
         offset_attr = f"{prefix}_offset"
+
         branch = getattr(statement, branch_attr)
         offset = getattr(statement, offset_attr)
-        if branch is not None:
-            offset = branch.start_offset
-        elif offset is None:
-            hint = getattr(statement, hint_attr)
-            if hint == "fallthrough":
-                offset = fallthrough
-        target_block = self._find_block_by_offset(block_order, offset)
+        hint = getattr(statement, hint_attr)
+
+        resolved_branch = branch
+        resolved_offset = offset
+        resolved_hint = hint
+
+        if resolved_branch is not None:
+            resolved_offset = resolved_branch.start_offset
+            resolved_hint = None
+        elif resolved_offset is not None:
+            target_block = self._find_block_by_offset(block_order, resolved_offset)
+            if target_block is not None:
+                resolved_branch = target_block
+                resolved_offset = target_block.start_offset
+                resolved_hint = None
+            else:
+                if hint and hint != "fallthrough":
+                    resolved_hint = hint
+                else:
+                    resolved_hint = None
+        elif hint == "fallthrough":
+            resolved_branch, resolved_offset = self._infer_fallthrough_destination(
+                block, block_order, fallthrough
+            )
+            if resolved_branch is not None or resolved_offset is not None:
+                resolved_hint = None
+            else:
+                resolved_hint = "fallthrough"
+
+        setattr(statement, branch_attr, resolved_branch)
+        setattr(statement, offset_attr, resolved_offset)
+        setattr(statement, hint_attr, resolved_hint)
+        return resolved_branch, resolved_offset, resolved_hint
+
+    @staticmethod
+    def _branch_targets_equivalent(
+        left: Tuple[Optional[ASTBlock], Optional[int], Optional[str]],
+        right: Tuple[Optional[ASTBlock], Optional[int], Optional[str]],
+    ) -> bool:
+        if left[0] is not None or right[0] is not None:
+            return left[0] is not None and left[0] is right[0]
+        if left[1] is not None or right[1] is not None:
+            return left[1] is not None and left[1] == right[1]
+        return left[2] == right[2]
+
+    @staticmethod
+    def _target_info_known(
+        info: Tuple[Optional[ASTBlock], Optional[int], Optional[str]]
+    ) -> bool:
+        block, offset, hint = info
+        if block is not None or offset is not None:
+            return True
+        return bool(hint)
+
+    @staticmethod
+    def _build_jump_from_info(
+        info: Tuple[Optional[ASTBlock], Optional[int], Optional[str]]
+    ) -> ASTJump:
+        block, offset, hint = info
+        if block is not None:
+            return ASTJump(target=block, target_offset=block.start_offset)
+        return ASTJump(target_offset=offset, hint=hint)
+
+    def _update_block_successors_for_jump(
+        self, block: ASTBlock, jump: ASTJump
+    ) -> None:
+        target_block = jump.target
         if target_block is not None:
-            setattr(statement, branch_attr, target_block)
-            setattr(statement, hint_attr, None)
-            setattr(statement, offset_attr, target_block.start_offset)
-            return target_block.start_offset
-        setattr(statement, offset_attr, offset)
-        return offset
+            block.successors = (target_block,)
+        elif jump.target_offset is None:
+            block.successors = tuple()
+
+    def _infer_fallthrough_destination(
+        self,
+        block: ASTBlock,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> Tuple[Optional[ASTBlock], Optional[int]]:
+        if fallthrough is not None:
+            target_block = self._find_block_by_offset(block_order, fallthrough)
+            if target_block is not None:
+                return target_block, target_block.start_offset
+            return None, fallthrough
+
+        # try the next block by start offset
+        candidates = [
+            candidate
+            for candidate in block_order
+            if candidate.start_offset > block.start_offset
+        ]
+        if candidates:
+            next_block = min(candidates, key=lambda entry: entry.start_offset)
+            return next_block, next_block.start_offset
+
+        if block.successors:
+            successor = block.successors[0]
+            return successor, successor.start_offset
+
+        return None, None
+
+    def _normalise_jump_target(
+        self,
+        block: ASTBlock,
+        jump: ASTJump,
+        block_order: Sequence[ASTBlock],
+        fallthrough: Optional[int],
+    ) -> None:
+        if jump.hint != "fallthrough":
+            return
+        target_block, offset = self._infer_fallthrough_destination(
+            block, block_order, fallthrough
+        )
+        jump.hint = None
+        if target_block is not None:
+            jump.target = target_block
+            jump.target_offset = target_block.start_offset
+            self._update_block_successors_for_jump(block, jump)
+        elif offset is not None:
+            jump.target_offset = offset
 
     @staticmethod
     def _find_block_by_offset(

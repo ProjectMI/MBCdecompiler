@@ -1263,9 +1263,21 @@ class ASTBranch(ASTTerminator):
 
     def render(self) -> str:
         condition = self.condition.render()
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        then_label = self._render_target(self.then_branch, self.then_hint, self.then_offset)
+        else_label = self._render_target(self.else_branch, self.else_hint, self.else_offset)
         return f"if {condition} then {then_label} else {else_label}"
+
+    @staticmethod
+    def _render_target(
+        block: "ASTBlock | None", hint: Optional[str], offset: Optional[int]
+    ) -> str:
+        if block is not None:
+            return block.label
+        if hint:
+            return hint
+        if offset is not None:
+            return f"0x{offset:04X}"
+        return "?"
 
 
 @dataclass
@@ -1282,8 +1294,12 @@ class ASTTestSet(ASTTerminator):
     else_offset: int | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        then_label = ASTBranch._render_target(
+            self.then_branch, self.then_hint, self.then_offset
+        )
+        else_label = ASTBranch._render_target(
+            self.else_branch, self.else_hint, self.else_offset
+        )
         return (
             f"testset {self.var.render()} = {self.expr.render()} "
             f"then {then_label} else {else_label}"
@@ -1303,8 +1319,12 @@ class ASTFlagCheck(ASTTerminator):
     else_offset: int | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        then_label = ASTBranch._render_target(
+            self.then_branch, self.then_hint, self.then_offset
+        )
+        else_label = ASTBranch._render_target(
+            self.else_branch, self.else_hint, self.else_offset
+        )
         return f"flag 0x{self.flag:04X} ? then {then_label} else {else_label}"
 
 
@@ -1322,8 +1342,12 @@ class ASTFunctionPrologue(ASTTerminator):
     else_offset: int | None = None
 
     def render(self) -> str:
-        then_label = self.then_branch.label if self.then_branch else self.then_hint or "?"
-        else_label = self.else_branch.label if self.else_branch else self.else_hint or "?"
+        then_label = ASTBranch._render_target(
+            self.then_branch, self.then_hint, self.then_offset
+        )
+        else_label = ASTBranch._render_target(
+            self.else_branch, self.else_hint, self.else_offset
+        )
         return (
             f"prologue {self.var.render()} = {self.expr.render()} "
             f"then {then_label} else {else_label}"
