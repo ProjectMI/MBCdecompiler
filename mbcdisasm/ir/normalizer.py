@@ -2614,9 +2614,10 @@ class IRNormalizer:
                 continue
 
             convention = item.convention
+            cleanup_shuffle_effect: Optional[IRStackEffect] = None
             arity = item.arity
             cleanup_mask = item.cleanup_mask
-            cleanup_steps = item.cleanup
+            cleanup_steps: List[IRStackEffect] = list(item.cleanup)
 
             consumed: List[int] = []
             scan = index - 1
@@ -2625,7 +2626,10 @@ class IRNormalizer:
                 if isinstance(candidate, IRCallPreparation):
                     for mnemonic, operand in candidate.steps:
                         if mnemonic == "stack_shuffle":
-                            convention = self._call_convention_effect(operand)
+                            cleanup_shuffle_effect = self._call_convention_effect(
+                                operand
+                            )
+                            convention = cleanup_shuffle_effect
                     consumed.append(scan)
                     scan -= 1
                     continue
@@ -2639,7 +2643,10 @@ class IRNormalizer:
                 if isinstance(candidate, IRCallCleanup):
                     shuffle_operand = self._extract_call_shuffle(candidate)
                     if shuffle_operand is not None:
-                        convention = self._call_convention_effect(shuffle_operand)
+                        cleanup_shuffle_effect = self._call_convention_effect(
+                            shuffle_operand
+                        )
+                        convention = cleanup_shuffle_effect
                         consumed.append(scan)
                         scan -= 1
                         continue
@@ -2653,7 +2660,7 @@ class IRNormalizer:
             if post_index < len(items) and isinstance(items[post_index], IRCallCleanup):
                 cleanup_index = post_index
                 cleanup_node = items[cleanup_index]
-                cleanup_steps = cleanup_steps + cleanup_node.steps
+                cleanup_steps.extend(cleanup_node.steps)
                 if cleanup_mask is None:
                     cleanup_mask = self._extract_cleanup_mask(cleanup_node.steps)
 
@@ -2674,13 +2681,19 @@ class IRNormalizer:
             if not tail and cleanup_mask == RET_MASK:
                 tail = True
 
+            final_convention = convention
+            if final_convention is not None and not call.args:
+                if cleanup_shuffle_effect is not None:
+                    cleanup_steps.append(cleanup_shuffle_effect)
+                final_convention = None
+
             updated = IRCall(
                 target=call.target,
                 args=call.args,
                 tail=tail,
                 arity=arity,
-                convention=convention,
-                cleanup=cleanup_steps,
+                convention=final_convention,
+                cleanup=tuple(cleanup_steps),
                 symbol=call.symbol,
                 abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
             )

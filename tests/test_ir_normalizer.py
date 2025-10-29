@@ -1776,6 +1776,31 @@ def test_normalizer_dispatch_index_traces_indirect_load_with_noise(tmp_path: Pat
     assert index_info.base == 0x10CC
 
 
+def test_call_shuffle_cleanup_without_arguments_does_not_set_convention() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    shuffle_step = IRStackEffect(
+        mnemonic="stack_shuffle",
+        operand=0x10AA,
+        category="stack_shuffle",
+    )
+    cleanup = IRCallCleanup(steps=(shuffle_step,))
+    call = IRCall(target=0x1064, args=tuple(), tail=True)
+
+    items = _ItemList([cleanup, call])
+
+    normalizer._pass_call_conventions(items)
+
+    assert len(items) == 1
+    updated_call = items[0]
+    assert isinstance(updated_call, IRCall)
+    assert updated_call.convention is None
+    assert updated_call.cleanup
+    assert updated_call.cleanup[0].mnemonic == "stack_shuffle"
+    assert updated_call.cleanup[0].operand == 0x10AA
+
+
 def test_normalizer_dispatch_index_uses_testset_slot_source(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
     normalizer = IRNormalizer(knowledge)
