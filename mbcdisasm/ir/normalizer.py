@@ -3729,12 +3729,18 @@ class IRNormalizer:
                 cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
                 mask = mask or item.cleanup_mask
 
+                args = item.args
+                convention = item.convention
+                if convention is not None and convention.mnemonic == "stack_shuffle":
+                    args = tuple(self._apply_call_shuffle(args, convention.operand))
+                    convention = None
+
                 updated_call = IRCall(
                     target=item.target,
-                    args=item.args,
+                    args=args,
                     tail=True,
                     arity=item.arity,
-                    convention=item.convention,
+                    convention=convention,
                     cleanup=item.call.cleanup,
                     symbol=item.symbol,
                     predicate=item.predicate,
@@ -3816,12 +3822,18 @@ class IRNormalizer:
             if item.varargs and not values:
                 values = ("ret*",)
 
+            args = item.args
+            convention = item.convention
+            if convention is not None and convention.mnemonic == "stack_shuffle":
+                args = tuple(self._apply_call_shuffle(args, convention.operand))
+                convention = None
+
             call = IRCall(
                 target=item.target,
-                args=item.args,
+                args=args,
                 tail=True,
                 arity=item.arity,
-                convention=item.convention,
+                convention=convention,
                 cleanup=tuple(),
                 symbol=item.symbol,
                 predicate=item.predicate,
