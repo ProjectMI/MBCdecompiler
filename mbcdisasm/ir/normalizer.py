@@ -3682,7 +3682,9 @@ class IRNormalizer:
                     prefix = items[pre]
                     if isinstance(prefix, IRCallCleanup):
                         absorbed, preserved = self._partition_cleanup_steps(prefix.steps)
-                        mask = mask or self._extract_cleanup_mask(prefix.steps)
+                        mask = self._combine_return_mask(
+                            mask, self._extract_cleanup_mask(prefix.steps)
+                        )
                         if absorbed:
                             cleanup_steps = absorbed + cleanup_steps
                         if preserved and absorbed:
@@ -3697,7 +3699,7 @@ class IRNormalizer:
                         pre -= 1
                         continue
                     else:
-                        mask = mask or prefix.mask
+                        mask = self._combine_return_mask(mask, prefix.mask)
                     items.pop(pre)
                     index -= 1
                     pre -= 1
@@ -3707,7 +3709,9 @@ class IRNormalizer:
                     suffix = items[follow]
                     if isinstance(suffix, IRCallCleanup):
                         absorbed, preserved = self._partition_cleanup_steps(suffix.steps)
-                        mask = mask or self._extract_cleanup_mask(suffix.steps)
+                        mask = self._combine_return_mask(
+                            mask, self._extract_cleanup_mask(suffix.steps)
+                        )
                         if absorbed:
                             cleanup_steps.extend(absorbed)
                         if preserved and absorbed:
@@ -3722,12 +3726,12 @@ class IRNormalizer:
                         items.pop(follow)
                         continue
                     else:
-                        mask = mask or suffix.mask
+                        mask = self._combine_return_mask(mask, suffix.mask)
                     items.pop(follow)
 
                 cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
                 cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
-                mask = mask or item.cleanup_mask
+                mask = self._combine_return_mask(mask, item.cleanup_mask)
 
                 updated_call = IRCall(
                     target=item.target,
@@ -3765,7 +3769,9 @@ class IRNormalizer:
                 prefix = items[pre]
                 if isinstance(prefix, IRCallCleanup):
                     absorbed, preserved = self._partition_cleanup_steps(prefix.steps)
-                    mask = mask or self._extract_cleanup_mask(prefix.steps)
+                    mask = self._combine_return_mask(
+                        mask, self._extract_cleanup_mask(prefix.steps)
+                    )
                     if absorbed:
                         cleanup_steps = absorbed + cleanup_steps
                     if preserved and absorbed:
@@ -3780,7 +3786,7 @@ class IRNormalizer:
                     pre -= 1
                     continue
                 else:
-                    mask = mask or prefix.mask
+                    mask = self._combine_return_mask(mask, prefix.mask)
                 items.pop(pre)
                 index -= 1
                 pre -= 1
@@ -3790,7 +3796,9 @@ class IRNormalizer:
                 suffix = items[follow]
                 if isinstance(suffix, IRCallCleanup):
                     absorbed, preserved = self._partition_cleanup_steps(suffix.steps)
-                    mask = mask or self._extract_cleanup_mask(suffix.steps)
+                    mask = self._combine_return_mask(
+                        mask, self._extract_cleanup_mask(suffix.steps)
+                    )
                     if absorbed:
                         cleanup_steps.extend(absorbed)
                     if preserved and absorbed:
@@ -3805,12 +3813,12 @@ class IRNormalizer:
                     items.pop(follow)
                     continue
                 else:
-                    mask = mask or suffix.mask
+                    mask = self._combine_return_mask(mask, suffix.mask)
                 items.pop(follow)
 
             cleanup_steps = self._coalesce_epilogue_steps(cleanup_steps)
             cleanup_steps = self._reorder_cleanup_steps(cleanup_steps)
-            mask = mask or item.cleanup_mask
+            mask = self._combine_return_mask(mask, item.cleanup_mask)
 
             values = self._normalise_return_tokens(item.returns)
             if item.varargs and not values:
@@ -5686,6 +5694,22 @@ class IRNormalizer:
             return tuple()
         alias = OPERAND_ALIASES.get(mask)
         return (IRAbiEffect(kind="return_mask", operand=mask, alias=alias),)
+
+    @staticmethod
+    def _combine_return_mask(
+        current: Optional[int], candidate: Optional[int]
+    ) -> Optional[int]:
+        if not candidate:
+            return current
+        if not current:
+            return candidate
+        if current == candidate:
+            return current
+        if current == RET_MASK:
+            return candidate
+        if candidate == RET_MASK:
+            return current
+        return candidate
 
     def _merge_return_mask_effects(
         self, effects: Sequence[IRAbiEffect], mask: Optional[int]
