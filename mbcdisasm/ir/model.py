@@ -150,7 +150,7 @@ class IRCall(IRNode):
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
-    def describe(self) -> str:
+    def describe(self, *, include_abi: bool = True) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
         target_repr = f"0x{self.target:04X}"
@@ -164,7 +164,7 @@ class IRCall(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
-        if self.abi_effects:
+        if include_abi and self.abi_effects:
             rendered = ", ".join(effect.describe() for effect in self.abi_effects)
             details.append(f"abi=[{rendered}]")
         if self.predicate is not None:
@@ -219,7 +219,7 @@ class IRTailCall(IRNode):
         return self.call.predicate
 
     def describe(self) -> str:
-        call_repr = self.call.describe()
+        call_repr = self.call.describe(include_abi=False)
         details: List[str] = []
         if self.returns:
             rendered = ", ".join(self.returns)

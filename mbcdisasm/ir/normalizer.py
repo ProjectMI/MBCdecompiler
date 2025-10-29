@@ -5674,8 +5674,17 @@ class IRNormalizer:
 
     @staticmethod
     def _extract_cleanup_mask(steps: Sequence[IRStackEffect]) -> Optional[int]:
+        """Return the effective return mask encoded in ``steps``.
+
+        Several helpers emit multiple mask updates in a single cleanup block.
+        The VM observes the last mask in the sequence, therefore we need to
+        scan the steps in reverse and pick the final mask instead of the first
+        one we encounter.  Otherwise, the inferred ABI advertises an outdated
+        mask value which no longer matches the surrounding cleanup chain.
+        """
+
         for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
-            for step in steps:
+            for step in reversed(steps):
                 if step.mnemonic == mnemonic:
                     return step.operand
         return None

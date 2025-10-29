@@ -2045,6 +2045,24 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.returns == ("ret0",)
 
 
+def test_cleanup_mask_prefers_last_return_mask() -> None:
+    steps = [
+        IRStackEffect(mnemonic="op_52_05", operand=0x0030, category="frame.return_mask"),
+        IRStackEffect(mnemonic="op_52_05", operand=0x1000, category="frame.return_mask"),
+    ]
+
+    assert IRNormalizer._extract_cleanup_mask(steps) == 0x1000
+
+
+def test_tailcall_description_avoids_nested_abi() -> None:
+    effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
+    call = IRCall(target=0x1234, args=(), tail=True, abi_effects=(effect,))
+    tail = IRTailCall(call=call, returns=("ret0",), abi_effects=(effect,))
+
+    rendered = tail.describe()
+    assert rendered.count("abi=[") == 1
+
+
 def test_abi_effect_rendering_avoids_nested_aliases() -> None:
     effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
     assert effect.describe() == "abi.return_mask value=RET_MASK(0x2910)"
