@@ -10,6 +10,41 @@ from ..constants import IO_PORT_NAME, OPERAND_ALIASES
 from .effect_aliases import cleanup_category
 
 
+def _resolve_effect_category(effect: "IRStackEffect") -> Optional[str]:
+    """Return the semantic category for ``effect``."""
+
+    if effect.category is not None:
+        return effect.category
+
+    alias_text = effect.operand_alias
+    if alias_text is None:
+        alias = OPERAND_ALIASES.get(effect.operand)
+        if alias is not None:
+            alias_text = str(alias)
+
+    return cleanup_category(effect.mnemonic, effect.operand, alias_text)
+
+
+def _normalise_cleanup_steps(
+    steps: Tuple["IRStackEffect", ...]
+) -> Tuple["IRStackEffect", ...]:
+    """Drop return-mask updates that are overwritten later in ``steps``."""
+
+    last_mask_index: Optional[int] = None
+    for index, step in enumerate(steps):
+        if _resolve_effect_category(step) == "frame.return_mask":
+            last_mask_index = index
+
+    if last_mask_index is None:
+        return steps
+
+    return tuple(
+        step
+        for index, step in enumerate(steps)
+        if _resolve_effect_category(step) != "frame.return_mask" or index == last_mask_index
+    )
+
+
 class MemSpace(Enum):
     """High level classification of indirect memory accesses."""
 
@@ -150,7 +185,10 @@ class IRCall(IRNode):
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
-    def describe(self) -> str:
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))
+
+    def describe(self, *, include_abi: bool = True) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
         target_repr = f"0x{self.target:04X}"
@@ -164,7 +202,7 @@ class IRCall(IRNode):
         if self.cleanup:
             rendered = ", ".join(step.describe() for step in self.cleanup)
             details.append(f"cleanup=[{rendered}]")
-        if self.abi_effects:
+        if include_abi and self.abi_effects:
             rendered = ", ".join(effect.describe() for effect in self.abi_effects)
             details.append(f"abi=[{rendered}]")
         if self.predicate is not None:
@@ -189,6 +227,9 @@ class IRTailCall(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))
 
     @property
     def target(self) -> int:
@@ -219,7 +260,7 @@ class IRTailCall(IRNode):
         return self.call.predicate
 
     def describe(self) -> str:
-        call_repr = self.call.describe()
+        call_repr = self.call.describe(include_abi=False)
         details: List[str] = []
         if self.returns:
             rendered = ", ".join(self.returns)
@@ -338,6 +379,9 @@ class IRReturn(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))
 
     def describe(self) -> str:
         cleanup = ""
@@ -1040,6 +1084,9 @@ class IRCallReturn(IRNode):
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))
+
     def describe(self) -> str:
         prefix = "call_return tail" if self.tail else "call_return"
         args = ", ".join(self.args)
@@ -1151,6 +1198,9 @@ class IRTailcallReturn(IRNode):
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))
 
     def describe(self) -> str:
         target_repr = f"0x{self.target:04X}"

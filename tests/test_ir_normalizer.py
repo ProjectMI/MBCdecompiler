@@ -622,9 +622,10 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
         == ["page_register", "op_5E_29", "op_F0_4B"]
         for node in cleanup_nodes
     )
-    cleanup_mnemonics = [step.mnemonic for step in contract_call.cleanup]
-    assert cleanup_mnemonics and cleanup_mnemonics[0] == "stack_teardown"
-    assert "op_29_10" in cleanup_mnemonics
+    cleanup_steps = list(contract_call.cleanup)
+    assert cleanup_steps and cleanup_steps[0].mnemonic == "stack_teardown"
+    assert any(step.category == "frame.return_mask" for step in cleanup_steps)
+    assert contract_call.cleanup_mask == RET_MASK
     assert contract_call.cleanup[0].pops == 1
 
     if_nodes = [
@@ -1342,21 +1343,24 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert [step.mnemonic for step in call_return.cleanup] == [
+    call_like = next(
+        node
+        for node in block.nodes
+        if isinstance(node, (IRCallReturn, IRTailCall, IRTailcallReturn))
+    )
+    assert [step.mnemonic for step in call_like.cleanup] == [
         "call_helpers",
-        "op_32_29",
         "op_29_10",
         "stack_teardown",
     ]
-    assert [step.operand for step in call_return.cleanup[:3]] == [0x0001, 0x1000, 0x2910]
-    assert call_return.cleanup[-1].pops == 4
-    assert call_return.target == 0x1234
-    assert call_return.symbol == "test_helper_1234"
-    assert call_return.convention is not None
-    assert call_return.convention.operand == 0x4B08
-    assert call_return.cleanup_mask == 0x1000
-    assert call_return.arity is None
+    assert [step.operand for step in call_like.cleanup[:2]] == [0x0001, RET_MASK]
+    assert call_like.cleanup[-1].pops == 4
+    assert call_like.target == 0x1234
+    assert call_like.symbol == "test_helper_1234"
+    assert call_like.convention is not None
+    assert call_like.convention.operand == 0x4B08
+    assert call_like.cleanup_mask == RET_MASK
+    assert call_like.arity is None
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
@@ -1417,8 +1421,12 @@ def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
     program = normalizer.normalise_container(container)
     block = program.segments[0].blocks[0]
 
-    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
-    assert call_return.returns == ("ret0",)
+    call_like = next(
+        node
+        for node in block.nodes
+        if isinstance(node, (IRCallReturn, IRTailCall, IRTailcallReturn))
+    )
+    assert call_like.returns == ("ret0",)
 
 
 def test_normalizer_absorbs_zero_stack_call_wrappers(tmp_path: Path) -> None:
@@ -2043,6 +2051,51 @@ def test_normalizer_collapses_inline_tail_dispatch() -> None:
     assert tail_call.call.symbol == "test_helper_1234"
     assert tail_call.call.args == ()
     assert tail_call.returns == ("ret0",)
+
+
+def test_cleanup_mask_prefers_last_return_mask() -> None:
+    steps = [
+        IRStackEffect(mnemonic="op_52_05", operand=0x0030, category="frame.return_mask"),
+        IRStackEffect(mnemonic="op_52_05", operand=0x1000, category="frame.return_mask"),
+    ]
+
+    assert IRNormalizer._extract_cleanup_mask(steps) == 0x1000
+
+
+def test_call_cleanup_discards_overwritten_return_masks() -> None:
+    initial = IRStackEffect(
+        mnemonic="op_52_05", operand=0x0030, category="frame.return_mask"
+    )
+    teardown = IRStackEffect(mnemonic="frame.teardown")
+    final = IRStackEffect(
+        mnemonic="op_52_05", operand=0x1000, category="frame.return_mask"
+    )
+
+    call = IRCall(target=0x1234, args=(), cleanup=(initial, teardown, final))
+
+    assert call.cleanup == (teardown, final)
+
+
+def test_return_cleanup_discards_overwritten_return_masks() -> None:
+    initial = IRStackEffect(
+        mnemonic="op_52_05", operand=0x0030, category="frame.return_mask"
+    )
+    final = IRStackEffect(
+        mnemonic="op_52_05", operand=0x1000, category="frame.return_mask"
+    )
+
+    node = IRReturn(values=(), cleanup=(initial, final))
+
+    assert node.cleanup == (final,)
+
+
+def test_tailcall_description_avoids_nested_abi() -> None:
+    effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
+    call = IRCall(target=0x1234, args=(), tail=True, abi_effects=(effect,))
+    tail = IRTailCall(call=call, returns=("ret0",), abi_effects=(effect,))
+
+    rendered = tail.describe()
+    assert rendered.count("abi=[") == 1
 
 
 def test_abi_effect_rendering_avoids_nested_aliases() -> None:
