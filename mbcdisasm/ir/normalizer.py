@@ -5683,10 +5683,17 @@ class IRNormalizer:
         mask value which no longer matches the surrounding cleanup chain.
         """
 
-        for mnemonic in ("epilogue", "op_52_05", "op_32_29", "fanout"):
-            for step in reversed(steps):
-                if step.mnemonic == mnemonic:
-                    return step.operand
+        for step in reversed(steps):
+            category = step.category
+            if category is None:
+                alias_text = step.operand_alias
+                if alias_text is None:
+                    alias = OPERAND_ALIASES.get(step.operand)
+                    if alias is not None:
+                        alias_text = str(alias)
+                category = cleanup_category(step.mnemonic, step.operand, alias_text)
+            if category == "frame.return_mask":
+                return step.operand
         return None
 
     @staticmethod
