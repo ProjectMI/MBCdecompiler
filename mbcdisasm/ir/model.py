@@ -294,6 +294,7 @@ class IRStackEffect:
     operand_role: Optional[str] = None
     operand_alias: Optional[str] = None
     category: Optional[str] = None
+    optional: bool = False
 
     def describe(self) -> str:
         details = []
