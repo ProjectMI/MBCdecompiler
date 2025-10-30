@@ -4802,7 +4802,7 @@ class IRNormalizer:
             tail = signature.tail or tail
         if signature.arity is not None:
             arity = signature.arity
-        if signature.cleanup_mask is not None and cleanup_mask is None:
+        if signature.cleanup_mask is not None:
             cleanup_mask = signature.cleanup_mask
         if signature.shuffle is not None:
             convention = self._call_convention_effect(signature.shuffle)
@@ -4858,6 +4858,8 @@ class IRNormalizer:
 
         signature_cleanup = self._convert_signature_effects(signature.cleanup)
         combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
+        if cleanup_mask is not None:
+            combined_cleanup = self._synchronise_cleanup_mask(combined_cleanup, cleanup_mask)
         has_mask_effect = any(
             step.category == "frame.return_mask" for step in combined_cleanup
         )
@@ -4990,6 +4992,30 @@ class IRNormalizer:
         for spec in specs:
             effects.append(self._stack_effect_from_signature(spec, None))
         return effects
+
+    def _synchronise_cleanup_mask(
+        self, steps: Sequence[IRStackEffect], mask: int
+    ) -> Tuple[IRStackEffect, ...]:
+        alias = OPERAND_ALIASES.get(mask)
+        alias_text = str(alias) if alias is not None else None
+        updated: List[IRStackEffect] = []
+        for step in steps:
+            if step.category == "frame.return_mask":
+                operand_alias = alias_text if alias_text is not None else step.operand_alias
+                updated.append(
+                    IRStackEffect(
+                        mnemonic=step.mnemonic,
+                        operand=mask,
+                        pops=step.pops,
+                        operand_role=step.operand_role,
+                        operand_alias=operand_alias,
+                        category=step.category,
+                        optional=step.optional,
+                    )
+                )
+            else:
+                updated.append(step)
+        return tuple(updated)
 
     def _stack_effect_from_signature(
         self,
