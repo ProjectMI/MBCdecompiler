@@ -1084,6 +1084,7 @@ class IRNormalizer:
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
         self._pass_resolve_dispatch_indices(items)
+        self._pass_enforce_abi_contracts(items)
 
         final_items = list(items)
         final_wrapper = _ItemList(final_items)
@@ -3557,6 +3558,21 @@ class IRNormalizer:
             items.replace_slice(idx, idx + 1, [updated])
             snapshot[idx] = updated
 
+    def _pass_enforce_abi_contracts(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if isinstance(item, IRReturn):
+                updated_return = self._finalise_return_node(item)
+                if updated_return is not item:
+                    items.replace_slice(index, index + 1, [updated_return])
+                    item = updated_return
+            if isinstance(item, CallLike):
+                updated_call = self._finalise_call_node(item)
+                if updated_call is not item:
+                    items.replace_slice(index, index + 1, [updated_call])
+            index += 1
+
     def _record_dispatch_hint(
         self, items: _ItemList, index: int, branch: IRTestSetBranch
     ) -> None:
@@ -3748,7 +3764,7 @@ class IRNormalizer:
                     abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
                 )
                 self._transfer_ssa(item, updated)
-                updated = self._normalise_call_result_arity(updated)
+                updated = self._finalise_call_node(updated)
                 items.replace_slice(index, index + 1, [updated])
                 index += 1
                 continue
@@ -3836,7 +3852,7 @@ class IRNormalizer:
                 abi_effects=self._merge_return_mask_effects(item.abi_effects, mask),
             )
             self._transfer_ssa(item, tail_call)
-            tail_call = self._normalise_call_result_arity(tail_call)
+            tail_call = self._finalise_call_node(tail_call)
             items.replace_slice(index, index + 1, [tail_call])
             index += 1
 
@@ -3972,7 +3988,7 @@ class IRNormalizer:
             abi_effects=self._merge_return_mask_effects(getattr(node, "abi_effects", tuple()), cleanup_mask),
         )
         self._transfer_ssa(node, tailcall)
-        tailcall = self._normalise_call_result_arity(tailcall)
+        tailcall = self._finalise_call_node(tailcall)
         items.replace_slice(index, index + 1, [tailcall])
 
         if teardown is not None:
@@ -4068,7 +4084,7 @@ class IRNormalizer:
                     abi_effects=tuple(),
                 )
             self._transfer_ssa(node, replacement)
-            replacement = self._normalise_call_result_arity(replacement)
+            replacement = self._finalise_call_node(replacement)
             items.replace_slice(index, index + 1, [replacement])
             return
 
@@ -4450,7 +4466,7 @@ class IRNormalizer:
                             abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
                         )
                     self._transfer_ssa(call, node)
-                    node = self._normalise_call_result_arity(node)
+                    node = self._finalise_call_node(node)
                     end = offset + 1
                     items.replace_slice(index, end, [node])
                     continue
@@ -4520,7 +4536,7 @@ class IRNormalizer:
             predicate, branch_index, alias = extracted
             updated = self._call_with_predicate(call, predicate)
             self._transfer_ssa(call, updated)
-            updated = self._normalise_call_result_arity(updated)
+            updated = self._finalise_call_node(updated)
             items.replace_slice(index, index + 1, [updated])
 
             branch = items[branch_index]
@@ -4781,7 +4797,7 @@ class IRNormalizer:
             signature=signature,
         )
         self._transfer_ssa(node, updated)
-        updated = self._normalise_call_result_arity(updated)
+        updated = self._finalise_call_node(updated)
         items.replace_slice(current_index, current_index + 1, [updated])
         return current_index
 
@@ -5041,6 +5057,12 @@ class IRNormalizer:
 
         return node
 
+    def _finalise_call_node(self, node: CallLike) -> CallLike:
+        node = self._normalise_call_result_arity(node)
+        node = self._normalise_call_argument_arity(node)
+        node = self._enforce_call_return_mask(node)
+        return node
+
     def _normalise_call_result_arity(self, node: CallLike) -> CallLike:
         if not isinstance(node, (IRCallReturn, IRTailCall, IRTailcallReturn)):
             return node
@@ -5115,6 +5137,184 @@ class IRNormalizer:
             self._transfer_ssa(node, updated)
             return updated
         return node
+
+    def _normalise_call_argument_arity(self, node: CallLike) -> CallLike:
+        arity = getattr(node, "arity", None)
+        if arity is None:
+            return node
+
+        args: Tuple[str, ...]
+        if isinstance(node, IRTailCall):
+            args = node.call.args
+        else:
+            args = getattr(node, "args", tuple())
+
+        actual = len(args)
+        if actual == arity:
+            return node
+
+        if isinstance(node, IRCall):
+            updated = IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=actual,
+                convention=node.convention,
+                cleanup=node.cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        if isinstance(node, IRCallReturn):
+            updated = IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                arity=actual,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        if isinstance(node, IRTailCall):
+            updated_call = IRCall(
+                target=node.call.target,
+                args=node.call.args,
+                tail=node.call.tail,
+                arity=actual,
+                convention=node.call.convention,
+                cleanup=node.call.cleanup,
+                symbol=node.call.symbol,
+                predicate=node.call.predicate,
+                abi_effects=node.call.abi_effects,
+            )
+            updated = IRTailCall(
+                call=updated_call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        if isinstance(node, IRTailcallReturn):
+            updated = IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                tail=node.tail,
+                arity=actual,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        return node
+
+    def _enforce_call_return_mask(self, node: CallLike) -> CallLike:
+        if isinstance(node, IRCall):
+            return node
+
+        mask = getattr(node, "cleanup_mask", None)
+        width = self._return_mask_width(mask)
+        if width is None:
+            return node
+
+        if isinstance(node, IRCallReturn):
+            if node.varargs or len(node.returns) <= width:
+                return node
+            trimmed = node.returns[:width]
+            updated = IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=trimmed,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        if isinstance(node, IRTailCall):
+            if node.varargs or len(node.returns) <= width:
+                return node
+            trimmed = node.returns[:width]
+            updated = IRTailCall(
+                call=node.call,
+                returns=trimmed,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        if isinstance(node, IRTailcallReturn):
+            if node.varargs or len(node.returns) <= width:
+                return node
+            trimmed = node.returns[:width]
+            updated = IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=trimmed,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=node.abi_effects,
+            )
+            self._transfer_ssa(node, updated)
+            return updated
+
+        return node
+
+    def _finalise_return_node(self, node: IRReturn) -> IRReturn:
+        return self._enforce_return_mask(node)
+
+    def _enforce_return_mask(self, node: IRReturn) -> IRReturn:
+        mask = node.mask
+        width = self._return_mask_width(mask)
+        if width is None or node.varargs or len(node.values) <= width:
+            return node
+
+        trimmed = node.values[:width]
+        updated = IRReturn(
+            values=trimmed,
+            varargs=node.varargs,
+            cleanup=node.cleanup,
+            abi_effects=node.abi_effects,
+        )
+        self._transfer_ssa(node, updated)
+        return updated
+
+    @staticmethod
+    def _return_mask_width(mask: Optional[int]) -> Optional[int]:
+        if mask is None:
+            return None
+        return int(mask & 0xFFFF).bit_count()
 
     @staticmethod
     def _matches_templates(
