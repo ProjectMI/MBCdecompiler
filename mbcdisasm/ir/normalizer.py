@@ -5860,6 +5860,10 @@ class IRNormalizer:
             ):
                 operand_role = step.operand_role or next_step.operand_role
                 operand_alias = step.operand_alias or next_step.operand_alias
+                if operand_alias == "ChatOut" or step.operand in IO_SLOT_ALIASES:
+                    combined.append(step)
+                    index += 1
+                    continue
                 combined.append(
                     IRStackEffect(
                         mnemonic="epilogue",
@@ -5880,6 +5884,10 @@ class IRNormalizer:
             ):
                 operand_role = step.operand_role or next_step.operand_role
                 operand_alias = step.operand_alias or next_step.operand_alias
+                if operand_alias == "ChatOut" or step.operand in IO_SLOT_ALIASES:
+                    combined.append(step)
+                    index += 1
+                    continue
                 combined.append(
                     IRStackEffect(
                         mnemonic="epilogue",

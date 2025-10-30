@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, RET_MASK
+from ..constants import FANOUT_FLAGS_A, FANOUT_FLAGS_B, IO_SLOT_ALIASES, RET_MASK
 
 DIRECT_EPILOGUE_KIND_MAP = {
     "call_helpers": "helpers.invoke",
@@ -163,6 +163,9 @@ def epilogue_step_kind(
 
     alias_text = alias if alias is not None else None
     alias_upper = alias_text.upper() if alias_text else ""
+
+    if alias_text == CHATOUT_ALIAS or (operand is not None and operand in IO_SLOT_ALIASES):
+        return "io.step"
 
     if mnemonic in MASK_STEP_MNEMONICS:
         return "frame.return_mask"
