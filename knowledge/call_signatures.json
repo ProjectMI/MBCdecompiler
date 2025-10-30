@@ -1,4 +1,7 @@
 {
+  "0x0000": {
+    "cleanup_mask": "0x0000"
+  },
   "0x0072": {
     "arity": 2,
     "cleanup_mask": "0x2910",
@@ -58,5 +61,11 @@
     "postlude": [
       {"kind": "raw", "mnemonic": "op_D0_06", "optional": true}
     ]
+  },
+  "0x01F1": {
+    "cleanup_mask": "0x6910"
+  },
+  "0x022C": {
+    "shuffle": "0x3D30"
   }
 }

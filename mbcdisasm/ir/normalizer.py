@@ -4802,8 +4802,9 @@ class IRNormalizer:
             tail = signature.tail or tail
         if signature.arity is not None:
             arity = signature.arity
-        if signature.cleanup_mask is not None and cleanup_mask is None:
-            cleanup_mask = signature.cleanup_mask
+        signature_mask = signature.cleanup_mask
+        if signature_mask is not None:
+            cleanup_mask = signature_mask
         if signature.shuffle is not None:
             convention = self._call_convention_effect(signature.shuffle)
         elif signature.shuffle_options:
@@ -4858,10 +4859,12 @@ class IRNormalizer:
 
         signature_cleanup = self._convert_signature_effects(signature.cleanup)
         combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
+        if signature_mask is not None:
+            combined_cleanup = self._override_cleanup_return_mask(combined_cleanup, signature_mask)
         has_mask_effect = any(
             step.category == "frame.return_mask" for step in combined_cleanup
         )
-        if not has_mask_effect:
+        if not has_mask_effect and signature_mask is None:
             cleanup_mask = None
 
         updated = self._rebuild_call_node(
@@ -4990,6 +4993,21 @@ class IRNormalizer:
         for spec in specs:
             effects.append(self._stack_effect_from_signature(spec, None))
         return effects
+
+    def _override_cleanup_return_mask(
+        self, steps: Sequence[IRStackEffect], mask: int
+    ) -> Tuple[IRStackEffect, ...]:
+        alias = OPERAND_ALIASES.get(mask)
+        alias_text = str(alias) if alias is not None else None
+        updated: List[IRStackEffect] = []
+        for step in steps:
+            if step.category == "frame.return_mask":
+                updated.append(
+                    replace(step, operand=mask, operand_alias=alias_text)
+                )
+            else:
+                updated.append(step)
+        return tuple(updated)
 
     def _stack_effect_from_signature(
         self,
