@@ -3526,57 +3526,51 @@ class IRNormalizer:
         for idx, item in enumerate(snapshot):
             if not isinstance(item, IRSwitchDispatch):
                 continue
-            existing = item.index
-            if existing is not None and existing.source:
-                continue
 
+            existing = item.index
             prefix = _ItemList(snapshot[: idx + 1])
-            index_info = self._infer_dispatch_index(prefix, len(prefix) - 1)
-            if index_info is None:
+            inferred = self._infer_dispatch_index(prefix, len(prefix) - 1)
+
+            if inferred is None:
                 hints = self._dispatch_index_hints.get(self._current_block_offset)
                 if hints:
-                    index_info = hints[-1]
+                    inferred = hints[-1]
                 else:
                     fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
+                    if fallback_source is None and existing is not None and existing.source:
+                        fallback_source = existing.source
                     if fallback_source is None:
                         fallback_source = "stack_top"
                     fallback_mask = existing.mask if existing else None
                     fallback_base = existing.base if existing else None
-                    index_info = IRDispatchIndex(
+                    inferred = IRDispatchIndex(
                         source=fallback_source,
                         mask=fallback_mask,
                         base=fallback_base,
                     )
-            if index_info.source is None and (existing is None or not existing.source):
+
+            if inferred is not None and inferred.source is None:
                 fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
+                if fallback_source is None and existing is not None and existing.source:
+                    fallback_source = existing.source
                 if fallback_source is None:
                     fallback_source = "stack_top"
-                mask = index_info.mask
-                base = index_info.base
-                if existing is not None:
-                    if mask is None:
-                        mask = existing.mask
-                    if base is None:
-                        base = existing.base
-                index_info = IRDispatchIndex(source=fallback_source, mask=mask, base=base)
-            elif existing is not None:
-                mask = existing.mask if existing.mask is not None else index_info.mask
-                base = existing.base if existing.base is not None else index_info.base
-                index_info = IRDispatchIndex(
-                    source=index_info.source,
-                    mask=mask,
-                    base=base,
+                inferred = IRDispatchIndex(
+                    source=fallback_source,
+                    mask=inferred.mask,
+                    base=inferred.base,
                 )
 
-            if existing is None:
-                updated = replace(item, index=index_info)
-            else:
-                merged = IRDispatchIndex(
-                    source=index_info.source or existing.source,
-                    mask=existing.mask if existing.mask is not None else index_info.mask,
-                    base=existing.base if existing.base is not None else index_info.base,
-                )
-                updated = replace(item, index=merged)
+            if existing is not None and inferred is not None:
+                source = inferred.source if inferred.source is not None else existing.source
+                mask = inferred.mask if inferred.mask is not None else existing.mask
+                base = inferred.base if inferred.base is not None else existing.base
+                inferred = IRDispatchIndex(source=source, mask=mask, base=base)
+
+            if inferred is None:
+                continue
+
+            updated = replace(item, index=inferred)
 
             items.replace_slice(idx, idx + 1, [updated])
             snapshot[idx] = updated
@@ -4797,12 +4791,17 @@ class IRNormalizer:
         cleanup_mask = self._call_like_cleanup_mask(node)
         predicate = getattr(node, "predicate", None)
         existing_cleanup = list(getattr(node, "cleanup", tuple()))
+        call_cleanup: Tuple[IRStackEffect, ...] = tuple()
+        if isinstance(node, IRTailCall):
+            call_cleanup = node.call.cleanup
+            if call_cleanup:
+                existing_cleanup = list(call_cleanup + tuple(existing_cleanup))
 
         if signature.tail is not None:
             tail = signature.tail or tail
         if signature.arity is not None:
             arity = signature.arity
-        if signature.cleanup_mask is not None and cleanup_mask is None:
+        if signature.cleanup_mask is not None:
             cleanup_mask = signature.cleanup_mask
         if signature.shuffle is not None:
             convention = self._call_convention_effect(signature.shuffle)
@@ -4858,11 +4857,23 @@ class IRNormalizer:
 
         signature_cleanup = self._convert_signature_effects(signature.cleanup)
         combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
+        if cleanup_mask is not None:
+            combined_cleanup = self._synchronise_cleanup_mask(combined_cleanup, cleanup_mask)
         has_mask_effect = any(
             step.category == "frame.return_mask" for step in combined_cleanup
         )
         if not has_mask_effect:
             cleanup_mask = None
+
+        if isinstance(node, IRTailCall):
+            call_cleanup_len = len(call_cleanup)
+            call_prefix_len = len(prefix_effects) + len(signature_cleanup)
+            call_span = call_prefix_len + call_cleanup_len + len(suffix_effects)
+            call_updated = combined_cleanup[:call_span]
+            cleanup = combined_cleanup[call_span:]
+        else:
+            call_updated = combined_cleanup
+            cleanup = combined_cleanup
 
         updated = self._rebuild_call_node(
             node,
@@ -4870,7 +4881,8 @@ class IRNormalizer:
             arity=arity,
             convention=convention,
             cleanup_mask=cleanup_mask,
-            cleanup=combined_cleanup,
+            cleanup=cleanup,
+            call_cleanup=call_updated,
             predicate=predicate,
             target=target,
             signature=signature,
@@ -4991,6 +5003,30 @@ class IRNormalizer:
             effects.append(self._stack_effect_from_signature(spec, None))
         return effects
 
+    def _synchronise_cleanup_mask(
+        self, steps: Sequence[IRStackEffect], mask: int
+    ) -> Tuple[IRStackEffect, ...]:
+        alias = OPERAND_ALIASES.get(mask)
+        alias_text = str(alias) if alias is not None else None
+        updated: List[IRStackEffect] = []
+        for step in steps:
+            if step.category == "frame.return_mask":
+                operand_alias = alias_text if alias_text is not None else step.operand_alias
+                updated.append(
+                    IRStackEffect(
+                        mnemonic=step.mnemonic,
+                        operand=mask,
+                        pops=step.pops,
+                        operand_role=step.operand_role,
+                        operand_alias=operand_alias,
+                        category=step.category,
+                        optional=step.optional,
+                    )
+                )
+            else:
+                updated.append(step)
+        return tuple(updated)
+
     def _stack_effect_from_signature(
         self,
         spec: CallSignatureEffect,
@@ -5070,6 +5106,7 @@ class IRNormalizer:
         convention: Optional[IRStackEffect],
         cleanup_mask: Optional[int],
         cleanup: Tuple[IRStackEffect, ...],
+        call_cleanup: Tuple[IRStackEffect, ...],
         predicate: Optional[CallPredicate],
         target: int,
         signature: CallSignature,
@@ -5119,7 +5156,7 @@ class IRNormalizer:
                 tail=True,
                 arity=arity,
                 convention=convention,
-                cleanup=node.call.cleanup,
+                cleanup=call_cleanup,
                 symbol=node.symbol,
                 predicate=predicate,
                 abi_effects=abi_effects,

@@ -1,4 +1,10 @@
 {
+  "0x0000": {
+    "cleanup_mask": "0x0000",
+    "cleanup": [
+      {"mnemonic": "op_52_05", "operand": "0x0000"}
+    ]
+  },
   "0x0072": {
     "arity": 2,
     "cleanup_mask": "0x2910",
@@ -47,6 +53,28 @@
         "optional": true
       }
     ]
+  },
+  "0x01F1": {
+    "cleanup_mask": "0x6910",
+    "cleanup": [
+      {"mnemonic": "op_52_05", "operand": "0x6910"}
+    ],
+    "postlude": [
+      {
+        "kind": "raw",
+        "mnemonic": "call_helpers",
+        "operand": "0x7223",
+        "optional": true,
+        "effect": {
+          "mnemonic": "call_helpers",
+          "inherit_operand": true,
+          "inherit_alias": true
+        }
+      }
+    ]
+  },
+  "0x022C": {
+    "shuffle": "0x3D30"
   },
   "0x3D30": {
     "tail": true,
