@@ -3526,57 +3526,51 @@ class IRNormalizer:
         for idx, item in enumerate(snapshot):
             if not isinstance(item, IRSwitchDispatch):
                 continue
-            existing = item.index
-            if existing is not None and existing.source:
-                continue
 
+            existing = item.index
             prefix = _ItemList(snapshot[: idx + 1])
-            index_info = self._infer_dispatch_index(prefix, len(prefix) - 1)
-            if index_info is None:
+            inferred = self._infer_dispatch_index(prefix, len(prefix) - 1)
+
+            if inferred is None:
                 hints = self._dispatch_index_hints.get(self._current_block_offset)
                 if hints:
-                    index_info = hints[-1]
+                    inferred = hints[-1]
                 else:
                     fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
+                    if fallback_source is None and existing is not None and existing.source:
+                        fallback_source = existing.source
                     if fallback_source is None:
                         fallback_source = "stack_top"
                     fallback_mask = existing.mask if existing else None
                     fallback_base = existing.base if existing else None
-                    index_info = IRDispatchIndex(
+                    inferred = IRDispatchIndex(
                         source=fallback_source,
                         mask=fallback_mask,
                         base=fallback_base,
                     )
-            if index_info.source is None and (existing is None or not existing.source):
+
+            if inferred is not None and inferred.source is None:
                 fallback_source = self._find_dispatch_source(prefix, len(prefix) - 1, set())
+                if fallback_source is None and existing is not None and existing.source:
+                    fallback_source = existing.source
                 if fallback_source is None:
                     fallback_source = "stack_top"
-                mask = index_info.mask
-                base = index_info.base
-                if existing is not None:
-                    if mask is None:
-                        mask = existing.mask
-                    if base is None:
-                        base = existing.base
-                index_info = IRDispatchIndex(source=fallback_source, mask=mask, base=base)
-            elif existing is not None:
-                mask = existing.mask if existing.mask is not None else index_info.mask
-                base = existing.base if existing.base is not None else index_info.base
-                index_info = IRDispatchIndex(
-                    source=index_info.source,
-                    mask=mask,
-                    base=base,
+                inferred = IRDispatchIndex(
+                    source=fallback_source,
+                    mask=inferred.mask,
+                    base=inferred.base,
                 )
 
-            if existing is None:
-                updated = replace(item, index=index_info)
-            else:
-                merged = IRDispatchIndex(
-                    source=index_info.source or existing.source,
-                    mask=existing.mask if existing.mask is not None else index_info.mask,
-                    base=existing.base if existing.base is not None else index_info.base,
-                )
-                updated = replace(item, index=merged)
+            if existing is not None and inferred is not None:
+                source = inferred.source if inferred.source is not None else existing.source
+                mask = inferred.mask if inferred.mask is not None else existing.mask
+                base = inferred.base if inferred.base is not None else existing.base
+                inferred = IRDispatchIndex(source=source, mask=mask, base=base)
+
+            if inferred is None:
+                continue
+
+            updated = replace(item, index=inferred)
 
             items.replace_slice(idx, idx + 1, [updated])
             snapshot[idx] = updated
