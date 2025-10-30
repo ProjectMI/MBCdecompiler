@@ -14,6 +14,7 @@ DIRECT_EPILOGUE_KIND_MAP = {
     "op_6C_01": "frame.page_select",
     "op_08_00": "helpers.dispatch",
     "op_72_23": "helpers.wrapper",
+    "op_4F_02": "helpers.wrapper",
     "op_52_06": "io.handshake",
     "op_0B_00": "io.handshake",
     "op_0B_E1": "io.handshake",
@@ -166,6 +167,8 @@ def epilogue_step_kind(
 
     if mnemonic in MASK_STEP_MNEMONICS:
         return "frame.return_mask"
+    if mnemonic == "terminator" and alias_upper == "FANOUT_FLAGS":
+        return "helpers.fanout"
     if operand is not None and operand in MASK_OPERANDS:
         return "frame.return_mask"
     if alias_upper in MASK_ALIAS_HINTS:

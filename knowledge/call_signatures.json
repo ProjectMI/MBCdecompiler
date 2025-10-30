@@ -48,6 +48,9 @@
       }
     ]
   },
+  "0x01F1": {
+    "cleanup_mask": "0x6910"
+  },
   "0x3D30": {
     "tail": true,
     "prelude": [

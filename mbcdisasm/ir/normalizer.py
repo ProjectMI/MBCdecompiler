@@ -2677,6 +2677,15 @@ class IRNormalizer:
             call = items[index]
             assert isinstance(call, IRCall)
 
+            target = call.target
+            if (
+                target == 0x022C
+                and convention is not None
+                and convention.mnemonic == "stack_shuffle"
+                and convention.operand == 0x3D30
+            ):
+                convention = None
+
             tail = call.tail
             mask_candidate = self._extract_cleanup_mask(
                 cleanup_steps, include_optional=False
@@ -5157,6 +5166,7 @@ class IRNormalizer:
         node = self._normalise_call_result_arity(node)
         node = self._normalise_call_argument_arity(node)
         node = self._enforce_call_return_mask(node)
+        node = self._enforce_signature_return_mask(node)
         return node
 
     def _normalise_call_result_arity(self, node: CallLike) -> CallLike:
@@ -5386,6 +5396,38 @@ class IRNormalizer:
             return updated
 
         return node
+
+    def _enforce_signature_return_mask(self, node: CallLike) -> CallLike:
+        signature = self.knowledge.call_signature(getattr(node, "target", -1))
+        if signature is None or signature.cleanup_mask is None:
+            return node
+
+        existing_mask = self._abi_return_mask(getattr(node, "abi_effects", tuple()))
+        if existing_mask is not None:
+            return node
+
+        tail = getattr(node, "tail", False)
+        arity = getattr(node, "arity", None)
+        convention = getattr(node, "convention", None)
+        predicate = getattr(node, "predicate", None)
+        cleanup = getattr(node, "cleanup", tuple())
+        target = getattr(node, "target", -1)
+
+        updated = self._rebuild_call_node(
+            node,
+            tail=tail,
+            arity=arity,
+            convention=convention,
+            cleanup_mask=signature.cleanup_mask,
+            cleanup=cleanup,
+            predicate=predicate,
+            target=target,
+            signature=signature,
+        )
+        if updated is node:
+            return node
+        self._transfer_ssa(node, updated)
+        return updated
 
     def _finalise_return_node(self, node: IRReturn) -> IRReturn:
         return self._enforce_return_mask(node)
