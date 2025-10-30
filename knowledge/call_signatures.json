@@ -76,6 +76,24 @@
   "0x022C": {
     "shuffle": "0x3D30"
   },
+  "0x003E": {
+    "cleanup_mask": "0x0053",
+    "cleanup": [
+      {"mnemonic": "op_52_05", "operand": "0x0053"}
+    ]
+  },
+  "0x00ED": {
+    "cleanup_mask": "0x0030",
+    "cleanup": [
+      {"mnemonic": "op_52_05", "operand": "0x0030"}
+    ]
+  },
+  "0x00F0": {
+    "cleanup_mask": "0x004A",
+    "cleanup": [
+      {"mnemonic": "op_52_05", "operand": "0x004A"}
+    ]
+  },
   "0x3D30": {
     "tail": true,
     "prelude": [

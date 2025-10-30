@@ -4862,7 +4862,7 @@ class IRNormalizer:
         has_mask_effect = any(
             step.category == "frame.return_mask" for step in combined_cleanup
         )
-        if not has_mask_effect:
+        if not has_mask_effect and signature.cleanup_mask is None:
             cleanup_mask = None
 
         if isinstance(node, IRTailCall):
@@ -4874,6 +4874,12 @@ class IRNormalizer:
         else:
             call_updated = combined_cleanup
             cleanup = combined_cleanup
+
+        if cleanup_mask is not None:
+            cleanup = self._rewrite_cleanup_return_mask(cleanup, cleanup_mask)
+            call_updated = self._rewrite_cleanup_return_mask(
+                call_updated, cleanup_mask
+            )
 
         updated = self._rebuild_call_node(
             node,
@@ -6080,6 +6086,34 @@ class IRNormalizer:
     ) -> Tuple[IRAbiEffect, ...]:
         base = tuple(effect for effect in effects if effect.kind != "return_mask")
         return base + self._return_mask_effect(mask)
+
+    def _rewrite_cleanup_return_mask(
+        self, steps: Tuple[IRStackEffect, ...], mask: Optional[int]
+    ) -> Tuple[IRStackEffect, ...]:
+        if mask is None or not steps:
+            return steps
+
+        alias = OPERAND_ALIASES.get(mask)
+        alias_text = str(alias) if alias is not None else None
+        updated: List[IRStackEffect] = []
+        changed = False
+        for step in steps:
+            if step.category == "frame.return_mask":
+                if step.operand == mask and (
+                    (alias_text is None and step.operand_alias is None)
+                    or step.operand_alias == alias_text
+                ):
+                    updated.append(step)
+                    continue
+                updated.append(
+                    replace(step, operand=mask, operand_alias=alias_text)
+                )
+                changed = True
+            else:
+                updated.append(step)
+        if not changed:
+            return steps
+        return tuple(updated)
 
     def _literal_at(self, items: _ItemList, index: int) -> Optional[IRLiteral]:
         item = items[index]
