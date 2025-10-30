@@ -5176,8 +5176,97 @@ class IRNormalizer:
     def _finalise_call_node(self, node: CallLike) -> CallLike:
         node = self._normalise_call_result_arity(node)
         node = self._normalise_call_argument_arity(node)
+        node = self._enforce_call_signature_contract(node)
         node = self._enforce_call_return_mask(node)
         return node
+
+    def _enforce_call_signature_contract(self, node: CallLike) -> CallLike:
+        target = getattr(node, "target", None)
+        if not isinstance(target, int):
+            return node
+
+        signature = self.knowledge.call_signature(target)
+        if signature is None:
+            return node
+
+        tail = getattr(node, "tail", False)
+        arity = getattr(node, "arity", None)
+        convention = getattr(node, "convention", None)
+        predicate = getattr(node, "predicate", None)
+        existing_cleanup = tuple(getattr(node, "cleanup", tuple()))
+        cleanup = existing_cleanup
+        existing_abi = tuple(getattr(node, "abi_effects", tuple()))
+        cleanup_mask = self._call_like_cleanup_mask(node)
+
+        changed = False
+
+        if signature.tail is not None:
+            new_tail = signature.tail or tail
+            if new_tail != tail:
+                tail = new_tail
+                changed = True
+
+        if signature.arity is not None and signature.arity != arity:
+            arity = signature.arity
+            changed = True
+
+        desired_convention: Optional[IRStackEffect] = convention
+        if signature.shuffle is not None:
+            desired_convention = self._call_convention_effect(signature.shuffle)
+        elif signature.shuffle_options:
+            current_operand = convention.operand if convention is not None else None
+            if current_operand not in signature.shuffle_options:
+                desired_convention = self._call_convention_effect(signature.shuffle_options[0])
+        if desired_convention != convention:
+            convention = desired_convention
+            changed = True
+
+        signature_cleanup = tuple(
+            self._convert_signature_effects(signature.cleanup)
+        )
+        signature_mask = signature.cleanup_mask
+        if signature_mask is not None:
+            has_mask_effect = any(
+                step.category == "frame.return_mask" for step in cleanup
+            )
+            if not has_mask_effect and signature_cleanup:
+                cleanup = signature_cleanup + cleanup
+                has_mask_effect = True
+                changed = True
+            if has_mask_effect:
+                updated_cleanup = self._synchronise_cleanup_mask(cleanup, signature_mask)
+                if updated_cleanup != cleanup:
+                    cleanup = updated_cleanup
+                    changed = True
+            if cleanup_mask != signature_mask:
+                cleanup_mask = signature_mask
+                changed = True
+        elif signature_cleanup and any(
+            effect not in cleanup for effect in signature_cleanup
+        ):
+            cleanup = signature_cleanup + cleanup
+            changed = True
+
+        abi_effects = self._merge_return_mask_effects(existing_abi, cleanup_mask)
+        if abi_effects != existing_abi:
+            changed = True
+
+        if not changed:
+            return node
+
+        updated = self._rebuild_call_node(
+            node,
+            tail=tail,
+            arity=arity,
+            convention=convention,
+            cleanup_mask=cleanup_mask,
+            cleanup=cleanup,
+            predicate=predicate,
+            target=target,
+            signature=signature,
+        )
+        self._transfer_ssa(node, updated)
+        return updated
 
     def _normalise_call_result_arity(self, node: CallLike) -> CallLike:
         if not isinstance(node, (IRCallReturn, IRTailCall, IRTailcallReturn)):

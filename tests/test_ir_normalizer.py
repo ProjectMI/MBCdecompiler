@@ -58,7 +58,12 @@ from mbcdisasm.constants import (
 )
 from mbcdisasm.mbc import Segment
 from mbcdisasm.instruction import InstructionWord
-from mbcdisasm.knowledge import KnowledgeBase, OpcodeInfo
+from mbcdisasm.knowledge import (
+    CallSignature,
+    CallSignatureEffect,
+    KnowledgeBase,
+    OpcodeInfo,
+)
 from mbcdisasm.analyzer.instruction_profile import (
     InstructionKind,
     InstructionProfile,
@@ -2087,6 +2092,52 @@ def test_return_cleanup_discards_overwritten_return_masks() -> None:
     node = IRReturn(values=(), cleanup=(initial, final))
 
     assert node.cleanup == (final,)
+
+
+def test_signature_enforcer_updates_return_mask_and_abi() -> None:
+    signature = CallSignature(
+        target=0x01F1,
+        cleanup_mask=0x6910,
+        cleanup=(CallSignatureEffect(mnemonic="op_52_05", operand=0x6910),),
+    )
+    knowledge = KnowledgeBase({}, call_signatures={0x01F1: signature})
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup_step = IRStackEffect(
+        mnemonic="op_52_05", operand=0x1070, category="frame.return_mask"
+    )
+    call = IRCall(
+        target=0x01F1,
+        args=(),
+        tail=True,
+        cleanup=(cleanup_step,),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x1070),),
+    )
+
+    updated = normalizer._finalise_call_node(call)
+    assert isinstance(updated, IRCall)
+    assert any(
+        step.category == "frame.return_mask" and step.operand == 0x6910
+        for step in updated.cleanup
+    )
+    assert any(
+        effect.kind == "return_mask" and effect.operand == 0x6910
+        for effect in updated.abi_effects
+    )
+
+
+def test_signature_enforcer_applies_stack_shuffle() -> None:
+    signature = CallSignature(target=0x022C, shuffle=0x3D30)
+    knowledge = KnowledgeBase({}, call_signatures={0x022C: signature})
+    normalizer = IRNormalizer(knowledge)
+
+    call = IRCall(target=0x022C, args=())
+    updated = normalizer._finalise_call_node(call)
+
+    assert isinstance(updated, IRCall)
+    assert updated.convention is not None
+    assert updated.convention.mnemonic == "stack_shuffle"
+    assert updated.convention.operand == 0x3D30
 
 
 def test_tailcall_description_avoids_nested_abi() -> None:
