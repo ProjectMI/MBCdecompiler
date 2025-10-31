@@ -1079,6 +1079,7 @@ class IRNormalizer:
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
         self._split_preserved_cleanup_nodes(items)
+        self._pass_elide_chatout_cleanup(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
         self._pass_epilogue_prologue_compaction(items)
@@ -1147,7 +1148,7 @@ class IRNormalizer:
                     preserved = tuple(
                         step for step in item.cleanup if step.operand_alias == "ChatOut"
                     )
-                    if preserved:
+                    if preserved and not self._is_chatout_return_mask_sequence(preserved):
                         nodes.append(IRCallCleanup(steps=preserved))
                 nodes.append(item)
 
@@ -2201,7 +2202,21 @@ class IRNormalizer:
                 retained_absorbed = [
                     step for step in absorbed_steps if step.operand_alias != "ChatOut"
                 ]
-                base_cleanup = return_node.cleanup + tuple(retained_absorbed)
+                base_cleanup_steps: List[IRStackEffect] = list(
+                    return_node.cleanup + tuple(retained_absorbed)
+                )
+                if detached_steps and not retained_absorbed:
+                    appended = [
+                        step
+                        for step in detached_steps
+                        if not self._has_equivalent_cleanup_step(
+                            base_cleanup_steps, step
+                        )
+                    ]
+                    if appended:
+                        base_cleanup_steps.extend(appended)
+                    detached_steps = []
+                base_cleanup = tuple(base_cleanup_steps)
                 include_preserved = False
                 if preserved_steps:
                     if any(step.mnemonic == "op_F0_E8" for step in base_cleanup):
@@ -2211,6 +2226,12 @@ class IRNormalizer:
                     preserved_steps = []
                 else:
                     combined = base_cleanup
+                filtered_detached = [
+                    step
+                    for step in detached_steps
+                    if not self._has_equivalent_cleanup_step(combined, step)
+                ]
+                detached_steps = filtered_detached
                 mask = self._extract_cleanup_mask(combined)
                 updated = IRReturn(
                     values=return_node.values,
@@ -4593,6 +4614,16 @@ class IRNormalizer:
                     continue
             index += 1
 
+    def _pass_elide_chatout_cleanup(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            node = items[index]
+            if isinstance(node, IRCallCleanup) and self._is_chatout_return_mask_cleanup(node):
+                if self._neighbor_has_chatout_channel(items, index - 1) or self._neighbor_has_chatout_channel(items, index + 1):
+                    items.pop(index)
+                    continue
+            index += 1
+
     def _pass_call_predicates(self, items: _ItemList) -> None:
         index = 0
         while index < len(items) - 1:
@@ -5994,6 +6025,104 @@ class IRNormalizer:
             else:
                 absorbed.append(step)
         return absorbed, preserved
+
+    @staticmethod
+    def _has_equivalent_cleanup_step(
+        steps: Sequence[IRStackEffect], candidate: IRStackEffect
+    ) -> bool:
+        for step in steps:
+            if step.category != candidate.category:
+                continue
+            if step.category == "frame.return_mask":
+                if step.operand == candidate.operand:
+                    return True
+                continue
+            if (
+                step.mnemonic == candidate.mnemonic
+                and step.operand == candidate.operand
+                and step.operand_alias == candidate.operand_alias
+                and step.operand_role == candidate.operand_role
+                and step.pops == candidate.pops
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _is_chatout_alias(alias: Optional[str], operand: int) -> bool:
+        if alias is not None:
+            alias_text = str(alias)
+        else:
+            mapped = OPERAND_ALIASES.get(operand)
+            if mapped is None:
+                return False
+            alias_text = str(mapped)
+        return alias_text.startswith("ChatOut")
+
+    def _steps_include_chatout_mask(self, steps: Sequence[IRStackEffect]) -> bool:
+        for step in steps:
+            if step.category != "frame.return_mask":
+                continue
+            if self._is_chatout_alias(step.operand_alias, step.operand):
+                return True
+        return False
+
+    def _abi_has_chatout(self, effects: Sequence[IRAbiEffect]) -> bool:
+        for effect in effects:
+            if effect.kind != "return_mask":
+                continue
+            operand = effect.operand if effect.operand is not None else 0
+            if self._is_chatout_alias(effect.alias, operand):
+                return True
+        return False
+
+    def _node_has_chatout_channel(self, items: _ItemList, index: int) -> bool:
+        if not (0 <= index < len(items)):
+            return False
+        node = items[index]
+        if isinstance(node, IRCallCleanup):
+            return self._steps_include_chatout_mask(node.steps)
+        if isinstance(node, IRReturn):
+            if self._steps_include_chatout_mask(node.cleanup):
+                return True
+            return self._abi_has_chatout(node.abi_effects)
+        if isinstance(node, IRCall):
+            if self._steps_include_chatout_mask(node.cleanup):
+                return True
+            return self._abi_has_chatout(node.abi_effects)
+        if isinstance(node, IRCallReturn):
+            if self._steps_include_chatout_mask(node.cleanup):
+                return True
+            return self._abi_has_chatout(node.abi_effects)
+        if isinstance(node, IRTailCall):
+            if self._steps_include_chatout_mask(node.cleanup):
+                return True
+            if self._steps_include_chatout_mask(node.call.cleanup):
+                return True
+            return self._abi_has_chatout(node.abi_effects) or self._abi_has_chatout(
+                node.call.abi_effects
+            )
+        if isinstance(node, IRTailcallReturn):
+            if self._steps_include_chatout_mask(node.cleanup):
+                return True
+            return self._abi_has_chatout(node.abi_effects)
+        return False
+
+    def _neighbor_has_chatout_channel(self, items: _ItemList, index: int) -> bool:
+        return self._node_has_chatout_channel(items, index)
+
+    def _is_chatout_return_mask_sequence(
+        self, steps: Sequence[IRStackEffect]
+    ) -> bool:
+        if not steps:
+            return False
+        return all(
+            step.category == "frame.return_mask"
+            and self._is_chatout_alias(step.operand_alias, step.operand)
+            for step in steps
+        )
+
+    def _is_chatout_return_mask_cleanup(self, cleanup: IRCallCleanup) -> bool:
+        return self._is_chatout_return_mask_sequence(cleanup.steps)
 
     @staticmethod
     def _extract_call_shuffle(cleanup: IRCallCleanup) -> Optional[int]:
