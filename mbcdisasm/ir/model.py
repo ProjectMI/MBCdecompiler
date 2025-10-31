@@ -2,33 +2,56 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 from typing import List, Optional, Tuple
 
-from ..constants import IO_PORT_NAME, OPERAND_ALIASES
+from ..constants import IO_PORT_NAME, IO_SLOT_ALIASES, OPERAND_ALIASES
 from .effect_aliases import cleanup_category
 
 
 def _resolve_effect_category(effect: "IRStackEffect") -> Optional[str]:
     """Return the semantic category for ``effect``."""
 
-    if effect.category is not None:
-        return effect.category
-
     alias_text = effect.operand_alias
+    category = effect.category
+    operand = effect.operand
+    if category is not None:
+        if category == "frame.return_mask" and (
+            alias_text == "ChatOut" or operand in IO_SLOT_ALIASES
+        ):
+            return "io.step"
+        return category
+
     if alias_text is None:
         alias = OPERAND_ALIASES.get(effect.operand)
         if alias is not None:
             alias_text = str(alias)
 
-    return cleanup_category(effect.mnemonic, effect.operand, alias_text)
+    category = cleanup_category(effect.mnemonic, effect.operand, alias_text)
+    if category == "frame.return_mask" and (
+        alias_text == "ChatOut" or effect.operand in IO_SLOT_ALIASES
+    ):
+        return "io.step"
+    return category
 
 
 def _normalise_cleanup_steps(
     steps: Tuple["IRStackEffect", ...]
 ) -> Tuple["IRStackEffect", ...]:
     """Drop return-mask updates that are overwritten later in ``steps``."""
+
+    if steps:
+        updated: List[IRStackEffect] = []
+        for step in steps:
+            resolved = _resolve_effect_category(step)
+            if (
+                step.category == "frame.return_mask"
+                and resolved == "io.step"
+            ):
+                step = replace(step, category=resolved)
+            updated.append(step)
+        steps = tuple(updated)
 
     last_mask_index: Optional[int] = None
     for index, step in enumerate(steps):

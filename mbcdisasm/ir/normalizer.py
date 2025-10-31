@@ -5864,6 +5864,14 @@ class IRNormalizer:
                 pops=pops,
                 opcode=instruction.profile.opcode,
             )
+        if (
+            category == "frame.return_mask"
+            and (
+                alias_text == "ChatOut"
+                or (operand is not None and operand in IO_SLOT_ALIASES)
+            )
+        ):
+            category = "io.step"
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
@@ -5918,6 +5926,9 @@ class IRNormalizer:
             ):
                 operand_role = step.operand_role or next_step.operand_role
                 operand_alias = step.operand_alias or next_step.operand_alias
+                category = "frame.return_mask"
+                if operand_alias == "ChatOut" or step.operand in IO_SLOT_ALIASES:
+                    category = "io.step"
                 combined.append(
                     IRStackEffect(
                         mnemonic="epilogue",
@@ -5925,7 +5936,7 @@ class IRNormalizer:
                         pops=step.pops + next_step.pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
-                        category="frame.return_mask",
+                        category=category,
                     )
                 )
                 index += 2
@@ -5938,6 +5949,9 @@ class IRNormalizer:
             ):
                 operand_role = step.operand_role or next_step.operand_role
                 operand_alias = step.operand_alias or next_step.operand_alias
+                category = "frame.return_mask"
+                if operand_alias == "ChatOut" or step.operand in IO_SLOT_ALIASES:
+                    category = "io.step"
                 combined.append(
                     IRStackEffect(
                         mnemonic="epilogue",
@@ -5945,7 +5959,7 @@ class IRNormalizer:
                         pops=step.pops + next_step.pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
-                        category="frame.return_mask",
+                        category=category,
                     )
                 )
                 index += 2
@@ -6094,7 +6108,7 @@ class IRNormalizer:
         if mask is None:
             return None
         if mask in IO_SLOT_ALIASES:
-            return IO_SLOT
+            return None
         return mask
 
     def _return_mask_effect(self, mask: Optional[int]) -> Tuple[IRAbiEffect, ...]:
