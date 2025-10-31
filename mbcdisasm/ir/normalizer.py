@@ -2695,7 +2695,11 @@ class IRNormalizer:
             tail_mask = cleanup_mask
             if tail_mask is None:
                 tail_mask = abi_mask
-            if not tail and tail_mask == RET_MASK:
+            if (
+                not tail
+                and tail_mask == RET_MASK
+                and self._call_followed_by_return(items, index)
+            ):
                 tail = True
 
             updated = IRCall(
@@ -4153,6 +4157,16 @@ class IRNormalizer:
             return reordered
         return list(args)
 
+    def _call_followed_by_return(self, items: _ItemList, index: int) -> bool:
+        pos = index + 1
+        while pos < len(items):
+            candidate = items[pos]
+            if isinstance(candidate, (IRCallCleanup, IRLiteral, IRLiteralChunk)):
+                pos += 1
+                continue
+            return isinstance(candidate, IRReturn)
+        return False
+
     def _attach_tail_helper_cleanup(
         self, items: _ItemList, index: int, effect: IRStackEffect
     ) -> None:
@@ -4802,7 +4816,7 @@ class IRNormalizer:
         if signature.arity is not None:
             arity = signature.arity
         if signature.cleanup_mask is not None:
-            cleanup_mask = signature.cleanup_mask
+            cleanup_mask = self._canonical_return_mask(signature.cleanup_mask)
         if signature.shuffle is not None:
             convention = self._call_convention_effect(signature.shuffle)
         elif signature.shuffle_options:
@@ -4853,7 +4867,7 @@ class IRNormalizer:
             # required pattern not matched: leave remaining nodes untouched
 
         if cleanup_mask is None:
-            cleanup_mask = signature.cleanup_mask
+            cleanup_mask = self._canonical_return_mask(signature.cleanup_mask)
 
         signature_cleanup = self._convert_signature_effects(signature.cleanup)
         combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
@@ -5012,6 +5026,7 @@ class IRNormalizer:
     def _synchronise_cleanup_mask(
         self, steps: Sequence[IRStackEffect], mask: int
     ) -> Tuple[IRStackEffect, ...]:
+        mask = self._canonical_return_mask(mask) or mask
         alias = OPERAND_ALIASES.get(mask)
         alias_text = str(alias) if alias is not None else None
         updated: List[IRStackEffect] = []
@@ -6036,14 +6051,14 @@ class IRNormalizer:
             if category == "frame.return_mask":
                 if not include_optional and getattr(step, "optional", False):
                     continue
-                return step.operand
+                return IRNormalizer._canonical_return_mask(step.operand)
         return None
 
     @staticmethod
     def _abi_return_mask(effects: Sequence[IRAbiEffect]) -> Optional[int]:
         for effect in effects:
             if effect.kind == "return_mask":
-                return effect.operand
+                return IRNormalizer._canonical_return_mask(effect.operand)
         return None
 
     def _call_like_cleanup_mask(self, node: CallLike) -> Optional[int]:
@@ -6075,11 +6090,19 @@ class IRNormalizer:
         return None
 
     @staticmethod
-    def _return_mask_effect(mask: Optional[int]) -> Tuple[IRAbiEffect, ...]:
+    def _canonical_return_mask(mask: Optional[int]) -> Optional[int]:
         if mask is None:
+            return None
+        if mask in IO_SLOT_ALIASES:
+            return IO_SLOT
+        return mask
+
+    def _return_mask_effect(self, mask: Optional[int]) -> Tuple[IRAbiEffect, ...]:
+        canonical = self._canonical_return_mask(mask)
+        if canonical is None:
             return tuple()
-        alias = OPERAND_ALIASES.get(mask)
-        return (IRAbiEffect(kind="return_mask", operand=mask, alias=alias),)
+        alias = OPERAND_ALIASES.get(canonical)
+        return (IRAbiEffect(kind="return_mask", operand=canonical, alias=alias),)
 
     def _merge_return_mask_effects(
         self, effects: Sequence[IRAbiEffect], mask: Optional[int]
@@ -6090,6 +6113,7 @@ class IRNormalizer:
     def _rewrite_cleanup_return_mask(
         self, steps: Tuple[IRStackEffect, ...], mask: Optional[int]
     ) -> Tuple[IRStackEffect, ...]:
+        mask = self._canonical_return_mask(mask)
         if mask is None or not steps:
             return steps
 
