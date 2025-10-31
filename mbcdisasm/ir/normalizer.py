@@ -4188,13 +4188,19 @@ class IRNormalizer:
                 and effect.pops in {0, 1}
             ):
                 pops = effect.pops if effect.pops else 1
+                category = cleanup_category(
+                    "stack_teardown",
+                    effect.operand,
+                    effect.operand_alias,
+                    pops=pops,
+                )
                 teardown = IRStackEffect(
                     mnemonic="stack_teardown",
                     operand=effect.operand,
                     pops=pops,
                     operand_role=effect.operand_role,
                     operand_alias=effect.operand_alias,
-                    category="frame.teardown",
+                    category=category,
                 )
                 continue
             retained_cleanup.append(effect)
@@ -6064,7 +6070,6 @@ class IRNormalizer:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
-            category = "frame.teardown"
         alias: Optional[str]
         if mnemonic == "call_helpers":
             alias = self._helper_symbol(operand)
@@ -6121,6 +6126,12 @@ class IRNormalizer:
                 ):
                     total_pops += steps[advance].pops
                     advance += 1
+                effect_category = cleanup_category(
+                    "stack_teardown",
+                    operand,
+                    operand_alias,
+                    pops=total_pops,
+                )
                 combined.append(
                     IRStackEffect(
                         mnemonic="stack_teardown",
@@ -6128,7 +6139,7 @@ class IRNormalizer:
                         pops=total_pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
-                        category="frame.teardown",
+                        category=effect_category,
                     )
                 )
                 index = advance

@@ -10,7 +10,6 @@ DIRECT_EPILOGUE_KIND_MAP = {
     "call_helpers": "helpers.invoke",
     "fanout": "helpers.fanout",
     "page_register": "frame.page_select",
-    "stack_teardown": "frame.teardown",
     "op_6C_01": "frame.page_select",
     "op_08_00": "helpers.dispatch",
     "op_72_23": "helpers.wrapper",
@@ -120,9 +119,14 @@ FRAME_OPERAND_KIND_OVERRIDES = {
     0x0020: "helpers.format",
     0x0029: "frame.scheduler",
     0x002C: "frame.scheduler",
+    0x003D: "frame.scheduler",
     0x0041: "frame.scheduler",
     0x0069: "frame.scheduler",
     0x006C: "frame.page_select",
+    0x0566: "frame.scheduler",
+    0x0600: "frame.scheduler",
+    0x0A00: "frame.scheduler",
+    0x0E00: "frame.scheduler",
     0x10E1: "io.bridge",
     0x2C04: "helpers.format",
     0x2DF0: "io.step",
@@ -167,6 +171,13 @@ def epilogue_step_kind(
 
     if operand is not None and operand in IO_SLOT_ALIASES:
         return "io.step"
+
+    if mnemonic == "stack_teardown":
+        if operand is not None and operand in FRAME_OPERAND_KIND_OVERRIDES:
+            return "frame.effect"
+        if pops and pops < 4:
+            return "frame.drop"
+        return "frame.teardown"
 
     alias_upper = alias_text.upper()
 
