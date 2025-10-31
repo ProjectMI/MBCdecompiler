@@ -1084,6 +1084,7 @@ class IRNormalizer:
         self._pass_epilogue_prologue_compaction(items)
         self._pass_promote_push_literals(items, metrics)
         self._pass_resolve_dispatch_indices(items)
+        self._pass_sanitize_abi_effects(items)
         self._pass_enforce_abi_contracts(items)
 
         final_items = list(items)
@@ -3579,19 +3580,67 @@ class IRNormalizer:
             items.replace_slice(idx, idx + 1, [updated])
             snapshot[idx] = updated
 
+    def _pass_sanitize_abi_effects(self, items: _ItemList) -> None:
+        for index, item in enumerate(items):
+            sanitized = self._sanitize_node_abi_effects(item)
+            if sanitized is not item:
+                items.replace_slice(index, index + 1, [sanitized])
+
+    def _sanitize_node_abi_effects(self, node: object) -> object:
+        effects = getattr(node, "abi_effects", None)
+        if effects is None:
+            return node
+        sanitized = self._sanitize_abi_effects(effects)
+        if sanitized == effects:
+            return node
+        try:
+            updated = replace(node, abi_effects=sanitized)
+        except TypeError:
+            return node
+        self._transfer_ssa(node, updated)
+        return updated
+
     def _pass_enforce_abi_contracts(self, items: _ItemList) -> None:
         index = 0
+        pending_return_mask: Optional[int] = None
         while index < len(items):
             item = items[index]
+            if isinstance(item, IRCallCleanup):
+                mask = self._extract_cleanup_mask(item.steps)
+                if mask is not None:
+                    pending_return_mask = mask
+                index += 1
+                continue
             if isinstance(item, IRReturn):
+                if not item.varargs and item.mask is None and pending_return_mask is not None:
+                    abi_effects = self._merge_return_mask_effects(
+                        item.abi_effects, pending_return_mask
+                    )
+                    if abi_effects != item.abi_effects:
+                        updated = IRReturn(
+                            values=item.values,
+                            varargs=item.varargs,
+                            cleanup=item.cleanup,
+                            abi_effects=abi_effects,
+                        )
+                        self._transfer_ssa(item, updated)
+                        items.replace_slice(index, index + 1, [updated])
+                        item = updated
                 updated_return = self._finalise_return_node(item)
                 if updated_return is not item:
                     items.replace_slice(index, index + 1, [updated_return])
                     item = updated_return
+                mask = item.mask
+                if mask is not None:
+                    pending_return_mask = mask
+                index += 1
+                continue
             if isinstance(item, CallLike):
                 updated_call = self._finalise_call_node(item)
                 if updated_call is not item:
                     items.replace_slice(index, index + 1, [updated_call])
+                index += 1
+                continue
             index += 1
 
     def _record_dispatch_hint(
@@ -5451,10 +5500,16 @@ class IRNormalizer:
     def _enforce_return_mask(self, node: IRReturn) -> IRReturn:
         mask = node.mask
         width = self._return_mask_width(mask)
-        if width is None or node.varargs or len(node.values) <= width:
+        if width is None or node.varargs:
             return node
 
-        trimmed = node.values[:width]
+        if len(node.values) == width:
+            return node
+
+        if len(node.values) > width:
+            trimmed = node.values[:width]
+        else:
+            trimmed = self._coerce_return_tokens(node.values, width)
         updated = IRReturn(
             values=trimmed,
             varargs=node.varargs,
@@ -6118,11 +6173,34 @@ class IRNormalizer:
         alias = OPERAND_ALIASES.get(canonical)
         return (IRAbiEffect(kind="return_mask", operand=canonical, alias=alias),)
 
+    def _sanitize_return_mask_effect(
+        self, effect: IRAbiEffect
+    ) -> Optional[IRAbiEffect]:
+        canonical = self._canonical_return_mask(effect.operand)
+        if canonical is None:
+            return None
+        alias = OPERAND_ALIASES.get(canonical)
+        return IRAbiEffect(kind="return_mask", operand=canonical, alias=alias)
+
+    def _sanitize_abi_effects(
+        self, effects: Sequence[IRAbiEffect]
+    ) -> Tuple[IRAbiEffect, ...]:
+        sanitized: List[IRAbiEffect] = []
+        for effect in effects:
+            if effect.kind != "return_mask":
+                sanitized.append(effect)
+                continue
+            sanitized_effect = self._sanitize_return_mask_effect(effect)
+            if sanitized_effect is not None:
+                sanitized.append(sanitized_effect)
+        return tuple(sanitized)
+
     def _merge_return_mask_effects(
         self, effects: Sequence[IRAbiEffect], mask: Optional[int]
     ) -> Tuple[IRAbiEffect, ...]:
         base = tuple(effect for effect in effects if effect.kind != "return_mask")
-        return base + self._return_mask_effect(mask)
+        merged = base + self._return_mask_effect(mask)
+        return self._sanitize_abi_effects(merged)
 
     def _rewrite_cleanup_return_mask(
         self, steps: Tuple[IRStackEffect, ...], mask: Optional[int]

@@ -2088,6 +2088,50 @@ def test_return_cleanup_discards_overwritten_return_masks() -> None:
     assert node.cleanup == (final,)
 
 
+def test_sanitize_chatout_return_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    effect = IRAbiEffect(kind="return_mask", operand=IO_SLOT, alias=IO_PORT_NAME)
+    call = IRCall(target=0x1234, args=(), abi_effects=(effect,))
+    items = _ItemList([call])
+
+    normalizer._pass_sanitize_abi_effects(items)
+
+    updated_call = items[0]
+    assert isinstance(updated_call, IRCall)
+    assert updated_call.abi_effects == tuple()
+
+
+def test_pending_return_mask_extends_subsequent_returns(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    mask_step = IRStackEffect(
+        mnemonic="epilogue", operand=0x00FF, category="frame.return_mask"
+    )
+    cleanup = IRCallCleanup(steps=(mask_step,))
+    first_return = IRReturn(
+        values=tuple(f"ret{i}" for i in range(8)), cleanup=tuple(), abi_effects=tuple()
+    )
+    second_return = IRReturn(values=("ret0", "ret1"), cleanup=tuple(), abi_effects=tuple())
+
+    items = _ItemList([cleanup, first_return, second_return])
+
+    normalizer._pass_sanitize_abi_effects(items)
+    normalizer._pass_enforce_abi_contracts(items)
+
+    updated_first = items[1]
+    updated_second = items[2]
+
+    assert isinstance(updated_first, IRReturn)
+    assert isinstance(updated_second, IRReturn)
+    assert updated_first.mask == 0x00FF
+    assert updated_second.mask == 0x00FF
+    assert len(updated_second.values) == 8
+    assert updated_second.values == tuple(f"ret{i}" for i in range(8))
+
+
 def test_tailcall_description_avoids_nested_abi() -> None:
     effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
     call = IRCall(target=0x1234, args=(), tail=True, abi_effects=(effect,))
