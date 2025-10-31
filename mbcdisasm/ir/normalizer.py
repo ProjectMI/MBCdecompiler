@@ -738,6 +738,8 @@ class IRNormalizer:
             metrics.observe(block_metrics)
             self._update_tail_helper_hints(block)
 
+        blocks = self._propagate_return_masks(segment.index, blocks)
+
         return IRSegment(
             index=segment.index,
             start=segment.start,
@@ -1052,6 +1054,7 @@ class IRNormalizer:
         self._pass_ascii_preamble(items)
         self._collapse_call_wrapper_sequences(items)
         self._pass_call_preparation(items)
+        self._pass_fix_call_preparation_order(items)
         self._pass_call_cleanup(items)
         self._pass_orphan_cleanup_sequences(items)
         self._pass_io_operations(items)
@@ -1151,6 +1154,8 @@ class IRNormalizer:
                     if preserved:
                         nodes.append(IRCallCleanup(steps=preserved))
                 nodes.append(item)
+
+        self._finalise_call_preparation_nodes(nodes)
 
         ir_block = IRBlock(
             label=f"block_{block.index}",
@@ -2135,6 +2140,85 @@ class IRNormalizer:
                 continue
 
             index += 1
+
+    def _pass_fix_call_preparation_order(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            call = items[index]
+            if not isinstance(call, IRCall):
+                index += 1
+                continue
+
+            convention = call.convention
+            if convention is None:
+                index += 1
+                continue
+
+            scan = index + 1
+            target_index: Optional[int] = None
+
+            while scan < len(items):
+                candidate = items[scan]
+                if isinstance(candidate, IRCallPreparation):
+                    if any(
+                        step[0] == convention.mnemonic
+                        and step[1] == convention.operand
+                        for step in candidate.steps
+                    ):
+                        target_index = scan
+                    break
+
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                    scan += 1
+                    continue
+
+                break
+
+            if target_index is not None:
+                prep = items.pop(target_index)
+                assert isinstance(prep, IRCallPreparation)
+                call_node = items.pop(index)
+                assert isinstance(call_node, IRCall)
+                items.insert(index, prep)
+                items.insert(index + 1, call_node)
+                index += 2
+                continue
+
+            index += 1
+
+    @staticmethod
+    def _finalise_call_preparation_nodes(nodes: List[IRNode]) -> None:
+        index = 0
+        while index < len(nodes):
+            call = nodes[index]
+            if not isinstance(call, IRCall):
+                index += 1
+                continue
+
+            convention = call.convention
+            if convention is None:
+                index += 1
+                continue
+
+            scan = index + 1
+            moved = False
+            while scan < len(nodes):
+                candidate = nodes[scan]
+                if isinstance(candidate, IRCallPreparation):
+                    nodes.pop(scan)
+                    nodes.insert(index, candidate)
+                    index += 2
+                    moved = True
+                    break
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                    scan += 1
+                    continue
+                break
+
+            if not moved:
+                index += 1
+
+        return None
 
     def _pass_call_cleanup(self, items: _ItemList) -> None:
         index = 0
@@ -3642,6 +3726,82 @@ class IRNormalizer:
                 index += 1
                 continue
             index += 1
+
+    def _propagate_return_masks(
+        self, segment_index: int, blocks: Sequence[IRBlock]
+    ) -> List[IRBlock]:
+        if not blocks:
+            return list(blocks)
+
+        function_masks: Dict[Tuple[int, str], int] = {}
+        block_functions: List[Tuple[int, str]] = []
+        current_function: Optional[Tuple[int, str]] = None
+        auto_counter = 0
+
+        for block in blocks:
+            if any(isinstance(node, IRFunctionPrologue) for node in block.nodes):
+                current_function = (segment_index, f"prologue_{block.start_offset:04X}")
+            elif current_function is None:
+                current_function = (segment_index, f"auto_{auto_counter}")
+                auto_counter += 1
+
+            assert current_function is not None
+            block_functions.append(current_function)
+
+            mask = self._block_return_mask(block)
+            if mask is not None:
+                function_masks[current_function] = mask
+
+        updated_blocks: List[IRBlock] = []
+        for block, function_id in zip(blocks, block_functions):
+            mask = function_masks.get(function_id)
+            if mask is None:
+                updated_blocks.append(block)
+                continue
+
+            updated_blocks.append(self._apply_function_return_mask(block, mask))
+
+        return updated_blocks
+
+    @staticmethod
+    def _block_return_mask(block: IRBlock) -> Optional[int]:
+        mask: Optional[int] = None
+        for node in block.nodes:
+            if isinstance(node, IRReturn) and not node.varargs and node.mask is not None:
+                if mask is None:
+                    mask = node.mask
+                elif mask != node.mask:
+                    mask = node.mask
+        return mask
+
+    def _apply_function_return_mask(self, block: IRBlock, mask: int) -> IRBlock:
+        updated_nodes: List[IRNode] = []
+        changed = False
+
+        for node in block.nodes:
+            if isinstance(node, IRReturn) and not node.varargs and node.mask is None:
+                abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
+                updated = IRReturn(
+                    values=node.values,
+                    varargs=node.varargs,
+                    cleanup=node.cleanup,
+                    abi_effects=abi_effects,
+                )
+                updated = self._enforce_return_mask(updated)
+                updated_nodes.append(updated)
+                changed = True
+                continue
+            updated_nodes.append(node)
+
+        if not changed:
+            return block
+
+        return IRBlock(
+            label=block.label,
+            start_offset=block.start_offset,
+            nodes=tuple(updated_nodes),
+            annotations=block.annotations,
+        )
 
     def _record_dispatch_hint(
         self, items: _ItemList, index: int, branch: IRTestSetBranch

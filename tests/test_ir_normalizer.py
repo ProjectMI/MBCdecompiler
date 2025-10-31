@@ -2132,6 +2132,54 @@ def test_pending_return_mask_extends_subsequent_returns(tmp_path: Path) -> None:
     assert updated_second.values == tuple(f"ret{i}" for i in range(8))
 
 
+def test_function_mask_propagation_across_blocks(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    words = [
+        build_word(0, 0x30, 0x00, 0x0003),  # return without mask
+        build_word(4, 0x29, 0x10, RET_MASK),  # cleanup return mask
+        build_word(8, 0x30, 0x00, 0x0001),  # return that advertises the mask
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = normalizer.normalise_container(container)
+    blocks = program.segments[0].blocks
+
+    first_return = blocks[0].nodes[-1]
+    second_return = blocks[1].nodes[-1]
+
+    assert isinstance(first_return, IRReturn)
+    assert isinstance(second_return, IRReturn)
+    assert first_return.mask == RET_MASK
+    assert len(first_return.values) == RET_MASK.bit_count()
+    assert second_return.mask == RET_MASK
+
+
+def test_reorders_trailing_call_preparation(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    convention = IRStackEffect(
+        mnemonic="stack_shuffle",
+        operand=CALL_SHUFFLE_STANDARD,
+        pops=0,
+        operand_alias="CALL_SHUFFLE_STD",
+    )
+    call = IRCall(target=0x1234, args=(), tail=True, convention=convention)
+    preparation = IRCallPreparation(steps=(("stack_shuffle", CALL_SHUFFLE_STANDARD),))
+    items = _ItemList([call, preparation])
+
+    normalizer._pass_fix_call_preparation_order(items)
+
+    assert isinstance(items[0], IRCallPreparation)
+    assert isinstance(items[1], IRCall)
+
+
 def test_tailcall_description_avoids_nested_abi() -> None:
     effect = IRAbiEffect(kind="return_mask", operand=RET_MASK, alias="RET_MASK")
     call = IRCall(target=0x1234, args=(), tail=True, abi_effects=(effect,))
