@@ -81,6 +81,7 @@ from .model import (
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
+    _stack_effect_from_pair,
 )
 
 
@@ -3581,17 +3582,57 @@ class IRNormalizer:
 
     def _pass_enforce_abi_contracts(self, items: _ItemList) -> None:
         index = 0
+        pending_return_mask: Optional[int] = None
         while index < len(items):
             item = items[index]
+            if isinstance(item, IRCallCleanup):
+                mask = self._extract_cleanup_mask(item.steps)
+                if mask is not None:
+                    pending_return_mask = mask
+            elif isinstance(item, IRCallPreparation):
+                prep_effects = tuple(
+                    _stack_effect_from_pair(mnemonic, operand)
+                    for mnemonic, operand in item.steps
+                )
+                mask = self._extract_cleanup_mask(prep_effects)
+                if mask is not None:
+                    pending_return_mask = mask
+            call_mask: Optional[int] = None
+            if isinstance(item, (IRCall, IRTailCall)):
+                call_mask = self._call_like_cleanup_mask(item)
+                if call_mask is None:
+                    call_mask = self._abi_return_mask(getattr(item, "abi_effects", tuple()))
+            if isinstance(item, IRReturn):
+                if (
+                    pending_return_mask is not None
+                    and self._abi_return_mask(item.abi_effects) is None
+                ):
+                    augmented = IRReturn(
+                        values=item.values,
+                        varargs=item.varargs,
+                        cleanup=item.cleanup,
+                        abi_effects=self._merge_return_mask_effects(
+                            item.abi_effects, pending_return_mask
+                        ),
+                    )
+                    self._transfer_ssa(item, augmented)
+                    items.replace_slice(index, index + 1, [augmented])
+                    item = augmented
             if isinstance(item, IRReturn):
                 updated_return = self._finalise_return_node(item)
                 if updated_return is not item:
                     items.replace_slice(index, index + 1, [updated_return])
                     item = updated_return
+                pending_return_mask = None
             if isinstance(item, CallLike):
                 updated_call = self._finalise_call_node(item)
                 if updated_call is not item:
                     items.replace_slice(index, index + 1, [updated_call])
+                    item = updated_call
+                if call_mask is not None:
+                    pending_return_mask = call_mask
+            elif call_mask is not None:
+                pending_return_mask = call_mask
             index += 1
 
     def _record_dispatch_hint(
@@ -4007,7 +4048,9 @@ class IRNormalizer:
                 values=returns_node.values,
                 varargs=returns_node.varargs,
                 cleanup=tuple(cleanup_chain),
-                abi_effects=returns_node.abi_effects,
+                abi_effects=self._merge_return_mask_effects(
+                    returns_node.abi_effects, cleanup_mask
+                ),
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
