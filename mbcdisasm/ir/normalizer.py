@@ -128,6 +128,7 @@ CALL_CLEANUP_MNEMONICS = {
     "op_01_2C",
     "op_01_2E",
     "op_01_6C",
+    "op_01_A8",
     "op_05_00",
     "op_10_0E",
     "op_10_12",

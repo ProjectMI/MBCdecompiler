@@ -357,6 +357,17 @@
       "01:00"
     ]
   },
+  "op_01_A8": {
+    "summary": "Frame meta update helper for scheduler registers",
+    "category": "frame.effect",
+    "stack_delta": 0,
+    "opcodes": [
+      "01:A8"
+    ],
+    "operand_aliases": {
+      "0x1400": "FRAME_META_1400"
+    }
+  },
   "unclassified": {
     "opcodes": []
   },
