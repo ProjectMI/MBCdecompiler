@@ -325,6 +325,7 @@
   "stack_teardown_1": {
     "control_flow": "fallthrough",
     "summary": "Очистка одного элемента стека",
+    "stack_pop": 1,
     "opcodes": [
       "01:236"
     ]
@@ -332,6 +333,7 @@
   "stack_teardown_2": {
     "control_flow": "fallthrough",
     "summary": "Очистка двух элементов стека",
+    "stack_pop": 2,
     "opcodes": [
       "01:8"
     ]
@@ -339,6 +341,7 @@
   "stack_teardown_3": {
     "control_flow": "fallthrough",
     "summary": "Очистка трёх элементов стека",
+    "stack_pop": 3,
     "opcodes": [
       "01:241"
     ]
@@ -346,6 +349,7 @@
   "stack_teardown_4": {
     "control_flow": "fallthrough",
     "summary": "Очистка четырёх элементов стека",
+    "stack_pop": 4,
     "opcodes": [
       "01:240"
     ]
@@ -353,6 +357,7 @@
   "stack_teardown_5": {
     "control_flow": "fallthrough",
     "summary": "Очистка пяти элементов стека",
+    "stack_pop": 5,
     "opcodes": [
       "01:00"
     ]
