@@ -157,12 +157,18 @@ def epilogue_step_kind(
 ) -> str:
     """Return a coarse classification for the cleanup stack effect."""
 
-    direct = DIRECT_EPILOGUE_KIND_MAP.get(mnemonic)
-    if direct is not None:
-        return direct
-
     alias_text = alias if alias is not None else None
     alias_upper = alias_text.upper() if alias_text else ""
+
+    direct = DIRECT_EPILOGUE_KIND_MAP.get(mnemonic)
+    if direct is not None:
+        if direct == "io.handshake":
+            if (
+                (operand is not None and operand in MASK_OPERANDS)
+                or alias_upper in MASK_ALIAS_HINTS
+            ):
+                return "frame.return_mask"
+        return direct
 
     if mnemonic in MASK_STEP_MNEMONICS:
         return "frame.return_mask"

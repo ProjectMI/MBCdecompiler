@@ -3584,6 +3584,11 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             if isinstance(item, IRReturn):
+                inherited, new_index = self._inherit_return_mask_from_cleanup(items, index, item)
+                if inherited is not item:
+                    items.replace_slice(index, index + 1, [inherited])
+                    item = inherited
+                index = new_index
                 updated_return = self._finalise_return_node(item)
                 if updated_return is not item:
                     items.replace_slice(index, index + 1, [updated_return])
@@ -3593,6 +3598,47 @@ class IRNormalizer:
                 if updated_call is not item:
                     items.replace_slice(index, index + 1, [updated_call])
             index += 1
+
+    def _inherit_return_mask_from_cleanup(
+        self, items: _ItemList, index: int, node: IRReturn
+    ) -> Tuple[IRReturn, int]:
+        if node.mask is not None:
+            return node, index
+
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, IRCallCleanup):
+                mask = self._extract_cleanup_mask(candidate.steps, include_optional=False)
+                if mask is None:
+                    scan -= 1
+                    continue
+
+                cleaned_steps = tuple(
+                    step for step in candidate.steps if step.category != "frame.return_mask"
+                )
+                if cleaned_steps != candidate.steps:
+                    replacement: List[IRCallCleanup] = []
+                    if cleaned_steps:
+                        replacement = [IRCallCleanup(steps=cleaned_steps)]
+                    items.replace_slice(scan, scan + 1, replacement)
+                    if not replacement:
+                        index -= 1
+
+                merged = IRReturn(
+                    values=node.values,
+                    varargs=node.varargs,
+                    cleanup=node.cleanup,
+                    abi_effects=self._merge_return_mask_effects(node.abi_effects, mask),
+                )
+                self._transfer_ssa(node, merged)
+                return merged, index
+            if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                scan -= 1
+                continue
+            break
+
+        return node, index
 
     def _record_dispatch_hint(
         self, items: _ItemList, index: int, branch: IRTestSetBranch
@@ -6135,6 +6181,17 @@ class IRNormalizer:
                 changed = True
             else:
                 updated.append(step)
+        mask_indices = [
+            idx for idx, step in enumerate(updated) if step.category == "frame.return_mask"
+        ]
+        if len(mask_indices) > 1:
+            keep_index = mask_indices[-1]
+            updated = [
+                step
+                for idx, step in enumerate(updated)
+                if step.category != "frame.return_mask" or idx == keep_index
+            ]
+            changed = True
         if not changed:
             return steps
         return tuple(updated)
