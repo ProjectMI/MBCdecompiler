@@ -195,6 +195,50 @@ def test_vararg_return_remains_packed_despite_depth() -> None:
     assert items[1].values == ("ret*",)
 
 
+def test_formatter_tailcall_demoted_when_followed_by_work() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    call = IRCall(
+        target=0x01F1,
+        args=tuple(),
+        tail=True,
+        cleanup=tuple(),
+        symbol="fmt.dispatch_commit",
+    )
+    literal = IRLiteral(value=0, mode=0, source="push_literal")
+
+    items = _ItemList([call, literal])
+
+    normalizer._pass_demote_formatter_tailcalls(items)
+
+    updated = items[0]
+    assert isinstance(updated, IRCall)
+    assert not updated.tail
+
+
+def test_formatter_tailcall_preserved_when_followed_by_return() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    call = IRCall(
+        target=0x003E,
+        args=tuple(),
+        tail=True,
+        cleanup=tuple(),
+        symbol="fmt.aggregate_flush",
+    )
+    return_node = IRReturn(values=tuple(), varargs=False)
+
+    items = _ItemList([call, return_node])
+
+    normalizer._pass_demote_formatter_tailcalls(items)
+
+    preserved = items[0]
+    assert isinstance(preserved, IRCall)
+    assert preserved.tail
+
+
 def write_manual(path: Path) -> KnowledgeBase:
     manual = {
         "push_literal": {

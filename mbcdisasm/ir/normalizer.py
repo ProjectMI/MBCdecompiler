@@ -245,6 +245,10 @@ TAIL_HELPER_ALIASES = {
 }
 
 
+FORMATTER_TAILCALL_TARGETS = {0x003E, 0x01F1}
+FORMATTER_TAILCALL_SYMBOLS = {"fmt.aggregate_flush", "fmt.dispatch_commit"}
+
+
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
     0x6704: "literal_hint",
@@ -1057,6 +1061,7 @@ class IRNormalizer:
         self._pass_io_operations(items)
         self._pass_io_facade(items)
         self._pass_call_conventions(items)
+        self._pass_demote_formatter_tailcalls(items)
         self._pass_tailcall_frames(items)
         self._pass_opcode_tables(items)
         self._pass_table_patches(items)
@@ -2716,6 +2721,39 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [updated])
             index += 1
 
+    def _pass_demote_formatter_tailcalls(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRCall) or not item.tail:
+                index += 1
+                continue
+
+            symbol = item.symbol
+            target = item.target
+            if symbol not in FORMATTER_TAILCALL_SYMBOLS and target not in FORMATTER_TAILCALL_TARGETS:
+                index += 1
+                continue
+
+            if not self._call_has_followup_instruction(items, index):
+                index += 1
+                continue
+
+            updated = IRCall(
+                target=item.target,
+                args=item.args,
+                tail=False,
+                arity=item.arity,
+                convention=item.convention,
+                cleanup=item.cleanup,
+                symbol=item.symbol,
+                predicate=item.predicate,
+                abi_effects=item.abi_effects,
+            )
+            self._transfer_ssa(item, updated)
+            items.replace_slice(index, index + 1, [updated])
+            index += 1
+
     def _pass_tailcall_frames(self, items: _ItemList) -> None:
         index = 0
         while index < len(items):
@@ -4166,6 +4204,27 @@ class IRNormalizer:
                 continue
             return isinstance(candidate, IRReturn)
         return False
+
+    def _call_has_followup_instruction(self, items: _ItemList, index: int) -> bool:
+        pos = index + 1
+        while pos < len(items):
+            candidate = items[pos]
+            if isinstance(candidate, (IRCallCleanup, IRConditionMask, IRCallPreparation, IRTailcallFrame)):
+                pos += 1
+                continue
+            if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                pos += 1
+                continue
+            break
+
+        if pos >= len(items):
+            return False
+
+        candidate = items[pos]
+        if isinstance(candidate, (IRReturn, IRTailcallReturn, IRTailCall, IRTerminator)):
+            return False
+
+        return True
 
     def _attach_tail_helper_cleanup(
         self, items: _ItemList, index: int, effect: IRStackEffect
