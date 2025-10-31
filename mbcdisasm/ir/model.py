@@ -403,6 +403,7 @@ class IRReturn(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     abi_effects: Tuple[IRAbiEffect, ...] = field(default_factory=tuple)
+    declared_width: Optional[int] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))

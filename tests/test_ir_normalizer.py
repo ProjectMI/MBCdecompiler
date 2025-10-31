@@ -1398,6 +1398,45 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_call_preparation_after_call_is_hoisted(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    call = IRCall(target=0x1234, args=tuple(), symbol="helper")
+    literal = IRLiteral(value=0x0002, mode=0, source="push_literal")
+    trailing = IRCallPreparation(steps=(("stack_shuffle", CALL_SHUFFLE_STANDARD),))
+
+    items = _ItemList([call, literal, trailing])
+    normalizer._pass_call_preparation(items)
+
+    sequence = list(items)
+    call_index = next(idx for idx, node in enumerate(sequence) if isinstance(node, IRCall))
+
+    assert call_index > 0
+    assert isinstance(sequence[call_index - 1], IRCallPreparation)
+    assert not any(
+        isinstance(node, IRCallPreparation) for node in sequence[call_index + 1 :]
+    )
+
+
+def test_call_preparation_with_literal_chunks_is_hoisted(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    call = IRCall(target=0x3032, args=tuple(), tail=True)
+    first = IRLiteralChunk(data=b"", source="", symbol="str_a")
+    second = IRLiteralChunk(data=b"", source="", symbol="str_b")
+    trailing = IRCallPreparation(steps=(("frame.write", 0x4B08),))
+
+    items = _ItemList([call, first, second, trailing])
+    normalizer._pass_hoist_trailing_call_preparations(items)
+
+    sequence = list(items)
+    assert isinstance(sequence[0], IRCallPreparation)
+    assert isinstance(sequence[1], IRCall)
+    assert not any(isinstance(node, IRCallPreparation) for node in sequence[2:])
+
+
 def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
@@ -2086,6 +2125,54 @@ def test_return_cleanup_discards_overwritten_return_masks() -> None:
     node = IRReturn(values=(), cleanup=(initial, final))
 
     assert node.cleanup == (final,)
+
+
+def test_return_mask_conflict_preserves_declared_width(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x32, 0x29, 0x1000),
+        build_word(4, 0x30, 0x00, 0x000C),
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    ret = block.nodes[0]
+    assert isinstance(ret, IRReturn)
+    assert len(ret.values) == 12
+    assert ret.mask is None
+    assert ret.declared_width == 12
+    assert any(step.category == "frame.return_mask" for step in ret.cleanup)
+
+
+def test_return_cleanup_mask_removed_when_return_strips_effect(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="op_B9_0B",
+                operand=RET_MASK,
+                category="frame.return_mask",
+            ),
+        )
+    )
+    ret = IRReturn(values=("ret0", "ret1"))
+
+    items = _ItemList([cleanup, ret])
+    normalizer._pass_enforce_abi_contracts(items)
+
+    sequence = list(items)
+    assert len(sequence) == 1
+    assert isinstance(sequence[0], IRReturn)
 
 
 def test_sanitize_chatout_return_mask(tmp_path: Path) -> None:

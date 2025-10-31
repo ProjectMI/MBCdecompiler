@@ -1086,6 +1086,7 @@ class IRNormalizer:
         self._pass_resolve_dispatch_indices(items)
         self._pass_sanitize_abi_effects(items)
         self._pass_enforce_abi_contracts(items)
+        self._pass_hoist_trailing_call_preparations(items)
 
         final_items = list(items)
         final_wrapper = _ItemList(final_items)
@@ -1550,11 +1551,15 @@ class IRNormalizer:
                 continue
 
             if mnemonic == "return_values":
-                count, varargs = self._resolve_return_signature(items, index)
+                count, varargs, declared = self._resolve_return_signature(items, index)
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
-                items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
+                items.replace_slice(
+                    index,
+                    index + 1,
+                    [IRReturn(values=values, varargs=varargs, declared_width=declared)],
+                )
                 metrics.returns += 1
                 continue
 
@@ -1732,14 +1737,21 @@ class IRNormalizer:
         while index < len(items):
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
-                count, varargs = self._resolve_return_signature(items, index)
+                count, varargs, declared = self._resolve_return_signature(items, index)
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
                 items.replace_slice(
                     index,
                     index + 1,
-                    [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
+                    [
+                        IRReturn(
+                            values=values,
+                            varargs=varargs,
+                            cleanup=tuple(collected_cleanup),
+                            declared_width=declared,
+                        )
+                    ],
                 )
                 metrics.returns += 1
                 return
@@ -1753,7 +1765,9 @@ class IRNormalizer:
                 continue
             break
 
-    def _resolve_return_signature(self, items: _ItemList, index: int) -> Tuple[int, bool]:
+    def _resolve_return_signature(
+        self, items: _ItemList, index: int
+    ) -> Tuple[int, bool, Optional[int]]:
         instruction = items[index]
         assert isinstance(instruction, RawInstruction)
 
@@ -1765,10 +1779,12 @@ class IRNormalizer:
 
         count: Optional[int] = None
         varargs = False
+        declared: Optional[int] = None
 
         if mode in RETURN_NIBBLE_MODES:
             if nibble:
                 count = nibble
+                declared = count
             else:
                 hint = self._stack_teardown_hint(items, index)
                 if hint is not None:
@@ -1777,6 +1793,7 @@ class IRNormalizer:
                     base = hi & 0x1F
                     if base:
                         count = base
+                        declared = count
                     else:
                         count = 0
                         varargs = True
@@ -1786,12 +1803,16 @@ class IRNormalizer:
                     narrowed = lo & 0x0F
                     if narrowed:
                         count = narrowed
+                        declared = count
                     else:
                         count = lo
+                        declared = count
                 else:
                     count = lo
+                    declared = count
             elif hi:
                 count = hi
+                declared = count
             else:
                 hint = self._stack_teardown_hint(items, index)
                 if hint is not None:
@@ -1803,8 +1824,12 @@ class IRNormalizer:
         if depth and not varargs:
             if not count or count > depth:
                 count = depth
+                declared = None
 
-        return count or 0, varargs
+        if varargs:
+            declared = None
+
+        return count or 0, varargs, declared
 
     def _stack_teardown_hint(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
@@ -2114,27 +2139,123 @@ class IRNormalizer:
 
             start = index
             steps: List[Tuple[str, int]] = []
+            prefix_sources: List[Union[IRCallPreparation, RawInstruction]] = []
             scan = index - 1
             while scan >= 0:
                 candidate = items[scan]
                 if isinstance(candidate, IRCallPreparation):
                     steps = list(candidate.steps) + steps
+                    prefix_sources.append(candidate)
                     start = scan
                     break
                 if isinstance(candidate, RawInstruction):
                     if self._is_call_preparation_instruction(candidate):
                         steps.insert(0, self._call_preparation_step(candidate))
+                        prefix_sources.append(candidate)
                         start = scan
+                        scan -= 1
+                        continue
+                    if self._is_annotation_only(candidate):
                         scan -= 1
                         continue
                 break
 
+            trailing_steps: List[Tuple[str, int]] = []
+            trailing_sources: List[IRCallPreparation] = []
+            forward = index + 1
+            lookahead = 0
+            while forward < len(items) and lookahead < 8:
+                candidate = items[forward]
+                if isinstance(candidate, IRCallPreparation):
+                    trailing_steps.extend(candidate.steps)
+                    trailing_sources.append(candidate)
+                    items.pop(forward)
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                    forward += 1
+                    lookahead += 1
+                    continue
+                if isinstance(
+                    candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)
+                ):
+                    forward += 1
+                    lookahead += 1
+                    continue
+                break
+
+            if trailing_steps:
+                if not steps:
+                    start = index
+                steps.extend(trailing_steps)
+
             if steps:
-                items.replace_slice(start, index, [IRCallPreparation(steps=tuple(steps))])
+                node = IRCallPreparation(steps=tuple(steps))
+                for source in prefix_sources:
+                    self._transfer_ssa(source, node)
+                for source in trailing_sources:
+                    self._transfer_ssa(source, node)
+                items.replace_slice(start, index, [node])
                 index = start + 2
                 continue
 
             index += 1
+
+    def _pass_hoist_trailing_call_preparations(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, CallLike):
+                index += 1
+                continue
+
+            trailing: List[IRCallPreparation] = []
+            scan = index + 1
+            lookahead = 0
+            while scan < len(items) and lookahead < 8:
+                candidate = items[scan]
+                if isinstance(candidate, IRCallPreparation):
+                    trailing.append(candidate)
+                    items.pop(scan)
+                    continue
+                if isinstance(candidate, RawInstruction) and self._is_annotation_only(candidate):
+                    scan += 1
+                    lookahead += 1
+                    continue
+                if isinstance(candidate, (IRLiteral, IRLiteralChunk, IRStringConstant)):
+                    scan += 1
+                    lookahead += 1
+                    continue
+                break
+
+            if not trailing:
+                index += 1
+                continue
+
+            prefix_index = index - 1
+            prefix_node: Optional[IRCallPreparation] = None
+            steps: List[Tuple[str, int]] = []
+
+            if 0 <= prefix_index < len(items) and isinstance(items[prefix_index], IRCallPreparation):
+                prefix_node = cast(IRCallPreparation, items[prefix_index])
+                steps.extend(prefix_node.steps)
+                items.pop(prefix_index)
+                index -= 1
+
+            for node in trailing:
+                steps.extend(node.steps)
+
+            if not steps:
+                index += 1
+                continue
+
+            merged = IRCallPreparation(steps=tuple(steps))
+            if prefix_node is not None:
+                self._transfer_ssa(prefix_node, merged)
+            for node in trailing:
+                self._transfer_ssa(node, merged)
+
+            items.insert(index, merged)
+            index += 2
 
     def _pass_call_cleanup(self, items: _ItemList) -> None:
         index = 0
@@ -2220,6 +2341,7 @@ class IRNormalizer:
                     abi_effects=self._merge_return_mask_effects(
                         return_node.abi_effects, mask
                     ),
+                    declared_width=return_node.declared_width,
                 )
                 self._transfer_ssa(return_node, updated)
                 removed = end - start
@@ -3603,12 +3725,14 @@ class IRNormalizer:
     def _pass_enforce_abi_contracts(self, items: _ItemList) -> None:
         index = 0
         pending_return_mask: Optional[int] = None
+        pending_mask_source: Optional[int] = None
         while index < len(items):
             item = items[index]
             if isinstance(item, IRCallCleanup):
                 mask = self._extract_cleanup_mask(item.steps)
                 if mask is not None:
                     pending_return_mask = mask
+                    pending_mask_source = index
                 index += 1
                 continue
             if isinstance(item, IRReturn):
@@ -3622,17 +3746,74 @@ class IRNormalizer:
                             varargs=item.varargs,
                             cleanup=item.cleanup,
                             abi_effects=abi_effects,
+                            declared_width=item.declared_width,
                         )
                         self._transfer_ssa(item, updated)
                         items.replace_slice(index, index + 1, [updated])
                         item = updated
                 updated_return = self._finalise_return_node(item)
+                if (
+                    updated_return.mask is not None
+                    and updated_return.mask == RET_MASK
+                    and updated_return.declared_width is None
+                    and not any(
+                        getattr(step, "category", None) == "frame.return_mask"
+                        for step in updated_return.cleanup
+                    )
+                ):
+                    stripped = IRReturn(
+                        values=updated_return.values,
+                        varargs=updated_return.varargs,
+                        cleanup=updated_return.cleanup,
+                        abi_effects=tuple(
+                            effect
+                            for effect in updated_return.abi_effects
+                            if effect.kind != "return_mask"
+                        ),
+                        declared_width=updated_return.declared_width,
+                    )
+                    self._transfer_ssa(updated_return, stripped)
+                    items.replace_slice(index, index + 1, [stripped])
+                    updated_return = stripped
+                if (
+                    pending_return_mask is not None
+                    and updated_return.mask is None
+                    and pending_mask_source is not None
+                    and 0 <= pending_mask_source < len(items)
+                ):
+                    cleanup_node = items[pending_mask_source]
+                    if isinstance(cleanup_node, IRCallCleanup):
+                        preserved_steps = tuple(
+                            step
+                            for step in cleanup_node.steps
+                            if getattr(step, "category", None) != "frame.return_mask"
+                        )
+                        if preserved_steps != cleanup_node.steps:
+                            if preserved_steps:
+                                replacement = IRCallCleanup(steps=preserved_steps)
+                                self._transfer_ssa(cleanup_node, replacement)
+                                items.replace_slice(
+                                    pending_mask_source, pending_mask_source + 1, [replacement]
+                                )
+                                if pending_mask_source < index:
+                                    index -= 1
+                            else:
+                                self._ssa_bindings.pop(id(cleanup_node), None)
+                                items.pop(pending_mask_source)
+                                if pending_mask_source < index:
+                                    index -= 1
+                        pending_mask_source = None
+                        pending_return_mask = None
                 if updated_return is not item:
                     items.replace_slice(index, index + 1, [updated_return])
                     item = updated_return
                 mask = item.mask
                 if mask is not None:
                     pending_return_mask = mask
+                    pending_mask_source = index
+                else:
+                    pending_return_mask = None
+                    pending_mask_source = None
                 index += 1
                 continue
             if isinstance(item, CallLike):
@@ -4057,6 +4238,7 @@ class IRNormalizer:
                 varargs=returns_node.varargs,
                 cleanup=tuple(cleanup_chain),
                 abi_effects=returns_node.abi_effects,
+                declared_width=returns_node.declared_width,
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
@@ -5503,6 +5685,23 @@ class IRNormalizer:
         if width is None or node.varargs:
             return node
 
+        declared = node.declared_width
+        if declared is not None and declared > width:
+            updated_effects = tuple(
+                effect for effect in node.abi_effects if effect.kind != "return_mask"
+            )
+            if updated_effects != node.abi_effects:
+                updated = IRReturn(
+                    values=node.values,
+                    varargs=node.varargs,
+                    cleanup=node.cleanup,
+                    abi_effects=updated_effects,
+                    declared_width=declared,
+                )
+                self._transfer_ssa(node, updated)
+                return updated
+            return node
+
         if len(node.values) == width:
             return node
 
@@ -5515,6 +5714,7 @@ class IRNormalizer:
             varargs=node.varargs,
             cleanup=node.cleanup,
             abi_effects=node.abi_effects,
+            declared_width=node.declared_width,
         )
         self._transfer_ssa(node, updated)
         return updated
@@ -6627,6 +6827,7 @@ class IRNormalizer:
                 varargs=target.varargs,
                 cleanup=combined,
                 abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
+                declared_width=target.declared_width,
             )
         if isinstance(target, IRTailCall):
             cleanup = list(effects) + list(target.cleanup)
