@@ -2620,8 +2620,6 @@ class IRNormalizer:
             cleanup_mask = self._extract_cleanup_mask(
                 cleanup_steps, include_optional=False
             )
-            abi_mask = self._abi_return_mask(item.abi_effects)
-
             consumed: List[int] = []
             scan = index - 1
             while scan >= 0:
@@ -2691,12 +2689,6 @@ class IRNormalizer:
                     cleanup_mask = self._extract_cleanup_mask(cleanup_steps)
                 else:
                     cleanup_mask = None
-
-            tail_mask = cleanup_mask
-            if tail_mask is None:
-                tail_mask = abi_mask
-            if not tail and tail_mask == RET_MASK:
-                tail = True
 
             updated = IRCall(
                 target=call.target,
@@ -4409,7 +4401,6 @@ class IRNormalizer:
                 cleanup_mask = self._extract_cleanup_mask(
                     cleanup_steps, include_optional=False
                 )
-                abi_mask = self._abi_return_mask(call.abi_effects)
                 base_tail = call.tail
                 consumed = 0
 
@@ -4479,11 +4470,6 @@ class IRNormalizer:
                         cleanup_mask = None
 
                 tail_hint = base_tail
-                mask_for_tail = cleanup_mask
-                if mask_for_tail is None:
-                    mask_for_tail = abi_mask
-                if mask_for_tail == RET_MASK:
-                    tail_hint = True
 
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
@@ -4510,11 +4496,6 @@ class IRNormalizer:
                         )
                     else:
                         tail = base_tail and consumed == 0 and not return_node.cleanup
-                        mask_for_tail = cleanup_mask
-                        if mask_for_tail is None:
-                            mask_for_tail = self._abi_return_mask(call.abi_effects)
-                        if not tail and mask_for_tail == RET_MASK and consumed == 0 and not return_node.cleanup:
-                            tail = True
                         node = IRCallReturn(
                             target=call.target,
                             args=call.args,
