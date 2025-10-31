@@ -38,6 +38,7 @@ from mbcdisasm.ir.model import (
     IRSwitchDispatch,
     IRDispatchCase,
     IRDispatchIndex,
+    IRSegment,
     IRTablePatch,
     IRTableBuilderBegin,
     IRTableBuilderEmit,
@@ -2690,4 +2691,45 @@ def test_normalizer_coalesces_indirect_configuration(tmp_path: Path) -> None:
         isinstance(node, IRRaw) and node.mnemonic in {"op_D4_06", "op_C8_06"}
         for node in block.nodes
     )
+
+
+def test_bank_function_teardown_symmetry() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    knowledge = KnowledgeBase.load(repo_root / "knowledge" / "manual_annotations.json")
+    container = MbcContainer.load(repo_root / "mbc" / "_bank.mbc", repo_root / "mbc" / "_bank.adb")
+    program = IRNormalizer(knowledge).normalise_container(container)
+
+    target_segment: IRSegment | None = None
+    prologue_index: int | None = None
+    for segment in program.segments:
+        for index, block in enumerate(segment.blocks):
+            for node in block.nodes:
+                if isinstance(node, IRFunctionPrologue) and node.var == "slot(0x3606)":
+                    target_segment = segment
+                    prologue_index = index
+                    break
+            if target_segment is not None:
+                break
+        if target_segment is not None:
+            break
+
+    assert target_segment is not None
+    assert prologue_index is not None
+
+    returns: list[IRReturn] = []
+    for block in target_segment.blocks[prologue_index:]:
+        for node in block.nodes:
+            if isinstance(node, IRReturn):
+                returns.append(node)
+
+    assert returns, "expected at least one return after the prologue"
+
+    for ret in returns:
+        teardown_steps = [
+            (effect.pops, effect.operand)
+            for effect in ret.cleanup
+            if effect.mnemonic == "stack_teardown"
+        ]
+        assert teardown_steps, "return missing frame teardown cleanup"
+        assert teardown_steps[0] == (5, 0x0029)
 

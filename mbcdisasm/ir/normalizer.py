@@ -739,6 +739,7 @@ class IRNormalizer:
             self._update_tail_helper_hints(block)
 
         blocks = self._propagate_return_masks(segment.index, blocks)
+        blocks = self._propagate_function_teardowns(segment.index, blocks)
 
         return IRSegment(
             index=segment.index,
@@ -3762,6 +3763,144 @@ class IRNormalizer:
             updated_blocks.append(self._apply_function_return_mask(block, mask))
 
         return updated_blocks
+
+    def _propagate_function_teardowns(
+        self, segment_index: int, blocks: Sequence[IRBlock]
+    ) -> List[IRBlock]:
+        if not blocks:
+            return list(blocks)
+
+        function_ids: List[Tuple[int, str]] = []
+        current_function: Optional[Tuple[int, str]] = None
+        auto_counter = 0
+
+        for block in blocks:
+            if any(isinstance(node, IRFunctionPrologue) for node in block.nodes):
+                current_function = (segment_index, f"prologue_{block.start_offset:04X}")
+            elif current_function is None:
+                current_function = (segment_index, f"auto_{auto_counter}")
+                auto_counter += 1
+            assert current_function is not None
+            function_ids.append(current_function)
+
+        teardown_prefix: Dict[Tuple[int, str], Tuple[IRStackEffect, ...]] = {}
+
+        for block, function_id in zip(blocks, function_ids):
+            for node in block.nodes:
+                if not isinstance(node, IRReturn):
+                    continue
+                sequence = tuple(
+                    step for step in node.cleanup if step.mnemonic == "stack_teardown"
+                )
+                if not sequence:
+                    continue
+                existing = teardown_prefix.get(function_id)
+                if existing is None:
+                    teardown_prefix[function_id] = sequence
+                else:
+                    prefix = self._teardown_common_prefix(existing, sequence)
+                    teardown_prefix[function_id] = prefix
+
+        if not teardown_prefix:
+            return list(blocks)
+
+        updated_blocks: List[IRBlock] = []
+
+        for block, function_id in zip(blocks, function_ids):
+            prefix = teardown_prefix.get(function_id)
+            if not prefix:
+                updated_blocks.append(block)
+                continue
+
+            changed = False
+            new_nodes: List[IRNode] = []
+
+            for node in block.nodes:
+                if not isinstance(node, IRReturn):
+                    new_nodes.append(node)
+                    continue
+
+                teardowns = [
+                    step for step in node.cleanup if step.mnemonic == "stack_teardown"
+                ]
+                match_len = self._teardown_prefix_length(tuple(teardowns), prefix)
+                if match_len >= len(prefix):
+                    new_nodes.append(node)
+                    continue
+
+                remainder: List[IRStackEffect] = []
+                if match_len > 0:
+                    remainder = teardowns[match_len:]
+
+                non_teardown = [
+                    step for step in node.cleanup if step.mnemonic != "stack_teardown"
+                ]
+                combined = list(prefix) + remainder + non_teardown
+                combined = self._coalesce_epilogue_steps(combined)
+                new_cleanup = tuple(combined)
+                if new_cleanup == node.cleanup:
+                    new_nodes.append(node)
+                    continue
+
+                updated = IRReturn(
+                    values=node.values,
+                    varargs=node.varargs,
+                    cleanup=new_cleanup,
+                    abi_effects=node.abi_effects,
+                )
+                self._transfer_ssa(node, updated)
+                new_nodes.append(updated)
+                changed = True
+
+            if changed:
+                updated_blocks.append(
+                    IRBlock(
+                        label=block.label,
+                        start_offset=block.start_offset,
+                        nodes=tuple(new_nodes),
+                        annotations=block.annotations,
+                    )
+                )
+            else:
+                updated_blocks.append(block)
+
+        return updated_blocks
+
+    @staticmethod
+    def _teardown_common_prefix(
+        first: Tuple[IRStackEffect, ...], second: Tuple[IRStackEffect, ...]
+    ) -> Tuple[IRStackEffect, ...]:
+        limit = min(len(first), len(second))
+        index = 0
+        while index < limit:
+            if not IRNormalizer._teardown_steps_equal(first[index], second[index]):
+                break
+            index += 1
+        return first[:index]
+
+    @staticmethod
+    def _teardown_prefix_length(
+        sequence: Tuple[IRStackEffect, ...], prefix: Tuple[IRStackEffect, ...]
+    ) -> int:
+        limit = min(len(sequence), len(prefix))
+        index = 0
+        while index < limit:
+            if not IRNormalizer._teardown_steps_equal(sequence[index], prefix[index]):
+                break
+            index += 1
+        return index
+
+    @staticmethod
+    def _teardown_steps_equal(
+        left: IRStackEffect, right: IRStackEffect
+    ) -> bool:
+        return (
+            left.mnemonic == right.mnemonic
+            and left.pops == right.pops
+            and left.operand == right.operand
+            and left.operand_role == right.operand_role
+            and left.operand_alias == right.operand_alias
+        )
 
     @staticmethod
     def _block_return_mask(block: IRBlock) -> Optional[int]:
