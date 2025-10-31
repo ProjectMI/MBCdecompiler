@@ -337,7 +337,6 @@ def write_manual(path: Path) -> KnowledgeBase:
     (path / "address_table.json").write_text(json.dumps(address_table, indent=2), "utf-8")
     call_signatures = {
         "0x0072": {
-            "arity": 2,
             "cleanup_mask": "0x2910",
             "cleanup": [
                 {"mnemonic": "stack_teardown", "pops": 1},

@@ -6,7 +6,6 @@
     ]
   },
   "0x0072": {
-    "arity": 2,
     "cleanup_mask": "0x2910",
     "cleanup": [
       {"mnemonic": "stack_teardown", "pops": 1}
