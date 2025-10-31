@@ -1078,6 +1078,8 @@ class IRNormalizer:
         self._pass_prune_testset_duplicates(items)
         self._pass_call_return_templates(items)
         self._pass_tailcall_returns(items)
+        self._pass_demote_zero_arity_tailcalls(items)
+        self._pass_rewrite_io_return_masks(items)
         self._split_preserved_cleanup_nodes(items)
         self._pass_page_registers(items)
         self._pass_indirect_access(items, metrics)
@@ -3901,6 +3903,65 @@ class IRNormalizer:
             items.replace_slice(index, index + 1, [tail_call])
             index += 1
 
+    def _pass_demote_zero_arity_tailcalls(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            if not isinstance(item, IRTailCall):
+                index += 1
+                continue
+
+            call = item.call
+            if call.arity != 0 or item.returns:
+                index += 1
+                continue
+
+            if not self._has_prior_calllike(items, index):
+                index += 1
+                continue
+
+            if not self._tailcall_followed_by_return(items, index):
+                index += 1
+                continue
+
+            merged_effects = self._merge_return_mask_effects(
+                call.abi_effects,
+                self._call_like_cleanup_mask(item),
+            )
+            updated_call = IRCall(
+                target=call.target,
+                args=call.args,
+                tail=False,
+                arity=None,
+                convention=call.convention,
+                cleanup=call.cleanup,
+                symbol=call.symbol,
+                predicate=call.predicate,
+                abi_effects=merged_effects,
+            )
+            self._transfer_ssa(item, updated_call)
+
+            replacement: List[IRNode] = [updated_call]
+            if item.cleanup:
+                cleanup_node = IRCallCleanup(steps=item.cleanup)
+                self._transfer_ssa(item, cleanup_node)
+                replacement.append(cleanup_node)
+
+            items.replace_slice(index, index + 1, replacement)
+            index += len(replacement)
+            continue
+
+        index += 1
+
+    def _pass_rewrite_io_return_masks(self, items: _ItemList) -> None:
+        index = 0
+        while index < len(items):
+            item = items[index]
+            rewritten = self._rewrite_node_io_masks(item)
+            if rewritten is not item:
+                items.replace_slice(index, index + 1, [rewritten])
+            index += 1
+
     def _extract_tail_helper_target(
         self, items: _ItemList, index: int, helper: int
     ) -> Optional[int]:
@@ -4166,6 +4227,204 @@ class IRNormalizer:
                 continue
             return isinstance(candidate, IRReturn)
         return False
+
+    def _has_prior_calllike(self, items: _ItemList, index: int) -> bool:
+        scan = index - 1
+        while scan >= 0:
+            candidate = items[scan]
+            if isinstance(candidate, CallLike):
+                return True
+            if isinstance(
+                candidate,
+                (IRReturn, IRIf, IRTestSetBranch, IRFunctionPrologue, IRTerminator),
+            ):
+                return False
+            scan -= 1
+        return False
+
+    def _tailcall_followed_by_return(self, items: _ItemList, index: int) -> bool:
+        scan = index + 1
+        while scan < len(items):
+            candidate = items[scan]
+            if isinstance(candidate, IRReturn):
+                return True
+            if isinstance(candidate, CallLike) or isinstance(
+                candidate, (IRFunctionPrologue, IRTerminator, IRIf, IRTestSetBranch)
+            ):
+                return False
+            scan += 1
+        return False
+
+    def _rewrite_node_io_masks(self, node: IRNode) -> IRNode:
+        if isinstance(node, IRCallCleanup):
+            updated_steps = self._rewrite_io_mask_steps(node.steps)
+            if updated_steps is node.steps:
+                return node
+            replacement = IRCallCleanup(steps=updated_steps)
+            self._transfer_ssa(node, replacement)
+            return replacement
+
+        if isinstance(node, IRReturn):
+            updated_cleanup = self._rewrite_io_mask_steps(node.cleanup)
+            updated_effects = self._filter_io_return_mask_effects(node.abi_effects)
+            if updated_cleanup is node.cleanup and updated_effects is node.abi_effects:
+                return node
+            replacement = IRReturn(
+                values=node.values,
+                varargs=node.varargs,
+                cleanup=updated_cleanup,
+                abi_effects=updated_effects,
+            )
+            self._transfer_ssa(node, replacement)
+            return replacement
+
+        if isinstance(node, IRCall):
+            updated_cleanup = self._rewrite_io_mask_steps(node.cleanup)
+            updated_effects = self._filter_io_return_mask_effects(node.abi_effects)
+            if updated_cleanup is node.cleanup and updated_effects is node.abi_effects:
+                return node
+            replacement = IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup=updated_cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=updated_effects,
+            )
+            self._transfer_ssa(node, replacement)
+            return replacement
+
+        if isinstance(node, IRCallReturn):
+            updated_cleanup = self._rewrite_io_mask_steps(node.cleanup)
+            updated_effects = self._filter_io_return_mask_effects(node.abi_effects)
+            if updated_cleanup is node.cleanup and updated_effects is node.abi_effects:
+                return node
+            replacement = IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=updated_cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=updated_effects,
+            )
+            self._transfer_ssa(node, replacement)
+            return replacement
+
+        if isinstance(node, IRTailCall):
+            rewritten_call = self._rewrite_call_io_masks(node.call)
+            updated_cleanup = self._rewrite_io_mask_steps(node.cleanup)
+            updated_effects = self._filter_io_return_mask_effects(node.abi_effects)
+            if (
+                rewritten_call is node.call
+                and updated_cleanup is node.cleanup
+                and updated_effects is node.abi_effects
+            ):
+                return node
+            replacement = IRTailCall(
+                call=rewritten_call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=updated_cleanup,
+                abi_effects=updated_effects,
+            )
+            self._transfer_ssa(node, replacement)
+            return replacement
+
+        if isinstance(node, IRTailcallReturn):
+            updated_cleanup = self._rewrite_io_mask_steps(node.cleanup)
+            updated_effects = self._filter_io_return_mask_effects(node.abi_effects)
+            if updated_cleanup is node.cleanup and updated_effects is node.abi_effects:
+                return node
+            replacement = IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=updated_cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=updated_effects,
+            )
+            self._transfer_ssa(node, replacement)
+            return replacement
+
+        return node
+
+    def _rewrite_call_io_masks(self, call: IRCall) -> IRCall:
+        updated_cleanup = self._rewrite_io_mask_steps(call.cleanup)
+        updated_effects = self._filter_io_return_mask_effects(call.abi_effects)
+        if updated_cleanup is call.cleanup and updated_effects is call.abi_effects:
+            return call
+        replacement = IRCall(
+            target=call.target,
+            args=call.args,
+            tail=call.tail,
+            arity=call.arity,
+            convention=call.convention,
+            cleanup=updated_cleanup,
+            symbol=call.symbol,
+            predicate=call.predicate,
+            abi_effects=updated_effects,
+        )
+        self._transfer_ssa(call, replacement)
+        return replacement
+
+    @staticmethod
+    def _rewrite_io_mask_steps(
+        steps: Sequence[IRStackEffect],
+    ) -> Tuple[IRStackEffect, ...]:
+        if not steps:
+            return tuple(steps)
+
+        updated: List[IRStackEffect] = []
+        changed = False
+        for step in steps:
+            if step.category == "frame.return_mask" and step.operand in IO_SLOT_ALIASES:
+                updated.append(
+                    IRStackEffect(
+                        mnemonic=step.mnemonic,
+                        operand=step.operand,
+                        pops=step.pops,
+                        operand_role=step.operand_role,
+                        operand_alias=step.operand_alias,
+                        category="io.step",
+                        optional=step.optional,
+                    )
+                )
+                changed = True
+            else:
+                updated.append(step)
+
+        if not changed:
+            return steps
+        return tuple(updated)
+
+    @staticmethod
+    def _filter_io_return_mask_effects(
+        effects: Sequence[IRAbiEffect],
+    ) -> Tuple[IRAbiEffect, ...]:
+        if not effects:
+            return tuple(effects)
+
+        filtered = tuple(
+            effect
+            for effect in effects
+            if not (effect.kind == "return_mask" and effect.operand in IO_SLOT_ALIASES)
+        )
+        if len(filtered) == len(effects):
+            return tuple(effects)
+        return filtered
 
     def _attach_tail_helper_cleanup(
         self, items: _ItemList, index: int, effect: IRStackEffect
@@ -5864,6 +6123,8 @@ class IRNormalizer:
                 pops=pops,
                 opcode=instruction.profile.opcode,
             )
+        if category == "frame.return_mask" and operand in IO_SLOT_ALIASES:
+            category = "io.step"
         return IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
@@ -6094,7 +6355,7 @@ class IRNormalizer:
         if mask is None:
             return None
         if mask in IO_SLOT_ALIASES:
-            return IO_SLOT
+            return None
         return mask
 
     def _return_mask_effect(self, mask: Optional[int]) -> Tuple[IRAbiEffect, ...]:

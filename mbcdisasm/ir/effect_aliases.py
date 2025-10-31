@@ -162,7 +162,11 @@ def epilogue_step_kind(
         return direct
 
     alias_text = alias if alias is not None else None
-    alias_upper = alias_text.upper() if alias_text else ""
+    alias_name = alias_text.split("(", 1)[0] if alias_text else None
+    alias_upper = alias_name.upper() if alias_name else ""
+
+    if alias_name == CHATOUT_ALIAS:
+        return "io.step"
 
     if mnemonic in MASK_STEP_MNEMONICS:
         return "frame.return_mask"
@@ -186,7 +190,7 @@ def epilogue_step_kind(
     if (
         mnemonic in IO_STEP_MNEMONICS
         or opcode in IO_OPCODE_FALLBACK
-        or (alias_text == CHATOUT_ALIAS)
+        or (alias_name == CHATOUT_ALIAS)
     ):
         return "io.step"
 
