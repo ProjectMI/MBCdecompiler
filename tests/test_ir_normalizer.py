@@ -1319,6 +1319,29 @@ def test_condition_mask_from_ret_mask_literal(tmp_path: Path) -> None:
     assert node.steps[0].operand == RET_MASK
 
 
+def test_cleanup_with_io_slot_operand_is_not_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [build_word(0, 0x29, 0x10, IO_SLOT)]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    assert len(block.nodes) == 1
+    node = block.nodes[0]
+    assert isinstance(node, IRCallCleanup)
+    assert len(node.steps) == 1
+    step = node.steps[0]
+    assert step.category == "io.step"
+    assert step.operand == IO_SLOT
+    assert step.operand_alias == "ChatOut"
+
+
 def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

@@ -164,6 +164,9 @@ def epilogue_step_kind(
     alias_text = alias if alias is not None else None
     alias_upper = alias_text.upper() if alias_text else ""
 
+    if alias_text == CHATOUT_ALIAS:
+        return "io.step"
+
     if mnemonic in MASK_STEP_MNEMONICS:
         return "frame.return_mask"
     if operand is not None and operand in MASK_OPERANDS:
@@ -183,11 +186,7 @@ def epilogue_step_kind(
     if mnemonic in IO_BRIDGE_MNEMONICS or opcode in BRIDGE_OPCODE_FALLBACK:
         return "io.bridge"
 
-    if (
-        mnemonic in IO_STEP_MNEMONICS
-        or opcode in IO_OPCODE_FALLBACK
-        or (alias_text == CHATOUT_ALIAS)
-    ):
+    if mnemonic in IO_STEP_MNEMONICS or opcode in IO_OPCODE_FALLBACK:
         return "io.step"
 
     if pops and mnemonic != "stack_teardown":

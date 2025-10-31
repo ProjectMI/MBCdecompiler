@@ -244,6 +244,8 @@ TAIL_HELPER_ALIASES = {
     0x16F0: "io.flush_deferred",
 }
 
+SPURIOUS_TAILCALL_TARGETS = {0x0000, 0x0001, 0xE803, 0x2C02}
+
 
 LITERAL_MARKER_HINTS: Dict[int, str] = {
     0x0067: "literal_hint",
@@ -408,7 +410,7 @@ STACK_NEUTRAL_CONTROL_KINDS = {
     InstructionKind.TAILCALL,
 }
 
-MASK_OPERAND_ALIASES = {"RET_MASK", "ChatOut", "FANOUT_FLAGS"}
+MASK_OPERAND_ALIASES = {"RET_MASK", "FANOUT_FLAGS"}
 
 SIDE_EFFECT_KIND_HINTS = {
     InstructionKind.INDIRECT,
@@ -5215,7 +5217,36 @@ class IRNormalizer:
         node = self._normalise_call_result_arity(node)
         node = self._normalise_call_argument_arity(node)
         node = self._enforce_call_return_mask(node)
+        node = self._demote_spurious_tailcall(node)
         return node
+
+    def _demote_spurious_tailcall(self, node: CallLike) -> CallLike:
+        if not isinstance(node, IRTailCall):
+            return node
+
+        call = node.call
+        if node.returns or node.cleanup or node.varargs:
+            return node
+        if call.args or call.cleanup:
+            return node
+        if node.abi_effects and node.abi_effects != call.abi_effects:
+            return node
+        if call.target not in SPURIOUS_TAILCALL_TARGETS:
+            return node
+
+        updated = IRCall(
+            target=call.target,
+            args=call.args,
+            tail=False,
+            arity=call.arity,
+            convention=call.convention,
+            cleanup=call.cleanup,
+            symbol=call.symbol,
+            predicate=call.predicate,
+            abi_effects=call.abi_effects,
+        )
+        self._transfer_ssa(node, updated)
+        return updated
 
     def _normalise_call_result_arity(self, node: CallLike) -> CallLike:
         if not isinstance(node, (IRCallReturn, IRTailCall, IRTailcallReturn)):
@@ -5487,11 +5518,9 @@ class IRNormalizer:
     def _has_mask_operand(instruction: RawInstruction) -> bool:
         alias = instruction.profile.operand_alias()
         if alias and alias in MASK_OPERAND_ALIASES:
-            if alias == "ChatOut":
-                return False
             return True
         operand = instruction.operand
-        if operand == RET_MASK or operand in IO_SLOT_ALIASES:
+        if operand == RET_MASK:
             return True
         role = instruction.profile.operand_role()
         if role:
@@ -5952,7 +5981,16 @@ class IRNormalizer:
                 continue
             combined.append(step)
             index += 1
-        return combined
+        sanitised: List[IRStackEffect] = []
+        for effect in combined:
+            if effect.category == "frame.return_mask" and (
+                effect.operand in IO_SLOT_ALIASES
+                or effect.operand_alias == "ChatOut"
+            ):
+                sanitised.append(replace(effect, category="io.step"))
+                continue
+            sanitised.append(effect)
+        return sanitised
 
     @staticmethod
     def _reorder_cleanup_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:
@@ -6094,7 +6132,7 @@ class IRNormalizer:
         if mask is None:
             return None
         if mask in IO_SLOT_ALIASES:
-            return IO_SLOT
+            return None
         return mask
 
     def _return_mask_effect(self, mask: Optional[int]) -> Tuple[IRAbiEffect, ...]:
