@@ -1056,6 +1056,7 @@ class IRNormalizer:
         self._pass_call_preparation(items)
         self._pass_fix_call_preparation_order(items)
         self._pass_call_cleanup(items)
+        self._pass_cleanup_stack_drops(items)
         self._pass_orphan_cleanup_sequences(items)
         self._pass_io_operations(items)
         self._pass_io_facade(items)
@@ -2331,6 +2332,34 @@ class IRNormalizer:
             else:
                 items.replace_slice(start, end, [])
             continue
+
+    def _pass_cleanup_stack_drops(self, items: _ItemList) -> None:
+        for index, node in enumerate(list(items)):
+            if not isinstance(node, IRCallCleanup):
+                continue
+            if not self._is_cleanup_stack_drop(node):
+                continue
+
+            value = self._describe_stack_top(items, index)
+            drop_node = IRStackDrop(value=value)
+            self._transfer_ssa(node, drop_node)
+            items.replace_slice(index, index + 1, [drop_node])
+
+    @staticmethod
+    def _is_cleanup_stack_drop(cleanup: IRCallCleanup) -> bool:
+        if len(cleanup.steps) != 1:
+            return False
+
+        step = cleanup.steps[0]
+        if step.mnemonic != "op_01_A8":
+            return False
+        if step.pops != 1:
+            return False
+        if step.category not in {None, "frame.teardown"}:
+            return False
+        if step.operand != 0x1400:
+            return False
+        return True
 
     def _pass_orphan_cleanup_sequences(self, items: _ItemList) -> None:
         index = 0
