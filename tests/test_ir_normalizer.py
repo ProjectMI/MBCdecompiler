@@ -27,6 +27,7 @@ from mbcdisasm.ir.model import (
     IRFunctionPrologue,
     IRStackEffect,
     IRTestSetBranch,
+    IRBlock,
     IRBankedLoad,
     IRIndirectLoad,
     IRIndirectStore,
@@ -2158,6 +2159,118 @@ def test_function_mask_propagation_across_blocks(tmp_path: Path) -> None:
     assert first_return.mask == RET_MASK
     assert len(first_return.values) == RET_MASK.bit_count()
     assert second_return.mask == RET_MASK
+
+
+def test_conflicting_return_masks_favour_narrower_mask() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    narrow_cleanup = IRStackEffect(
+        mnemonic="op_52_05", operand=0x1001, category="frame.return_mask"
+    )
+    wide_cleanup = IRStackEffect(
+        mnemonic="op_52_05", operand=0x10A6, category="frame.return_mask"
+    )
+
+    narrow_return = IRReturn(
+        values=("ret0", "ret1"),
+        cleanup=(narrow_cleanup,),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x1001),),
+    )
+    wide_return = IRReturn(
+        values=("ret0", "ret1", "ret2", "ret3", "ret4"),
+        cleanup=(wide_cleanup,),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x10A6),),
+    )
+
+    blocks = (
+        IRBlock(label="b0", start_offset=0, nodes=(narrow_return,)),
+        IRBlock(label="b1", start_offset=4, nodes=(wide_return,)),
+    )
+
+    updated = normalizer._propagate_return_masks(0, blocks)
+
+    first = updated[0].nodes[0]
+    second = updated[1].nodes[0]
+
+    assert isinstance(first, IRReturn)
+    assert isinstance(second, IRReturn)
+    assert first.mask == 0x1001
+    assert first.values == ("ret0", "ret1")
+    assert second.mask == 0x1001
+    assert second.values == ("ret0", "ret1")
+    assert all(
+        step.operand == 0x1001
+        for step in second.cleanup
+        if step.category == "frame.return_mask"
+    )
+    assert all(effect.operand == 0x1001 for effect in second.abi_effects)
+
+
+def test_zero_return_mask_is_ignored() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    canonical_return = IRReturn(
+        values=("ret0", "ret1"),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0030),),
+    )
+    zero_cleanup = IRStackEffect(
+        mnemonic="op_52_05", operand=0x0000, category="frame.return_mask"
+    )
+    zero_return = IRReturn(
+        values=("ret0", "ret1", "ret2"),
+        cleanup=(zero_cleanup,),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0000),),
+    )
+
+    blocks = (
+        IRBlock(label="b0", start_offset=0, nodes=(canonical_return,)),
+        IRBlock(label="b1", start_offset=4, nodes=(zero_return,)),
+    )
+
+    updated = normalizer._propagate_return_masks(0, blocks)
+
+    patched = updated[1].nodes[0]
+    assert isinstance(patched, IRReturn)
+    assert patched.mask == 0x0030
+    assert patched.values == ("ret0", "ret1")
+    assert all(effect.operand == 0x0030 for effect in patched.abi_effects)
+
+
+def test_tailcall_cleanup_mask_converges_to_function_mask() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    canonical_return = IRReturn(
+        values=("ret0", "ret1"),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0030),),
+    )
+
+    tail_cleanup = IRStackEffect(
+        mnemonic="op_52_05", operand=0x004A, category="frame.return_mask"
+    )
+    tail_call = IRTailCall(
+        call=IRCall(target=0x1234, args=(), tail=True),
+        returns=("ret0", "ret1", "ret2"),
+        cleanup=(tail_cleanup,),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x004A),),
+    )
+
+    blocks = (
+        IRBlock(label="b0", start_offset=0, nodes=(canonical_return,)),
+        IRBlock(label="b1", start_offset=4, nodes=(tail_call,)),
+    )
+
+    updated = normalizer._propagate_return_masks(0, blocks)
+
+    rewritten_tail = updated[1].nodes[0]
+    assert isinstance(rewritten_tail, IRTailCall)
+    assert rewritten_tail.cleanup_mask == 0x0030
+    assert rewritten_tail.returns == ("ret0", "ret1")
+    assert all(
+        effect.operand == 0x0030 for effect in rewritten_tail.abi_effects
+    )
 
 
 def test_reorders_trailing_call_preparation(tmp_path: Path) -> None:

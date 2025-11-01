@@ -88,9 +88,9 @@
     ]
   },
   "0x00F0": {
-    "cleanup_mask": "0x004A",
+    "cleanup_mask": "0x0030",
     "cleanup": [
-      {"mnemonic": "op_52_05", "operand": "0x004A"}
+      {"mnemonic": "op_52_05", "operand": "0x0030"}
     ]
   },
   "0x3D30": {

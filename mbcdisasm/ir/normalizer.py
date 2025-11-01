@@ -3750,7 +3750,13 @@ class IRNormalizer:
 
             mask = self._block_return_mask(block)
             if mask is not None:
-                function_masks[current_function] = mask
+                existing = function_masks.get(current_function)
+                if existing is None:
+                    function_masks[current_function] = mask
+                else:
+                    selected = self._select_return_mask(existing, mask)
+                    if selected is not None:
+                        function_masks[current_function] = selected
 
         updated_blocks: List[IRBlock] = []
         for block, function_id in zip(blocks, block_functions):
@@ -3763,34 +3769,64 @@ class IRNormalizer:
 
         return updated_blocks
 
-    @staticmethod
-    def _block_return_mask(block: IRBlock) -> Optional[int]:
+    def _block_return_mask(self, block: IRBlock) -> Optional[int]:
         mask: Optional[int] = None
         for node in block.nodes:
-            if isinstance(node, IRReturn) and not node.varargs and node.mask is not None:
-                if mask is None:
-                    mask = node.mask
-                elif mask != node.mask:
-                    mask = node.mask
+            candidate: Optional[int] = None
+            if isinstance(node, IRReturn) and not node.varargs:
+                candidate = node.mask
+            elif isinstance(node, CallLike) and getattr(node, "tail", False):
+                if getattr(node, "varargs", False):
+                    continue
+                candidate = self._call_like_cleanup_mask(node)
+            if candidate is None:
+                continue
+            canonical = self._canonical_return_mask(candidate)
+            if canonical is None:
+                continue
+            mask = self._select_return_mask(mask, canonical)
         return mask
 
     def _apply_function_return_mask(self, block: IRBlock, mask: int) -> IRBlock:
+        canonical_mask = self._canonical_return_mask(mask)
+        if canonical_mask is None:
+            return block
+
         updated_nodes: List[IRNode] = []
         changed = False
 
         for node in block.nodes:
-            if isinstance(node, IRReturn) and not node.varargs and node.mask is None:
-                abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
-                updated = IRReturn(
-                    values=node.values,
-                    varargs=node.varargs,
-                    cleanup=node.cleanup,
-                    abi_effects=abi_effects,
+            if isinstance(node, IRReturn) and not node.varargs:
+                node_mask = self._canonical_return_mask(node.mask)
+                if node_mask != canonical_mask:
+                    cleanup = self._rewrite_cleanup_return_mask(
+                        node.cleanup, canonical_mask
+                    )
+                    abi_effects = self._merge_return_mask_effects(
+                        node.abi_effects, canonical_mask
+                    )
+                    updated = replace(
+                        node,
+                        cleanup=cleanup,
+                        abi_effects=abi_effects,
+                    )
+                    updated = self._enforce_return_mask(updated)
+                    self._transfer_ssa(node, updated)
+                    updated_nodes.append(updated)
+                    changed = True
+                    continue
+            if isinstance(node, CallLike) and getattr(node, "tail", False):
+                if getattr(node, "varargs", False):
+                    updated_nodes.append(node)
+                    continue
+                node_mask = self._canonical_return_mask(
+                    self._call_like_cleanup_mask(node)
                 )
-                updated = self._enforce_return_mask(updated)
-                updated_nodes.append(updated)
-                changed = True
-                continue
+                if node_mask != canonical_mask:
+                    updated = self._update_call_like_return_mask(node, canonical_mask)
+                    updated_nodes.append(updated)
+                    changed = True
+                    continue
             updated_nodes.append(node)
 
         if not changed:
@@ -3802,6 +3838,38 @@ class IRNormalizer:
             nodes=tuple(updated_nodes),
             annotations=block.annotations,
         )
+
+    @staticmethod
+    def _select_return_mask(
+        existing: Optional[int], candidate: Optional[int]
+    ) -> Optional[int]:
+        canonical_existing = IRNormalizer._canonical_return_mask(existing)
+        canonical_candidate = IRNormalizer._canonical_return_mask(candidate)
+        if canonical_candidate is None:
+            return canonical_existing
+        if canonical_existing is None:
+            return canonical_candidate
+        width_existing = IRNormalizer._return_mask_width(canonical_existing) or 0
+        width_candidate = IRNormalizer._return_mask_width(canonical_candidate) or 0
+        if width_candidate < width_existing:
+            return canonical_candidate
+        if width_candidate > width_existing:
+            return canonical_existing
+        return canonical_existing
+
+    def _update_call_like_return_mask(
+        self, node: CallLike, mask: int
+    ) -> CallLike:
+        cleanup = self._rewrite_cleanup_return_mask(
+            getattr(node, "cleanup", tuple()), mask
+        )
+        abi_effects = self._merge_return_mask_effects(
+            getattr(node, "abi_effects", tuple()), mask
+        )
+        replaced = replace(node, cleanup=cleanup, abi_effects=abi_effects)
+        enforced = self._enforce_call_return_mask(replaced)
+        self._transfer_ssa(node, enforced)
+        return enforced
 
     def _record_dispatch_hint(
         self, items: _ItemList, index: int, branch: IRTestSetBranch
@@ -6321,6 +6389,8 @@ class IRNormalizer:
     @staticmethod
     def _canonical_return_mask(mask: Optional[int]) -> Optional[int]:
         if mask is None:
+            return None
+        if mask == 0:
             return None
         if mask in IO_SLOT_ALIASES:
             return None
