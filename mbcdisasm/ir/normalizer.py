@@ -3687,12 +3687,14 @@ class IRNormalizer:
     def _pass_enforce_abi_contracts(self, items: _ItemList) -> None:
         index = 0
         pending_return_mask: Optional[int] = None
+        pending_cleanup_index: Optional[int] = None
         while index < len(items):
             item = items[index]
             if isinstance(item, IRCallCleanup):
                 mask = self._extract_cleanup_mask(item.steps)
                 if mask is not None:
                     pending_return_mask = mask
+                    pending_cleanup_index = index
                 index += 1
                 continue
             if isinstance(item, IRReturn):
@@ -3715,14 +3717,63 @@ class IRNormalizer:
                     items.replace_slice(index, index + 1, [updated_return])
                     item = updated_return
                 mask = item.mask
+                if (
+                    mask is not None
+                    and pending_return_mask is not None
+                    and pending_cleanup_index is not None
+                ):
+                    canonical_cleanup = self._canonical_return_mask(pending_return_mask)
+                    canonical_return = self._canonical_return_mask(mask)
+                    if canonical_cleanup != canonical_return:
+                        cleanup = items[pending_cleanup_index]
+                        if isinstance(cleanup, IRCallCleanup):
+                            rewritten_steps = self._rewrite_cleanup_return_mask(
+                                cleanup.steps, mask
+                            )
+                            if rewritten_steps != cleanup.steps:
+                                updated_cleanup = IRCallCleanup(steps=rewritten_steps)
+                                self._transfer_ssa(cleanup, updated_cleanup)
+                                items.replace_slice(
+                                    pending_cleanup_index,
+                                    pending_cleanup_index + 1,
+                                    [updated_cleanup],
+                                )
+                mask = item.mask
                 if mask is not None:
                     pending_return_mask = mask
+                pending_cleanup_index = None
                 index += 1
                 continue
             if isinstance(item, CallLike):
                 updated_call = self._finalise_call_node(item)
                 if updated_call is not item:
                     items.replace_slice(index, index + 1, [updated_call])
+                    item = updated_call
+                call_mask = self._call_like_cleanup_mask(item)
+                if (
+                    getattr(item, "tail", False)
+                    and call_mask is not None
+                    and pending_return_mask is not None
+                    and pending_cleanup_index is not None
+                ):
+                    canonical_cleanup = self._canonical_return_mask(pending_return_mask)
+                    canonical_call = self._canonical_return_mask(call_mask)
+                    if canonical_cleanup != canonical_call:
+                        cleanup = items[pending_cleanup_index]
+                        if isinstance(cleanup, IRCallCleanup):
+                            rewritten_steps = self._rewrite_cleanup_return_mask(
+                                cleanup.steps, call_mask
+                            )
+                            if rewritten_steps != cleanup.steps:
+                                updated_cleanup = IRCallCleanup(steps=rewritten_steps)
+                                self._transfer_ssa(cleanup, updated_cleanup)
+                                items.replace_slice(
+                                    pending_cleanup_index,
+                                    pending_cleanup_index + 1,
+                                    [updated_cleanup],
+                                )
+                    pending_return_mask = call_mask
+                    pending_cleanup_index = None
                 index += 1
                 continue
             index += 1
@@ -3796,6 +3847,18 @@ class IRNormalizer:
         changed = False
 
         for node in block.nodes:
+            if isinstance(node, IRCallCleanup):
+                rewritten_steps = self._rewrite_cleanup_return_mask(
+                    node.steps, canonical_mask
+                )
+                if rewritten_steps != node.steps:
+                    updated_cleanup = IRCallCleanup(steps=rewritten_steps)
+                    self._transfer_ssa(node, updated_cleanup)
+                    updated_nodes.append(updated_cleanup)
+                    changed = True
+                    continue
+                updated_nodes.append(node)
+                continue
             if isinstance(node, IRReturn) and not node.varargs:
                 node_mask = self._canonical_return_mask(node.mask)
                 if node_mask != canonical_mask:

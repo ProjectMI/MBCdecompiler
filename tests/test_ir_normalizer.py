@@ -2089,6 +2089,60 @@ def test_return_cleanup_discards_overwritten_return_masks() -> None:
     assert node.cleanup == (final,)
 
 
+def test_enforce_abi_contracts_aligns_cleanup_with_return_mask() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="op_52_05", operand=0x0030, category="frame.return_mask"
+            ),
+        )
+    )
+    ret = IRReturn(
+        values=("ret0",),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x1000),),
+    )
+
+    items = _ItemList([cleanup, ret])
+    normalizer._pass_enforce_abi_contracts(items)
+
+    updated_cleanup = items[0]
+    assert isinstance(updated_cleanup, IRCallCleanup)
+    assert [step.operand for step in updated_cleanup.steps] == [0x1000]
+
+
+def test_enforce_abi_contracts_aligns_cleanup_with_tailcall_mask() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    cleanup = IRCallCleanup(
+        steps=(
+            IRStackEffect(
+                mnemonic="op_52_05", operand=0x1000, category="frame.return_mask"
+            ),
+        )
+    )
+    tail = IRTailCall(
+        call=IRCall(target=0x1234, args=()),
+        returns=("ret0",),
+        cleanup=(
+            IRStackEffect(
+                mnemonic="op_52_05", operand=0x0030, category="frame.return_mask"
+            ),
+        ),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0030),),
+    )
+
+    items = _ItemList([cleanup, tail])
+    normalizer._pass_enforce_abi_contracts(items)
+
+    updated_cleanup = items[0]
+    assert isinstance(updated_cleanup, IRCallCleanup)
+    assert [step.operand for step in updated_cleanup.steps] == [0x0030]
+
+
 def test_sanitize_chatout_return_mask(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
     normalizer = IRNormalizer(knowledge)
