@@ -3849,13 +3849,47 @@ class IRNormalizer:
             return canonical_existing
         if canonical_existing is None:
             return canonical_candidate
-        width_existing = IRNormalizer._return_mask_width(canonical_existing) or 0
-        width_candidate = IRNormalizer._return_mask_width(canonical_candidate) or 0
-        if width_candidate < width_existing:
+        score_existing = IRNormalizer._return_mask_score(canonical_existing)
+        score_candidate = IRNormalizer._return_mask_score(canonical_candidate)
+        if score_candidate < score_existing:
             return canonical_candidate
-        if width_candidate > width_existing:
-            return canonical_existing
         return canonical_existing
+
+    @staticmethod
+    def _return_mask_score(mask: int) -> Tuple[int, int, int, int, int]:
+        """Return a tuple that ranks how stable ``mask`` is as a contract."""
+
+        width = IRNormalizer._return_mask_width(mask) or 0
+        alias_rank = IRNormalizer._return_mask_alias_rank(mask)
+        bits = IRNormalizer._return_mask_bits(mask)
+        if not bits:
+            span = 0
+            gaps = 0
+        else:
+            span = bits[-1] - bits[0]
+            gaps = span + 1 - len(bits)
+        return (width, alias_rank, gaps, span, mask)
+
+    @staticmethod
+    def _return_mask_bits(mask: int) -> List[int]:
+        bits: List[int] = []
+        value = mask & 0xFFFF_FFFF
+        index = 0
+        while value:
+            if value & 1:
+                bits.append(index)
+            value >>= 1
+            index += 1
+        return bits
+
+    @staticmethod
+    def _return_mask_alias_rank(mask: int) -> int:
+        alias = OPERAND_ALIASES.get(mask)
+        if alias == "RET_MASK":
+            return 0
+        if alias is not None:
+            return 1
+        return 2
 
     def _update_call_like_return_mask(
         self, node: CallLike, mask: int

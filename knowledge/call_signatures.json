@@ -76,9 +76,9 @@
     "shuffle": "0x3D30"
   },
   "0x003E": {
-    "cleanup_mask": "0x0053",
+    "cleanup_mask": "0x0030",
     "cleanup": [
-      {"mnemonic": "op_52_05", "operand": "0x0053"}
+      {"mnemonic": "op_52_05", "operand": "0x0030"}
     ]
   },
   "0x00ED": {
