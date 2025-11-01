@@ -3738,9 +3738,19 @@ class IRNormalizer:
         current_function: Optional[Tuple[int, str]] = None
         auto_counter = 0
 
+        previous_block: Optional[IRBlock] = None
+
         for block in blocks:
-            if any(isinstance(node, IRFunctionPrologue) for node in block.nodes):
-                current_function = (segment_index, f"prologue_{block.start_offset:04X}")
+            has_prologue = any(
+                isinstance(node, IRFunctionPrologue) for node in block.nodes
+            )
+            if has_prologue:
+                if current_function is None or (
+                    previous_block is not None
+                    and self._block_ends_function(previous_block)
+                ):
+                    current_function = (segment_index, f"prologue_{block.start_offset:04X}")
+                # Otherwise treat the prologue as part of the current function.
             elif current_function is None:
                 current_function = (segment_index, f"auto_{auto_counter}")
                 auto_counter += 1
@@ -3750,7 +3760,16 @@ class IRNormalizer:
 
             mask = self._block_return_mask(block)
             if mask is not None:
-                function_masks[current_function] = mask
+                existing = function_masks.get(current_function)
+                if existing is None:
+                    function_masks[current_function] = mask
+                else:
+                    existing_width = self._return_mask_width(existing) or -1
+                    candidate_width = self._return_mask_width(mask) or -1
+                    if candidate_width > existing_width:
+                        function_masks[current_function] = mask
+
+            previous_block = block
 
         updated_blocks: List[IRBlock] = []
         for block, function_id in zip(blocks, block_functions):
@@ -3763,34 +3782,65 @@ class IRNormalizer:
 
         return updated_blocks
 
-    @staticmethod
-    def _block_return_mask(block: IRBlock) -> Optional[int]:
+    def _block_return_mask(self, block: IRBlock) -> Optional[int]:
         mask: Optional[int] = None
+        mask_width = -1
         for node in block.nodes:
-            if isinstance(node, IRReturn) and not node.varargs and node.mask is not None:
-                if mask is None:
-                    mask = node.mask
-                elif mask != node.mask:
-                    mask = node.mask
+            current: Optional[int] = None
+            if isinstance(node, IRReturn) and not node.varargs:
+                current = node.mask
+            elif isinstance(node, CallLike) and getattr(node, "tail", False):
+                current = self._call_like_cleanup_mask(node)
+            if current is None:
+                continue
+            width = self._return_mask_width(current)
+            if width is None:
+                continue
+            if width > mask_width or mask is None:
+                mask = current
+                mask_width = width
+            elif width == mask_width and mask != current:
+                mask = current
         return mask
+
+    @staticmethod
+    def _block_ends_function(block: IRBlock) -> bool:
+        for node in reversed(block.nodes):
+            if isinstance(node, IRReturn):
+                return True
+            if isinstance(node, CallLike) and getattr(node, "tail", False):
+                return True
+            if isinstance(node, IRTerminator):
+                return True
+            if isinstance(node, (IRIf, IRTestSetBranch, IRDispatchCase, IRSwitchDispatch)):
+                return False
+        return False
 
     def _apply_function_return_mask(self, block: IRBlock, mask: int) -> IRBlock:
         updated_nodes: List[IRNode] = []
         changed = False
 
         for node in block.nodes:
-            if isinstance(node, IRReturn) and not node.varargs and node.mask is None:
-                abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
-                updated = IRReturn(
-                    values=node.values,
-                    varargs=node.varargs,
-                    cleanup=node.cleanup,
-                    abi_effects=abi_effects,
-                )
-                updated = self._enforce_return_mask(updated)
-                updated_nodes.append(updated)
-                changed = True
-                continue
+            if isinstance(node, IRReturn) and not node.varargs:
+                if node.mask != mask:
+                    abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
+                    updated = IRReturn(
+                        values=node.values,
+                        varargs=node.varargs,
+                        cleanup=node.cleanup,
+                        abi_effects=abi_effects,
+                    )
+                    updated = self._enforce_return_mask(updated)
+                    updated_nodes.append(updated)
+                    changed = True
+                    continue
+            if isinstance(node, CallLike) and getattr(node, "tail", False):
+                existing_mask = self._call_like_cleanup_mask(node)
+                if existing_mask != mask:
+                    updated_call = self._rewrite_call_like_return_mask(node, mask)
+                    updated_nodes.append(updated_call)
+                    changed = True
+                    continue
             updated_nodes.append(node)
 
         if not changed:
@@ -3802,6 +3852,64 @@ class IRNormalizer:
             nodes=tuple(updated_nodes),
             annotations=block.annotations,
         )
+
+    def _rewrite_call_like_return_mask(self, node: CallLike, mask: int) -> CallLike:
+        abi_effects = self._merge_return_mask_effects(
+            getattr(node, "abi_effects", tuple()), mask
+        )
+        if isinstance(node, IRCall):
+            updated = IRCall(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                cleanup=node.cleanup,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+            return self._enforce_call_return_mask(updated)
+        if isinstance(node, IRCallReturn):
+            updated = IRCallReturn(
+                target=node.target,
+                args=node.args,
+                tail=node.tail,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+            return self._enforce_call_return_mask(updated)
+        if isinstance(node, IRTailCall):
+            updated = IRTailCall(
+                call=node.call,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                abi_effects=abi_effects,
+            )
+            return cast(IRTailCall, self._enforce_call_return_mask(updated))
+        if isinstance(node, IRTailcallReturn):
+            updated = IRTailcallReturn(
+                target=node.target,
+                args=node.args,
+                returns=node.returns,
+                varargs=node.varargs,
+                cleanup=node.cleanup,
+                tail=node.tail,
+                arity=node.arity,
+                convention=node.convention,
+                symbol=node.symbol,
+                predicate=node.predicate,
+                abi_effects=abi_effects,
+            )
+            return cast(IRTailcallReturn, self._enforce_call_return_mask(updated))
+        return node
 
     def _record_dispatch_hint(
         self, items: _ItemList, index: int, branch: IRTestSetBranch
