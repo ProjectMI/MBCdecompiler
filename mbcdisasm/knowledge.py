@@ -124,7 +124,6 @@ class CallSignature:
     """Contract describing how a helper call should appear in the IR."""
 
     target: int
-    arity: Optional[int] = None
     returns: Optional[int] = None
     shuffle: Optional[int] = None
     shuffle_options: Tuple[int, ...] = tuple()
@@ -488,7 +487,6 @@ def _parse_call_signature_entry(
     if not isinstance(entry, Mapping):
         return CallSignature(target=target)
 
-    arity = _parse_optional_int(entry.get("arity"))
     returns = _parse_optional_int(entry.get("returns"))
     shuffle = _parse_optional_int(entry.get("shuffle"))
 
@@ -535,7 +533,6 @@ def _parse_call_signature_entry(
 
     return CallSignature(
         target=target,
-        arity=arity,
         returns=returns,
         shuffle=shuffle,
         shuffle_options=shuffle_options,

@@ -502,24 +502,30 @@ def build_template_container(tmp_path: Path) -> tuple[MbcContainer, KnowledgeBas
 
     container = MbcContainer(Path("dummy"), segments)
     return container, knowledge
-
-
-def test_decode_call_arity_filters_encoded_masks() -> None:
-    decode = IRNormalizer._decode_call_arity
-    assert decode(RET_MASK) is None
-    assert decode(0x2C10) is None
-    assert decode(0x6910) is None
-    assert decode(0x003F) is None
-    assert decode(0x0002) == 2
-    assert decode(0x0200) == 2
-
-
 def test_coalesce_epilogue_steps_merges_stack_teardown() -> None:
     effect_a = IRStackEffect(mnemonic="stack_teardown", operand=0x2000, pops=4)
     effect_b = IRStackEffect(mnemonic="stack_teardown", operand=0x2000, pops=6)
     combined = IRNormalizer._coalesce_epilogue_steps([effect_a, effect_b])
     assert len(combined) == 1
     assert combined[0].pops == 10
+
+
+def test_call_tail_description_uses_return_mask() -> None:
+    call = IRCall(
+        target=0x1234,
+        args=("arg0",),
+        tail=True,
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0003),),
+    )
+    assert "returns=[ret0, ret1]" in call.describe()
+
+    empty = IRCall(
+        target=0x1234,
+        args=("arg0",),
+        tail=True,
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0000),),
+    )
+    assert "returns=0" in empty.describe()
 
 
 def test_normalizer_clamps_return_count_to_stack_depth(tmp_path: Path) -> None:
@@ -910,6 +916,9 @@ def test_normalizer_structural_templates(tmp_path: Path) -> None:
 
     assert any("literal_block" in text and "via reduce_pair" in text for text in descriptions)
     assert any(text.startswith("call tail") for text in descriptions)
+    assert any(
+        text.startswith("call tail") and "returns=" in text for text in descriptions
+    )
     assert any(text.startswith("ascii_header[") for text in descriptions)
     assert any(text.startswith("function_prologue") for text in descriptions)
     assert any(text.startswith("call_return") for text in descriptions)
@@ -1360,7 +1369,6 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert call_like.convention is not None
     assert call_like.convention.operand == 0x4B08
     assert call_like.cleanup_mask == RET_MASK
-    assert call_like.arity is None
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
