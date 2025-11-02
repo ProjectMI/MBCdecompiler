@@ -1521,6 +1521,7 @@ class IRNormalizer:
                 args, start = self._collect_call_arguments(items, index)
                 target = item.operand
                 symbol = self._helper_symbol(target)
+                abi_effects: Tuple[IRAbiEffect, ...] = tuple()
                 if mnemonic == "tailcall_dispatch":
                     inline_target = self._extract_tail_dispatch_target(items, index)
                     if inline_target is not None:
@@ -1539,11 +1540,15 @@ class IRNormalizer:
                                 source = getattr(prior, "source", "")
                                 if source in {"op_00_52", "push_literal"} or prior.value == 0:
                                     start = literal_index
+                mask_hint = self._call_return_mask_hint(item)
+                if mask_hint is not None:
+                    abi_effects = self._return_mask_effect(mask_hint)
                 call = IRCall(
                     target=target,
                     args=tuple(args),
                     tail=mnemonic == "tailcall_dispatch",
                     symbol=symbol,
+                    abi_effects=abi_effects,
                 )
                 metrics.calls += 1
                 if call.tail:
@@ -1555,11 +1560,20 @@ class IRNormalizer:
                 continue
 
             if mnemonic == "return_values":
+                instruction = cast(RawInstruction, items[index])
                 count, varargs = self._resolve_return_signature(items, index)
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
-                items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
+                abi_effects: Tuple[IRAbiEffect, ...] = tuple()
+                mask_hint = self._return_mask_hint(instruction)
+                if mask_hint is not None:
+                    abi_effects = self._return_mask_effect(mask_hint)
+                items.replace_slice(
+                    index,
+                    index + 1,
+                    [IRReturn(values=values, varargs=varargs, abi_effects=abi_effects)],
+                )
                 metrics.returns += 1
                 continue
 
@@ -1832,6 +1846,24 @@ class IRNormalizer:
         if total:
             return total
         return None
+
+    def _call_return_mask_hint(self, instruction: RawInstruction) -> Optional[int]:
+        if instruction.mnemonic != "tailcall_dispatch":
+            return None
+        raw = instruction.profile.word.raw
+        mask = (raw >> 16) & 0xFFFF
+        if mask <= 0x00FF:
+            return None
+        return mask
+
+    def _return_mask_hint(self, instruction: RawInstruction) -> Optional[int]:
+        mode = instruction.profile.mode
+        if mode != 0x69:
+            return None
+        operand = instruction.operand
+        if operand <= 0x00FF:
+            return None
+        return operand
 
     def _pass_aggregates(self, items: _ItemList, metrics: NormalizerMetrics) -> None:
         index = 0
@@ -6525,6 +6557,9 @@ class IRNormalizer:
     def _merge_return_mask_effects(
         self, effects: Sequence[IRAbiEffect], mask: Optional[int]
     ) -> Tuple[IRAbiEffect, ...]:
+        if mask is None:
+            return self._sanitize_abi_effects(effects)
+
         base = tuple(effect for effect in effects if effect.kind != "return_mask")
         merged = base + self._return_mask_effect(mask)
         return self._sanitize_abi_effects(merged)

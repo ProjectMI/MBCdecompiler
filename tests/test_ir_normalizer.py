@@ -2215,6 +2215,41 @@ def test_function_mask_propagation_across_blocks(tmp_path: Path) -> None:
     assert second_return.mask == RET_MASK
 
 
+def test_return_mask_hint_from_operand() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    normalizer = IRNormalizer(knowledge)
+
+    words = [build_word(0, 0x30, 0x69, 0x10AC)]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = normalizer.normalise_container(container)
+    ret = program.segments[0].blocks[0].nodes[0]
+
+    assert isinstance(ret, IRReturn)
+    assert ret.mask == 0x10AC
+
+
+def test_tailcall_mask_inferred_from_opcode() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge/manual_annotations.json"))
+    normalizer = IRNormalizer(knowledge)
+
+    words = [build_word(0, 0x29, 0x10, 0x0429)]
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    program = normalizer.normalise_container(container)
+    call = program.segments[0].blocks[0].nodes[0]
+
+    assert isinstance(call, IRCall)
+    assert call.tail
+    assert call.cleanup_mask == 0x2910
+
+
 def test_conflicting_return_masks_favour_narrower_mask() -> None:
     knowledge = KnowledgeBase({})
     normalizer = IRNormalizer(knowledge)
