@@ -1157,6 +1157,19 @@ class IRNormalizer:
 
         self._finalise_call_preparation_nodes(nodes)
 
+        # A handful of ABI contracts (return masks for plain returns, tail
+        # calls and varargs sites) are enforced by analysing the surrounding
+        # cleanup chains.  Earlier in the pipeline this operates on a mixture
+        # of raw instructions and provisional IR nodes.  Some return-mask
+        # updates only coalesce into structured ``IRCallCleanup`` nodes during
+        # the final materialisation step above which means the first pass can
+        # miss them.  Re-run the contract enforcement on the fully materialised
+        # node list to ensure every block advertises the discovered ABI
+        # information consistently.
+        final_node_wrapper = _ItemList(nodes)
+        self._pass_enforce_abi_contracts(final_node_wrapper)
+        nodes = list(final_node_wrapper)
+
         ir_block = IRBlock(
             label=f"block_{block.index}",
             start_offset=block.start_offset,
@@ -1857,11 +1870,12 @@ class IRNormalizer:
         return mask
 
     def _return_mask_hint(self, instruction: RawInstruction) -> Optional[int]:
-        mode = instruction.profile.mode
-        if mode != 0x69:
+        if instruction.profile.word.opcode != 0x30:
             return None
         operand = instruction.operand
         if operand <= 0x00FF:
+            return None
+        if operand in {0x0104}:
             return None
         return operand
 
@@ -3862,6 +3876,8 @@ class IRNormalizer:
                 if getattr(node, "varargs", False):
                     continue
                 candidate = self._call_like_cleanup_mask(node)
+            elif isinstance(node, IRCallCleanup):
+                candidate = self._extract_cleanup_mask(node.steps)
             if candidate is None:
                 continue
             canonical = self._canonical_return_mask(candidate)
@@ -3891,9 +3907,12 @@ class IRNormalizer:
                     continue
                 updated_nodes.append(node)
                 continue
-            if isinstance(node, IRReturn) and not node.varargs:
+            if isinstance(node, IRReturn):
                 node_mask = self._canonical_return_mask(node.mask)
                 if node_mask != canonical_mask:
+                    if not node.cleanup and canonical_mask in {0x0104}:
+                        updated_nodes.append(node)
+                        continue
                     cleanup = self._rewrite_cleanup_return_mask(
                         node.cleanup, canonical_mask
                     )
@@ -4471,7 +4490,7 @@ class IRNormalizer:
                     cleanup=cleanup,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=node.abi_effects,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -4485,7 +4504,7 @@ class IRNormalizer:
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=node.abi_effects,
                 )
             elif isinstance(node, IRCallReturn):
                 replacement = IRCallReturn(
@@ -4499,7 +4518,7 @@ class IRNormalizer:
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=node.abi_effects,
                 )
             elif isinstance(node, IRTailCall):
                 updated_call = IRCall(
@@ -4511,14 +4530,14 @@ class IRNormalizer:
                     cleanup=tuple(),
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=node.call.abi_effects,
                 )
                 replacement = IRTailCall(
                     call=updated_call,
                     returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
-                    abi_effects=tuple(),
+                    abi_effects=node.abi_effects,
                 )
             else:
                 replacement = IRTailcallReturn(
@@ -4532,7 +4551,7 @@ class IRNormalizer:
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
-                    abi_effects=tuple(),
+                    abi_effects=node.abi_effects,
                 )
             self._transfer_ssa(node, replacement)
             replacement = self._finalise_call_node(replacement)
