@@ -88,6 +88,14 @@ ANNOTATION_MNEMONICS = {"literal_marker"}
 RETURN_NIBBLE_MODES = {0x29, 0x2C, 0x32, 0x41, 0x65, 0x69, 0x6C}
 DATA_MARKER_MNEMONICS = {"op_DE_00", "op_94_00"}
 
+DEFAULT_RETURN_MASKS = {
+    1: 0x1000,
+    2: 0x0030,
+    3: 0x004A,
+    4: RET_MASK,
+    5: 0x0A15,
+}
+
 
 _HUMAN_STRING_MIN_LENGTH = 3
 _HUMAN_STRING_CLUSTER_GAP = 256
@@ -739,6 +747,7 @@ class IRNormalizer:
             self._update_tail_helper_hints(block)
 
         blocks = self._propagate_return_masks(segment.index, blocks)
+        blocks = self._apply_return_operand_masks(blocks)
 
         return IRSegment(
             index=segment.index,
@@ -1556,10 +1565,21 @@ class IRNormalizer:
 
             if mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
+                mask_hint = self._return_operand_mask(item)
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
-                items.replace_slice(index, index + 1, [IRReturn(values=values, varargs=varargs)])
+                items.replace_slice(
+                    index,
+                    index + 1,
+                    [
+                        IRReturn(
+                            values=values,
+                            varargs=varargs,
+                            operand_mask=mask_hint,
+                        )
+                    ],
+                )
                 metrics.returns += 1
                 continue
 
@@ -1738,13 +1758,21 @@ class IRNormalizer:
             item = items[index]
             if isinstance(item, RawInstruction) and item.mnemonic == "return_values":
                 count, varargs = self._resolve_return_signature(items, index)
+                mask_hint = self._return_operand_mask(item)
                 values = tuple(f"ret{i}" for i in range(count)) if count else tuple()
                 if varargs and not values:
                     values = ("ret*",)
                 items.replace_slice(
                     index,
                     index + 1,
-                    [IRReturn(values=values, varargs=varargs, cleanup=tuple(collected_cleanup))],
+                    [
+                        IRReturn(
+                            values=values,
+                            varargs=varargs,
+                            cleanup=tuple(collected_cleanup),
+                            operand_mask=mask_hint,
+                        )
+                    ],
                 )
                 metrics.returns += 1
                 return
@@ -1810,6 +1838,12 @@ class IRNormalizer:
                 count = depth
 
         return count or 0, varargs
+
+    def _return_operand_mask(self, instruction: RawInstruction) -> Optional[int]:
+        mask = self._canonical_return_mask(instruction.operand)
+        if mask is None:
+            return None
+        return mask
 
     def _stack_teardown_hint(self, items: _ItemList, index: int) -> Optional[int]:
         scan = index - 1
@@ -2304,6 +2338,7 @@ class IRNormalizer:
                     abi_effects=self._merge_return_mask_effects(
                         return_node.abi_effects, mask
                     ),
+                    operand_mask=return_node.operand_mask,
                 )
                 self._transfer_ssa(return_node, updated)
                 removed = end - start
@@ -3708,6 +3743,7 @@ class IRNormalizer:
                             varargs=item.varargs,
                             cleanup=item.cleanup,
                             abi_effects=abi_effects,
+                            operand_mask=item.operand_mask,
                         )
                         self._transfer_ssa(item, updated)
                         items.replace_slice(index, index + 1, [updated])
@@ -3819,6 +3855,193 @@ class IRNormalizer:
             updated_blocks.append(self._apply_function_return_mask(block, mask))
 
         return updated_blocks
+
+    def _apply_return_operand_masks(self, blocks: Sequence[IRBlock]) -> List[IRBlock]:
+        if not blocks:
+            return list(blocks)
+
+        updated_blocks: List[IRBlock] = []
+        for block in blocks:
+            changed = False
+            new_nodes: List[IRNode] = []
+            for node in block.nodes:
+                if isinstance(node, IRReturn):
+                    existing_mask = self._canonical_return_mask(node.mask)
+                    operand_mask = self._canonical_return_mask(node.operand_mask)
+                    if existing_mask is not None:
+                        new_nodes.append(node)
+                        continue
+
+                    width_hint = self._return_width_hint(node)
+                    mask_candidate = operand_mask
+                    if mask_candidate is not None:
+                        mask_candidate = self._adjust_return_mask_width(
+                            mask_candidate, width_hint
+                        )
+
+                    if mask_candidate is None and operand_mask is None:
+                        mask_candidate = self._default_return_mask(width_hint)
+                        if mask_candidate is not None:
+                            mask_candidate = self._adjust_return_mask_width(
+                                mask_candidate, width_hint
+                            )
+
+                    mask_candidate = self._canonical_return_mask(mask_candidate)
+                    if mask_candidate is not None:
+                        cleanup = self._rewrite_cleanup_return_mask(
+                            node.cleanup, mask_candidate
+                        )
+                        abi_effects = self._merge_return_mask_effects(
+                            node.abi_effects, mask_candidate
+                        )
+                        updated = IRReturn(
+                            values=node.values,
+                            varargs=node.varargs,
+                            cleanup=cleanup,
+                            abi_effects=abi_effects,
+                            operand_mask=node.operand_mask,
+                        )
+                        if not updated.varargs:
+                            updated = self._enforce_return_mask(updated)
+                        self._transfer_ssa(node, updated)
+                        new_nodes.append(updated)
+                        changed = True
+                        continue
+                elif isinstance(node, CallLike) and getattr(node, "tail", False):
+                    existing_mask = self._canonical_return_mask(
+                        self._call_like_cleanup_mask(node)
+                    )
+                    if existing_mask is not None:
+                        new_nodes.append(node)
+                        continue
+
+                    width_hint = self._tail_return_width_hint(node)
+                    cleanup_mask = self._call_like_cleanup_mask(node)
+                    canonical_cleanup = self._canonical_return_mask(cleanup_mask)
+                    if canonical_cleanup is not None:
+                        canonical_cleanup = self._adjust_return_mask_width(
+                            canonical_cleanup, width_hint
+                        )
+
+                    mask_candidate = canonical_cleanup
+                    had_cleanup_mask = cleanup_mask is not None
+
+                    if mask_candidate is None:
+                        abi_mask = self._abi_return_mask(
+                            getattr(node, "abi_effects", tuple())
+                        )
+                        canonical_abi = self._canonical_return_mask(abi_mask)
+                        if canonical_abi is not None:
+                            canonical_abi = self._adjust_return_mask_width(
+                                canonical_abi, width_hint
+                            )
+                        if canonical_abi is not None:
+                            mask_candidate = canonical_abi
+                        elif abi_mask is not None and not had_cleanup_mask:
+                            cleanup_mask = abi_mask
+                            had_cleanup_mask = True
+
+                    if mask_candidate is None:
+                        signature = self.knowledge.call_signature(
+                            getattr(node, "target", -1)
+                        )
+                        if signature and signature.cleanup_mask is not None:
+                            canonical_signature = self._canonical_return_mask(
+                                signature.cleanup_mask
+                            )
+                            if canonical_signature is not None:
+                                canonical_signature = self._adjust_return_mask_width(
+                                    canonical_signature, width_hint
+                                )
+                            if canonical_signature is not None:
+                                mask_candidate = canonical_signature
+                            elif not had_cleanup_mask:
+                                cleanup_mask = signature.cleanup_mask
+                                had_cleanup_mask = True
+
+                    if mask_candidate is None and width_hint == 0:
+                        mask_candidate = 0
+
+                    canonical_candidate = self._canonical_return_mask(mask_candidate)
+                    if canonical_candidate is not None:
+                        updated = self._update_call_like_return_mask(
+                            node, canonical_candidate
+                        )
+                        self._transfer_ssa(node, updated)
+                        new_nodes.append(updated)
+                        changed = True
+                        continue
+                    if mask_candidate is not None or cleanup_mask is not None:
+                        raw_effect_mask = mask_candidate
+                        if raw_effect_mask is None:
+                            raw_effect_mask = cleanup_mask
+                        abi_effects = self._merge_raw_return_mask_effects(
+                            getattr(node, "abi_effects", tuple()), raw_effect_mask
+                        )
+                        updated = replace(node, abi_effects=abi_effects)
+                        self._transfer_ssa(node, updated)
+                        new_nodes.append(updated)
+                        changed = True
+                        continue
+                new_nodes.append(node)
+            if changed:
+                block = IRBlock(
+                    label=block.label,
+                    start_offset=block.start_offset,
+                    nodes=tuple(new_nodes),
+                    annotations=block.annotations,
+                )
+            updated_blocks.append(block)
+        return updated_blocks
+
+    @staticmethod
+    def _return_width_hint(node: IRReturn) -> int:
+        explicit = [value for value in node.values if value != "ret*"]
+        if explicit:
+            return len(explicit)
+        if node.values:
+            return 1
+        return 0
+
+    @staticmethod
+    def _default_return_mask(width: int) -> Optional[int]:
+        if width <= 0:
+            return None
+        return DEFAULT_RETURN_MASKS.get(width)
+
+    def _adjust_return_mask_width(
+        self, mask: Optional[int], width_hint: int
+    ) -> Optional[int]:
+        if mask is None or width_hint <= 0:
+            return mask
+
+        mask_width = self._return_mask_width(mask)
+        if mask_width is None:
+            return mask
+
+        if mask_width == width_hint:
+            return mask
+
+        if mask_width > width_hint:
+            bits = self._return_mask_bits(mask)
+            if not bits:
+                return 0
+            trimmed = 0
+            for bit in bits[:width_hint]:
+                trimmed |= 1 << bit
+            return trimmed
+
+        return None
+
+    @staticmethod
+    def _tail_return_width_hint(node: CallLike) -> int:
+        returns = getattr(node, "returns", tuple())
+        explicit = [value for value in returns if value != "ret*"]
+        if explicit:
+            return len(explicit)
+        if returns:
+            return 1
+        return 0
 
     def _block_return_mask(self, block: IRBlock) -> Optional[int]:
         mask: Optional[int] = None
@@ -4382,6 +4605,7 @@ class IRNormalizer:
                 varargs=returns_node.varargs,
                 cleanup=tuple(cleanup_chain),
                 abi_effects=returns_node.abi_effects,
+                operand_mask=returns_node.operand_mask,
             )
             self._transfer_ssa(node, new_return)
             items.replace_slice(index, index + 1, [new_return])
@@ -5840,6 +6064,7 @@ class IRNormalizer:
             varargs=node.varargs,
             cleanup=node.cleanup,
             abi_effects=node.abi_effects,
+            operand_mask=node.operand_mask,
         )
         self._transfer_ssa(node, updated)
         return updated
@@ -6529,6 +6754,14 @@ class IRNormalizer:
         merged = base + self._return_mask_effect(mask)
         return self._sanitize_abi_effects(merged)
 
+    @staticmethod
+    def _merge_raw_return_mask_effects(
+        effects: Sequence[IRAbiEffect], mask: int
+    ) -> Tuple[IRAbiEffect, ...]:
+        base = tuple(effect for effect in effects if effect.kind != "return_mask")
+        alias = OPERAND_ALIASES.get(mask)
+        return base + (IRAbiEffect(kind="return_mask", operand=mask, alias=alias),)
+
     def _rewrite_cleanup_return_mask(
         self, steps: Tuple[IRStackEffect, ...], mask: Optional[int]
     ) -> Tuple[IRStackEffect, ...]:
@@ -6954,6 +7187,7 @@ class IRNormalizer:
                 varargs=target.varargs,
                 cleanup=combined,
                 abi_effects=self._merge_return_mask_effects(target.abi_effects, mask),
+                operand_mask=target.operand_mask,
             )
         if isinstance(target, IRTailCall):
             cleanup = list(effects) + list(target.cleanup)

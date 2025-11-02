@@ -93,6 +93,9 @@
       {"mnemonic": "op_52_05", "operand": "0x0030"}
     ]
   },
+  "0x0429": {
+    "cleanup_mask": "0x2910"
+  },
   "0x3D30": {
     "tail": true,
     "prelude": [
