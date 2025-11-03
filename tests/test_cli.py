@@ -61,5 +61,5 @@ def test_cli_generates_ir_only(tmp_path: Path) -> None:
     assert not default_ir.exists()
     assert output_path.exists()
     ir_text = output_path.read_text("utf-8")
-    assert "normalizer metrics" in ir_text
+    assert ";   normalizer:" in ir_text
     assert "segment" in ir_text

@@ -49,6 +49,12 @@ from .model import (
     IRIOWrite,
     MemSpace,
     NormalizerMetrics,
+    IRControlFlowGraph,
+    IRFunctionCfg,
+    IRCfgBlock,
+    IRCfgEdge,
+    IRAbiMetrics,
+    IRAbiFunctionReport,
 )
 from .normalizer import IRNormalizer
 from .printer import IRTextRenderer
@@ -104,4 +110,10 @@ __all__ = [
     "IRRaw",
     "MemSpace",
     "NormalizerMetrics",
+    "IRControlFlowGraph",
+    "IRFunctionCfg",
+    "IRCfgBlock",
+    "IRCfgEdge",
+    "IRAbiMetrics",
+    "IRAbiFunctionReport",
 ]
