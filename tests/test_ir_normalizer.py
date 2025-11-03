@@ -2397,6 +2397,7 @@ def test_tailcall_description_avoids_nested_abi() -> None:
 
     rendered = tail.describe()
     assert rendered.count("abi=[") == 1
+    assert rendered.count("returns=") == 1
 
 
 def test_abi_effect_rendering_avoids_nested_aliases() -> None:

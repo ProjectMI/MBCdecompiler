@@ -210,14 +210,19 @@ class IRCall(IRNode):
     def __post_init__(self) -> None:
         object.__setattr__(self, "cleanup", _normalise_cleanup_steps(self.cleanup))
 
-    def describe(self, *, include_abi: bool = True) -> str:
+    def describe(
+        self,
+        *,
+        include_abi: bool = True,
+        include_tail_returns: bool = True,
+    ) -> str:
         suffix = " tail" if self.tail else ""
         args = ", ".join(self.args)
         target_repr = f"0x{self.target:04X}"
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         details = []
-        if self.tail:
+        if self.tail and include_tail_returns:
             mask = self.cleanup_mask
             if mask is not None:
                 width = int(mask & 0xFFFF).bit_count()
@@ -285,7 +290,9 @@ class IRTailCall(IRNode):
         return self.call.predicate
 
     def describe(self) -> str:
-        call_repr = self.call.describe(include_abi=False)
+        call_repr = self.call.describe(
+            include_abi=False, include_tail_returns=False
+        )
         details: List[str] = []
         if self.returns:
             rendered = ", ".join(self.returns)
