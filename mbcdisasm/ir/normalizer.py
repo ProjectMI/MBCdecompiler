@@ -2746,7 +2746,6 @@ class IRNormalizer:
                 continue
 
             convention = item.convention
-            arity = item.arity
             cleanup_steps = item.cleanup
             cleanup_mask = self._extract_cleanup_mask(
                 cleanup_steps, include_optional=False
@@ -2764,13 +2763,6 @@ class IRNormalizer:
                     consumed.append(scan)
                     scan -= 1
                     continue
-                if isinstance(candidate, IRLiteral) and arity is None:
-                    decoded = self._decode_call_arity(candidate.value)
-                    if decoded is not None:
-                        arity = decoded
-                        consumed.append(scan)
-                        scan -= 1
-                        continue
                 if isinstance(candidate, IRCallCleanup):
                     shuffle_operand = self._extract_call_shuffle(candidate)
                     if shuffle_operand is not None:
@@ -2837,7 +2829,6 @@ class IRNormalizer:
                 target=call.target,
                 args=call.args,
                 tail=tail,
-                arity=arity,
                 convention=convention,
                 cleanup=cleanup_steps,
                 symbol=call.symbol,
@@ -4207,7 +4198,6 @@ class IRNormalizer:
                     target=item.target,
                     args=item.args,
                     tail=True,
-                    arity=item.arity,
                     convention=item.convention,
                     cleanup=item.call.cleanup,
                     symbol=item.symbol,
@@ -4306,7 +4296,6 @@ class IRNormalizer:
                 target=item.target,
                 args=item.args,
                 tail=True,
-                arity=item.arity,
                 convention=item.convention,
                 cleanup=tuple(),
                 symbol=item.symbol,
@@ -4392,7 +4381,6 @@ class IRNormalizer:
 
         cleanup_mask = self._call_like_cleanup_mask(node)
         predicate = getattr(node, "predicate", None)
-        arity = getattr(node, "arity", None)
 
         cleanup_effects = list(getattr(node, "cleanup", tuple()))
         teardown: Optional[IRStackEffect] = None
@@ -4451,7 +4439,6 @@ class IRNormalizer:
             varargs=varargs,
             cleanup=tuple(retained_cleanup),
             tail=True,
-            arity=arity,
             convention=None,
             symbol=symbol,
             predicate=predicate,
@@ -4479,13 +4466,11 @@ class IRNormalizer:
             cleanup: Tuple[IRStackEffect, ...] = tuple()
             args = getattr(node, "args", tuple())
             predicate = getattr(node, "predicate", None)
-            arity = getattr(node, "arity", None)
             if isinstance(node, IRCall):
                 replacement = IRCall(
                     target=target,
                     args=args,
                     tail=getattr(node, "tail", False),
-                    arity=arity,
                     convention=None,
                     cleanup=cleanup,
                     symbol=symbol,
@@ -4500,7 +4485,6 @@ class IRNormalizer:
                     returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
-                    arity=arity,
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
@@ -4514,7 +4498,6 @@ class IRNormalizer:
                     returns=self._normalise_return_tokens(getattr(node, "returns", tuple())),
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
-                    arity=arity,
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
@@ -4525,7 +4508,6 @@ class IRNormalizer:
                     target=target,
                     args=args,
                     tail=True,
-                    arity=arity,
                     convention=None,
                     cleanup=tuple(),
                     symbol=symbol,
@@ -4547,7 +4529,6 @@ class IRNormalizer:
                     varargs=getattr(node, "varargs", False),
                     cleanup=cleanup,
                     tail=getattr(node, "tail", True),
-                    arity=arity,
                     convention=None,
                     symbol=symbol,
                     predicate=predicate,
@@ -4941,7 +4922,6 @@ class IRNormalizer:
                             varargs=varargs,
                             cleanup=combined_cleanup,
                             tail=True,
-                            arity=call.arity,
                             convention=call.convention,
                             symbol=call.symbol,
                             predicate=call.predicate,
@@ -4961,7 +4941,6 @@ class IRNormalizer:
                             returns=return_node.values,
                             varargs=varargs,
                             cleanup=combined_cleanup,
-                            arity=call.arity,
                             convention=call.convention,
                             symbol=call.symbol,
                             predicate=call.predicate,
@@ -5134,7 +5113,6 @@ class IRNormalizer:
                 target=node.target,
                 args=node.args,
                 tail=node.tail,
-                arity=node.arity,
                 convention=node.convention,
                 cleanup=node.cleanup,
                 symbol=node.symbol,
@@ -5151,7 +5129,6 @@ class IRNormalizer:
                 returns=node.returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
-                arity=node.arity,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -5165,7 +5142,6 @@ class IRNormalizer:
                 target=node.target,
                 args=node.args,
                 tail=True,
-                arity=node.arity,
                 convention=node.convention,
                 cleanup=node.call.cleanup,
                 symbol=node.symbol,
@@ -5189,7 +5165,6 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 tail=node.tail,
-                arity=node.arity,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -5225,7 +5200,6 @@ class IRNormalizer:
         target = getattr(node, "target", -1)
 
         tail = getattr(node, "tail", False)
-        arity = getattr(node, "arity", None)
         convention = getattr(node, "convention", None)
         cleanup_mask = self._call_like_cleanup_mask(node)
         predicate = getattr(node, "predicate", None)
@@ -5238,8 +5212,6 @@ class IRNormalizer:
 
         if signature.tail is not None:
             tail = signature.tail or tail
-        if signature.arity is not None:
-            arity = signature.arity
         if signature.cleanup_mask is not None:
             cleanup_mask = self._canonical_return_mask(signature.cleanup_mask)
         if signature.shuffle is not None:
@@ -5323,7 +5295,6 @@ class IRNormalizer:
         updated = self._rebuild_call_node(
             node,
             tail=tail,
-            arity=arity,
             convention=convention,
             cleanup_mask=cleanup_mask,
             cleanup=cleanup,
@@ -5548,7 +5519,6 @@ class IRNormalizer:
         node: CallLike,
         *,
         tail: bool,
-        arity: Optional[int],
         convention: Optional[IRStackEffect],
         cleanup_mask: Optional[int],
         cleanup: Tuple[IRStackEffect, ...],
@@ -5564,7 +5534,6 @@ class IRNormalizer:
                 target=target,
                 args=node.args,
                 tail=tail,
-                arity=arity,
                 convention=convention,
                 cleanup=cleanup,
                 symbol=node.symbol,
@@ -5584,7 +5553,6 @@ class IRNormalizer:
                 returns=returns,
                 varargs=node.varargs,
                 cleanup=cleanup,
-                arity=arity,
                 convention=convention,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -5600,7 +5568,6 @@ class IRNormalizer:
                 target=target,
                 args=node.args,
                 tail=True,
-                arity=arity,
                 convention=convention,
                 cleanup=call_cleanup,
                 symbol=node.symbol,
@@ -5627,7 +5594,6 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=cleanup,
                 tail=tail,
-                arity=arity,
                 convention=convention,
                 symbol=node.symbol,
                 predicate=predicate,
@@ -5638,7 +5604,6 @@ class IRNormalizer:
 
     def _finalise_call_node(self, node: CallLike) -> CallLike:
         node = self._normalise_call_result_arity(node)
-        node = self._normalise_call_argument_arity(node)
         node = self._enforce_call_return_mask(node)
         return node
 
@@ -5664,7 +5629,6 @@ class IRNormalizer:
                     returns=new_returns,
                     varargs=node.varargs,
                     cleanup=node.cleanup,
-                    arity=node.arity,
                     convention=node.convention,
                     symbol=node.symbol,
                     predicate=node.predicate,
@@ -5707,7 +5671,6 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 tail=node.tail,
-                arity=node.arity,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,
@@ -5715,94 +5678,6 @@ class IRNormalizer:
             )
             self._transfer_ssa(node, updated)
             return updated
-        return node
-
-    def _normalise_call_argument_arity(self, node: CallLike) -> CallLike:
-        arity = getattr(node, "arity", None)
-        if arity is None:
-            return node
-
-        args: Tuple[str, ...]
-        if isinstance(node, IRTailCall):
-            args = node.call.args
-        else:
-            args = getattr(node, "args", tuple())
-
-        actual = len(args)
-        if actual == arity:
-            return node
-
-        if isinstance(node, IRCall):
-            updated = IRCall(
-                target=node.target,
-                args=node.args,
-                tail=node.tail,
-                arity=actual,
-                convention=node.convention,
-                cleanup=node.cleanup,
-                symbol=node.symbol,
-                predicate=node.predicate,
-                abi_effects=node.abi_effects,
-            )
-            self._transfer_ssa(node, updated)
-            return updated
-
-        if isinstance(node, IRCallReturn):
-            updated = IRCallReturn(
-                target=node.target,
-                args=node.args,
-                tail=node.tail,
-                returns=node.returns,
-                varargs=node.varargs,
-                cleanup=node.cleanup,
-                arity=actual,
-                convention=node.convention,
-                symbol=node.symbol,
-                predicate=node.predicate,
-                abi_effects=node.abi_effects,
-            )
-            self._transfer_ssa(node, updated)
-            return updated
-
-        if isinstance(node, IRTailCall):
-            updated_call = IRCall(
-                target=node.call.target,
-                args=node.call.args,
-                tail=node.call.tail,
-                arity=actual,
-                convention=node.call.convention,
-                cleanup=node.call.cleanup,
-                symbol=node.call.symbol,
-                predicate=node.call.predicate,
-                abi_effects=node.call.abi_effects,
-            )
-            updated = IRTailCall(
-                call=updated_call,
-                returns=node.returns,
-                varargs=node.varargs,
-                cleanup=node.cleanup,
-                abi_effects=node.abi_effects,
-            )
-            self._transfer_ssa(node, updated)
-            return updated
-
-        if isinstance(node, IRTailcallReturn):
-            updated = IRTailcallReturn(
-                target=node.target,
-                args=node.args,
-                returns=node.returns,
-                varargs=node.varargs,
-                cleanup=node.cleanup,
-                tail=node.tail,
-                arity=actual,
-                convention=node.convention,
-                symbol=node.symbol,
-                predicate=node.predicate,
-                abi_effects=node.abi_effects,
-            )
-            self._transfer_ssa(node, updated)
-            return updated
-
         return node
 
     def _enforce_call_return_mask(self, node: CallLike) -> CallLike:
@@ -5825,7 +5700,6 @@ class IRNormalizer:
                 returns=trimmed,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
-                arity=node.arity,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,
@@ -5859,7 +5733,6 @@ class IRNormalizer:
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 tail=node.tail,
-                arity=node.arity,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,

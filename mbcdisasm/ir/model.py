@@ -201,7 +201,6 @@ class IRCall(IRNode):
     target: int
     args: Tuple[str, ...]
     tail: bool = False
-    arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     symbol: Optional[str] = None
@@ -218,8 +217,10 @@ class IRCall(IRNode):
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         details = []
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
+        if include_abi and self.tail:
+            returns_detail = self._describe_tail_returns()
+            if returns_detail is not None:
+                details.append(returns_detail)
         if self.convention is not None:
             details.append(f"convention={self.convention.describe()}")
         if self.cleanup:
@@ -239,6 +240,16 @@ class IRCall(IRNode):
             if effect.kind == "return_mask":
                 return effect.operand
         return None
+
+    def _describe_tail_returns(self) -> Optional[str]:
+        mask = self.cleanup_mask
+        if mask is None:
+            return None
+        width = int(mask & 0xFFFF).bit_count()
+        if width <= 0:
+            return "returns=0"
+        tokens = ", ".join(f"ret{index}" for index in range(width))
+        return f"returns=[{tokens}]"
 
 
 @dataclass(frozen=True)
@@ -265,10 +276,6 @@ class IRTailCall(IRNode):
     @property
     def tail(self) -> bool:
         return True
-
-    @property
-    def arity(self) -> Optional[int]:
-        return self.call.arity
 
     @property
     def convention(self) -> Optional[IRStackEffect]:
@@ -1102,7 +1109,6 @@ class IRCallReturn(IRNode):
     returns: Tuple[str, ...]
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
-    arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
@@ -1128,8 +1134,6 @@ class IRCallReturn(IRNode):
         if self.symbol:
             target_repr = f"{self.symbol}({target_repr})"
         details = []
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
         if self.convention is not None:
             details.append(f"convention={self.convention.describe()}")
         if self.predicate is not None:
@@ -1217,7 +1221,6 @@ class IRTailcallReturn(IRNode):
     varargs: bool = False
     cleanup: Tuple[IRStackEffect, ...] = field(default_factory=tuple)
     tail: bool = True
-    arity: Optional[int] = None
     convention: Optional[IRStackEffect] = None
     symbol: Optional[str] = None
     predicate: Optional[CallPredicate] = None
@@ -1249,8 +1252,6 @@ class IRTailcallReturn(IRNode):
         if self.abi_effects:
             rendered = ", ".join(effect.describe() for effect in self.abi_effects)
             details.append(f"abi=[{rendered}]")
-        if self.arity is not None:
-            details.append(f"arity={self.arity}")
         if self.predicate is not None:
             details.append(f"predicate={self.predicate.describe()}")
         suffix = " ".join(details)
