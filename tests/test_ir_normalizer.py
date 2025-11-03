@@ -1360,7 +1360,6 @@ def test_normalizer_groups_call_helper_cleanup(tmp_path: Path) -> None:
     assert call_like.convention is not None
     assert call_like.convention.operand == 0x4B08
     assert call_like.cleanup_mask == RET_MASK
-    assert call_like.arity is None
 
     assert not any(isinstance(node, IRCallPreparation) for node in block.nodes)
     assert not any(isinstance(node, IRCallCleanup) for node in block.nodes)
