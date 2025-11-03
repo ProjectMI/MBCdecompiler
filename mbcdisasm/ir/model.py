@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..constants import IO_PORT_NAME, IO_SLOT_ALIASES, OPERAND_ALIASES
 from .effect_aliases import cleanup_category
@@ -1266,6 +1266,88 @@ class IRTailcallReturn(IRNode):
 
 
 @dataclass(frozen=True)
+class IRCfgEdge:
+    """Single directed edge in a function control-flow graph."""
+
+    kind: str
+    target: str
+
+
+@dataclass(frozen=True)
+class IRCfgBlock:
+    """Summary describing a block and its outgoing edges."""
+
+    label: str
+    start_offset: int
+    terminator: str
+    edges: Tuple[IRCfgEdge, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class IRFunctionCfg:
+    """Control-flow graph for a single function."""
+
+    segment_index: int
+    name: str
+    entry_block: str
+    entry_offset: int
+    blocks: Tuple[IRCfgBlock, ...]
+
+
+@dataclass(frozen=True)
+class IRControlFlowGraph:
+    """Aggregate control-flow view for the entire programme."""
+
+    functions: Tuple[IRFunctionCfg, ...]
+
+
+@dataclass(frozen=True)
+class IRAbiFunctionReport:
+    """Summary of ABI return-mask coverage for a single function."""
+
+    segment_index: int
+    name: str
+    entry_offset: int
+    total_exits: int
+    masked_exits: int
+    masks: Tuple[Optional[int], ...]
+
+    def describe_masks(self) -> str:
+        rendered: List[str] = []
+        for mask in self.masks:
+            if mask is None:
+                rendered.append("none")
+            else:
+                rendered.append(f"0x{mask:04X}")
+        return ", ".join(rendered)
+
+
+@dataclass(frozen=True)
+class IRAbiMetrics:
+    """Aggregated ABI consistency metrics derived from the CFG."""
+
+    total_exits: int
+    masked_exits: int
+    total_functions: int
+    inconsistent_functions: int
+    missing_mask_functions: Tuple[IRAbiFunctionReport, ...] = tuple()
+    inconsistent_mask_functions: Tuple[IRAbiFunctionReport, ...] = tuple()
+
+    @property
+    def return_mask_coverage(self) -> float:
+        if not self.total_exits:
+            return 100.0
+        return (self.masked_exits / self.total_exits) * 100.0
+
+    @property
+    def mask_consistency(self) -> float:
+        if not self.total_functions:
+            return 100.0
+        consistent = self.total_functions - self.inconsistent_functions
+        return (consistent / self.total_functions) * 100.0
+
+
+@dataclass(frozen=True)
 class IRConditionMask(IRNode):
     """High level view of flag fan-out and RET_MASK terminators."""
 
@@ -1305,6 +1387,8 @@ class IRProgram:
     segments: Tuple[IRSegment, ...]
     metrics: "NormalizerMetrics"
     string_pool: Tuple[IRStringConstant, ...] = tuple()
+    cfg: Optional[IRControlFlowGraph] = None
+    abi_metrics: Optional[IRAbiMetrics] = None
 
 
 @dataclass
@@ -1398,6 +1482,12 @@ __all__ = [
     "IRLiteral",
     "IRLiteralChunk",
     "IRDataMarker",
+    "IRControlFlowGraph",
+    "IRFunctionCfg",
+    "IRCfgBlock",
+    "IRCfgEdge",
+    "IRAbiMetrics",
+    "IRAbiFunctionReport",
     "IRStringConstant",
     "IRAsciiPreamble",
     "IRCallPreparation",

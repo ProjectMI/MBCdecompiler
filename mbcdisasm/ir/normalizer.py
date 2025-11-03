@@ -82,6 +82,7 @@ from .model import (
     SSAValueKind,
     NormalizerMetrics,
 )
+from .cfg import analyse_segments
 
 
 ANNOTATION_MNEMONICS = {"literal_marker"}
@@ -719,10 +720,15 @@ class IRNormalizer:
                 if constant.name in used_strings
             )
 
+        segment_tuple = tuple(segments)
+        cfg, abi_metrics = analyse_segments(segment_tuple)
+
         return IRProgram(
-            segments=tuple(segments),
+            segments=segment_tuple,
             metrics=aggregate_metrics,
             string_pool=string_pool,
+            cfg=cfg,
+            abi_metrics=abi_metrics,
         )
 
     def normalise_segment(self, segment: Segment) -> IRSegment:

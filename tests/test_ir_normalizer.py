@@ -6,6 +6,7 @@ import pytest
 from mbcdisasm import IRNormalizer, KnowledgeBase, MbcContainer
 from mbcdisasm.adb import SegmentDescriptor
 from mbcdisasm.ir import IRTextRenderer
+from mbcdisasm.ir.cfg import analyse_segments
 from dataclasses import replace
 
 from mbcdisasm.ir.model import (
@@ -47,6 +48,7 @@ from mbcdisasm.ir.model import (
     IRSlot,
     NormalizerMetrics,
     IRIORead,
+    IRSegment,
 )
 from mbcdisasm.ir.normalizer import RawBlock, RawInstruction, _ItemList
 from mbcdisasm.constants import (
@@ -578,8 +580,17 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
 
     renderer = IRTextRenderer()
     text = renderer.render(program)
-    assert "normalizer metrics" in text
+    assert ";   normalizer:" in text
     assert f"segment {segment.index}" in text
+    assert text.startswith("; string pool")
+    assert "; metrics" in text
+    assert "; cfg" in text
+
+    assert program.cfg is not None
+    assert program.cfg.functions
+    assert program.abi_metrics is not None
+    assert 0.0 <= program.abi_metrics.return_mask_coverage <= 100.0
+    assert 0.0 <= program.abi_metrics.mask_consistency <= 100.0
 
     call_nodes = [
         node
@@ -652,6 +663,41 @@ def test_normalizer_builds_ir(tmp_path: Path) -> None:
             if isinstance(node, IRFunctionPrologue)
         ]
         assert prologue_nodes
+
+
+def test_cfg_metrics_detects_return_mask_violations() -> None:
+    mask_effect = IRAbiEffect(kind="return_mask", operand=0x1234)
+    masked_block = IRBlock(
+        label="block_0",
+        start_offset=0x0000,
+        nodes=(IRReturn(values=("ret0",), abi_effects=(mask_effect,)),),
+    )
+    bare_block = IRBlock(
+        label="block_1",
+        start_offset=0x0004,
+        nodes=(IRReturn(values=("ret0",), abi_effects=tuple()),),
+    )
+    segment = IRSegment(
+        index=0,
+        start=0,
+        length=8,
+        blocks=(masked_block, bare_block),
+        metrics=NormalizerMetrics(),
+    )
+
+    cfg, abi_metrics = analyse_segments((segment,))
+
+    assert cfg.functions
+    assert len(cfg.functions[0].blocks) == 2
+
+    assert abi_metrics.total_exits == 2
+    assert abi_metrics.masked_exits == 1
+    assert abi_metrics.missing_mask_functions
+    assert abi_metrics.inconsistent_mask_functions
+    report = abi_metrics.missing_mask_functions[0]
+    assert report.segment_index == 0
+    assert report.total_exits == 2
+    assert report.masked_exits == 1
 
 
 def test_tail_helper_wrappers_collapse(tmp_path: Path) -> None:
