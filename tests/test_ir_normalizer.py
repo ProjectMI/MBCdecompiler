@@ -1474,6 +1474,27 @@ def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
     assert call_like.returns == ("ret0",)
 
 
+def test_normalizer_assigns_call_return_mask() -> None:
+    knowledge = KnowledgeBase.load(Path("knowledge"))
+    container = MbcContainer.load(Path("mbc/_bank.mbc"), Path("mbc/_bank.adb"))
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+
+    call_returns = [
+        node
+        for segment in program.segments
+        for block in segment.blocks
+        for node in block.nodes
+        if isinstance(node, IRCallReturn)
+    ]
+
+    assert call_returns, "expected call_return terminators in _bank container"
+
+    for node in call_returns:
+        assert node.cleanup_mask == RET_MASK
+
+
 def test_normalizer_absorbs_zero_stack_call_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

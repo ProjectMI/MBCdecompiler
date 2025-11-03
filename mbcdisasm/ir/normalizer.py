@@ -5692,12 +5692,29 @@ class IRNormalizer:
 
         mask = self._call_like_cleanup_mask(node)
         width = self._return_mask_width(mask)
+
+        def _with_effects(updated_node: CallLike, effects: Tuple[IRAbiEffect, ...]) -> CallLike:
+            if getattr(updated_node, "abi_effects", tuple()) == effects:
+                return updated_node
+            replaced = replace(updated_node, abi_effects=effects)
+            self._transfer_ssa(updated_node, replaced)
+            return replaced
+
+        abi_effects: Tuple[IRAbiEffect, ...]
+        if mask is not None:
+            existing = cast(Tuple[IRAbiEffect, ...], getattr(node, "abi_effects", tuple()))
+            abi_effects = self._merge_return_mask_effects(existing, mask)
+        else:
+            abi_effects = getattr(node, "abi_effects", tuple())
+
         if width is None:
+            if mask is not None and isinstance(node, (IRCallReturn, IRTailCall, IRTailcallReturn)):
+                return cast(CallLike, _with_effects(node, abi_effects))
             return node
 
         if isinstance(node, IRCallReturn):
             if node.varargs or len(node.returns) <= width:
-                return node
+                return cast(CallLike, _with_effects(node, abi_effects))
             trimmed = node.returns[:width]
             updated = IRCallReturn(
                 target=node.target,
@@ -5709,28 +5726,28 @@ class IRNormalizer:
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,
-                abi_effects=node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, updated)
             return updated
 
         if isinstance(node, IRTailCall):
             if node.varargs or len(node.returns) <= width:
-                return node
+                return cast(CallLike, _with_effects(node, abi_effects))
             trimmed = node.returns[:width]
             updated = IRTailCall(
                 call=node.call,
                 returns=trimmed,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
-                abi_effects=node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, updated)
             return updated
 
         if isinstance(node, IRTailcallReturn):
             if node.varargs or len(node.returns) <= width:
-                return node
+                return cast(CallLike, _with_effects(node, abi_effects))
             trimmed = node.returns[:width]
             updated = IRTailcallReturn(
                 target=node.target,
@@ -5742,7 +5759,7 @@ class IRNormalizer:
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,
-                abi_effects=node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, updated)
             return updated
@@ -6378,6 +6395,18 @@ class IRNormalizer:
                 return IRNormalizer._canonical_return_mask(step.operand)
         return None
 
+    def _cleanup_helper_mask(
+        self, steps: Sequence[IRStackEffect]
+    ) -> Optional[int]:
+        for step in reversed(steps):
+            category = step.category or ""
+            mnemonic = step.mnemonic
+            if category == "helpers.invoke" or mnemonic in {"call_helpers", "helpers.invoke"}:
+                mask = self._canonical_return_mask(step.operand)
+                if mask is not None:
+                    return mask
+        return None
+
     @staticmethod
     def _abi_return_mask(effects: Sequence[IRAbiEffect]) -> Optional[int]:
         for effect in effects:
@@ -6390,6 +6419,9 @@ class IRNormalizer:
         mask = self._extract_cleanup_mask(cleanup_steps, include_optional=False)
         if mask is not None:
             return mask
+        helper_mask = self._cleanup_helper_mask(cleanup_steps)
+        if helper_mask is not None:
+            return helper_mask
         has_mask_effect = any(
             step.category == "frame.return_mask" for step in cleanup_steps
         )
