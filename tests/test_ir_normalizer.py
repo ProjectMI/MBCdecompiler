@@ -1474,6 +1474,33 @@ def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
     assert call_like.returns == ("ret0",)
 
 
+def test_finalise_call_return_assigns_return_mask_to_abi() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+
+    cleanup = (
+        IRStackEffect(
+            mnemonic="return_mask",
+            operand=0x0003,
+            category="frame.return_mask",
+        ),
+    )
+
+    node = IRCallReturn(
+        target=0x1000,
+        args=("arg0",),
+        tail=False,
+        returns=("ret0", "ret1"),
+        cleanup=cleanup,
+    )
+
+    finalised = normalizer._finalise_call_node(node)
+
+    assert isinstance(finalised, IRCallReturn)
+    assert finalised.cleanup_mask == 0x0003
+    assert finalised.abi_effects
+    assert any(effect.kind == "return_mask" and effect.operand == 0x0003 for effect in finalised.abi_effects)
+
+
 def test_normalizer_absorbs_zero_stack_call_wrappers(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 

@@ -5691,6 +5691,47 @@ class IRNormalizer:
             return node
 
         mask = self._call_like_cleanup_mask(node)
+
+        abi_effects = getattr(node, "abi_effects", tuple())
+        merged_effects = self._merge_return_mask_effects(abi_effects, mask)
+        if merged_effects != abi_effects:
+            if isinstance(node, IRCallReturn):
+                updated = IRCallReturn(
+                    target=node.target,
+                    args=node.args,
+                    tail=node.tail,
+                    returns=node.returns,
+                    varargs=node.varargs,
+                    cleanup=node.cleanup,
+                    convention=node.convention,
+                    symbol=node.symbol,
+                    predicate=node.predicate,
+                    abi_effects=merged_effects,
+                )
+            elif isinstance(node, IRTailCall):
+                updated = IRTailCall(
+                    call=node.call,
+                    returns=node.returns,
+                    varargs=node.varargs,
+                    cleanup=node.cleanup,
+                    abi_effects=merged_effects,
+                )
+            else:  # IRTailcallReturn
+                updated = IRTailcallReturn(
+                    target=node.target,
+                    args=node.args,
+                    returns=node.returns,
+                    varargs=node.varargs,
+                    cleanup=node.cleanup,
+                    tail=node.tail,
+                    convention=node.convention,
+                    symbol=node.symbol,
+                    predicate=node.predicate,
+                    abi_effects=merged_effects,
+                )
+            self._transfer_ssa(node, updated)
+            node = updated
+
         width = self._return_mask_width(mask)
         if width is None:
             return node
