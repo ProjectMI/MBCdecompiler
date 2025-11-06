@@ -662,6 +662,7 @@ class IRNormalizer:
         0x05F0: "fmt.reset",
     }
     _INDEX_MASK_MAX_BITS = 4
+    _TEARDOWN_FALLBACK_PREFIX = "teardown@"
 
     def __init__(self, knowledge: KnowledgeBase) -> None:
         self.knowledge = knowledge
@@ -746,12 +747,14 @@ class IRNormalizer:
             self._update_tail_helper_hints(block)
 
         blocks = self._propagate_return_masks(segment.index, blocks)
+        block_tuple = tuple(blocks)
+        self._refresh_teardown_metrics(metrics, block_tuple)
 
         return IRSegment(
             index=segment.index,
             start=segment.start,
             length=segment.length,
-            blocks=tuple(blocks),
+            blocks=block_tuple,
             metrics=metrics,
         )
 
@@ -4426,6 +4429,9 @@ class IRNormalizer:
 
         symbol = self._helper_symbol(target)
 
+        if teardown is not None:
+            teardown = self._ensure_teardown_alias(teardown, alias=symbol)
+
         if cleanup_mask == RET_MASK and returns_node is not None:
             cleanup_chain = list(returns_node.cleanup)
             if teardown is not None:
@@ -5247,6 +5253,12 @@ class IRNormalizer:
             if call_cleanup:
                 existing_cleanup = list(call_cleanup + tuple(existing_cleanup))
 
+        call_alias = getattr(node, "symbol", None)
+        if call_alias is None and target >= 0:
+            call_alias = self._helper_symbol(target)
+        if call_alias is None and target >= 0:
+            call_alias = f"helper_0x{target & 0xFFFF:04X}"
+
         if signature.tail is not None:
             tail = signature.tail or tail
         if signature.cleanup_mask is not None:
@@ -5303,7 +5315,9 @@ class IRNormalizer:
         if cleanup_mask is None:
             cleanup_mask = self._canonical_return_mask(signature.cleanup_mask)
 
-        signature_cleanup = self._convert_signature_effects(signature.cleanup)
+        signature_cleanup = self._convert_signature_effects(
+            signature.cleanup, alias=call_alias
+        )
         combined_cleanup = tuple(prefix_effects + signature_cleanup + existing_cleanup + suffix_effects)
         if cleanup_mask is not None:
             combined_cleanup = self._synchronise_cleanup_mask(combined_cleanup, cleanup_mask)
@@ -5449,11 +5463,16 @@ class IRNormalizer:
         return False, [], None, False, None
 
     def _convert_signature_effects(
-        self, specs: Sequence[CallSignatureEffect]
+        self,
+        specs: Sequence[CallSignatureEffect],
+        *,
+        alias: Optional[str] = None,
     ) -> List[IRStackEffect]:
         effects: List[IRStackEffect] = []
         for spec in specs:
-            effects.append(self._stack_effect_from_signature(spec, None))
+            effect = self._stack_effect_from_signature(spec, None)
+            effect = self._ensure_teardown_alias(effect, alias=alias)
+            effects.append(effect)
         return effects
 
     def _synchronise_cleanup_mask(
@@ -5529,9 +5548,140 @@ class IRNormalizer:
             category=category,
             optional=optional,
         )
+        effect = self._ensure_teardown_alias(effect)
         if instruction is not None:
             self._record_teardown_metric(instruction, effect)
         return effect
+
+    def _teardown_fallback_alias(self, effect: IRStackEffect) -> str:
+        pops = effect.pops if effect.pops else 0
+        offset = self._current_block_offset
+        location = f"0x{offset:06X}" if offset >= 0 else "unknown"
+        return f"{self._TEARDOWN_FALLBACK_PREFIX}{location}/pop{pops}"
+
+    def _ensure_teardown_alias(
+        self, effect: IRStackEffect, *, alias: Optional[str] = None
+    ) -> IRStackEffect:
+        name = effect.category or effect.mnemonic
+        if not name or "teardown" not in name:
+            return effect
+        if effect.operand_role:
+            return effect
+        current_alias = effect.operand_alias
+        if alias is not None:
+            if current_alias == alias:
+                return effect
+            if current_alias and not current_alias.startswith(self._TEARDOWN_FALLBACK_PREFIX):
+                return effect
+            return replace(effect, operand_alias=alias)
+        if effect.operand:
+            if current_alias:
+                return effect
+            return effect
+        if current_alias:
+            if current_alias.startswith(self._TEARDOWN_FALLBACK_PREFIX):
+                return effect
+            return effect
+        fallback = self._teardown_fallback_alias(effect)
+        if current_alias == fallback:
+            return effect
+        return replace(effect, operand_alias=fallback)
+
+    def _retarget_teardown_aliases(
+        self, steps: Sequence[IRStackEffect], alias: str
+    ) -> Tuple[Tuple[IRStackEffect, ...], bool]:
+        if not alias:
+            return tuple(steps), False
+        updated: List[IRStackEffect] = []
+        changed = False
+        for step in steps:
+            new_step = self._ensure_teardown_alias(step, alias=alias)
+            if new_step is not step:
+                changed = True
+            updated.append(new_step)
+        return tuple(updated), changed
+
+    def _annotate_call_teardowns(self, node: CallLike) -> CallLike:
+        target = getattr(node, "target", -1)
+        alias = getattr(node, "symbol", None)
+        if alias is None and target >= 0:
+            alias = self._helper_symbol(target)
+        if alias is None and target >= 0:
+            alias = f"helper_0x{target & 0xFFFF:04X}"
+        if not alias:
+            return node
+
+        cleanup = getattr(node, "cleanup", tuple())
+        updated_cleanup, changed = self._retarget_teardown_aliases(cleanup, alias)
+
+        if isinstance(node, IRTailCall):
+            call_cleanup, call_changed = self._retarget_teardown_aliases(
+                node.call.cleanup, alias
+            )
+            call = node.call
+            if call_changed:
+                new_call = replace(call, cleanup=call_cleanup)
+                self._transfer_ssa(call, new_call)
+                call = new_call
+            if changed:
+                updated_node = replace(node, cleanup=updated_cleanup)
+                self._transfer_ssa(node, updated_node)
+                node = updated_node
+            if call is not node.call:
+                updated_node = replace(node, call=call)
+                self._transfer_ssa(node, updated_node)
+                node = updated_node
+            return node
+
+        if changed:
+            updated_node = replace(node, cleanup=updated_cleanup)
+            self._transfer_ssa(node, updated_node)
+            return updated_node
+        return node
+
+    @staticmethod
+    def _iter_teardown_effects(block: IRBlock) -> Iterator[IRStackEffect]:
+        for node in block.nodes:
+            cleanup = getattr(node, "cleanup", None)
+            if cleanup:
+                for effect in cleanup:
+                    name = effect.category or effect.mnemonic
+                    if name and "teardown" in name:
+                        yield effect
+            if isinstance(node, IRCallCleanup):
+                for effect in node.steps:
+                    name = effect.category or effect.mnemonic
+                    if name and "teardown" in name:
+                        yield effect
+
+    def _refresh_teardown_metrics(
+        self, metrics: NormalizerMetrics, blocks: Sequence[IRBlock]
+    ) -> None:
+        total = 0
+        with_operands = 0
+        missing_offsets: List[int] = []
+        hidden = 0
+        seen: Set[int] = set()
+        for block in blocks:
+            block_offset = block.start_offset
+            for effect in self._iter_teardown_effects(block):
+                total += 1
+                if self._teardown_has_operand(effect):
+                    with_operands += 1
+                    continue
+                if block_offset in seen:
+                    continue
+                if len(missing_offsets) >= NormalizerMetrics._MAX_TEARDOWN_OFFSETS:
+                    hidden += 1
+                    seen.add(block_offset)
+                    continue
+                missing_offsets.append(block_offset)
+                seen.add(block_offset)
+
+        metrics.teardowns = total
+        metrics.teardown_with_operands = with_operands
+        metrics.teardown_missing_operand_offsets = missing_offsets
+        metrics.teardown_missing_hidden = hidden
 
     @staticmethod
     def _normalise_return_tokens(value: Any) -> Tuple[str, ...]:
@@ -5645,6 +5795,7 @@ class IRNormalizer:
     def _finalise_call_node(self, node: CallLike) -> CallLike:
         node = self._normalise_call_result_arity(node)
         node = self._enforce_call_return_mask(node)
+        node = self._annotate_call_teardowns(node)
         return node
 
     def _normalise_call_result_arity(self, node: CallLike) -> CallLike:
@@ -6248,6 +6399,7 @@ class IRNormalizer:
             operand_alias=alias_text,
             category=category,
         )
+        effect = self._ensure_teardown_alias(effect)
         self._record_teardown_metric(instruction, effect)
         return effect
 
@@ -6277,13 +6429,13 @@ class IRNormalizer:
                     total_pops += steps[advance].pops
                     advance += 1
                 combined.append(
-                    IRStackEffect(
-                        mnemonic="stack_teardown",
-                        operand=operand,
+                    replace(
+                        step,
                         pops=total_pops,
+                        operand=operand,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
-                        category="frame.teardown",
+                        category=step.category or "frame.teardown",
                     )
                 )
                 index = advance
