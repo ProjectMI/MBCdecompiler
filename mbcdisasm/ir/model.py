@@ -1505,7 +1505,7 @@ class NormalizerMetrics:
                 suffix = ""
                 if self.teardown_missing_hidden:
                     suffix = f" (...{self.teardown_missing_hidden} offsets hidden)"
-                parts.append(f"teardown_missing=[{missing}]{suffix}")
+                parts.append(f"teardown_operand_missing=[{missing}]{suffix}")
         return " ".join(parts)
 
 
