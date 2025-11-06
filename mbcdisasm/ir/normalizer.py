@@ -5696,53 +5696,68 @@ class IRNormalizer:
             return node
 
         if isinstance(node, IRCallReturn):
-            if node.varargs or len(node.returns) <= width:
+            abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
+            returns = node.returns
+            changed = abi_effects != node.abi_effects
+            if not node.varargs and len(returns) > width:
+                returns = returns[:width]
+                changed = True
+            if not changed:
                 return node
-            trimmed = node.returns[:width]
             updated = IRCallReturn(
                 target=node.target,
                 args=node.args,
                 tail=node.tail,
-                returns=trimmed,
+                returns=returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,
-                abi_effects=node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, updated)
             return updated
 
         if isinstance(node, IRTailCall):
-            if node.varargs or len(node.returns) <= width:
+            abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
+            returns = node.returns
+            changed = abi_effects != node.abi_effects
+            if not node.varargs and len(returns) > width:
+                returns = returns[:width]
+                changed = True
+            if not changed:
                 return node
-            trimmed = node.returns[:width]
             updated = IRTailCall(
                 call=node.call,
-                returns=trimmed,
+                returns=returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
-                abi_effects=node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, updated)
             return updated
 
         if isinstance(node, IRTailcallReturn):
-            if node.varargs or len(node.returns) <= width:
+            abi_effects = self._merge_return_mask_effects(node.abi_effects, mask)
+            returns = node.returns
+            changed = abi_effects != node.abi_effects
+            if not node.varargs and len(returns) > width:
+                returns = returns[:width]
+                changed = True
+            if not changed:
                 return node
-            trimmed = node.returns[:width]
             updated = IRTailcallReturn(
                 target=node.target,
                 args=node.args,
-                returns=trimmed,
+                returns=returns,
                 varargs=node.varargs,
                 cleanup=node.cleanup,
                 tail=node.tail,
                 convention=node.convention,
                 symbol=node.symbol,
                 predicate=node.predicate,
-                abi_effects=node.abi_effects,
+                abi_effects=abi_effects,
             )
             self._transfer_ssa(node, updated)
             return updated
