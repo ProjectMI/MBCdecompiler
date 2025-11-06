@@ -4437,6 +4437,13 @@ class IRNormalizer:
         if returns_node is not None:
             returns = tuple(returns_node.values)
             varargs = returns_node.varargs
+            return_effects = returns_node.abi_effects
+            return_mask = self._abi_return_mask(return_effects)
+            if cleanup_mask is None and return_mask is not None:
+                cleanup_mask = return_mask
+        else:
+            return_effects = tuple()
+            return_mask = None
 
         tailcall = IRTailcallReturn(
             target=target,
@@ -4448,7 +4455,10 @@ class IRNormalizer:
             convention=None,
             symbol=symbol,
             predicate=predicate,
-            abi_effects=self._merge_return_mask_effects(getattr(node, "abi_effects", tuple()), cleanup_mask),
+            abi_effects=self._merge_return_mask_effects(
+                tuple(getattr(node, "abi_effects", tuple())) + tuple(return_effects),
+                cleanup_mask,
+            ),
         )
         self._transfer_ssa(node, tailcall)
         tailcall = self._finalise_call_node(tailcall)
@@ -4913,12 +4923,18 @@ class IRNormalizer:
 
                 if offset < len(items) and isinstance(items[offset], IRReturn):
                     return_node = items[offset]
+                    return_effects = getattr(return_node, "abi_effects", tuple())
+                    return_mask = self._abi_return_mask(return_effects)
+                    if cleanup_mask is None and return_mask is not None:
+                        cleanup_mask = return_mask
                     combined_cleanup = tuple(cleanup_steps + list(return_node.cleanup))
                     varargs = return_node.varargs
                     return_count = len(return_node.values)
                     should_bundle = tail_hint and (
                         base_tail or (return_count == 0 and not varargs)
                     )
+
+                    combined_effects = tuple(call.abi_effects) + tuple(return_effects)
 
                     if should_bundle:
                         node = IRTailcallReturn(
@@ -4931,13 +4947,17 @@ class IRNormalizer:
                             convention=call.convention,
                             symbol=call.symbol,
                             predicate=call.predicate,
-                            abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                            abi_effects=self._merge_return_mask_effects(
+                                combined_effects, cleanup_mask
+                            ),
                         )
                     else:
                         tail = base_tail and consumed == 0 and not return_node.cleanup
                         mask_for_tail = cleanup_mask
                         if mask_for_tail is None:
                             mask_for_tail = self._abi_return_mask(call.abi_effects)
+                        if mask_for_tail is None and return_mask is not None:
+                            mask_for_tail = return_mask
                         if not tail and mask_for_tail == RET_MASK and consumed == 0 and not return_node.cleanup:
                             tail = True
                         node = IRCallReturn(
@@ -4950,7 +4970,9 @@ class IRNormalizer:
                             convention=call.convention,
                             symbol=call.symbol,
                             predicate=call.predicate,
-                            abi_effects=self._merge_return_mask_effects(call.abi_effects, cleanup_mask),
+                            abi_effects=self._merge_return_mask_effects(
+                                combined_effects, cleanup_mask
+                            ),
                         )
                     self._transfer_ssa(call, node)
                     node = self._finalise_call_node(node)

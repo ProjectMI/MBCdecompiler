@@ -1444,6 +1444,27 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_call_return_inherits_return_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x0020),  # call_dispatch
+        build_word(4, 0x30, 0x00, RET_MASK),  # return_values with mask hint
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.cleanup_mask == RET_MASK
+
+
 def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
