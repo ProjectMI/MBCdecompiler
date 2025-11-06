@@ -118,7 +118,7 @@ class IRTextRenderer:
             f"length={segment.length}"
         )
         yield header
-        yield "; metrics: " + segment.metrics.describe()
+        yield "; metrics: " + segment.metrics.describe(include_teardowns=False)
         for block in segment.blocks:
             yield from self._render_block(block)
         yield ""
