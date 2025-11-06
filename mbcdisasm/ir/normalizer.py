@@ -3926,10 +3926,15 @@ class IRNormalizer:
                     updated_nodes.append(updated)
                     changed = True
                     continue
-            if isinstance(node, CallLike) and getattr(node, "tail", False):
-                if getattr(node, "varargs", False):
-                    updated_nodes.append(node)
-                    continue
+            if isinstance(node, CallLike):
+                if isinstance(node, IRCallReturn):
+                    if node.varargs:
+                        updated_nodes.append(node)
+                        continue
+                else:
+                    if not getattr(node, "tail", False) or getattr(node, "varargs", False):
+                        updated_nodes.append(node)
+                        continue
                 node_mask = self._canonical_return_mask(
                     self._call_like_cleanup_mask(node)
                 )
