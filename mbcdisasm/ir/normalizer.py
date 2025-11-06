@@ -23,7 +23,7 @@ from ..analyzer.stack import StackEvent, StackTracker, StackValueType
 from ..instruction import read_instructions
 from ..knowledge import CallSignature, CallSignatureEffect, CallSignaturePattern, KnowledgeBase
 from ..mbc import MbcContainer, Segment
-from .effect_aliases import cleanup_category
+from .effect_aliases import cleanup_category, FRAME_OPERAND_KIND_OVERRIDES
 from .model import (
     IRAsciiFinalize,
     IRAsciiHeader,
@@ -228,6 +228,15 @@ CALL_HELPER_ALIASES = {
     0x5B01: "fmt.chunk_emit",
     0xED4D: "page.sync",
     0xF0EB: "io.flush_mask",
+}
+
+
+STACK_METADATA_TEARDOWN_CATEGORIES = {
+    "frame.scheduler",
+    "helpers.format",
+    "helpers.fanout",
+    "io.step",
+    "frame.page_select",
 }
 
 
@@ -6182,17 +6191,33 @@ class IRNormalizer:
             mnemonic = "fanout"
         if mnemonic == "op_6C_01" and operand == PAGE_REGISTER:
             mnemonic = "page_register"
+
+        operand_role = instruction.profile.operand_role()
+        alias_text: Optional[str]
+        if mnemonic == "call_helpers":
+            alias_text = self._helper_symbol(operand)
+        else:
+            alias = instruction.profile.operand_alias()
+            alias_text = str(alias) if alias is not None else None
+
         if instruction.profile.kind is InstructionKind.STACK_TEARDOWN:
             pops = -instruction.event.delta
             if mnemonic.startswith("stack_teardown"):
                 mnemonic = "stack_teardown"
             category = "frame.teardown"
-        alias: Optional[str]
-        if mnemonic == "call_helpers":
-            alias = self._helper_symbol(operand)
-        else:
-            alias = instruction.profile.operand_alias()
-        alias_text = str(alias) if alias is not None else None
+
+            override_category = FRAME_OPERAND_KIND_OVERRIDES.get(operand)
+            if override_category:
+                category = override_category
+                if alias_text is None:
+                    alias_text = CALL_HELPER_ALIASES.get(operand)
+
+            if alias_text == "FANOUT_FLAGS":
+                category = "helpers.fanout"
+
+            if category in STACK_METADATA_TEARDOWN_CATEGORIES or alias_text == "FANOUT_FLAGS":
+                pops = 0
+
         if category is None:
             category = cleanup_category(
                 mnemonic,
@@ -6213,7 +6238,7 @@ class IRNormalizer:
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
-            operand_role=instruction.profile.operand_role(),
+            operand_role=operand_role,
             operand_alias=alias_text,
             category=category,
         )
