@@ -6263,23 +6263,48 @@ class IRNormalizer:
             next_step = steps[index + 1] if index + 1 < len(steps) else None
             if step.mnemonic == "stack_teardown":
                 total_pops = step.pops
-                operand = step.operand
+                operand: Optional[int] = step.operand or None
                 operand_role = step.operand_role
                 operand_alias = step.operand_alias
                 advance = index + 1
-                while (
-                    advance < len(steps)
-                    and steps[advance].mnemonic == "stack_teardown"
-                    and steps[advance].operand == operand
-                    and steps[advance].operand_role == operand_role
-                    and steps[advance].operand_alias == operand_alias
-                ):
-                    total_pops += steps[advance].pops
+                while advance < len(steps):
+                    candidate = steps[advance]
+                    if candidate.mnemonic != "stack_teardown":
+                        break
+
+                    candidate_operand = candidate.operand or None
+                    candidate_role = candidate.operand_role
+                    candidate_alias = candidate.operand_alias
+
+                    if operand is not None and candidate_operand not in (None, operand):
+                        break
+                    if operand_role is not None and candidate_role not in (None, operand_role):
+                        break
+                    if operand_alias is not None and candidate_alias not in (None, operand_alias):
+                        break
+
+                    total_pops += candidate.pops
+                    if operand is None and candidate_operand is not None:
+                        operand = candidate_operand
+                    if operand_role is None:
+                        operand_role = candidate_role
+                    if operand_alias is None:
+                        operand_alias = candidate_alias
                     advance += 1
+
+                if operand is None:
+                    hint = IRNormalizer._stack_teardown_operand_hint(steps, index, advance)
+                    if hint is not None:
+                        operand = hint.operand or None
+                        if operand_role is None:
+                            operand_role = hint.operand_role
+                        if operand_alias is None:
+                            operand_alias = hint.operand_alias
+
                 combined.append(
                     IRStackEffect(
                         mnemonic="stack_teardown",
-                        operand=operand,
+                        operand=operand or 0,
                         pops=total_pops,
                         operand_role=operand_role,
                         operand_alias=operand_alias,
@@ -6337,6 +6362,40 @@ class IRNormalizer:
             combined.append(step)
             index += 1
         return combined
+
+    @staticmethod
+    def _stack_teardown_operand_hint(
+        steps: Sequence[IRStackEffect], start: int, end: int
+    ) -> Optional[IRStackEffect]:
+        """Return a neighbouring stack/frame effect with operand information."""
+
+        def candidate_effect(effect: IRStackEffect) -> Optional[IRStackEffect]:
+            if not effect.operand:
+                return None
+            category = effect.category or effect.mnemonic
+            if not category:
+                return None
+            if category == "frame.teardown" or category.startswith("frame."):
+                return effect
+            if effect.mnemonic == "stack_teardown":
+                return effect
+            return None
+
+        scan = start - 1
+        while scan >= 0:
+            effect = candidate_effect(steps[scan])
+            if effect is not None:
+                return effect
+            scan -= 1
+
+        scan = end
+        while scan < len(steps):
+            effect = candidate_effect(steps[scan])
+            if effect is not None:
+                return effect
+            scan += 1
+
+        return None
 
     @staticmethod
     def _reorder_cleanup_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:

@@ -524,6 +524,42 @@ def test_coalesce_epilogue_steps_merges_stack_teardown() -> None:
     assert combined[0].pops == 10
 
 
+def test_coalesce_epilogue_steps_merges_operandless_prefix() -> None:
+    effect_a = IRStackEffect(mnemonic="stack_teardown", pops=4)
+    effect_b = IRStackEffect(mnemonic="stack_teardown", operand=0x2000, pops=6)
+    combined = IRNormalizer._coalesce_epilogue_steps([effect_a, effect_b])
+    assert len(combined) == 1
+    step = combined[0]
+    assert step.pops == 10
+    assert step.operand == 0x2000
+
+
+def test_coalesce_epilogue_steps_infers_operand_from_previous_frame_effect() -> None:
+    hint = IRStackEffect(
+        mnemonic="frame.page_select",
+        operand=0x2000,
+        pops=0,
+        category="frame.page_select",
+    )
+    teardown = IRStackEffect(mnemonic="stack_teardown", pops=4)
+    combined = IRNormalizer._coalesce_epilogue_steps([hint, teardown])
+    assert len(combined) == 2
+    assert combined[1].operand == 0x2000
+
+
+def test_coalesce_epilogue_steps_infers_operand_from_following_frame_effect() -> None:
+    teardown = IRStackEffect(mnemonic="stack_teardown", pops=4)
+    hint = IRStackEffect(
+        mnemonic="frame.page_select",
+        operand=0x2000,
+        pops=0,
+        category="frame.page_select",
+    )
+    combined = IRNormalizer._coalesce_epilogue_steps([teardown, hint])
+    assert len(combined) == 2
+    assert combined[0].operand == 0x2000
+
+
 def test_normalizer_clamps_return_count_to_stack_depth(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
