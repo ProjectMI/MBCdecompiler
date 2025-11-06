@@ -4414,6 +4414,7 @@ class IRNormalizer:
                     operand_role=effect.operand_role,
                     operand_alias=effect.operand_alias,
                     category="frame.teardown",
+                    has_operand=effect.has_operand,
                 )
                 continue
             retained_cleanup.append(effect)
@@ -5520,6 +5521,15 @@ class IRNormalizer:
             opcode=opcode,
         )
 
+        provided_operand = spec.operand is not None
+        provided_alias = alias_text is not None
+        has_operand = False
+        if category and "teardown" in category:
+            if instruction is not None:
+                has_operand = True
+            else:
+                has_operand = provided_operand or provided_alias or operand_role is not None
+
         effect = IRStackEffect(
             mnemonic=spec.mnemonic,
             operand=operand,
@@ -5527,6 +5537,7 @@ class IRNormalizer:
             operand_role=operand_role,
             operand_alias=alias_text,
             category=category,
+            has_operand=has_operand,
             optional=optional,
         )
         if instruction is not None:
@@ -6197,6 +6208,8 @@ class IRNormalizer:
     def _teardown_has_operand(effect: IRStackEffect) -> bool:
         if effect.operand_role or effect.operand_alias:
             return True
+        if effect.has_operand:
+            return True
         if effect.operand:
             return True
         name = effect.category or effect.mnemonic
@@ -6240,13 +6253,21 @@ class IRNormalizer:
             )
         ):
             category = "io.step"
+        operand_role = instruction.profile.operand_role()
+        has_operand = False
+        if category and "teardown" in category:
+            has_operand = True
+        elif mnemonic == "stack_teardown":
+            has_operand = True
+
         effect = IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
-            operand_role=instruction.profile.operand_role(),
+            operand_role=operand_role,
             operand_alias=alias_text,
             category=category,
+            has_operand=has_operand,
         )
         self._record_teardown_metric(instruction, effect)
         return effect
@@ -6266,6 +6287,7 @@ class IRNormalizer:
                 operand = step.operand
                 operand_role = step.operand_role
                 operand_alias = step.operand_alias
+                has_operand = step.has_operand
                 advance = index + 1
                 while (
                     advance < len(steps)
@@ -6275,6 +6297,7 @@ class IRNormalizer:
                     and steps[advance].operand_alias == operand_alias
                 ):
                     total_pops += steps[advance].pops
+                    has_operand = has_operand or steps[advance].has_operand
                     advance += 1
                 combined.append(
                     IRStackEffect(
@@ -6284,6 +6307,7 @@ class IRNormalizer:
                         operand_role=operand_role,
                         operand_alias=operand_alias,
                         category="frame.teardown",
+                        has_operand=has_operand,
                     )
                 )
                 index = advance

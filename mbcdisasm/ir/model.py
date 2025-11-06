@@ -324,6 +324,7 @@ class IRStackEffect:
     operand_role: Optional[str] = None
     operand_alias: Optional[str] = None
     category: Optional[str] = None
+    has_operand: bool = False
     optional: bool = False
 
     def describe(self) -> str:
@@ -332,6 +333,8 @@ class IRStackEffect:
         if self.pops:
             details.append(f"pop={self.pops}")
         include_operand = bool(self.operand_role or self.operand_alias)
+        if not include_operand and self.has_operand:
+            include_operand = True
         if not include_operand:
             include_operand = bool(self.operand) or name not in {"frame.teardown", "stack_teardown"}
         if include_operand:
