@@ -1411,6 +1411,7 @@ class NormalizerMetrics:
     teardowns: int = 0
     teardown_with_operands: int = 0
     teardown_missing_operand_offsets: List[int] = field(default_factory=list)
+    teardown_missing_hidden: int = 0
 
     _MAX_TEARDOWN_OFFSETS = 5
 
@@ -1433,6 +1434,7 @@ class NormalizerMetrics:
         if offset in self.teardown_missing_operand_offsets:
             return
         if len(self.teardown_missing_operand_offsets) >= self._MAX_TEARDOWN_OFFSETS:
+            self.teardown_missing_hidden += 1
             return
         self.teardown_missing_operand_offsets.append(offset)
 
@@ -1459,14 +1461,16 @@ class NormalizerMetrics:
         else:
             seen = set()
         for offset in other.teardown_missing_operand_offsets:
-            if len(self.teardown_missing_operand_offsets) >= self._MAX_TEARDOWN_OFFSETS:
-                break
             if offset in seen:
+                continue
+            if len(self.teardown_missing_operand_offsets) >= self._MAX_TEARDOWN_OFFSETS:
+                self.teardown_missing_hidden += 1
                 continue
             self.teardown_missing_operand_offsets.append(offset)
             seen.add(offset)
+        self.teardown_missing_hidden += other.teardown_missing_hidden
 
-    def describe(self) -> str:
+    def describe(self, *, include_teardowns: bool = True) -> str:
         """Return a stable textual summary of the metrics."""
 
         parts = [
@@ -1484,20 +1488,24 @@ class NormalizerMetrics:
             f"raw_remaining={self.raw_remaining}",
             f"meta_remaining={self.meta_remaining}",
         ]
-        coverage = self.teardown_operand_coverage()
-        detail = (
-            f"{self.teardown_with_operands}/{self.teardowns}"
-            if self.teardowns
-            else "0/0"
-        )
-        parts.append(
-            f"teardowns={self.teardowns} teardown_operand_coverage={coverage:.2f}%({detail})"
-        )
-        if self.teardown_missing_operand_offsets:
-            missing = ",".join(
-                f"0x{offset:06X}" for offset in self.teardown_missing_operand_offsets
+        if include_teardowns:
+            coverage = self.teardown_operand_coverage()
+            detail = (
+                f"{self.teardown_with_operands}/{self.teardowns}"
+                if self.teardowns
+                else "0/0"
             )
-            parts.append(f"teardown_missing=[{missing}]")
+            parts.append(
+                f"teardowns={self.teardowns} teardown_operand_coverage={coverage:.2f}%({detail})"
+            )
+            if self.teardown_missing_operand_offsets:
+                missing = ",".join(
+                    f"0x{offset:06X}" for offset in self.teardown_missing_operand_offsets
+                )
+                suffix = ""
+                if self.teardown_missing_hidden:
+                    suffix = f" (...{self.teardown_missing_hidden} offsets hided)"
+                parts.append(f"teardown_missing=[{missing}]{suffix}")
         return " ".join(parts)
 
 
