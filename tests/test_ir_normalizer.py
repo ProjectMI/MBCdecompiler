@@ -1444,6 +1444,60 @@ def test_normalizer_inlines_call_preparation_shuffle(tmp_path: Path) -> None:
     )
 
 
+def test_call_return_inherits_return_mask(tmp_path: Path) -> None:
+    knowledge = write_manual(tmp_path)
+
+    words = [
+        build_word(0, 0x28, 0x00, 0x0020),  # call_dispatch
+        build_word(4, 0x30, 0x00, RET_MASK),  # return_values with mask hint
+    ]
+
+    data = encode_instructions(words)
+    descriptor = SegmentDescriptor(0, 0, len(data))
+    segment = Segment(descriptor, data)
+    container = MbcContainer(Path("dummy"), [segment])
+
+    normalizer = IRNormalizer(knowledge)
+    program = normalizer.normalise_container(container)
+    block = program.segments[0].blocks[0]
+
+    call_return = next(node for node in block.nodes if isinstance(node, IRCallReturn))
+    assert call_return.cleanup_mask == RET_MASK
+
+
+def test_call_return_mask_canonicalises_to_function_mask() -> None:
+    knowledge = KnowledgeBase({})
+    normalizer = IRNormalizer(knowledge)
+
+    call_return = IRCallReturn(
+        target=0x1234,
+        args=tuple(),
+        tail=False,
+        returns=tuple(),
+        cleanup=tuple(),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0105, alias=None),),
+    )
+    return_node = IRReturn(
+        values=tuple(),
+        varargs=False,
+        cleanup=tuple(),
+        abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0104, alias=None),),
+    )
+    block = IRBlock(
+        label="test",
+        start_offset=0,
+        nodes=(call_return, return_node),
+        annotations=tuple(),
+    )
+
+    updated_block = normalizer._apply_function_return_mask(block, 0x0104)
+    updated_call_return = next(
+        node for node in updated_block.nodes if isinstance(node, IRCallReturn)
+    )
+
+    assert updated_call_return.cleanup_mask == 0x0104
+
+
 def test_normalizer_trims_call_return_arity(tmp_path: Path) -> None:
     knowledge = write_manual(tmp_path)
 
