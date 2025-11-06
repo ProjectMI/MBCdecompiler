@@ -81,6 +81,9 @@ from .model import (
     MemSpace,
     SSAValueKind,
     NormalizerMetrics,
+    _apply_teardown_hint,
+    _has_teardown_operand,
+    _is_teardown_effect,
 )
 from .cfg import analyse_segments
 
@@ -1178,6 +1181,7 @@ class IRNormalizer:
         final_node_wrapper = _ItemList(nodes)
         self._pass_enforce_abi_contracts(final_node_wrapper)
         nodes = list(final_node_wrapper)
+        nodes = self._propagate_block_teardown_operands(nodes)
 
         ir_block = IRBlock(
             label=f"block_{block.index}",
@@ -3824,6 +3828,85 @@ class IRNormalizer:
                 index += 1
                 continue
             index += 1
+
+    def _propagate_block_teardown_operands(
+        self, nodes: List[IRNode]
+    ) -> List[IRNode]:
+        if not nodes:
+            return nodes
+
+        updated: List[IRNode] = list(nodes)
+        for index, node in enumerate(nodes):
+            if not isinstance(node, IRCallCleanup):
+                continue
+
+            steps = list(node.steps)
+            changed = False
+            for step_index, step in enumerate(steps):
+                if not _is_teardown_effect(step) or _has_teardown_operand(step):
+                    continue
+                hint = self._block_teardown_hint(nodes, index, step.pops)
+                if hint is None:
+                    continue
+                steps[step_index] = _apply_teardown_hint(step, hint)
+                changed = True
+
+            if not changed:
+                continue
+
+            replacement = IRCallCleanup(steps=tuple(steps))
+            self._transfer_ssa(node, replacement)
+            updated[index] = replacement
+
+        return updated
+
+    def _block_teardown_hint(
+        self, nodes: Sequence[IRNode], index: int, pops: int
+    ) -> Optional[IRStackEffect]:
+        prior_match, prior_fallback = self._scan_block_teardown(nodes, index, -1, pops)
+        if prior_match is not None:
+            return prior_match
+        next_match, next_fallback = self._scan_block_teardown(nodes, index, 1, pops)
+        if next_match is not None:
+            return next_match
+        if prior_fallback is not None:
+            return prior_fallback
+        return next_fallback
+
+    def _scan_block_teardown(
+        self, nodes: Sequence[IRNode], start: int, direction: int, pops: int
+    ) -> Tuple[Optional[IRStackEffect], Optional[IRStackEffect]]:
+        fallback: Optional[IRStackEffect] = None
+        match: Optional[IRStackEffect] = None
+        pos = start + direction
+        while 0 <= pos < len(nodes):
+            candidates = self._node_teardown_effects(nodes[pos])
+            for effect in candidates:
+                if pops and effect.pops == pops:
+                    match = effect
+                    break
+                if fallback is None:
+                    fallback = effect
+            if match is not None:
+                break
+            pos += direction
+        return match, fallback
+
+    @staticmethod
+    def _node_teardown_effects(node: IRNode) -> Sequence[IRStackEffect]:
+        effects: Sequence[IRStackEffect] = ()
+        if isinstance(node, IRCallCleanup):
+            effects = node.steps
+        else:
+            cleanup = getattr(node, "cleanup", None)
+            if cleanup:
+                effects = cleanup
+
+        return tuple(
+            effect
+            for effect in effects
+            if _is_teardown_effect(effect) and _has_teardown_operand(effect)
+        )
 
     def _propagate_return_masks(
         self, segment_index: int, blocks: Sequence[IRBlock]

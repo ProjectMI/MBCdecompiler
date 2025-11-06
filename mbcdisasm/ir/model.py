@@ -53,6 +53,9 @@ def _normalise_cleanup_steps(
             updated.append(step)
         steps = tuple(updated)
 
+    steps = _propagate_teardown_operands(steps)
+    steps = _merge_teardown_runs(steps)
+
     last_mask_index: Optional[int] = None
     for index, step in enumerate(steps):
         if _resolve_effect_category(step) == "frame.return_mask":
@@ -66,6 +69,149 @@ def _normalise_cleanup_steps(
         for index, step in enumerate(steps)
         if _resolve_effect_category(step) != "frame.return_mask" or index == last_mask_index
     )
+
+
+def _propagate_teardown_operands(
+    steps: Tuple["IRStackEffect", ...]
+) -> Tuple["IRStackEffect", ...]:
+    if not steps:
+        return steps
+
+    hints: Dict[int, IRStackEffect] = {}
+    updated: List[IRStackEffect] = list(steps)
+
+    for index, step in enumerate(updated):
+        if not _is_teardown_effect(step):
+            continue
+        if _has_teardown_operand(step):
+            hints[step.pops] = step
+            continue
+
+        hint = hints.get(step.pops)
+        if hint is None:
+            hint = _find_teardown_hint(updated, index, step.pops)
+        if hint is None:
+            continue
+
+        propagated = _apply_teardown_hint(step, hint)
+        updated[index] = propagated
+        hints[propagated.pops] = propagated
+
+    return tuple(updated)
+
+
+def _merge_teardown_runs(
+    steps: Tuple["IRStackEffect", ...]
+) -> Tuple["IRStackEffect", ...]:
+    if not steps:
+        return steps
+
+    merged: List[IRStackEffect] = []
+    for step in steps:
+        if not _is_teardown_effect(step) or not merged:
+            merged.append(step)
+            continue
+
+        prev = merged[-1]
+        if not _is_teardown_effect(prev):
+            merged.append(step)
+            continue
+
+        adjusted_prev = prev
+        adjusted_step = step
+
+        if not _has_teardown_operand(prev) and _has_teardown_operand(step):
+            adjusted_prev = _apply_teardown_hint(prev, step)
+        elif _has_teardown_operand(prev) and not _has_teardown_operand(step):
+            adjusted_step = _apply_teardown_hint(step, prev)
+
+        if _teardown_compatible(adjusted_prev, adjusted_step):
+            merged[-1] = replace(
+                adjusted_prev,
+                pops=adjusted_prev.pops + adjusted_step.pops,
+                operand=adjusted_step.operand,
+                operand_role=adjusted_step.operand_role,
+                operand_alias=adjusted_step.operand_alias,
+            )
+            continue
+
+        if adjusted_prev is not prev:
+            merged[-1] = adjusted_prev
+        merged.append(adjusted_step)
+
+    return tuple(merged)
+
+
+def _is_teardown_effect(effect: "IRStackEffect") -> bool:
+    return _resolve_effect_category(effect) == "frame.teardown"
+
+
+def _has_teardown_operand(effect: "IRStackEffect") -> bool:
+    return bool(effect.operand or effect.operand_alias or effect.operand_role)
+
+
+def _find_teardown_hint(
+    steps: Sequence["IRStackEffect"], index: int, pops: int
+) -> Optional["IRStackEffect"]:
+    prior_match, prior_fallback = _scan_teardown_hints(steps, index, -1, pops)
+    if prior_match is not None:
+        return prior_match
+    next_match, next_fallback = _scan_teardown_hints(steps, index, 1, pops)
+    if next_match is not None:
+        return next_match
+    if prior_fallback is not None:
+        return prior_fallback
+    return next_fallback
+
+
+def _scan_teardown_hints(
+    steps: Sequence["IRStackEffect"], start: int, direction: int, pops: int
+) -> Tuple[Optional["IRStackEffect"], Optional["IRStackEffect"]]:
+    fallback: Optional[IRStackEffect] = None
+    match: Optional[IRStackEffect] = None
+    pos = start + direction
+    while 0 <= pos < len(steps):
+        candidate = steps[pos]
+        if not _is_teardown_effect(candidate):
+            pos += direction
+            continue
+        if not _has_teardown_operand(candidate):
+            pos += direction
+            continue
+        if pops and candidate.pops == pops:
+            match = candidate
+            break
+        if fallback is None:
+            fallback = candidate
+        pos += direction
+    return match, fallback
+
+
+def _apply_teardown_hint(
+    effect: "IRStackEffect", hint: "IRStackEffect"
+) -> "IRStackEffect":
+    operand_role = effect.operand_role or hint.operand_role
+    operand_alias = effect.operand_alias or hint.operand_alias
+    return replace(
+        effect,
+        operand=hint.operand,
+        operand_role=operand_role,
+        operand_alias=operand_alias,
+    )
+
+
+def _teardown_compatible(
+    left: "IRStackEffect", right: "IRStackEffect"
+) -> bool:
+    if not (_is_teardown_effect(left) and _is_teardown_effect(right)):
+        return False
+    if left.operand != right.operand:
+        return False
+    if (left.operand_role or "") != (right.operand_role or ""):
+        return False
+    if (left.operand_alias or "") != (right.operand_alias or ""):
+        return False
+    return True
 
 
 class MemSpace(Enum):
@@ -870,7 +1016,9 @@ class IRCallCleanup(IRNode):
     pops: int = field(init=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "pops", sum(step.pops for step in self.steps))
+        normalised = _normalise_cleanup_steps(self.steps)
+        object.__setattr__(self, "steps", normalised)
+        object.__setattr__(self, "pops", sum(step.pops for step in normalised))
 
     def describe(self) -> str:
         rendered = ", ".join(step.describe() for step in self.steps)
