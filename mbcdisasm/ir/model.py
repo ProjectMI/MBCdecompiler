@@ -1408,6 +1408,33 @@ class NormalizerMetrics:
     reduce_replaced: int = 0
     raw_remaining: int = 0
     meta_remaining: int = 0
+    teardowns: int = 0
+    teardown_with_operands: int = 0
+    teardown_missing_operand_offsets: List[int] = field(default_factory=list)
+
+    _MAX_TEARDOWN_OFFSETS = 5
+
+    def teardown_operand_coverage(self) -> float:
+        """Return the percentage of teardowns that expose operand information."""
+
+        if not self.teardowns:
+            return 100.0
+        return (self.teardown_with_operands / self.teardowns) * 100.0
+
+    def record_teardown(self, has_operand: bool, offset: Optional[int]) -> None:
+        """Record a teardown observation for the current block."""
+
+        self.teardowns += 1
+        if has_operand:
+            self.teardown_with_operands += 1
+            return
+        if offset is None:
+            return
+        if offset in self.teardown_missing_operand_offsets:
+            return
+        if len(self.teardown_missing_operand_offsets) >= self._MAX_TEARDOWN_OFFSETS:
+            return
+        self.teardown_missing_operand_offsets.append(offset)
 
     def observe(self, other: "NormalizerMetrics") -> None:
         """Accumulate values from ``other`` into this instance."""
@@ -1425,6 +1452,19 @@ class NormalizerMetrics:
         self.reduce_replaced += other.reduce_replaced
         self.raw_remaining += other.raw_remaining
         self.meta_remaining += other.meta_remaining
+        self.teardowns += other.teardowns
+        self.teardown_with_operands += other.teardown_with_operands
+        if self.teardown_missing_operand_offsets:
+            seen = set(self.teardown_missing_operand_offsets)
+        else:
+            seen = set()
+        for offset in other.teardown_missing_operand_offsets:
+            if len(self.teardown_missing_operand_offsets) >= self._MAX_TEARDOWN_OFFSETS:
+                break
+            if offset in seen:
+                continue
+            self.teardown_missing_operand_offsets.append(offset)
+            seen.add(offset)
 
     def describe(self) -> str:
         """Return a stable textual summary of the metrics."""
@@ -1444,6 +1484,20 @@ class NormalizerMetrics:
             f"raw_remaining={self.raw_remaining}",
             f"meta_remaining={self.meta_remaining}",
         ]
+        coverage = self.teardown_operand_coverage()
+        detail = (
+            f"{self.teardown_with_operands}/{self.teardowns}"
+            if self.teardowns
+            else "0/0"
+        )
+        parts.append(
+            f"teardowns={self.teardowns} teardown_operand_coverage={coverage:.2f}%({detail})"
+        )
+        if self.teardown_missing_operand_offsets:
+            missing = ",".join(
+                f"0x{offset:06X}" for offset in self.teardown_missing_operand_offsets
+            )
+            parts.append(f"teardown_missing=[{missing}]")
         return " ".join(parts)
 
 

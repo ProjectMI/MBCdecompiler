@@ -678,6 +678,7 @@ class IRNormalizer:
         self._string_pool_order: List[IRStringConstant] = []
         self._dispatch_index_hints: Dict[int, List[IRDispatchIndex]] = defaultdict(list)
         self._current_block_offset: int = -1
+        self._active_metrics: Optional[NormalizerMetrics] = None
 
     def _helper_symbol(self, helper: int) -> Optional[str]:
         alias = TAIL_HELPER_ALIASES.get(helper)
@@ -1046,6 +1047,8 @@ class IRNormalizer:
         self._current_block_offset = block.start_offset
         items = _ItemList(block.instructions)
         metrics = NormalizerMetrics()
+        previous_metrics = self._active_metrics
+        self._active_metrics = metrics
 
         self._pass_literals(items, metrics)
         self._pass_data_markers(items)
@@ -1182,6 +1185,7 @@ class IRNormalizer:
             nodes=tuple(nodes),
             annotations=tuple(block_annotations),
         )
+        self._active_metrics = previous_metrics
         return ir_block, metrics
 
     # ------------------------------------------------------------------
@@ -5516,7 +5520,7 @@ class IRNormalizer:
             opcode=opcode,
         )
 
-        return IRStackEffect(
+        effect = IRStackEffect(
             mnemonic=spec.mnemonic,
             operand=operand,
             pops=pops,
@@ -5525,6 +5529,9 @@ class IRNormalizer:
             category=category,
             optional=optional,
         )
+        if instruction is not None:
+            self._record_teardown_metric(instruction, effect)
+        return effect
 
     @staticmethod
     def _normalise_return_tokens(value: Any) -> Tuple[str, ...]:
@@ -6171,6 +6178,27 @@ class IRNormalizer:
             operand_alias=alias,
         )
 
+    def _record_teardown_metric(
+        self, instruction: RawInstruction, effect: IRStackEffect
+    ) -> None:
+        metrics = self._active_metrics
+        if metrics is None:
+            return
+        category = effect.category or effect.mnemonic
+        if not category or "teardown" not in category:
+            return
+        has_operand = self._teardown_has_operand(effect)
+        metrics.record_teardown(has_operand, instruction.offset)
+
+    @staticmethod
+    def _teardown_has_operand(effect: IRStackEffect) -> bool:
+        if effect.operand_role or effect.operand_alias:
+            return True
+        if effect.operand:
+            return True
+        name = effect.category or effect.mnemonic
+        return name not in {"frame.teardown", "stack_teardown"}
+
     def _call_cleanup_effect(self, instruction: RawInstruction) -> IRStackEffect:
         mnemonic = instruction.mnemonic
         operand = instruction.operand
@@ -6209,7 +6237,7 @@ class IRNormalizer:
             )
         ):
             category = "io.step"
-        return IRStackEffect(
+        effect = IRStackEffect(
             mnemonic=mnemonic,
             operand=operand,
             pops=pops,
@@ -6217,6 +6245,8 @@ class IRNormalizer:
             operand_alias=alias_text,
             category=category,
         )
+        self._record_teardown_metric(instruction, effect)
+        return effect
 
     @staticmethod
     def _coalesce_epilogue_steps(steps: Sequence[IRStackEffect]) -> List[IRStackEffect]:
