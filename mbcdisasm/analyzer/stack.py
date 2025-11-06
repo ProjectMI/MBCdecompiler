@@ -16,7 +16,12 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Iterable, List, Sequence, Tuple
 
-from ..constants import CALL_SHUFFLE_STANDARD, RET_MASK
+from ..constants import (
+    CALL_SHUFFLE_STANDARD,
+    FANOUT_FLAGS_A,
+    FANOUT_FLAGS_B,
+    RET_MASK,
+)
 from .instruction_profile import InstructionKind, InstructionProfile, StackEffectHint
 
 
@@ -399,6 +404,23 @@ def _apply_wrapper_overrides(
         hint = StackEffectHint(nominal=0, minimum=0, maximum=0, confidence=0.9)
         kind_override = InstructionKind.TAILCALL
         return hint, popped, pushed, kind_override
+
+    # Scheduler/fanout mask shims reuse the ``stack_teardown`` opcodes but do not
+    # actually release stack slots.  Treat them as bookkeeping helpers so the
+    # tracker does not underflow the evaluation stack when these appear without a
+    # matching prologue.
+    if opcode == 0x01:
+        scheduler_masks = {0x0029, 0x002C, 0x0041, 0x0069}
+        fanout_masks = {FANOUT_FLAGS_A, FANOUT_FLAGS_B}
+        if operand in scheduler_masks | fanout_masks:
+            hint = StackEffectHint(
+                nominal=0,
+                minimum=0,
+                maximum=0,
+                confidence=max(0.85, hint.confidence),
+            )
+            popped.clear()
+            return hint, popped, pushed, kind_override
 
     # Dedicated helper entrypoints (opcode 0x10/0x16) behave like a ``call``
     # instruction in the IR but do not change the evaluation stack.  Boost the
