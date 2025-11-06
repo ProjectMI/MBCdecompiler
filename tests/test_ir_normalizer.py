@@ -132,6 +132,40 @@ def make_stack_neutral_instruction(
     )
 
 
+def make_stack_teardown_instruction(offset: int, operand: int, pops: int) -> RawInstruction:
+    word = build_word(offset, 0x01, 0xF0, operand)
+    profile = InstructionProfile(
+        word=word,
+        info=None,
+        mnemonic="stack_teardown",
+        summary=None,
+        category=None,
+        control_flow=None,
+        stack_hint=StackEffectHint(
+            nominal=-pops, minimum=-pops, maximum=-pops, confidence=1.0
+        ),
+        kind=InstructionKind.STACK_TEARDOWN,
+        traits={},
+    )
+    event = StackEvent(
+        profile=profile,
+        delta=-pops,
+        minimum=-pops,
+        maximum=-pops,
+        confidence=1.0,
+        depth_before=pops,
+        depth_after=0,
+        kind=InstructionKind.STACK_TEARDOWN,
+    )
+    return RawInstruction(
+        profile=profile,
+        event=event,
+        annotations=tuple(),
+        ssa_values=tuple(),
+        ssa_kinds=tuple(),
+    )
+
+
 def test_epilogue_compaction_merges_raw_markers() -> None:
     knowledge = KnowledgeBase({})
     normalizer = IRNormalizer(knowledge)
@@ -522,6 +556,22 @@ def test_coalesce_epilogue_steps_merges_stack_teardown() -> None:
     combined = IRNormalizer._coalesce_epilogue_steps([effect_a, effect_b])
     assert len(combined) == 1
     assert combined[0].pops == 10
+
+
+def test_call_cleanup_records_teardown_operand() -> None:
+    normalizer = IRNormalizer(KnowledgeBase({}))
+    instruction = make_stack_teardown_instruction(0, 0x0000, 4)
+    metrics = NormalizerMetrics()
+    normalizer._active_metrics = metrics
+    normalizer._current_block_offset = 0x10
+
+    effect = normalizer._call_cleanup_effect(instruction)
+
+    assert effect.has_operand
+    assert effect.describe().startswith("frame.teardown(")
+    assert "operand=0x0000" in effect.describe()
+    assert metrics.teardowns == 1
+    assert metrics.teardown_with_operands == 1
 
 
 def test_normalizer_clamps_return_count_to_stack_depth(tmp_path: Path) -> None:
