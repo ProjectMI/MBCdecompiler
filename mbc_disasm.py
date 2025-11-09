@@ -14,6 +14,8 @@ from mbcdisasm import (
     IRTextRenderer,
     KnowledgeBase,
     MbcContainer,
+    ASTBuilder,
+    ASTRenderer
 )
 
 
@@ -105,6 +107,13 @@ def main() -> None:
     ir_output_path = args.ir_out or mbc_path.with_suffix(".ir.txt")
     IRTextRenderer().write(program, ir_output_path)
     print(f"ir written to {ir_output_path}")
+    
+    ast_program = ASTBuilder().build(program)
+    ast_text = ASTRenderer().render(ast_program)
+    ast_output_path = args.ast_out or mbc_path.with_suffix(".ast.txt")
+    with ast_output_path.open("w", encoding="utf-8") as f:
+        f.write(ast_text)
+    print(f"ast written to {ast_output_path}")
 
     total_time = time.perf_counter() - start_time
     print(f"total execution time: {total_time:.2f}s")
