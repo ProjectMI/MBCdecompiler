@@ -54,6 +54,16 @@ class ASTBlock:
 
 
 @dataclass(frozen=True)
+class ASTFunctionAlias:
+    """Summary of an additional function instance folded into a template."""
+
+    name: str
+    segment_index: int
+    entry_block: str
+    entry_offset: int
+
+
+@dataclass(frozen=True)
 class DominatorInfo:
     """Summary of a dominator/post-dominator tree."""
 
@@ -97,6 +107,7 @@ class ASTFunction:
     dominators: DominatorInfo
     post_dominators: DominatorInfo
     loops: Tuple[ASTLoop, ...]
+    aliases: Tuple[ASTFunctionAlias, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

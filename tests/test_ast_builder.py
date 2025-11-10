@@ -3,16 +3,24 @@ from __future__ import annotations
 from mbcdisasm.ast import ASTBuilder
 from mbcdisasm.ir.model import (
     IRBlock,
+    IRCall,
+    IRCallCleanup,
     IRCfgBlock,
     IRCfgEdge,
     IRControlFlowGraph,
+    IRIndirectStore,
     IRFunctionCfg,
     IRIf,
     IRLiteral,
+    IRLiteralChunk,
     IRProgram,
     IRReturn,
     IRSegment,
+    IRTailCall,
     IRTerminator,
+    IRAbiEffect,
+    IRStackEffect,
+    MemRef,
     NormalizerMetrics,
 )
 
@@ -229,4 +237,113 @@ def test_branch_folding_to_goto() -> None:
     entry_block = next(block for block in function.blocks if block.label == "entry")
     assert entry_block.terminator.kind == "goto"
     assert entry_block.terminator.targets == ("target",)
+
+
+def test_auto_trampoline_folded_into_template() -> None:
+    def make_trampoline_block(label: str, offset: int) -> IRBlock:
+        frame_reset = IRStackEffect(mnemonic="frame.reset", operand=0, category="frame.reset")
+        cleanup_reset = IRCallCleanup(steps=(frame_reset,))
+        initial_call = IRCall(
+            target=0x04F0,
+            args=tuple(),
+            tail=True,
+            abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0030),),
+        )
+        frame_write = IRStackEffect(mnemonic="frame.write", operand=0x4AA2, category="frame.write")
+        cleanup_write = IRCallCleanup(steps=(frame_write,))
+        slot_literal = IRLiteral(value=0x6910, mode=0, source="slot")
+        cleanup_second = IRCallCleanup(steps=(frame_reset,))
+        helper_call = IRCall(
+            target=0x0EF0,
+            args=tuple(),
+            tail=True,
+            abi_effects=(IRAbiEffect(kind="return_mask", operand=0x0030),),
+        )
+        marker = IRLiteralChunk(data=b"", source="chunk", symbol="str_0126")
+        store = IRIndirectStore(
+            base="ptr0",
+            value="bool1",
+            offset=0xE401,
+            ref=MemRef(region="mem", page=0xE4, offset=0x01),
+            pointer="ptr0",
+        )
+        ret_literal = IRLiteral(value=0x2910, mode=0, source="ret_mask")
+        tail = IRTailCall(
+            call=IRCall(
+                target=0x6910,
+                args=tuple(),
+                tail=True,
+                abi_effects=(IRAbiEffect(kind="return_mask", operand=0x2910),),
+            ),
+            returns=("ret0",),
+        )
+        nodes = (
+            cleanup_reset,
+            initial_call,
+            cleanup_write,
+            slot_literal,
+            cleanup_second,
+            helper_call,
+            marker,
+            store,
+            ret_literal,
+            tail,
+        )
+        return IRBlock(label=label, start_offset=offset, nodes=nodes)
+
+    block_a = make_trampoline_block("block_a", 0x0100)
+    block_b = make_trampoline_block("block_b", 0x0200)
+
+    segment = IRSegment(
+        index=0,
+        start=0,
+        length=0,
+        blocks=(block_a, block_b),
+        metrics=NormalizerMetrics(),
+    )
+
+    cfg_block_a = IRCfgBlock(
+        label="block_a",
+        start_offset=0x0100,
+        terminator="tailcall",
+        edges=tuple(),
+    )
+    cfg_block_b = IRCfgBlock(
+        label="block_b",
+        start_offset=0x0200,
+        terminator="tailcall",
+        edges=tuple(),
+    )
+
+    function_a = IRFunctionCfg(
+        segment_index=0,
+        name="auto_0",
+        entry_block="block_a",
+        entry_offset=0x0100,
+        blocks=(cfg_block_a,),
+    )
+    function_b = IRFunctionCfg(
+        segment_index=0,
+        name="auto_0",
+        entry_block="block_b",
+        entry_offset=0x0200,
+        blocks=(cfg_block_b,),
+    )
+
+    cfg = IRControlFlowGraph(functions=(function_a, function_b))
+    program = IRProgram(
+        segments=(segment,),
+        metrics=NormalizerMetrics(),
+        cfg=cfg,
+    )
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    assert len(ast_program.functions) == 1
+    template = ast_program.functions[0]
+    assert template.name == "template.bank_init_trampoline"
+    assert len(template.aliases) == 2
+    offsets = {alias.entry_offset for alias in template.aliases}
+    assert offsets == {0x0100, 0x0200}
 

@@ -29,6 +29,14 @@ class ASTRenderer:
             f"entry={function.entry_block} offset=0x{function.entry_offset:04X}"
         )
         lines.append(header)
+        if function.aliases:
+            lines.append("  aliases:")
+            for alias in function.aliases:
+                lines.append(
+                    "    "
+                    f"{alias.name} segment={alias.segment_index} "
+                    f"entry={alias.entry_block} offset=0x{alias.entry_offset:04X}"
+                )
         lines.append("  blocks:")
         for block in function.blocks:
             self._render_block(block, lines)

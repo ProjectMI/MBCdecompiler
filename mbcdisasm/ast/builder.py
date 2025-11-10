@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
     IRBlock,
+    IRCall,
     IRCallReturn,
+    IRCallCleanup,
     IRFunctionCfg,
     IRIf,
+    IRLiteral,
+    IRLiteralChunk,
     IRReturn,
     IRSegment,
     IRSwitchDispatch,
@@ -21,9 +25,20 @@ from ..ir.model import (
     IRTerminator,
     IRProgram,
     IRNode,
+    IRIndirectStore,
+    IRAbiEffect,
 )
 from ..ir.cfg import analyse_segments
-from .model import ASTBlock, ASTFunction, ASTLoop, ASTProgram, ASTTerminator, DominatorInfo
+from ..constants import IO_SLOT, RET_MASK
+from .model import (
+    ASTBlock,
+    ASTFunction,
+    ASTFunctionAlias,
+    ASTLoop,
+    ASTProgram,
+    ASTTerminator,
+    DominatorInfo,
+)
 
 
 @dataclass
@@ -77,6 +92,8 @@ class ASTBuilder:
         for function_cfg in cfg.functions:
             ast_function = self._build_function(function_cfg, block_lookup)
             functions.append(ast_function)
+
+        self._fold_function_templates(functions)
 
         return ASTProgram(functions=tuple(functions))
 
@@ -316,6 +333,160 @@ class ASTBuilder:
                 continue
             block.edges = [_Edge("goto", then_target)]
             block.terminator = _GotoTerminator(target=then_target)
+
+    # ------------------------------------------------------------------
+    # template folding
+    # ------------------------------------------------------------------
+    def _fold_function_templates(self, functions: List[ASTFunction]) -> None:
+        template_groups: Dict[Tuple[str, Tuple[Tuple, ...]], List[int]] = {}
+        for index, function in enumerate(functions):
+            template_name = self._identify_bank_initialisation_template(function)
+            if template_name is None:
+                continue
+            signature = self._function_signature(function)
+            template_groups.setdefault((template_name, signature), []).append(index)
+
+        removal_indices: List[int] = []
+
+        for (template_name, _signature), indices in template_groups.items():
+            if len(indices) <= 1:
+                continue
+            canonical_index = indices[0]
+            canonical = functions[canonical_index]
+            alias_entries: List[ASTFunctionAlias] = []
+            canonical_alias = ASTFunctionAlias(
+                name=canonical.name,
+                segment_index=canonical.segment_index,
+                entry_block=canonical.entry_block,
+                entry_offset=canonical.entry_offset,
+            )
+            clone_aliases: List[ASTFunctionAlias] = []
+            for clone_index in indices[1:]:
+                clone = functions[clone_index]
+                clone_aliases.append(
+                    ASTFunctionAlias(
+                        name=clone.name,
+                        segment_index=clone.segment_index,
+                        entry_block=clone.entry_block,
+                        entry_offset=clone.entry_offset,
+                    )
+                )
+                removal_indices.append(clone_index)
+            clone_aliases.sort(
+                key=lambda alias: (alias.segment_index, alias.entry_offset, alias.name)
+            )
+            alias_entries.append(canonical_alias)
+            alias_entries.extend(clone_aliases)
+            updated = replace(
+                canonical,
+                name=template_name,
+                aliases=tuple(alias_entries),
+            )
+            functions[canonical_index] = updated
+
+        for index in sorted(set(removal_indices), reverse=True):
+            del functions[index]
+
+    def _function_signature(self, function: ASTFunction) -> Tuple[Tuple, ...]:
+        signature: List[Tuple] = []
+        for block in function.blocks:
+            statements = []
+            for statement in block.statements:
+                describe = getattr(statement, "describe", None)
+                if callable(describe):
+                    statements.append((type(statement).__name__, describe()))
+                else:
+                    statements.append((type(statement).__name__, repr(statement)))
+            terminator_detail = block.terminator.describe()
+            signature.append(
+                (
+                    len(signature),
+                    tuple(statements),
+                    block.terminator.kind,
+                    terminator_detail,
+                )
+            )
+        return tuple(signature)
+
+    def _identify_bank_initialisation_template(
+        self, function: ASTFunction
+    ) -> Optional[str]:
+        if function.name != "auto_0":
+            return None
+        if len(function.blocks) != 1:
+            return None
+        block = function.blocks[0]
+        if block.successors:
+            return None
+        statements = block.statements
+        if len(statements) != 9:
+            return None
+        if not self._matches_frame_reset(statements[0]):
+            return None
+        if not self._matches_bank_helper_call(statements[1], target=0x04F0):
+            return None
+        if not self._matches_frame_write(statements[2], operand=0x4AA2):
+            return None
+        if not isinstance(statements[3], IRLiteral) or statements[3].value != IO_SLOT:
+            return None
+        if not self._matches_frame_reset(statements[4]):
+            return None
+        if not self._matches_bank_helper_call(statements[5], target=0x0EF0):
+            return None
+        if not isinstance(statements[6], IRLiteralChunk):
+            return None
+        if not self._matches_bank_flag_store(statements[7]):
+            return None
+        if not isinstance(statements[8], IRLiteral) or statements[8].value != RET_MASK:
+            return None
+        if block.terminator.kind != "tailcall":
+            return None
+        detail = block.terminator.detail
+        if not isinstance(detail, IRTailCall):
+            return None
+        call = detail.call
+        if call.target != IO_SLOT:
+            return None
+        if not self._call_has_return_mask(call, RET_MASK):
+            return None
+        return "template.bank_init_trampoline"
+
+    def _matches_frame_reset(self, node: IRNode) -> bool:
+        if not isinstance(node, IRCallCleanup):
+            return False
+        return any(step.category == "frame.reset" and step.operand == 0 for step in node.steps)
+
+    def _matches_frame_write(self, node: IRNode, operand: int) -> bool:
+        if not isinstance(node, IRCallCleanup):
+            return False
+        return any(step.category == "frame.write" and step.operand == operand for step in node.steps)
+
+    def _matches_bank_helper_call(self, node: IRNode, target: int) -> bool:
+        if not isinstance(node, IRCall):
+            return False
+        if not node.tail:
+            return False
+        if node.target != target:
+            return False
+        return self._call_has_return_mask(node, 0x0030)
+
+    def _matches_bank_flag_store(self, node: IRNode) -> bool:
+        if not isinstance(node, IRIndirectStore):
+            return False
+        if node.value != "bool1":
+            return False
+        if node.ref is None:
+            return False
+        if node.ref.page != 0xE4 or node.ref.offset != 0x01:
+            return False
+        return True
+
+    def _call_has_return_mask(self, node: IRCall, mask: int) -> bool:
+        for effect in node.abi_effects:
+            if isinstance(effect, IRAbiEffect) and effect.kind == "return_mask":
+                if effect.operand == mask:
+                    return True
+        return False
 
     # ------------------------------------------------------------------
     # dominator analysis
