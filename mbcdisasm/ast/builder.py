@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
 
 from ..ir.model import (
@@ -23,7 +23,15 @@ from ..ir.model import (
     IRNode,
 )
 from ..ir.cfg import analyse_segments
-from .model import ASTBlock, ASTFunction, ASTLoop, ASTProgram, ASTTerminator, DominatorInfo
+from .model import (
+    ASTBlock,
+    ASTFunction,
+    ASTFunctionAlias,
+    ASTLoop,
+    ASTProgram,
+    ASTTerminator,
+    DominatorInfo,
+)
 
 
 @dataclass
@@ -77,6 +85,8 @@ class ASTBuilder:
         for function_cfg in cfg.functions:
             ast_function = self._build_function(function_cfg, block_lookup)
             functions.append(ast_function)
+
+        functions = self._collapse_auto_trampoline_templates(functions)
 
         return ASTProgram(functions=tuple(functions))
 
@@ -168,6 +178,85 @@ class ASTBuilder:
     # ------------------------------------------------------------------
     # graph normalisation passes
     # ------------------------------------------------------------------
+    def _collapse_auto_trampoline_templates(
+        self, functions: Sequence[ASTFunction]
+    ) -> List[ASTFunction]:
+        groups: Dict[Tuple[Tuple[str, ...], str], List[int]] = {}
+        for index, function in enumerate(functions):
+            if not self._is_auto_trampoline_candidate(function):
+                continue
+            signature = self._auto_trampoline_signature(function)
+            groups.setdefault(signature, []).append(index)
+
+        if not groups:
+            return list(functions)
+
+        updated: Dict[int, ASTFunction] = {}
+        removed: Set[int] = set()
+        template_index = 0
+
+        for indices in groups.values():
+            if len(indices) <= 1:
+                continue
+
+            functions_for_group = [functions[index] for index in indices]
+            aliases = tuple(
+                ASTFunctionAlias(
+                    name=item.name,
+                    entry_block=item.entry_block,
+                    entry_offset=item.entry_offset,
+                )
+                for item in sorted(
+                    functions_for_group,
+                    key=lambda func: (func.segment_index, func.entry_offset),
+                )
+            )
+
+            template_name = self._auto_trampoline_template_name(template_index)
+            template_index += 1
+
+            primary_index = indices[0]
+            primary = functions[primary_index]
+            updated[primary_index] = replace(
+                primary, name=template_name, aliases=aliases
+            )
+            for extra_index in indices[1:]:
+                removed.add(extra_index)
+
+        if not updated and not removed:
+            return list(functions)
+
+        collapsed: List[ASTFunction] = []
+        for index, function in enumerate(functions):
+            if index in removed:
+                continue
+            collapsed.append(updated.get(index, function))
+        return collapsed
+
+    def _is_auto_trampoline_candidate(self, function: ASTFunction) -> bool:
+        if not function.name.startswith("auto_"):
+            return False
+        if len(function.blocks) != 1:
+            return False
+        block = function.blocks[0]
+        if block.successors:
+            return False
+        return block.terminator.kind == "tailcall"
+
+    def _auto_trampoline_signature(self, function: ASTFunction) -> Tuple[Tuple[str, ...], str]:
+        block = function.blocks[0]
+        statements = tuple(
+            getattr(statement, "describe", lambda: repr(statement))()
+            for statement in block.statements
+        )
+        terminator_detail = block.terminator.describe()
+        return statements, terminator_detail
+
+    def _auto_trampoline_template_name(self, index: int) -> str:
+        if index == 0:
+            return "template.bank_init_trampoline"
+        return f"template.bank_init_trampoline_{index + 1}"
+
     def _prune_unreachable(
         self, entry: str, blocks: MutableMapping[str, _MutableBlock]
     ) -> None:

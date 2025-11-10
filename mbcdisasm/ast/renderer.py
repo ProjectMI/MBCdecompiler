@@ -28,6 +28,11 @@ class ASTRenderer:
             f"function {function.name} segment={function.segment_index} "
             f"entry={function.entry_block} offset=0x{function.entry_offset:04X}"
         )
+        if function.aliases:
+            aliases = ", ".join(
+                f"{alias.name}@0x{alias.entry_offset:04X}" for alias in function.aliases
+            )
+            header += f" aliases=[{aliases}]"
         lines.append(header)
         lines.append("  blocks:")
         for block in function.blocks:

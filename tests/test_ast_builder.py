@@ -3,6 +3,7 @@ from __future__ import annotations
 from mbcdisasm.ast import ASTBuilder
 from mbcdisasm.ir.model import (
     IRBlock,
+    IRCall,
     IRCfgBlock,
     IRCfgEdge,
     IRControlFlowGraph,
@@ -12,6 +13,7 @@ from mbcdisasm.ir.model import (
     IRProgram,
     IRReturn,
     IRSegment,
+    IRTailCall,
     IRTerminator,
     NormalizerMetrics,
 )
@@ -229,4 +231,75 @@ def test_branch_folding_to_goto() -> None:
     entry_block = next(block for block in function.blocks if block.label == "entry")
     assert entry_block.terminator.kind == "goto"
     assert entry_block.terminator.targets == ("target",)
+
+
+def test_auto_trampoline_collapse() -> None:
+    block_a = IRBlock(
+        label="auto_block_a",
+        start_offset=0x0010,
+        nodes=(
+            IRLiteral(value=1, mode=0, source="lit"),
+            IRTailCall(call=IRCall(target=0x1234, args=(), tail=True), returns=tuple()),
+        ),
+    )
+    block_b = IRBlock(
+        label="auto_block_b",
+        start_offset=0x0020,
+        nodes=(
+            IRLiteral(value=1, mode=0, source="lit"),
+            IRTailCall(call=IRCall(target=0x1234, args=(), tail=True), returns=tuple()),
+        ),
+    )
+
+    segment = IRSegment(
+        index=0,
+        start=0,
+        length=0,
+        blocks=(block_a, block_b),
+        metrics=NormalizerMetrics(),
+    )
+
+    function_a = IRFunctionCfg(
+        segment_index=0,
+        name="auto_0",
+        entry_block="auto_block_a",
+        entry_offset=0x0010,
+        blocks=(
+            IRCfgBlock(
+                label="auto_block_a",
+                start_offset=0x0010,
+                terminator="tailcall",
+                edges=tuple(),
+            ),
+        ),
+    )
+    function_b = IRFunctionCfg(
+        segment_index=0,
+        name="auto_1",
+        entry_block="auto_block_b",
+        entry_offset=0x0020,
+        blocks=(
+            IRCfgBlock(
+                label="auto_block_b",
+                start_offset=0x0020,
+                terminator="tailcall",
+                edges=tuple(),
+            ),
+        ),
+    )
+
+    program = IRProgram(
+        segments=(segment,),
+        metrics=NormalizerMetrics(),
+        cfg=IRControlFlowGraph(functions=(function_a, function_b)),
+    )
+
+    builder = ASTBuilder()
+    ast_program = builder.build(program)
+
+    assert len(ast_program.functions) == 1
+    function = ast_program.functions[0]
+    assert function.name == "template.bank_init_trampoline"
+    assert [alias.name for alias in function.aliases] == ["auto_0", "auto_1"]
+    assert [alias.entry_offset for alias in function.aliases] == [0x0010, 0x0020]
 

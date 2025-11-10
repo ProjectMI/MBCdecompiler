@@ -86,6 +86,15 @@ class ASTLoop:
 
 
 @dataclass(frozen=True)
+class ASTFunctionAlias:
+    """Alias that points back to the original auto-generated entry point."""
+
+    name: str
+    entry_block: str
+    entry_offset: int
+
+
+@dataclass(frozen=True)
 class ASTFunction:
     """High level representation of a single function."""
 
@@ -97,6 +106,7 @@ class ASTFunction:
     dominators: DominatorInfo
     post_dominators: DominatorInfo
     loops: Tuple[ASTLoop, ...]
+    aliases: Tuple[ASTFunctionAlias, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)
