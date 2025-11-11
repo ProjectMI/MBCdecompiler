@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import List
 
-from .model import ASTBlock, ASTFunction, ASTProgram
+from .model import ASTBlock, ASTFunction, ASTProgram, ASTTemplate
 
 
 def _describe_node(node) -> str:
@@ -19,6 +19,14 @@ class ASTRenderer:
 
     def render(self, program: ASTProgram) -> str:
         lines: List[str] = []
+        if getattr(program, "templates", ()):
+            lines.append("templates:")
+            for template in program.templates:
+                offsets = ", ".join(f"0x{off:04X}" for off in template.offsets)
+                lines.append(
+                    f"  {template.name}: offsets=[{offsets}] signature={len(template.function.blocks)}b"
+                )
+            lines.append("")
         for function in program.functions:
             self._render_function(function, lines)
         return "\n".join(lines)

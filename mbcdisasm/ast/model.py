@@ -98,10 +98,19 @@ class ASTFunction:
     post_dominators: DominatorInfo
     loops: Tuple[ASTLoop, ...]
 
+@dataclass(frozen=True)
+class ASTTemplate:
+    """Свернутый темплейт, образованный из группы однотипных auto-функций."""
+
+    name: str
+    signature: str
+    offsets: Tuple[str, ...]
+    function: "ASTFunction"
 
 @dataclass(frozen=True)
 class ASTProgram:
     """High level AST representation for the entire container."""
 
     functions: Tuple[ASTFunction, ...]
+    templates: Tuple[ASTTemplate, ...] = field(default_factory=tuple)
 

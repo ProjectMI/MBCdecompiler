@@ -1,7 +1,7 @@
 """Public exports for the AST reconstruction stage."""
 
 from .builder import ASTBuilder
-from .model import ASTBlock, ASTFunction, ASTLoop, ASTProgram, ASTTerminator, DominatorInfo
+from .model import ASTBlock, ASTFunction, ASTLoop, ASTProgram, ASTTerminator, DominatorInfo, ASTTemplate
 from .renderer import ASTRenderer
 
 __all__ = [
@@ -13,5 +13,5 @@ __all__ = [
     "ASTLoop",
     "ASTTerminator",
     "DominatorInfo",
+    "ASTTemplate",
 ]
-

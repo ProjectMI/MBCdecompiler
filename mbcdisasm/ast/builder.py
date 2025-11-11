@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+import re
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Set, Tuple
-
 from ..ir.model import (
     IRBlock,
     IRCallReturn,
@@ -23,7 +23,7 @@ from ..ir.model import (
     IRNode,
 )
 from ..ir.cfg import analyse_segments
-from .model import ASTBlock, ASTFunction, ASTLoop, ASTProgram, ASTTerminator, DominatorInfo
+from .model import ASTBlock, ASTFunction, ASTLoop, ASTProgram, ASTTerminator, DominatorInfo, ASTTemplate
 
 
 @dataclass
@@ -78,7 +78,9 @@ class ASTBuilder:
             ast_function = self._build_function(function_cfg, block_lookup)
             functions.append(ast_function)
 
-        return ASTProgram(functions=tuple(functions))
+        program_ast = ASTProgram(functions=tuple(functions))
+        program_ast = self._fold_auto_templates(program_ast)
+        return program_ast
 
     # ------------------------------------------------------------------
     # construction helpers
@@ -644,3 +646,115 @@ class ASTBuilder:
             return ASTTerminator(kind="halt", targets=targets, detail=term)
         return ASTTerminator(kind="goto", targets=targets, detail=term)
 
+    # ------------------------------------------------------------------
+    # auto-template folding pass
+    # ------------------------------------------------------------------
+    def _fold_auto_templates(self, program: ASTProgram) -> ASTProgram:
+        """Сгруппировать однотипные auto-функции в темплейты и сохранить
+        их описание в программе. Каждая группа заменяется одной функцией
+        с именем template_N.
+        """
+        functions = list(program.functions)
+        auto_funcs = [fn for fn in functions if self._is_auto_name(fn.name)]
+        if not auto_funcs:
+            return program
+
+        groups: Dict[str, List[ASTFunction]] = {}
+        for fn in auto_funcs:
+            sig = self._function_signature(fn)
+            groups.setdefault(sig, []).append(fn)
+
+        new_functions: List[ASTFunction] = [fn for fn in functions if fn not in auto_funcs]
+        templates = []
+        template_index = 0
+
+        for sig, members in groups.items():
+            base = sorted(members, key=lambda f: (f.segment_index, f.entry_offset, f.name))[0]
+            template_name = f"template_{template_index}"
+            template_index += 1
+            renamed = replace(base, name=template_name)
+            new_functions.append(renamed)
+            offsets = tuple(sorted(fn.entry_offset for fn in members))
+            templates.append(
+                ASTTemplate(
+                    name=template_name,
+                    signature=sig,
+                    offsets=offsets,
+                    function=renamed,
+                )
+            )
+
+        new_functions.sort(key=lambda f: (f.name, f.segment_index, f.entry_offset))
+        templates.sort(key=lambda t: int(t.name.split("_")[-1]))
+        return ASTProgram(functions=tuple(new_functions), templates=tuple(templates))
+
+    def _is_auto_name(self, name: str) -> bool:
+        return bool(re.match(r"^auto(\b|_|[0-9A-Za-z].*)", name))
+
+    def _function_signature(self, fn: ASTFunction) -> str:
+        """Построить каноническую структурную сигнатуру функции.
+
+        Внутренние переходы кодируются номерами блоков.
+        Переходы на внешние адреса фиксируются как ext:<адрес>.
+        """
+        block_map = {b.label: b for b in fn.blocks}
+        order: List[str] = []
+        seen = set()
+
+        def walk(lbl: str) -> None:
+            if lbl in seen or lbl not in block_map:
+                return
+            seen.add(lbl)
+            order.append(lbl)
+            succs = sorted(block_map[lbl].successors)
+            for s in succs:
+                walk(s)
+
+        walk(fn.entry_block)
+        for lbl in sorted(block_map.keys()):
+            if lbl not in seen:
+                walk(lbl)
+
+        index = {lbl: i for i, lbl in enumerate(order)}
+        parts: List[str] = [f"b{len(order)}"]
+
+        for lbl in order:
+            b = block_map[lbl]
+            stmt_fps = [self._normalize_stmt(s) for s in b.statements]
+            term_kind = b.terminator.kind
+
+            # ключ сортировки теперь всегда кортеж (prio, value)
+            def succ_key(name: str):
+                if name in index:
+                    return (0, index[name])
+                return (1, name)
+
+            succs_sorted = sorted(b.successors, key=succ_key)
+
+            succ_ids: List[str] = []
+            for s in succs_sorted:
+                if s in index:
+                    succ_ids.append(str(index[s]))
+                else:
+                    succ_ids.append(f"ext:{s}")
+
+            succ_repr = ",".join(succ_ids)
+            parts.append(f"[{term_kind}|{len(stmt_fps)}|{';'.join(stmt_fps)}|->{succ_repr}]")
+
+        return "|".join(parts)
+
+
+    def _normalize_stmt(self, node) -> str:
+        describe = getattr(node, "describe", None)
+        text = None
+        if callable(describe):
+            try:
+                text = describe()
+            except Exception:
+                text = None
+        if not text:
+            text = type(node).__name__
+        text = re.sub(r"0x[0-9A-Fa-f]+", "0x#", text)
+        text = re.sub(r"\d+", "#", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
