@@ -1,110 +1,328 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from pathlib import Path
 import json
-from collections import Counter, defaultdict
+import math
 
 from .parser import MBCModule, MAGIC_HEADER
 from .tokenizer import Token, tokenize_stream, coverage
 
+# These are token kinds that provide relatively strong evidence that we matched a real
+# bytecode structure, not just filler, plain data, or a stream of trivially accepted ops.
+HARD_SEMANTIC_TOKEN_KINDS = {
+    "AGG", "AGG0",
+    "REF", "REF16",
+    "REC41", "REC61", "REC62",
+    "CALL66", "CALL63A", "CALL63B",
+    "IMM", "IMM16", "IMM24S", "IMM24U", "IMM32",
+    "F32", "BR", "OPU16",
+    "SIG_USEOWNER_HEAD", "SIG_USECLIENT_HEAD", "SIG_UNIQUEGEN_HEAD",
+    "SIG_USEOFF_HEAD", "SIG_INPUTDONE_HEAD",
+    "SIG_U32_U8_CALL66_TAIL", "SIG_AGG2_PARTIAL_HEAD", "SIG_AGG1_PARTIAL_HEAD",
+    "SIG_USECLIENT_ALT_HEAD", "SIG_CALL66_REFPAIR_HEAD", "SIG_CALL66_SMALLIMM",
+    "SIG_CONST_U32_TRAILER", "SIG_SLOT_CONST", "SIG_SETOSST_HEAD",
+    "SIG_GETPLAYERID_HEAD", "SIG_USEOFF_CONST_CHAIN", "SIG_GETCASTLENUM_HEAD",
+}
+
+PAD_DRIVEN_TOKEN_KINDS = {
+    "PAD",
+    "SIG_PAD17", "SIG_PAD11_BR", "SIG_PADRUN_BR", "SIG_PADRUN_OPREF",
+    "SIG_PADDED_CHECKPUT", "SIG_GETMODIFIERS_PADTAIL",
+}
+
+DATA_TOKEN_KINDS = {"ASCII", "DWBLOB"}
 
 SUSPICIOUS_PREFIX_DEF_NAMES = {"ITSOFF", "MBS", "ie"}
-DATA_LIKE_EXPORT_NAMES = {"pClanName", "pUSTATE", "GetTableTime"}
-TRIVIAL_STUB_EXPORT_NAMES = {"empty", "halt", "thalt", "CallLink", "CallEnd", "M"}
 
-SEMANTIC_TOKEN_KINDS = {
-    "OP", "AGG", "AGG0", "REF", "REF16", "REC41", "REC61", "REC62",
-    "CALL66", "CALL63A", "CALL63B", "IMM", "IMM16", "IMM24S", "IMM24U",
-    "IMM32", "BR", "OPU16", "DWBLOB", "SIG_CALL66_REFPAIR_HEAD",
-    "SIG_CALL66_SMALLIMM", "SIG_CONST_U32_TRAILER", "SIG_SLOT_CONST",
-    "SIG_PADDED_CHECKPUT", "SIG_USEOWNER_HEAD", "SIG_USECLIENT_HEAD",
-    "SIG_UNIQUEGEN_HEAD", "SIG_USEOFF_HEAD", "SIG_INPUTDONE_HEAD",
-    "SIG_U32_U8_CALL66_TAIL", "SIG_AGG2_PARTIAL_HEAD", "SIG_AGG1_PARTIAL_HEAD",
-    "SIG_USECLIENT_ALT_HEAD", "SIG_SETOSST_HEAD", "SIG_GETPLAYERID_HEAD",
-    "SIG_PAD17", "SIG_PAD11_BR", "SIG_GETMODIFIERS_PADTAIL",
+DATA_LIKE_EXPORT_NAMES = {"pClanName", "pUSTATE", "GetTableTime"}
+
+SAFE_MICRO_KIND_BY_FIRST_TOKEN = {
+    "SIG_USEOFF_HEAD": "useoff_wrapper",
+    "SIG_USECLIENT_HEAD": "useclient_wrapper",
+    "SIG_USEOWNER_HEAD": "useowner_wrapper",
+    "SIG_UNIQUEGEN_HEAD": "unique_generation_wrapper_head",
+    "SIG_INPUTDONE_HEAD": "inputdone_wrapper_head",
+    "SIG_U32_U8_CALL66_TAIL": "u32_call66_tail_wrapper",
+    "SIG_AGG2_PARTIAL_HEAD": "agg2_partial_head",
+    "SIG_AGG1_PARTIAL_HEAD": "agg1_partial_head",
+    "SIG_USECLIENT_ALT_HEAD": "useclient_alt_wrapper_head",
+    "SIG_CALL66_SMALLIMM": "call66_smallimm_wrapper",
+    "SIG_CALL66_REFPAIR_HEAD": "call66_refpair_wrapper",
+    "SIG_CONST_U32_TRAILER": "u32_const_trailer",
+    "SIG_SLOT_CONST": "slot_const_wrapper",
+    "SIG_SETOSST_HEAD": "setosst_wrapper",
+    "SIG_GETPLAYERID_HEAD": "getplayerid_wrapper",
+    "SIG_USEOFF_CONST_CHAIN": "useoff_const_chain",
+    "SIG_GETCASTLENUM_HEAD": "getcastlenum_wrapper",
 }
 
 
-def _vm_export_slices(mod: MBCModule, code_base: int, name: str, next_head_bytes: int = 16) -> tuple[bytes, bytes] | None:
-    defs = sorted(mod.definitions, key=lambda r: r.a)
-    if not defs:
+def _ratio(part: int, whole: int) -> float:
+    return (part / whole) if whole else 0.0
+
+
+def _token_bytes(tokens: list[Token], include: set[str]) -> int:
+    return sum(tok.size for tok in tokens if tok.kind in include)
+
+
+
+def _entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    freq = Counter(data)
+    n = len(data)
+    acc = 0.0
+    for count in freq.values():
+        p = count / n
+        acc -= p * math.log2(p)
+    return acc
+
+
+
+def _dominant_byte_info(data: bytes) -> tuple[int | None, float]:
+    if not data:
+        return None, 0.0
+    value, count = Counter(data).most_common(1)[0]
+    return value, count / len(data)
+
+
+
+def _op_stats(tokens: list[Token]) -> dict:
+    op_values = [tok.payload.get("op") for tok in tokens if tok.kind == "OP"]
+    op_values = [x for x in op_values if isinstance(x, int)]
+    if not op_values:
+        return {
+            "op_token_count": 0,
+            "unique_op_values": 0,
+            "dominant_op_value": None,
+            "dominant_op_ratio": 0.0,
+        }
+
+    counts = Counter(op_values)
+    value, count = counts.most_common(1)[0]
+    return {
+        "op_token_count": len(op_values),
+        "unique_op_values": len(counts),
+        "dominant_op_value": value,
+        "dominant_op_ratio": count / len(op_values),
+    }
+
+
+
+def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
+    filtered = [tok.kind for tok in tokens if tok.kind not in PAD_DRIVEN_TOKEN_KINDS and tok.kind not in DATA_TOKEN_KINDS]
+    if not filtered:
         return None
-    by_name = {r.name: r for r in defs}
-    rec = by_name.get(name)
+    first = filtered[0]
+    if first in SAFE_MICRO_KIND_BY_FIRST_TOKEN:
+        return SAFE_MICRO_KIND_BY_FIRST_TOKEN[first]
+    if filtered == ["AGG"] or filtered == ["AGG0"]:
+        return "aggregate_wrapper"
+    if filtered and all(kind == "REF" for kind in filtered):
+        return "ref_chain"
+    return None
+
+
+
+def _byte_profile(data: bytes) -> dict:
+    dominant, dominant_ratio = _dominant_byte_info(data)
+    size = len(data)
+    return {
+        "raw_size": size,
+        "zero_byte_ratio": _ratio(data.count(0x00), size),
+        "pad7c_byte_ratio": _ratio(data.count(0x7C), size),
+        "ff_byte_ratio": _ratio(data.count(0xFF), size),
+        "dominant_byte": dominant,
+        "dominant_byte_ratio": dominant_ratio,
+        "entropy_bits_per_byte": _entropy(data),
+    }
+
+
+
+def _filler_reasons(profile: dict, op_stats: dict, hard_sem_ratio: float, pad_ratio: float) -> list[str]:
+    reasons: list[str] = []
+    if profile["raw_size"] == 0:
+        reasons.append("empty_slice")
+        return reasons
+
+    dominant = profile.get("dominant_byte")
+    dominant_ratio = profile.get("dominant_byte_ratio", 0.0)
+    if dominant in (0x00, 0x7C, 0xFF) and dominant_ratio >= 0.60:
+        reasons.append("dominant_filler_byte")
+    if profile.get("zero_byte_ratio", 0.0) >= 0.50:
+        reasons.append("zero_dominated")
+    if profile.get("pad7c_byte_ratio", 0.0) >= 0.40:
+        reasons.append("pad7c_dominated")
+    if profile.get("ff_byte_ratio", 0.0) >= 0.40:
+        reasons.append("ff_dominated")
+    if op_stats["op_token_count"] > 0 and op_stats["unique_op_values"] <= 2 and op_stats["dominant_op_value"] in (0x00, 0x7C, 0xFF) and op_stats["dominant_op_ratio"] >= 0.80:
+        reasons.append("degenerate_op_stream")
+    if pad_ratio >= 0.35 and hard_sem_ratio < 0.30:
+        reasons.append("pad_driven_match")
+    if profile.get("entropy_bits_per_byte", 0.0) <= 1.0 and hard_sem_ratio < 0.30:
+        reasons.append("very_low_entropy")
+    return sorted(set(reasons))
+
+
+
+def _classify_evidence_level(slice_status: str, hard_sem_ratio: float, recognized_nonpadding_ratio: float, suspicious_reasons: list[str]) -> str:
+    if hard_sem_ratio >= 0.80 and not suspicious_reasons:
+        return "strong"
+    if hard_sem_ratio >= 0.50 and len(suspicious_reasons) <= 1:
+        return "moderate"
+    if hard_sem_ratio >= 0.20 or recognized_nonpadding_ratio >= 0.50:
+        return "weak"
+    return "none"
+
+
+
+def _classify_ir_readiness(slice_status: str, evidence_level: str, suspicious_reasons: list[str], hard_sem_ratio: float) -> str:
+    if evidence_level == "strong":
+        return "candidate_ir"
+    if evidence_level == "moderate":
+        return "review_required"
+    if suspicious_reasons and hard_sem_ratio < 0.30:
+        return "not_ready"
+    if evidence_level == "weak":
+        return "not_ready"
+    return "not_ready"
+
+
+
+def _data_like_export_reason(name: str, data_ratio: float, dominant_byte_ratio: float) -> bool:
+    if name in DATA_LIKE_EXPORT_NAMES and data_ratio >= 0.30:
+        return True
+    if name.startswith("p") and len(name) > 1 and name[1].isupper() and dominant_byte_ratio >= 0.40:
+        return True
+    return False
+
+
+
+def _raw_export_span(mod: MBCModule, name: str) -> tuple[int, int, int]:
+    names = mod.export_names()
+    idx = names.index(name)
+    start = mod.exports[idx].a
+    if idx + 1 < len(mod.exports):
+        end = mod.exports[idx + 1].a
+    elif mod.code_size:
+        end = mod.code_size
+    else:
+        end = max(start, len(mod.data) - mod.code_base)
+    return idx, start, end
+
+
+
+def _definition_backed_file_slice(mod: MBCModule, name: str) -> tuple[bytes, dict] | None:
+    idx, start, raw_end = _raw_export_span(mod, name)
+    defs_by_name = {r.name: r for r in mod.definitions}
+    rec = defs_by_name.get(name)
     if rec is None:
         return None
-
-    start_addr = rec.a
-    end_addr = rec.b + 1
-    start = code_base + start_addr
-    end = code_base + end_addr
-    if start < 0 or end < 0 or end > len(mod.data) or start >= end:
+    if rec.a != start or rec.b < rec.a:
         return None
 
-    raw = mod.data[start:end]
-    stitched = raw
-    idx = next((i for i, r in enumerate(defs) if r.name == name), None)
-    if idx is not None and idx + 1 < len(defs):
-        nxt = defs[idx + 1]
-        nstart = code_base + nxt.a
-        if 0 <= nstart < len(mod.data):
-            stitched = raw + mod.data[nstart:nstart + next_head_bytes]
-    return raw, stitched
-
-
-def _infer_vm_code_base(mod: MBCModule) -> int | None:
-    if not mod.definitions or not mod.exports:
+    code_end = rec.b + 1
+    if mod.code_size and code_end > mod.code_size:
         return None
-    if not any(r.a < len(MAGIC_HEADER) for r in mod.exports):
+    if code_end > raw_end:
         return None
 
-    boundary = min(
-        [
-            c.start
-            for c in (mod.definition_table, mod.globals_table, mod.exports_table)
-            if c is not None
-        ]
-        + [len(mod.data)]
-    )
-
-    defs = sorted(mod.definitions, key=lambda r: r.a)
-    exported = [r.name for r in mod.exports]
-    max_addr = max((rec.b for rec in defs if rec.name in exported), default=None)
-    if max_addr is None:
+    file_start = mod.code_base + start
+    file_end = mod.code_base + code_end
+    if file_start < 0 or file_end > len(mod.data) or file_start >= file_end:
         return None
 
-    start_base = 0x20
-    max_base = boundary - (max_addr + 1)
-    if max_base <= start_base:
+    return mod.data[file_start:file_end], {
+        "slice_status": "definition_exact",
+        "slice_proof": "definition_table_code_relative",
+        "raw_export_span_size": raw_end - start,
+        "code_body_size": code_end - start,
+        "trailing_data_size": raw_end - code_end,
+        "slice_start": file_start,
+        "slice_end": file_end,
+        "code_offset_start": start,
+        "code_offset_end": code_end,
+        "export_index": idx,
+    }
+
+
+def _override_vm_slice(mod: MBCModule, name: str, code_base: int) -> tuple[bytes, dict] | None:
+    defs_by_name = {r.name: r for r in mod.definitions}
+    rec = defs_by_name.get(name)
+    if rec is None or rec.b < rec.a:
         return None
 
-    best = None
-    best_score = -1.0
-    for base in range(start_base, max_base + 1):
-        total = 0
-        covered = 0
-        ok = 0
-        for name in exported:
-            pair = _vm_export_slices(mod, base, name, next_head_bytes=2)
-            if pair is None:
-                continue
-            _, stitched = pair
-            toks = tokenize_stream(stitched)
-            cov = coverage(toks, len(stitched))
-            total += cov["total_bytes"]
-            covered += cov["covered_bytes"]
-            if cov["coverage_ratio"] >= 0.75:
-                ok += 1
-        if total == 0:
-            continue
-        score = (covered / total) + (ok * 0.01)
-        if score > best_score:
-            best_score = score
-            best = base
-
-    if best is None or best_score < 0.85:
+    start = code_base + rec.a
+    end = code_base + rec.b + 1
+    limit = code_base + (mod.code_size or max(rec.b + 1, 0))
+    if start < 0 or end > min(limit, len(mod.data)) or start >= end:
         return None
-    return best
+
+    idx = mod.export_names().index(name)
+    return mod.data[start:end], {
+        "slice_status": "vm_definition_exact",
+        "slice_proof": "override_code_base",
+        "raw_export_span_size": None,
+        "code_body_size": end - start,
+        "trailing_data_size": None,
+        "slice_start": start,
+        "slice_end": end,
+        "code_offset_start": rec.a,
+        "code_offset_end": rec.b + 1,
+        "export_index": idx,
+    }
+
+
+def _unverified_file_span(mod: MBCModule, name: str) -> tuple[bytes, dict] | None:
+    idx, start, end = _raw_export_span(mod, name)
+    file_start = mod.code_base + start
+    file_end = mod.code_base + end
+    code_limit = mod.code_base + (mod.code_size or (len(mod.data) - mod.code_base))
+    if file_start < 0 or file_end > min(code_limit, len(mod.data)) or file_start >= file_end:
+        return None
+    return mod.data[file_start:file_end], {
+        "slice_status": "export_span_unverified",
+        "slice_proof": "export_table_code_relative",
+        "raw_export_span_size": end - start,
+        "code_body_size": end - start,
+        "trailing_data_size": None,
+        "slice_start": file_start,
+        "slice_end": file_end,
+        "code_offset_start": start,
+        "code_offset_end": end,
+        "export_index": idx,
+    }
+
+
+def _select_export_slice(mod: MBCModule, name: str, override_entry: dict | None) -> tuple[bytes, dict]:
+    if override_entry and "code_base" in override_entry:
+        vm = _override_vm_slice(mod, name, int(override_entry["code_base"]))
+        if vm is not None:
+            return vm
+
+    idx, start, end = _raw_export_span(mod, name)
+
+    exact = _definition_backed_file_slice(mod, name)
+    if exact is not None:
+        return exact
+
+    span = _unverified_file_span(mod, name)
+    if span is not None:
+        return span
+
+    return b"", {
+        "slice_status": "invalid_export_span",
+        "slice_proof": None,
+        "raw_export_span_size": max(0, end - start),
+        "code_body_size": None,
+        "trailing_data_size": None,
+        "slice_start": None,
+        "slice_end": None,
+        "code_offset_start": start,
+        "code_offset_end": end,
+        "export_index": idx,
+    }
 
 
 def classify_layout(mod: MBCModule) -> str:
@@ -120,6 +338,7 @@ def classify_layout(mod: MBCModule) -> str:
             return "split_interface_with_toggle_splice"
         return "split_interface_with_embedded_import_block"
     return "clean_split_interface"
+
 
 
 def classify_interface_signature(mod: MBCModule) -> str | None:
@@ -177,183 +396,78 @@ def classify_interface_signature(mod: MBCModule) -> str | None:
     return None
 
 
-def _coverage_for_kinds(tokens: list[Token], total_size: int, include_kinds: set[str]) -> dict:
-    covered = sum(tok.size for tok in tokens if tok.kind in include_kinds)
-    return {
-        "covered_bytes": covered,
-        "total_bytes": total_size,
-        "coverage_ratio": (covered / total_size) if total_size else 0.0,
-        "token_counts": dict(Counter(tok.kind for tok in tokens if tok.kind in include_kinds)),
+
+def _analyze_export(mod: MBCModule, name: str, override_entry: dict | None) -> dict:
+    raw, meta = _select_export_slice(mod, name, override_entry)
+    tokens = tokenize_stream(raw) if raw else []
+    raw_cov = coverage(tokens, len(raw)) if raw else {"coverage_ratio": 0.0, "covered_bytes": 0, "total_bytes": len(raw), "token_counts": {}}
+
+    hard_sem_bytes = _token_bytes(tokens, HARD_SEMANTIC_TOKEN_KINDS)
+    pad_bytes = _token_bytes(tokens, PAD_DRIVEN_TOKEN_KINDS)
+    data_bytes = _token_bytes(tokens, DATA_TOKEN_KINDS)
+    op_bytes = _token_bytes(tokens, {"OP"})
+    recognized_nonpadding_bytes = sum(tok.size for tok in tokens if tok.kind not in PAD_DRIVEN_TOKEN_KINDS and tok.kind != "UNK")
+
+    hard_sem_ratio = _ratio(hard_sem_bytes, len(raw))
+    pad_ratio = _ratio(pad_bytes, len(raw))
+    data_ratio = _ratio(data_bytes, len(raw))
+    op_ratio = _ratio(op_bytes, len(raw))
+    recognized_nonpadding_ratio = _ratio(recognized_nonpadding_bytes, len(raw))
+
+    profile = _byte_profile(raw)
+    op_stats = _op_stats(tokens)
+    suspicious_reasons = _filler_reasons(profile, op_stats, hard_sem_ratio, pad_ratio)
+    evidence_level = _classify_evidence_level(meta["slice_status"], hard_sem_ratio, recognized_nonpadding_ratio, suspicious_reasons)
+    ir_readiness = _classify_ir_readiness(meta["slice_status"], evidence_level, suspicious_reasons, hard_sem_ratio)
+
+    entry = {
+        "name": name,
+        "start_offset": mod.exports[meta["export_index"]].a,
+        "slice_status": meta["slice_status"],
+        "slice_proof": meta["slice_proof"],
+        "slice_start": meta["slice_start"],
+        "slice_end": meta["slice_end"],
+        "code_offset_start": meta.get("code_offset_start"),
+        "code_offset_end": meta.get("code_offset_end"),
+        "raw_export_span_size": meta["raw_export_span_size"],
+        "code_body_size": meta["code_body_size"],
+        "trailing_data_size": meta["trailing_data_size"],
+        "raw_size": len(raw),
+        "tokenizer_recognition_ratio": raw_cov["coverage_ratio"],
+        "recognized_nonpadding_ratio": recognized_nonpadding_ratio,
+        "hard_semantic_ratio": hard_sem_ratio,
+        "opcode_ratio": op_ratio,
+        "pad_ratio": pad_ratio,
+        "data_ratio": data_ratio,
+        "token_counts": raw_cov["token_counts"],
+        "dominant_byte": profile["dominant_byte"],
+        "dominant_byte_ratio": profile["dominant_byte_ratio"],
+        "zero_byte_ratio": profile["zero_byte_ratio"],
+        "pad7c_byte_ratio": profile["pad7c_byte_ratio"],
+        "ff_byte_ratio": profile["ff_byte_ratio"],
+        "entropy_bits_per_byte": profile["entropy_bits_per_byte"],
+        "op_token_count": op_stats["op_token_count"],
+        "unique_op_values": op_stats["unique_op_values"],
+        "dominant_op_value": op_stats["dominant_op_value"],
+        "dominant_op_ratio": op_stats["dominant_op_ratio"],
+        "micro_semantic_kind": _infer_micro_semantic_kind(tokens),
+        "data_like": _data_like_export_reason(name, data_ratio, profile["dominant_byte_ratio"]),
+        "evidence_level": evidence_level,
+        "ir_readiness": ir_readiness,
+        "suspicious_reasons": suspicious_reasons,
+        "raw_signature_hex": raw[:32].hex(" ") if raw else "",
     }
+    return entry
 
 
-def _semantic_coverage(tokens: list[Token], total_size: int) -> dict:
-    return _coverage_for_kinds(tokens, total_size, SEMANTIC_TOKEN_KINDS)
 
-
-def _repair_export_tail(mod: MBCModule, name: str, raw: bytes, max_borrow: int = 8) -> tuple[bytes, list[Token], int] | None:
-    names = mod.export_names()
-    idx = names.index(name)
-    if idx + 1 >= len(names):
+def _weighted_average(entries: list[dict], key: str, weight_key: str = "raw_size") -> float | None:
+    weighted = [(entry.get(weight_key, 0), entry.get(key)) for entry in entries if entry.get(key) is not None and entry.get(weight_key, 0) > 0]
+    if not weighted:
         return None
+    total_w = sum(w for w, _ in weighted)
+    return sum(w * v for w, v in weighted) / total_w if total_w else None
 
-    next_head = mod.get_export_body(names[idx + 1])[:max_borrow]
-    if not next_head:
-        return None
-
-    raw_tokens = tokenize_stream(raw)
-    raw_cov = coverage(raw_tokens, len(raw))["coverage_ratio"]
-    best: tuple[float, int, bytes, list[Token]] | None = None
-    raw_len = len(raw)
-
-    for borrow in range(1, len(next_head) + 1):
-        data = raw + next_head[:borrow]
-        toks = tokenize_stream(data)
-
-        if any(tok.offset >= raw_len for tok in toks):
-            continue
-
-        crossing = [tok for tok in toks if tok.offset < raw_len < (tok.offset + tok.size) and tok.kind != "UNK"]
-        if not crossing:
-            continue
-
-        if not all(any(tok.offset <= pos < (tok.offset + tok.size) for tok in crossing) for pos in range(raw_len, len(data))):
-            continue
-
-        cov = coverage(toks, len(data))["coverage_ratio"]
-        if cov <= raw_cov:
-            continue
-
-        if best is None or cov > best[0] or (cov == best[0] and borrow < best[1]):
-            best = (cov, borrow, data, toks)
-
-    if best is None:
-        return None
-    return best[2], best[3], best[1]
-
-
-def _data_like_export_reason(name: str, best_cov: float) -> bool:
-    if name in DATA_LIKE_EXPORT_NAMES and best_cov < 0.65:
-        return True
-    if name.startswith("p") and len(name) > 1 and name[1].isupper() and best_cov < 0.25:
-        return True
-    return False
-
-
-def _best_size(entry: dict) -> int:
-    if entry["best_mode"] == "repaired" and entry.get("repaired_size") is not None:
-        return entry["repaired_size"]
-    return entry["stitched_size"] if entry["best_mode"] == "stitched" else entry["raw_size"]
-
-
-def _weighted_average(entries: list[dict], key: str) -> float | None:
-    if not entries:
-        return None
-    denom = sum(_best_size(x) for x in entries)
-    if not denom:
-        return None
-    num = sum(_best_size(x) * x[key] for x in entries)
-    return num / denom
-
-
-def _dominant_byte_info(data: bytes) -> tuple[int | None, float]:
-    if not data:
-        return None, 0.0
-    value, count = Counter(data).most_common(1)[0]
-    return value, count / len(data)
-
-
-def _is_padding_like_export(entry: dict) -> bool:
-    dominant_ratio = entry.get("dominant_byte_ratio", 0.0)
-    dominant_byte = entry.get("dominant_byte")
-    if dominant_byte is None:
-        return False
-    if entry.get("best_coverage_ratio", 0.0) >= 0.95:
-        return False
-    if entry["raw_size"] <= 64 and dominant_ratio >= 0.80:
-        return True
-    if dominant_byte in {0x7C, 0x00} and entry["raw_size"] <= 64 and dominant_ratio >= 0.65 and entry["best_coverage_ratio"] < 0.90:
-        return True
-    return False
-
-
-def _is_stub_like(entry: dict) -> bool:
-    if entry.get("header_overlap"):
-        return True
-    if entry.get("padding_like"):
-        return True
-    if entry.get("name") in TRIVIAL_STUB_EXPORT_NAMES:
-        return True
-    if _best_size(entry) <= 32 and entry.get("best_coverage_ratio", 0.0) < 0.85:
-        return True
-    return False
-
-
-def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
-    kinds = [tok.kind for tok in tokens if tok.kind not in {"PAD", "ASCII"}]
-    if not kinds:
-        return None
-    first = kinds[0]
-    if first == "SIG_USEOFF_HEAD":
-        return "useoff_wrapper"
-    if first == "SIG_USECLIENT_HEAD":
-        return "useclient_wrapper"
-    if first == "SIG_USEOWNER_HEAD":
-        return "useowner_wrapper"
-    if first == "SIG_UNIQUEGEN_HEAD":
-        return "unique_generation_wrapper_head"
-    if first == "SIG_PADDED_CHECKPUT":
-        return "padded_checkput_stub"
-    if first == "SIG_INPUTDONE_HEAD":
-        return "inputdone_wrapper_head"
-    if first == "SIG_U32_U8_CALL66_TAIL":
-        return "u32_call66_tail_wrapper"
-    if first == "SIG_AGG2_PARTIAL_HEAD":
-        return "agg2_partial_head"
-    if first == "SIG_AGG1_PARTIAL_HEAD":
-        return "agg1_partial_head"
-    if first == "SIG_USECLIENT_ALT_HEAD":
-        return "useclient_alt_wrapper_head"
-    if first == "SIG_CALL66_SMALLIMM":
-        return "call66_smallimm_wrapper"
-    if first == "SIG_CALL66_REFPAIR_HEAD":
-        return "call66_refpair_wrapper"
-    if first == "SIG_CONST_U32_TRAILER":
-        return "u32_const_trailer"
-    if first == "SIG_SLOT_CONST":
-        return "slot_const_wrapper"
-    if first == "SIG_SETOSST_HEAD":
-        return "setosst_wrapper"
-    if first == "SIG_GETPLAYERID_HEAD":
-        return "getplayerid_wrapper"
-    if first == "SIG_PAD17":
-        return "pad17_stub"
-    if first == "SIG_PAD11_BR":
-        return "pad11_branch_stub"
-    if first == "SIG_GETMODIFIERS_PADTAIL":
-        return "getmodifiers_padtail_stub"
-    if first == "DWBLOB":
-        return "dword_blob_segment"
-    if kinds == ["AGG"] or kinds == ["AGG0"]:
-        return "aggregate_wrapper"
-    if all(kind == "REF" for kind in kinds):
-        return "ref_chain"
-    return None
-
-
-def _classify_ir_readiness(entry: dict) -> str:
-    if entry.get("padding_like"):
-        return "padding_or_noise"
-    if entry.get("data_like"):
-        return "data_like"
-    sem = entry.get("best_semantic_coverage_ratio", 0.0)
-    if sem >= 0.95:
-        return "ir_ready"
-    if sem >= 0.75:
-        return "mostly_ir_ready"
-    if sem >= 0.35:
-        return "partial_semantic"
-    return "opaque_or_unresolved"
 
 
 def module_attention_reasons(result: dict) -> list[str]:
@@ -366,26 +480,24 @@ def module_attention_reasons(result: dict) -> list[str]:
     if result.get("interface_signature_type") == "prefix_contaminated_definitions":
         reasons.append("prefix_contamination")
 
-    if (result.get("adjusted_avg_semantic_coverage") or 0.0) < 0.80:
-        reasons.append("low_adjusted_semantic_coverage")
-    if (result.get("adjusted_avg_semantic_gap") or 0.0) >= 0.15:
-        reasons.append("large_semantic_gap")
+    if (result.get("strong_export_ratio") or 0.0) < 0.30 and result.get("exports_count", 0) > 0:
+        reasons.append("low_strong_evidence")
 
-    opaque = [
-        x["name"]
-        for x in result.get("export_analysis", [])
-        if x["ir_readiness"] == "opaque_or_unresolved"
-        and not x.get("data_like")
-        and not x.get("padding_like")
-    ]
-    if opaque:
-        reasons.append("opaque_exports")
+    if (result.get("weighted_opcode_ratio") or 0.0) >= 0.60 and (result.get("weighted_hard_semantic_ratio") or 0.0) < 0.30:
+        reasons.append("opcode_dominated")
 
-    raw_header_overlap = [] if result.get("export_address_mode") == "vmaddr" else (result.get("header_overlap_exports") or [])
-    if raw_header_overlap:
-        reasons.append("header_overlap_exports")
+    if (result.get("weighted_pad_ratio") or 0.0) >= 0.25:
+        reasons.append("padding_dominated")
+
+    if (result.get("weighted_zero_byte_ratio") or 0.0) >= 0.40:
+        reasons.append("zero_dominated")
+
+    suspicious = [x["name"] for x in result.get("export_analysis", []) if x.get("suspicious_reasons")]
+    if suspicious:
+        reasons.append("suspicious_exports")
 
     return sorted(set(reasons))
+
 
 
 def _export_entry(path: str, layout_type: str, interface_signature_type: str | None, export: dict) -> dict:
@@ -394,15 +506,17 @@ def _export_entry(path: str, layout_type: str, interface_signature_type: str | N
         "layout_type": layout_type,
         "interface_signature_type": interface_signature_type,
         "name": export["name"],
+        "evidence_level": export["evidence_level"],
         "ir_readiness": export["ir_readiness"],
-        "best_mode": export["best_mode"],
-        "best_coverage_ratio": export["best_coverage_ratio"],
-        "best_semantic_coverage_ratio": export["best_semantic_coverage_ratio"],
-        "semantic_gap_ratio": export["semantic_gap_ratio"],
+        "hard_semantic_ratio": export["hard_semantic_ratio"],
+        "opcode_ratio": export["opcode_ratio"],
+        "pad_ratio": export["pad_ratio"],
+        "data_ratio": export["data_ratio"],
         "raw_size": export["raw_size"],
-        "stitched_size": export["stitched_size"],
         "start_offset": export["start_offset"],
+        "slice_status": export["slice_status"],
     }
+
 
 
 def _group_modules_by_adb_signature(modules: list[dict]) -> dict[str, list[dict]]:
@@ -415,14 +529,15 @@ def _group_modules_by_adb_signature(modules: list[dict]) -> dict[str, list[dict]
     return groups
 
 
+
 def _export_name_tuple(module: dict) -> tuple[str, ...]:
     return tuple(x["name"] for x in module.get("export_analysis", []))
+
 
 
 def _annotate_adb_consensus(modules: list[dict]) -> dict:
     groups = _group_modules_by_adb_signature(modules)
     summary_clusters = []
-    resolved_count = 0
     annotated_count = 0
 
     for sig, members in groups.items():
@@ -437,18 +552,17 @@ def _annotate_adb_consensus(modules: list[dict]) -> dict:
 
         top_interface = interface_counts.most_common(1)[0][0] if interface_counts else None
         top_layout = layout_counts.most_common(1)[0][0] if layout_counts else None
-        unanimous_interface = bool(interface_counts) and len(interface_counts) == 1
-        strong_cluster = unanimous_interface and same_export_order and len(export_count_set) == 1
+        stable_cluster = same_export_order and len(export_count_set) == 1
 
         sample_paths = [m["path"] for m in members[:8]]
         short_sig = sig[:12]
 
-        if strong_cluster:
+        if stable_cluster:
             summary_clusters.append({
                 "adb_signature": short_sig,
                 "module_count": len(members),
-                "interface_signature_type": top_interface,
-                "layout_type": top_layout,
+                "interface_name_pattern_hint": top_interface,
+                "layout_type_hint": top_layout,
                 "exports_count": export_count_set[0] if export_count_set else None,
                 "sample_paths": sample_paths,
             })
@@ -458,285 +572,159 @@ def _annotate_adb_consensus(modules: list[dict]) -> dict:
             module["adb_cluster_size"] = len(members)
             module["adb_peer_examples"] = sample_paths
             module["adb_consensus"] = {
-                "strong_family_cluster": strong_cluster,
-                "interface_signature_type": top_interface,
-                "layout_type": top_layout,
+                "stable_family_shape": stable_cluster,
+                "interface_name_pattern_hint": top_interface,
+                "layout_type_hint": top_layout,
                 "same_export_order": same_export_order,
                 "export_counts": export_count_set,
             }
+            # Deliberately do not auto-resolve semantics from adb clustering.
             module["resolved_interface_signature_type"] = module.get("interface_signature_type")
-            module["resolved_interface_source"] = "native" if module.get("interface_signature_type") else None
+            module["resolved_interface_source"] = module.get("resolved_interface_source")
             annotated_count += 1
 
-            if strong_cluster and not module.get("interface_signature_type") and top_interface:
-                module["resolved_interface_signature_type"] = top_interface
-                module["resolved_interface_source"] = "adb_family_cluster"
-                resolved_count += 1
-
-    summary_clusters.sort(key=lambda x: (-x["module_count"], x["interface_signature_type"] or "", x["adb_signature"]))
+    summary_clusters.sort(key=lambda x: (-x["module_count"], x["interface_name_pattern_hint"] or "", x["adb_signature"]))
     return {
         "group_count": len(groups),
         "annotated_module_count": annotated_count,
-        "resolved_interface_module_count": resolved_count,
+        "resolved_interface_module_count": 0,
         "top_family_clusters": summary_clusters[:25],
     }
 
 
+
 def summarize_many(modules: list[dict]) -> dict:
-    layout_counts = Counter(m["layout_type"] for m in modules)
-    interface_signature_counts = Counter(m["interface_signature_type"] for m in modules if m.get("interface_signature_type"))
-    resolved_interface_signature_counts = Counter(m["resolved_interface_signature_type"] for m in modules if m.get("resolved_interface_signature_type"))
-    best_mode_counts = Counter()
+    layout_counts = Counter(m.get("layout_type") for m in modules)
+    interface_signature_counts = Counter(m.get("interface_signature_type") for m in modules if m.get("interface_signature_type"))
+    resolved_interface_signature_counts = Counter(m.get("resolved_interface_signature_type") for m in modules if m.get("resolved_interface_signature_type"))
+    evidence_level_counts = Counter()
     ir_readiness_counts = Counter()
-    micro_semantic_counts = Counter()
-
-    module_count_nonempty = 0
-    export_count = 0
-    sum_simple_best = 0.0
-    sum_simple_sem = 0.0
-    sum_adjusted_best = 0.0
-    sum_adjusted_sem = 0.0
-    adjusted_count = 0
-
-    low_semantic_modules = []
-    low_semantic_exports = []
-    high_gap_exports = []
+    suspicious_reason_counts = Counter()
     modules_requiring_attention = []
-    unresolved_signature_counts = Counter()
-
+    low_evidence_modules = []
     weighted_entries: list[dict] = []
 
     for m in modules:
         exports = m.get("export_analysis", [])
-        if m.get("simple_avg_best_coverage") is not None:
-            module_count_nonempty += 1
-            sum_simple_best += m["simple_avg_best_coverage"]
-            sum_simple_sem += m["simple_avg_semantic_coverage"]
-            low_semantic_modules.append({
-                "path": m["path"],
-                "layout_type": m["layout_type"],
-                "interface_signature_type": m.get("interface_signature_type"),
-                "adjusted_avg_best_coverage": m.get("adjusted_avg_best_coverage"),
-                "adjusted_avg_semantic_coverage": m.get("adjusted_avg_semantic_coverage"),
-                "adjusted_avg_semantic_gap": m.get("adjusted_avg_semantic_gap"),
-                "exports_count": m.get("exports_count", 0),
-            })
-        if m.get("adjusted_avg_best_coverage") is not None:
-            adjusted_count += 1
-            sum_adjusted_best += m["adjusted_avg_best_coverage"]
-            sum_adjusted_sem += m["adjusted_avg_semantic_coverage"]
+        for e in exports:
+            evidence_level_counts[e["evidence_level"]] += 1
+            ir_readiness_counts[e["ir_readiness"]] += 1
+            suspicious_reason_counts.update(e.get("suspicious_reasons", []))
+            weighted_entries.append(_export_entry(m["path"], m.get("layout_type"), m.get("interface_signature_type"), e))
 
-        weighted_entries.extend(exports)
-        export_count += len(exports)
-
-        for x in exports:
-            best_mode_counts[x["best_mode"]] += 1
-            ir_readiness_counts[x["ir_readiness"]] += 1
-            if x.get("micro_semantic_kind"):
-                micro_semantic_counts[x["micro_semantic_kind"]] += 1
-            if x["best_semantic_coverage_ratio"] < 0.75 and not x.get("data_like") and not x.get("padding_like"):
-                low_semantic_exports.append(_export_entry(m["path"], m["layout_type"], m.get("interface_signature_type"), x))
-                sig = x.get("raw_signature_hex")
-                if sig:
-                    unresolved_signature_counts[(x.get("micro_semantic_kind"), sig)] += 1
-            if x["semantic_gap_ratio"] >= 0.10 and not x.get("data_like") and not x.get("padding_like"):
-                high_gap_exports.append(_export_entry(m["path"], m["layout_type"], m.get("interface_signature_type"), x))
-
-        reasons = m.get("attention_reasons", [])
-        if reasons:
+        low_evidence_modules.append({
+            "path": m["path"],
+            "layout_type": m.get("layout_type"),
+            "interface_signature_type": m.get("interface_signature_type"),
+            "strong_export_ratio": m.get("strong_export_ratio"),
+            "weighted_hard_semantic_ratio": m.get("weighted_hard_semantic_ratio"),
+            "weighted_opcode_ratio": m.get("weighted_opcode_ratio"),
+            "weighted_pad_ratio": m.get("weighted_pad_ratio"),
+            "exports_count": m.get("exports_count", 0),
+        })
+        if m.get("attention_reasons"):
             modules_requiring_attention.append({
                 "path": m["path"],
-                "layout_type": m["layout_type"],
+                "layout_type": m.get("layout_type"),
                 "interface_signature_type": m.get("interface_signature_type"),
-                "attention_reasons": reasons,
-                "adjusted_avg_best_coverage": m.get("adjusted_avg_best_coverage"),
-                "adjusted_avg_semantic_coverage": m.get("adjusted_avg_semantic_coverage"),
-                "adjusted_avg_semantic_gap": m.get("adjusted_avg_semantic_gap"),
+                "attention_reasons": m.get("attention_reasons"),
+                "strong_export_ratio": m.get("strong_export_ratio"),
+                "weighted_hard_semantic_ratio": m.get("weighted_hard_semantic_ratio"),
+                "exports_count": m.get("exports_count", 0),
             })
 
-    low_semantic_modules.sort(key=lambda x: (
-        x["adjusted_avg_semantic_coverage"] if x["adjusted_avg_semantic_coverage"] is not None else 999,
-        x["adjusted_avg_semantic_gap"] if x["adjusted_avg_semantic_gap"] is not None else -999,
-        x["path"],
-    ))
-    low_semantic_exports.sort(key=lambda x: (x["best_semantic_coverage_ratio"], -x["semantic_gap_ratio"], x["path"], x["name"]))
-    high_gap_exports.sort(key=lambda x: (-x["semantic_gap_ratio"], x["best_semantic_coverage_ratio"], x["path"], x["name"]))
-    modules_requiring_attention.sort(key=lambda x: (
-        -len(x["attention_reasons"]),
-        x["adjusted_avg_semantic_coverage"] if x["adjusted_avg_semantic_coverage"] is not None else 999,
-        x["path"],
-    ))
+    low_evidence_modules.sort(key=lambda x: (x.get("strong_export_ratio") or 0.0, x.get("weighted_hard_semantic_ratio") or 0.0, -(x.get("exports_count") or 0), x["path"]))
+    modules_requiring_attention.sort(key=lambda x: (-len(x["attention_reasons"]), x.get("strong_export_ratio") or 0.0, x["path"]))
 
-    simple_avg_best = (sum_simple_best / module_count_nonempty) if module_count_nonempty else None
-    simple_avg_sem = (sum_simple_sem / module_count_nonempty) if module_count_nonempty else None
-    adjusted_avg_best = (sum_adjusted_best / adjusted_count) if adjusted_count else None
-    adjusted_avg_sem = (sum_adjusted_sem / adjusted_count) if adjusted_count else None
-    weighted_best = _weighted_average(weighted_entries, "best_coverage_ratio")
-    weighted_sem = _weighted_average(weighted_entries, "best_semantic_coverage_ratio")
+    weighted_hard = _weighted_average([{"raw_size": e["raw_size"], "value": e["hard_semantic_ratio"]} for e in weighted_entries], "value")
+    weighted_op = _weighted_average([{"raw_size": e["raw_size"], "value": e["opcode_ratio"]} for e in weighted_entries], "value")
+    weighted_pad = _weighted_average([{"raw_size": e["raw_size"], "value": e["pad_ratio"]} for e in weighted_entries], "value")
+    weighted_data = _weighted_average([{"raw_size": e["raw_size"], "value": e["data_ratio"]} for e in weighted_entries], "value")
 
     return {
         "module_count": len(modules),
-        "nonempty_module_count": module_count_nonempty,
-        "export_count": export_count,
         "layout_counts": dict(layout_counts),
         "interface_signature_counts": dict(interface_signature_counts),
         "resolved_interface_signature_counts": dict(resolved_interface_signature_counts),
-        "best_mode_counts": dict(best_mode_counts),
+        "evidence_level_counts": dict(evidence_level_counts),
         "ir_readiness_counts": dict(ir_readiness_counts),
-        "micro_semantic_counts": dict(micro_semantic_counts),
-        "overall": {
-            "simple_avg_best_coverage": simple_avg_best,
-            "weighted_best_coverage": weighted_best,
-            "adjusted_avg_best_coverage": adjusted_avg_best,
-            "simple_avg_semantic_coverage": simple_avg_sem,
-            "weighted_semantic_coverage": weighted_sem,
-            "adjusted_avg_semantic_coverage": adjusted_avg_sem,
-            "simple_avg_semantic_gap": (simple_avg_best - simple_avg_sem) if simple_avg_best is not None and simple_avg_sem is not None else None,
-            "weighted_semantic_gap": (weighted_best - weighted_sem) if weighted_best is not None and weighted_sem is not None else None,
-            "adjusted_avg_semantic_gap": (adjusted_avg_best - adjusted_avg_sem) if adjusted_avg_best is not None and adjusted_avg_sem is not None else None,
-            "exports_below_0_75_best": sum(1 for x in weighted_entries if x["best_coverage_ratio"] < 0.75),
-            "exports_below_0_75_semantic": sum(1 for x in weighted_entries if x["best_semantic_coverage_ratio"] < 0.75),
-            "exports_semantic_gap_ge_0_10": sum(1 for x in weighted_entries if x["semantic_gap_ratio"] >= 0.10),
-            "exports_semantic_gap_ge_0_25": sum(1 for x in weighted_entries if x["semantic_gap_ratio"] >= 0.25),
-        },
-        "lowest_semantic_modules": low_semantic_modules[:25],
-        "lowest_semantic_exports": low_semantic_exports[:50],
-        "highest_semantic_gap_exports": high_gap_exports[:50],
-        "modules_requiring_attention": modules_requiring_attention[:100],
-        "top_unresolved_signatures": [
-            {"micro_semantic_kind": kind, "raw_signature_hex": sig, "count": count}
-            for (kind, sig), count in unresolved_signature_counts.most_common(25)
-        ],
+        "suspicious_reason_counts": dict(suspicious_reason_counts),
+        "weighted_hard_semantic_ratio": weighted_hard,
+        "weighted_opcode_ratio": weighted_op,
+        "weighted_pad_ratio": weighted_pad,
+        "weighted_data_ratio": weighted_data,
+        "lowest_evidence_modules": low_evidence_modules[:25],
+        "modules_requiring_attention": modules_requiring_attention[:25],
     }
 
 
+
 def analyze_module(path: str | Path, overrides: dict | None = None) -> dict:
+    path = Path(path)
+    override_entry = None
+    if overrides:
+        override_entry = overrides.get(path.name)
+
     mod = MBCModule(path, overrides=overrides)
-    vm_code_base = _infer_vm_code_base(mod)
-    header_overlap_names = {r.name for r in mod.header_overlap_exports(len(MAGIC_HEADER))}
+    layout_type = classify_layout(mod)
+    interface_signature_type = classify_interface_signature(mod)
 
-    export_analysis = []
-    for idx, name in enumerate(mod.export_names()):
-        if vm_code_base is not None:
-            pair = _vm_export_slices(mod, vm_code_base, name, next_head_bytes=16)
-            if pair is None:
-                raw = mod.get_export_body(name)
-                stitched = mod.stitch_export_body(name, next_head_bytes=16)
-                addr_mode = "file_fallback"
-            else:
-                raw, stitched = pair
-                addr_mode = "vmaddr"
-        else:
-            raw = mod.get_export_body(name)
-            stitched = mod.stitch_export_body(name, next_head_bytes=16)
-            addr_mode = "file_offset"
-
-        raw_tokens = tokenize_stream(raw)
-        stitched_tokens = tokenize_stream(stitched)
-        raw_cov = coverage(raw_tokens, len(raw))
-        raw_sem = _semantic_coverage(raw_tokens, len(raw))
-        stitched_cov = coverage(stitched_tokens, len(stitched))
-        stitched_sem = _semantic_coverage(stitched_tokens, len(stitched))
-
-        repaired_cov = None
-        repaired_sem = None
-        repaired_size = None
-        repaired_borrow = 0
-        repaired = _repair_export_tail(mod, name, raw)
-        if repaired is not None:
-            repaired_bytes, repaired_tokens, repaired_borrow = repaired
-            repaired_cov = coverage(repaired_tokens, len(repaired_bytes))
-            repaired_sem = _semantic_coverage(repaired_tokens, len(repaired_bytes))
-            repaired_size = len(repaired_bytes)
-
-        candidates = [("raw", raw_cov, raw_sem, raw_tokens)]
-        if repaired_cov is not None and repaired_sem is not None and repaired is not None:
-            candidates.append(("repaired", repaired_cov, repaired_sem, repaired_tokens))
-        candidates.append(("stitched", stitched_cov, stitched_sem, stitched_tokens))
-        best_mode, best_cov, best_sem, best_tokens = max(candidates, key=lambda item: item[1]["coverage_ratio"])
-
-        dominant_byte, dominant_ratio = _dominant_byte_info(raw)
-        entry = {
-            "name": name,
-            "start_offset": mod.exports[idx].a,
-            "addr_mode": addr_mode,
-            "header_overlap": (name in header_overlap_names) and vm_code_base is None,
-            "raw_size": len(raw),
-            "repaired_size": repaired_size,
-            "repaired_borrowed_bytes": repaired_borrow,
-            "stitched_size": len(stitched),
-            "raw_coverage_ratio": raw_cov["coverage_ratio"],
-            "raw_semantic_coverage_ratio": raw_sem["coverage_ratio"],
-            "best_mode": best_mode,
-            "best_coverage_ratio": best_cov["coverage_ratio"],
-            "best_semantic_coverage_ratio": best_sem["coverage_ratio"],
-            "dominant_byte": dominant_byte,
-            "dominant_byte_ratio": dominant_ratio,
-            "raw_signature_hex": raw[:32].hex(" "),
-        }
-        entry["micro_semantic_kind"] = _infer_micro_semantic_kind(best_tokens)
-        entry["data_like"] = _data_like_export_reason(entry["name"], entry["best_coverage_ratio"])
-        entry["padding_like"] = _is_padding_like_export(entry)
-        entry["semantic_gap_ratio"] = entry["best_coverage_ratio"] - entry["best_semantic_coverage_ratio"]
-        entry["ir_readiness"] = _classify_ir_readiness(entry)
-        export_analysis.append(entry)
+    export_analysis = [_analyze_export(mod, name, override_entry) for name in mod.export_names()]
 
     result = {
-        "path": str(Path(path)),
+        "path": str(path),
         "has_magic_header": mod.has_magic_header,
         "adb_info": mod.adb_info.to_dict(),
         "definition_count": len(mod.definitions),
         "globals_count": len(mod.globals),
         "exports_count": len(mod.exports),
         "embedded_import_like_export_count": len(mod.embedded_import_like_exports),
-        "layout_type": classify_layout(mod),
-        "interface_signature_type": classify_interface_signature(mod),
-        "resolved_interface_signature_type": classify_interface_signature(mod),
-        "resolved_interface_source": "native" if classify_interface_signature(mod) else None,
-        "export_address_mode": "vmaddr" if vm_code_base is not None else "file_offset",
-        "vm_code_base": vm_code_base,
-        "header_overlap_exports": [name for name in mod.export_names() if name in header_overlap_names and vm_code_base is None],
+        "layout_type": layout_type,
+        "interface_signature_type": interface_signature_type,
+        "resolved_interface_signature_type": interface_signature_type,
+        "resolved_interface_source": "names_only_pattern" if interface_signature_type else None,
+        "export_address_mode": (
+            "override_vm_code_base"
+            if override_entry and "code_base" in override_entry else
+            "header_code_relative"
+        ),
+        "vm_code_base": int(override_entry["code_base"]) if override_entry and "code_base" in override_entry else mod.code_base,
+        "code_base": mod.code_base,
+        "code_size": mod.code_size,
+        "data_blob_size": mod.data_blob_size,
+        "code_prefix_exports": [r.name for r in mod.exports if r.a < 16],
+        "header_overlap_exports": [],
         "export_analysis": export_analysis,
     }
 
-    result["simple_avg_best_coverage"] = (
-        sum(x["best_coverage_ratio"] for x in export_analysis) / len(export_analysis)
-        if export_analysis else None
-    )
-    result["weighted_best_coverage"] = _weighted_average(export_analysis, "best_coverage_ratio")
-    result["simple_avg_semantic_coverage"] = (
-        sum(x["best_semantic_coverage_ratio"] for x in export_analysis) / len(export_analysis)
-        if export_analysis else None
-    )
-    result["weighted_semantic_coverage"] = _weighted_average(export_analysis, "best_semantic_coverage_ratio")
+    result["weighted_tokenizer_recognition_ratio"] = _weighted_average([{"raw_size": x["raw_size"], "value": x["tokenizer_recognition_ratio"]} for x in export_analysis], "value")
+    result["weighted_hard_semantic_ratio"] = _weighted_average([{"raw_size": x["raw_size"], "value": x["hard_semantic_ratio"]} for x in export_analysis], "value")
+    result["weighted_opcode_ratio"] = _weighted_average([{"raw_size": x["raw_size"], "value": x["opcode_ratio"]} for x in export_analysis], "value")
+    result["weighted_pad_ratio"] = _weighted_average([{"raw_size": x["raw_size"], "value": x["pad_ratio"]} for x in export_analysis], "value")
+    result["weighted_data_ratio"] = _weighted_average([{"raw_size": x["raw_size"], "value": x["data_ratio"]} for x in export_analysis], "value")
+    result["weighted_zero_byte_ratio"] = _weighted_average([{"raw_size": x["raw_size"], "value": x["zero_byte_ratio"]} for x in export_analysis], "value")
 
-    adjusted_entries = [x for x in export_analysis if not _is_stub_like(x)]
-    result["adjusted_avg_best_coverage"] = (
-        sum(x["best_coverage_ratio"] for x in adjusted_entries) / len(adjusted_entries)
-        if adjusted_entries else None
-    )
-    result["adjusted_avg_semantic_coverage"] = (
-        sum(x["best_semantic_coverage_ratio"] for x in adjusted_entries) / len(adjusted_entries)
-        if adjusted_entries else None
-    )
-    result["simple_avg_semantic_gap"] = (
-        result["simple_avg_best_coverage"] - result["simple_avg_semantic_coverage"]
-        if result["simple_avg_best_coverage"] is not None and result["simple_avg_semantic_coverage"] is not None else None
-    )
-    result["weighted_semantic_gap"] = (
-        result["weighted_best_coverage"] - result["weighted_semantic_coverage"]
-        if result["weighted_best_coverage"] is not None and result["weighted_semantic_coverage"] is not None else None
-    )
-    result["adjusted_avg_semantic_gap"] = (
-        result["adjusted_avg_best_coverage"] - result["adjusted_avg_semantic_coverage"]
-        if result["adjusted_avg_best_coverage"] is not None and result["adjusted_avg_semantic_coverage"] is not None else None
-    )
+    strong = [x for x in export_analysis if x["evidence_level"] == "strong"]
+    moderate = [x for x in export_analysis if x["evidence_level"] == "moderate"]
+    weak = [x for x in export_analysis if x["evidence_level"] == "weak"]
+    unresolved = [x for x in export_analysis if x["evidence_level"] == "unresolved"]
+    suspicious = [x for x in export_analysis if x.get("suspicious_reasons")]
+
+    total_exports = len(export_analysis)
+    result["strong_export_ratio"] = _ratio(len(strong), total_exports)
+    result["moderate_export_ratio"] = _ratio(len(moderate), total_exports)
+    result["weak_export_ratio"] = _ratio(len(weak), total_exports)
+    result["unresolved_export_ratio"] = _ratio(len(unresolved), total_exports)
+    result["suspicious_export_ratio"] = _ratio(len(suspicious), total_exports)
+
     result["attention_reasons"] = module_attention_reasons(result)
     return result
 
 
+
 def analyze_modules(paths: list[str | Path], overrides: dict | None = None) -> list[dict]:
     return [analyze_module(path, overrides=overrides) for path in paths]
+
 
 
 def analyze_many(paths: list[str | Path], overrides: dict | None = None) -> dict:
@@ -748,6 +736,7 @@ def analyze_many(paths: list[str | Path], overrides: dict | None = None) -> dict
         "summary": summary,
         "modules": modules,
     }
+
 
 
 def dump_json(obj: dict, out_path: str | Path) -> None:

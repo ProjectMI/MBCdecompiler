@@ -322,9 +322,46 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 13
             continue
 
+        matched_pad_sig = False
+        for pad_len in (5, 8, 16):
+            if i + pad_len + 3 <= size and data[i:i + pad_len] == (b"\x7c" * pad_len) and data[i + pad_len] in (0x4A, 0x4B, 0x4C, 0x4D):
+                out.append(Token(i, "SIG_PADRUN_BR", pad_len + 3, {"pad_len": pad_len, "op": data[i + pad_len], "off": struct.unpack_from("<H", data, i + pad_len + 1)[0]}))
+                i += pad_len + 3
+                matched_pad_sig = True
+                break
+        if matched_pad_sig:
+            continue
+
+        # recurring wrapper head: short 0x7c pad run bridging directly into 30+REF.
+        for pad_len in (5, 8, 9, 13):
+            if i + pad_len + 7 <= size and data[i:i + pad_len] == (b"\x7c" * pad_len) and data[i + pad_len] == 0x30 and data[i + pad_len + 1] in (0x69, 0x65, 0x6C):
+                out.append(Token(i, "SIG_PADRUN_OPREF", pad_len + 7, {"pad_len": pad_len, "ref_op": data[i + pad_len + 1], "mode": data[i + pad_len + 2], "ref": u32(data, i + pad_len + 3)}))
+                i += pad_len + 7
+                matched_pad_sig = True
+                break
+        if matched_pad_sig:
+            continue
+
+        if i + 11 <= size and data[i:i + 11] == b"\x00\x80\x3f\x28\x10\xc0\x00\x2e\x2f\x2d\x3d":
+            out.append(Token(i, "SIG_USEOFF_CONST_CHAIN", 11, {}))
+            i += 11
+            continue
+
         if i + 17 <= size and data[i:i + 17] == b"\x00\x00\x29\x10\x1e\x3c\x4b\x15\x00" + (b"\x7c" * 8):
             out.append(Token(i, "SIG_GETMODIFIERS_PADTAIL", 17, {}))
             i += 17
+            continue
+
+        if i + 18 <= size and data[i:i + 18] == b"\xff\x23\x4f\x00\x31\x30\x32\x6c\x01\x08\x00\x00\x00\x14\x00\x00\x00\x72":
+            out.append(Token(i, "SIG_GETCASTLENUM_HEAD", 18, {}))
+            i += 18
+            continue
+
+        if i + 6 <= size and data[i] == 0x39 and data[i + 1] == 0x20:
+            bits = u32(data, i + 2)
+            value = struct.unpack('<f', struct.pack('<I', bits))[0]
+            out.append(Token(i, "F32", 6, {"op": 0x39, "mode": 0x20, "bits": bits, "value": value if math.isfinite(value) else None}))
+            i += 6
             continue
 
         blob_size, blob_payload = _scan_dword_blob(data, i, size)

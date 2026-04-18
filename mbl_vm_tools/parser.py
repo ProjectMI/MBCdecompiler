@@ -10,6 +10,8 @@ from typing import Optional
 
 KNOWN_FLAGS = {0, 1, 255, 257, 511, 767, 0x101, 0x1FF, 0x201, 0x2FF}
 MAGIC_HEADER = b"MBL script v4.0\x00"
+FIXED_CODE_BASE = 0x20
+MAX_INTER_RECORD_ZERO_RUN = 16
 
 
 def u32(data: bytes, offset: int) -> int:
@@ -127,15 +129,21 @@ EMPTY_ADB_INFO = ADBInfo(
 )
 
 
-def parse_table_with_padding(data: bytes, start: int, globals_mode: bool = False, max_records: int = 5000) -> tuple[list[TableRecord], int]:
+def parse_table_with_padding(data: bytes, start: int, globals_mode: bool = False, max_records: int = 5000, max_inter_record_zero_run: int = MAX_INTER_RECORD_ZERO_RUN) -> tuple[list[TableRecord], int]:
     records: list[TableRecord] = []
     pos = start
     size = len(data)
+    seen_record = False
 
     while pos < size and len(records) < max_records:
+        zero_start = pos
         while pos < size and data[pos] == 0:
             pos += 1
         if pos >= size:
+            break
+
+        zero_run = pos - zero_start
+        if seen_record and zero_run > max_inter_record_zero_run:
             break
 
         if pos > 0 and data[pos - 1] != 0:
@@ -156,6 +164,7 @@ def parse_table_with_padding(data: bytes, start: int, globals_mode: bool = False
             break
 
         records.append(TableRecord(pos, name, a, b, c))
+        seen_record = True
         pos = end + 12
 
     return records, pos
@@ -246,6 +255,93 @@ def _score_exports(records: list[TableRecord]) -> float:
 
 
 
+def _is_strict_definition_record(rec: TableRecord, code_size: int) -> bool:
+    return rec.b != 0xFFFFFFFF and rec.a <= rec.b < code_size and rec.c in KNOWN_FLAGS
+
+
+def _iter_candidate_starts_in_window(data: bytes, start: int, end: int):
+    start = max(0, start)
+    end = min(len(data), end)
+    if start >= end:
+        return
+
+    yielded = set()
+    if data[start:start + 1] == b"\x00":
+        yielded.add(start)
+        yield start
+
+    i = max(1, start)
+    while i < end:
+        if data[i] == 0 and data[i - 1] != 0:
+            run_start = i
+            j = i
+            while j + 1 < end and data[j + 1] == 0:
+                j += 1
+            next_pos = j + 1
+            if next_pos < end:
+                b = data[next_pos]
+                if ((65 <= b <= 90) or (97 <= b <= 122) or b == 95) and run_start not in yielded:
+                    yielded.add(run_start)
+                    yield run_start
+            i = j + 1
+            continue
+        i += 1
+
+
+def _score_header_guided_definition(start: int, records: list[TableRecord], predicted_start: int, code_size: int) -> float:
+    valid = sum(1 for rec in records if _is_strict_definition_record(rec, code_size))
+    import_like = sum(1 for rec in records if rec.b == 0xFFFFFFFF and rec.c == 0)
+    invalid = len(records) - valid - import_like
+    if valid == 0:
+        return float('-inf')
+
+    score = (valid * 12.0) + (len(records) * 0.5) - (invalid * 30.0) - (import_like * 20.0)
+    if records and _is_strict_definition_record(records[0], code_size):
+        score += 10.0
+    score -= abs(start - predicted_start) * 0.05
+    return score
+
+
+def _find_header_guided_definition(data: bytes) -> TableCandidate | None:
+    if len(data) < FIXED_CODE_BASE or not data.startswith(MAGIC_HEADER):
+        return None
+
+    header = [u32(data, 0x10 + i * 4) for i in range(4)]
+    code_size = header[2]
+    predicted_start = FIXED_CODE_BASE + header[2] + header[3] + 1
+    search_start = max(0, predicted_start - 128)
+    search_end = min(len(data), predicted_start + 512)
+
+    best: TableCandidate | None = None
+    best_score = float('-inf')
+    for pos in _iter_candidate_starts_in_window(data, search_start, search_end):
+        recs, end = parse_table_with_padding(data, pos, globals_mode=False, max_records=5000)
+        if not recs:
+            continue
+        score = _score_header_guided_definition(pos, recs, predicted_start, code_size)
+        if score > best_score:
+            best_score = score
+            best = TableCandidate(pos, end, "definitions", score, recs)
+
+    return best if best_score != float('-inf') else None
+
+
+def _find_first_table_after(data: bytes, start: int, kind: str) -> TableCandidate | None:
+    scan_start = max(0, start - 64)
+    scan_end = min(len(data), start + 65536)
+    for pos in _iter_candidate_starts_in_window(data, scan_start, scan_end):
+        if kind == "globals":
+            recs, end = parse_table_with_padding(data, pos, globals_mode=True, max_records=5000)
+            if recs and recs[0].offset >= start and _looks_like_globals(recs):
+                return TableCandidate(pos, end, "globals", _score_globals(recs), recs)
+            continue
+
+        recs, end = parse_table_with_padding(data, pos, globals_mode=False, max_records=5000)
+        if recs and recs[0].offset >= start and _looks_like_exports(recs):
+            return TableCandidate(pos, end, "exports", _score_exports(recs), recs)
+    return None
+
+
 def _iter_candidate_starts(data: bytes):
     """
     Yield only plausible table starts:
@@ -304,30 +400,48 @@ def find_table_candidates(data: bytes, min_records: int = 3) -> list[TableCandid
 
 def detect_module_layout(data: bytes) -> dict:
     cands = find_table_candidates(data)
-    # Extremely small service modules can contain a legitimate one-record table.
-    # Keep the default min_records=3 for normal operation, but fall back only when
-    # the strict pass finds nothing at all.
     if not cands:
         cands = find_table_candidates(data, min_records=1)
 
-    globals_cands = [c for c in cands if c.kind == "globals"]
-    export_cands = [c for c in cands if c.kind == "exports"]
-    def_cands = [c for c in cands if c.kind == "definitions"]
+    definitions_best = _find_header_guided_definition(data)
+    globals_best = None
+    exports_best = None
 
-    globals_best = max(globals_cands, key=lambda c: (c.score, -c.start), default=None)
-    exports_best = max(export_cands, key=lambda c: (c.score, -c.start), default=None)
+    if definitions_best is not None:
+        first_globals = _find_first_table_after(data, definitions_best.end, "globals")
+        first_exports = _find_first_table_after(data, definitions_best.end, "exports")
 
-    definitions_best = None
-    if globals_best is not None:
-        defs_before = [c for c in def_cands if c.start < globals_best.start]
-        if defs_before:
-            definitions_best = max(defs_before, key=lambda c: (c.score, -c.start))
-    if definitions_best is None and exports_best is not None:
-        defs_before = [c for c in def_cands if c.start < exports_best.start]
-        if defs_before:
-            definitions_best = max(defs_before, key=lambda c: (c.score, -c.start))
-    if definitions_best is None and def_cands:
-        definitions_best = max(def_cands, key=lambda c: (c.score, -c.start))
+        if first_globals is not None and first_exports is not None and first_globals.start == first_exports.start:
+            later_exports = _find_first_table_after(data, first_globals.end, "exports")
+            if later_exports is not None and later_exports.start > first_globals.start:
+                globals_best = first_globals
+                exports_best = later_exports
+            else:
+                exports_best = first_exports
+        elif first_globals is not None and (first_exports is None or first_globals.start < first_exports.start):
+            globals_best = first_globals
+            exports_best = _find_first_table_after(data, globals_best.end, "exports")
+        else:
+            exports_best = first_exports
+
+    if definitions_best is None:
+        globals_cands = [c for c in cands if c.kind == "globals"]
+        export_cands = [c for c in cands if c.kind == "exports"]
+        def_cands = [c for c in cands if c.kind == "definitions"]
+
+        globals_best = max(globals_cands, key=lambda c: (c.score, -c.start), default=None)
+        exports_best = max(export_cands, key=lambda c: (c.score, -c.start), default=None)
+
+        if globals_best is not None:
+            defs_before = [c for c in def_cands if c.start < globals_best.start]
+            if defs_before:
+                definitions_best = max(defs_before, key=lambda c: (c.score, -c.start))
+        if definitions_best is None and exports_best is not None:
+            defs_before = [c for c in def_cands if c.start < exports_best.start]
+            if defs_before:
+                definitions_best = max(defs_before, key=lambda c: (c.score, -c.start))
+        if definitions_best is None and def_cands:
+            definitions_best = max(def_cands, key=lambda c: (c.score, -c.start))
 
     return {
         "definitions": definitions_best,
@@ -378,8 +492,11 @@ class MBCModule:
     def __init__(self, path: str | Path, overrides: dict | None = None):
         self.path = Path(path)
         self.data = self.path.read_bytes()
-        self.header = [u32(self.data, 0x10 + i * 4) for i in range(4)]
         self.has_magic_header = self.data.startswith(MAGIC_HEADER)
+        self.header = [u32(self.data, 0x10 + i * 4) for i in range(4)] if len(self.data) >= FIXED_CODE_BASE else [0, 0, 0, 0]
+        self.code_base = FIXED_CODE_BASE if self.has_magic_header and len(self.data) >= FIXED_CODE_BASE else 0
+        self.code_size = self.header[2] if self.has_magic_header else 0
+        self.data_blob_size = (self.header[3] + 1) if self.has_magic_header else 0
         self.adb_info = read_adb_info(self.path)
 
         layout = {"definitions": None, "globals": None, "exports": None, "candidates": []}

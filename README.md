@@ -4,5 +4,5 @@
 python analyze_mbc.py mbc/door1.mbc
 
 Прогон по каталогу:
-python analyze_mbc.py mbc/ --out report.json
+python analyze_mbc.py mbc/ --out report.json --workers 16
 

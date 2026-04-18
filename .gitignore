@@ -1,8 +1,8 @@
 # Cache
-mbcdisasm/__pycache__/*
-mbcdisasm/analyzer/__pycache__/*
+mbl_vm_tools/__pycache__/*
 
 # Decompile
+*.json
 *.txt
 *.pyc
 *.lua
