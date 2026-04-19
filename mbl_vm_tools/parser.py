@@ -108,6 +108,8 @@ class ADBInfo:
     shape_signature: str | None
     family_signature: str | None
     all_words_strictly_increasing: bool | None
+    usable_for_family_shape: bool
+    quality: str
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -126,6 +128,8 @@ EMPTY_ADB_INFO = ADBInfo(
     shape_signature=None,
     family_signature=None,
     all_words_strictly_increasing=None,
+    usable_for_family_shape=False,
+    quality="missing",
 )
 
 
@@ -458,19 +462,58 @@ def read_adb_info(mbc_path: str | Path) -> ADBInfo:
         return EMPTY_ADB_INFO
 
     data = adb_path.read_bytes()
-    words: list[int] = []
-    if len(data) % 4 == 0 and data:
-        words = list(struct.unpack("<" + ("I" * (len(data) // 4)), data))
+    exact_signature = hashlib.sha1(data).hexdigest() if data else None
+    if not data:
+        return ADBInfo(
+            present=True,
+            path=str(adb_path),
+            size=0,
+            word_count=0,
+            first_words=[],
+            last_word=None,
+            delta_signature=[],
+            top_deltas=[],
+            exact_signature=exact_signature,
+            shape_signature=None,
+            family_signature=None,
+            all_words_strictly_increasing=None,
+            usable_for_family_shape=False,
+            quality="empty",
+        )
 
-    increasing = None
-    if words:
-        increasing = all(words[i] < words[i + 1] for i in range(len(words) - 1))
+    if len(data) % 4 != 0:
+        return ADBInfo(
+            present=True,
+            path=str(adb_path),
+            size=len(data),
+            word_count=0,
+            first_words=[],
+            last_word=None,
+            delta_signature=[],
+            top_deltas=[],
+            exact_signature=exact_signature,
+            shape_signature=None,
+            family_signature=None,
+            all_words_strictly_increasing=None,
+            usable_for_family_shape=False,
+            quality="unaligned_bytes",
+        )
 
+    words = list(struct.unpack("<" + ("I" * (len(data) // 4)), data))
+    increasing = all(words[i] < words[i + 1] for i in range(len(words) - 1)) if words else None
     deltas = [words[i + 1] - words[i] for i in range(len(words) - 1)] if len(words) >= 2 else []
     top_deltas = [
         {"delta": delta, "count": count}
         for delta, count in Counter(deltas).most_common(8)
     ]
+
+    usable_for_family_shape = len(words) >= 2 and bool(deltas)
+    quality = "usable" if usable_for_family_shape else "too_short"
+    shape_signature = None
+    family_signature = None
+    if usable_for_family_shape:
+        shape_signature = hashlib.sha1((str(len(words)) + '|' + ','.join(str(x) for x in deltas)).encode('ascii')).hexdigest()
+        family_signature = hashlib.sha1((str(len(words)) + '|' + ','.join(str(x) for x in deltas[:16])).encode('ascii')).hexdigest()
 
     return ADBInfo(
         present=True,
@@ -481,10 +524,12 @@ def read_adb_info(mbc_path: str | Path) -> ADBInfo:
         last_word=words[-1] if words else None,
         delta_signature=deltas[:32],
         top_deltas=top_deltas,
-        exact_signature=hashlib.sha1(data).hexdigest(),
-        shape_signature=hashlib.sha1((str(len(words)) + '|' + ','.join(str(x) for x in deltas)).encode('ascii')).hexdigest(),
-        family_signature=hashlib.sha1((str(len(words)) + '|' + ','.join(str(x) for x in deltas[:16])).encode('ascii')).hexdigest(),
+        exact_signature=exact_signature,
+        shape_signature=shape_signature,
+        family_signature=family_signature,
         all_words_strictly_increasing=increasing,
+        usable_for_family_shape=usable_for_family_shape,
+        quality=quality,
     )
 
 

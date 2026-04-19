@@ -4,6 +4,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 import json
 import math
+import random
 
 from .parser import MBCModule
 from .tokenizer import Token, tokenize_stream, coverage
@@ -55,6 +56,23 @@ SAFE_MICRO_KIND_BY_FIRST_TOKEN = {
     "SIG_GETPLAYERID_HEAD": "getplayerid_wrapper",
     "SIG_USEOFF_CONST_CHAIN": "useoff_const_chain",
     "SIG_GETCASTLENUM_HEAD": "getcastlenum_wrapper",
+}
+
+
+MICRO_SEMANTIC_FAMILY = {
+    "aggregate_wrapper": "aggregate_wrapper_family",
+    "agg0_const_wrapper": "aggregate_wrapper_family",
+    "agg0_ref_wrapper": "aggregate_wrapper_family",
+    "agg0_u16_wrapper": "aggregate_wrapper_family",
+    "agg0_head_wrapper": "aggregate_wrapper_family",
+    "u32_call66_tail_wrapper": "call66_wrapper_family",
+    "call66_smallimm_wrapper": "call66_wrapper_family",
+    "call66_refpair_wrapper": "call66_wrapper_family",
+    "useoff_wrapper": "context_use_wrapper_family",
+    "useclient_wrapper": "context_use_wrapper_family",
+    "useowner_wrapper": "context_use_wrapper_family",
+    "useclient_alt_wrapper_head": "context_use_wrapper_family",
+    "useoff_const_chain": "context_use_wrapper_family",
 }
 
 
@@ -138,6 +156,13 @@ def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
 
 
 
+def _normalize_micro_semantic_kind(kind: str | None) -> str | None:
+    if not kind:
+        return None
+    return MICRO_SEMANTIC_FAMILY.get(kind, kind)
+
+
+
 def _byte_profile(data: bytes) -> dict:
     dominant, dominant_ratio = _dominant_byte_info(data)
     size = len(data)
@@ -179,19 +204,21 @@ def _filler_reasons(profile: dict, op_stats: dict, hard_sem_ratio: float, pad_ra
 
 
 
-def _classify_evidence_level(slice_status: str, hard_sem_ratio: float, recognized_nonpadding_ratio: float, suspicious_reasons: list[str]) -> str:
-    if hard_sem_ratio >= 0.80 and not suspicious_reasons:
+def _classify_evidence_level(slice_status: str, hard_sem_ratio: float, recognized_nonpadding_ratio: float, suspicious_reasons: list[str], tokenizer_recognition_ratio: float) -> str:
+    exact_slice = slice_status in {"definition_exact", "vm_definition_exact"}
+    if exact_slice and hard_sem_ratio >= 0.82 and recognized_nonpadding_ratio >= 0.97 and tokenizer_recognition_ratio >= 0.97 and not suspicious_reasons:
         return "strong"
-    if hard_sem_ratio >= 0.50 and len(suspicious_reasons) <= 1:
+    if hard_sem_ratio >= 0.55 and recognized_nonpadding_ratio >= 0.80 and len(suspicious_reasons) <= 1:
         return "moderate"
-    if hard_sem_ratio >= 0.20 or recognized_nonpadding_ratio >= 0.50:
+    if hard_sem_ratio >= 0.20 or recognized_nonpadding_ratio >= 0.50 or tokenizer_recognition_ratio >= 0.50:
         return "weak"
     return "unresolved"
 
 
 
 def _classify_ir_readiness(slice_status: str, evidence_level: str, suspicious_reasons: list[str], hard_sem_ratio: float) -> str:
-    if evidence_level == "strong":
+    exact_slice = slice_status in {"definition_exact", "vm_definition_exact"}
+    if evidence_level == "strong" and exact_slice:
         return "candidate_ir"
     if evidence_level == "moderate":
         return "review_required"
@@ -410,8 +437,7 @@ def classify_interface_signature(mod: MBCModule) -> str | None:
 
 
 
-def _analyze_export(mod: MBCModule, name: str, override_entry: dict | None) -> dict:
-    raw, meta = _select_export_slice(mod, name, override_entry)
+def _analyze_raw_slice(raw: bytes, slice_status: str) -> dict:
     tokens = tokenize_stream(raw) if raw else []
     raw_cov = coverage(tokens, len(raw)) if raw else {"coverage_ratio": 0.0, "covered_bytes": 0, "total_bytes": len(raw), "token_counts": {}}
 
@@ -430,21 +456,12 @@ def _analyze_export(mod: MBCModule, name: str, override_entry: dict | None) -> d
     profile = _byte_profile(raw)
     op_stats = _op_stats(tokens)
     suspicious_reasons = _filler_reasons(profile, op_stats, hard_sem_ratio, pad_ratio)
-    evidence_level = _classify_evidence_level(meta["slice_status"], hard_sem_ratio, recognized_nonpadding_ratio, suspicious_reasons)
-    ir_readiness = _classify_ir_readiness(meta["slice_status"], evidence_level, suspicious_reasons, hard_sem_ratio)
+    evidence_level = _classify_evidence_level(slice_status, hard_sem_ratio, recognized_nonpadding_ratio, suspicious_reasons, raw_cov["coverage_ratio"])
+    ir_readiness = _classify_ir_readiness(slice_status, evidence_level, suspicious_reasons, hard_sem_ratio)
+    micro_semantic_kind = _infer_micro_semantic_kind(tokens)
+    micro_semantic_family = _normalize_micro_semantic_kind(micro_semantic_kind)
 
-    entry = {
-        "name": name,
-        "start_offset": mod.exports[meta["export_index"]].a,
-        "slice_status": meta["slice_status"],
-        "slice_proof": meta["slice_proof"],
-        "slice_start": meta["slice_start"],
-        "slice_end": meta["slice_end"],
-        "code_offset_start": meta.get("code_offset_start"),
-        "code_offset_end": meta.get("code_offset_end"),
-        "raw_export_span_size": meta["raw_export_span_size"],
-        "code_body_size": meta["code_body_size"],
-        "trailing_data_size": meta["trailing_data_size"],
+    return {
         "raw_size": len(raw),
         "tokenizer_recognition_ratio": raw_cov["coverage_ratio"],
         "recognized_nonpadding_ratio": recognized_nonpadding_ratio,
@@ -463,13 +480,33 @@ def _analyze_export(mod: MBCModule, name: str, override_entry: dict | None) -> d
         "unique_op_values": op_stats["unique_op_values"],
         "dominant_op_value": op_stats["dominant_op_value"],
         "dominant_op_ratio": op_stats["dominant_op_ratio"],
-        "micro_semantic_kind": _infer_micro_semantic_kind(tokens),
-        "data_like": _data_like_export_reason(name, data_ratio, profile["dominant_byte_ratio"]),
+        "micro_semantic_kind": micro_semantic_kind,
+        "micro_semantic_family": micro_semantic_family,
         "evidence_level": evidence_level,
         "ir_readiness": ir_readiness,
         "suspicious_reasons": suspicious_reasons,
         "raw_signature_hex": raw[:32].hex(" ") if raw else "",
     }
+
+
+
+def _analyze_export(mod: MBCModule, name: str, override_entry: dict | None) -> dict:
+    raw, meta = _select_export_slice(mod, name, override_entry)
+    entry = {
+        "name": name,
+        "start_offset": mod.exports[meta["export_index"]].a,
+        "slice_status": meta["slice_status"],
+        "slice_proof": meta["slice_proof"],
+        "slice_start": meta["slice_start"],
+        "slice_end": meta["slice_end"],
+        "code_offset_start": meta.get("code_offset_start"),
+        "code_offset_end": meta.get("code_offset_end"),
+        "raw_export_span_size": meta["raw_export_span_size"],
+        "code_body_size": meta["code_body_size"],
+        "trailing_data_size": meta["trailing_data_size"],
+    }
+    entry.update(_analyze_raw_slice(raw, meta["slice_status"]))
+    entry["data_like"] = _data_like_export_reason(name, entry["data_ratio"], entry["dominant_byte_ratio"])
     return entry
 
 
@@ -509,6 +546,10 @@ def module_attention_reasons(result: dict) -> list[str]:
     if suspicious:
         reasons.append("suspicious_exports")
 
+    adb_consensus = result.get("adb_consensus") or {}
+    if adb_consensus.get("hypothesis_penalties"):
+        reasons.append("adb_family_conflict")
+
     return sorted(set(reasons))
 
 
@@ -536,8 +577,10 @@ def _group_modules_by_adb_signature(modules: list[dict]) -> dict[str, list[dict]
     groups: dict[str, list[dict]] = defaultdict(list)
     for module in modules:
         adb = module.get("adb_info") or {}
-        sig = adb.get("family_signature") or adb.get("shape_signature") or adb.get("exact_signature")
-        if adb.get("present") and sig:
+        if not adb.get("present") or not adb.get("usable_for_family_shape"):
+            continue
+        sig = adb.get("family_signature") or adb.get("shape_signature")
+        if sig:
             groups[sig].append(module)
     return groups
 
@@ -548,10 +591,25 @@ def _export_name_tuple(module: dict) -> tuple[str, ...]:
 
 
 
+def _majority_hint(counter: Counter, total: int, min_ratio: float = 0.70, min_count: int = 2) -> tuple[str | None, int, float]:
+    if not counter or total <= 0:
+        return None, 0, 0.0
+    value, count = counter.most_common(1)[0]
+    ratio = count / total
+    if count >= min_count and ratio >= min_ratio:
+        return value, count, ratio
+    return None, count, ratio
+
+
+
 def _annotate_adb_consensus(modules: list[dict]) -> dict:
     groups = _group_modules_by_adb_signature(modules)
     summary_clusters = []
     annotated_count = 0
+    resolved_interface_count = 0
+    stable_group_count = 0
+    export_semantic_hint_count = 0
+    conflict_reason_counts: Counter = Counter()
 
     for sig, members in groups.items():
         if len(members) < 2:
@@ -562,25 +620,78 @@ def _annotate_adb_consensus(modules: list[dict]) -> dict:
         export_name_counts = Counter(_export_name_tuple(m) for m in members)
         export_count_set = sorted({m.get("exports_count", 0) for m in members})
         same_export_order = len(export_name_counts) == 1
-
-        top_interface = interface_counts.most_common(1)[0][0] if interface_counts else None
-        top_layout = layout_counts.most_common(1)[0][0] if layout_counts else None
         stable_cluster = same_export_order and len(export_count_set) == 1
+
+        top_interface, interface_support_count, interface_support_ratio = _majority_hint(interface_counts, len(members), min_ratio=0.75)
+        top_layout, layout_support_count, layout_support_ratio = _majority_hint(layout_counts, len(members), min_ratio=0.75)
 
         sample_paths = [m["path"] for m in members[:8]]
         short_sig = sig[:12]
+        export_hints_by_name: dict[str, dict] = {}
 
         if stable_cluster:
+            stable_group_count += 1
+            ordered_names = list(_export_name_tuple(members[0]))
+            semantic_export_hints = []
+            for export_index, export_name in enumerate(ordered_names):
+                export_entries = [m.get("export_analysis", [])[export_index] for m in members]
+                micro_counts = Counter(e.get("micro_semantic_kind") for e in export_entries if e.get("micro_semantic_kind"))
+                micro_family_counts = Counter(e.get("micro_semantic_family") for e in export_entries if e.get("micro_semantic_family"))
+                evidence_counts = Counter(e.get("evidence_level") for e in export_entries if e.get("evidence_level"))
+                data_like_true = sum(1 for e in export_entries if e.get("data_like"))
+                micro_hint, micro_support_count, micro_support_ratio = _majority_hint(micro_counts, len(members), min_ratio=0.60)
+                micro_family_hint, micro_family_support_count, micro_family_support_ratio = _majority_hint(micro_family_counts, len(members), min_ratio=0.60)
+                data_like_hint = data_like_true >= max(2, math.ceil(len(members) * 0.75))
+                hint = {
+                    "name": export_name,
+                    "micro_semantic_kind_hint": micro_hint,
+                    "micro_support_count": micro_support_count,
+                    "micro_support_ratio": micro_support_ratio,
+                    "micro_semantic_family_hint": micro_family_hint,
+                    "micro_family_support_count": micro_family_support_count,
+                    "micro_family_support_ratio": micro_family_support_ratio,
+                    "data_like_hint": data_like_hint,
+                    "strong_count": evidence_counts.get("strong", 0),
+                    "moderate_count": evidence_counts.get("moderate", 0),
+                }
+                if micro_hint or micro_family_hint or data_like_hint:
+                    export_hints_by_name[export_name] = hint
+                    export_semantic_hint_count += 1
+                    semantic_export_hints.append(hint)
+
             summary_clusters.append({
                 "adb_signature": short_sig,
                 "module_count": len(members),
                 "interface_name_pattern_hint": top_interface,
                 "layout_type_hint": top_layout,
                 "exports_count": export_count_set[0] if export_count_set else None,
+                "semantic_export_hints": semantic_export_hints[:6],
                 "sample_paths": sample_paths,
             })
 
         for module in members:
+            penalties: list[str] = []
+            support: list[str] = []
+            if stable_cluster and top_interface:
+                if module.get("interface_signature_type") and module.get("interface_signature_type") != top_interface:
+                    penalties.append("interface_mismatch_vs_stable_adb_family")
+                    conflict_reason_counts["interface_mismatch_vs_stable_adb_family"] += 1
+                elif module.get("interface_signature_type") == top_interface:
+                    support.append("interface_matches_stable_adb_family")
+            if stable_cluster and top_layout:
+                if module.get("layout_type") and module.get("layout_type") != top_layout:
+                    penalties.append("layout_mismatch_vs_stable_adb_family")
+                    conflict_reason_counts["layout_mismatch_vs_stable_adb_family"] += 1
+                elif module.get("layout_type") == top_layout:
+                    support.append("layout_matches_stable_adb_family")
+
+            resolved_interface = module.get("interface_signature_type")
+            resolved_source = module.get("resolved_interface_source")
+            if not resolved_interface and stable_cluster and top_interface:
+                resolved_interface = top_interface
+                resolved_source = "adb_family_consensus"
+                resolved_interface_count += 1
+
             module["adb_cluster_id"] = short_sig
             module["adb_cluster_size"] = len(members)
             module["adb_peer_examples"] = sample_paths
@@ -590,17 +701,69 @@ def _annotate_adb_consensus(modules: list[dict]) -> dict:
                 "layout_type_hint": top_layout,
                 "same_export_order": same_export_order,
                 "export_counts": export_count_set,
+                "hypothesis_penalties": penalties,
+                "hypothesis_support": support,
             }
-            # Deliberately do not auto-resolve semantics from adb clustering.
-            module["resolved_interface_signature_type"] = module.get("interface_signature_type")
-            module["resolved_interface_source"] = module.get("resolved_interface_source")
+            if export_hints_by_name:
+                module["adb_consensus"]["export_semantic_hints"] = list(export_hints_by_name.values())
+
+            module["resolved_interface_signature_type"] = resolved_interface
+            module["resolved_interface_source"] = resolved_source
+
+            for export in module.get("export_analysis", []):
+                hint = export_hints_by_name.get(export["name"])
+                if not hint:
+                    continue
+                export["adb_family_semantic_hint"] = {
+                    "micro_semantic_kind_hint": hint.get("micro_semantic_kind_hint"),
+                    "micro_semantic_family_hint": hint.get("micro_semantic_family_hint"),
+                    "data_like_hint": hint.get("data_like_hint"),
+                    "micro_support_ratio": hint.get("micro_support_ratio"),
+                    "micro_support_count": hint.get("micro_support_count"),
+                    "micro_family_support_ratio": hint.get("micro_family_support_ratio"),
+                    "micro_family_support_count": hint.get("micro_family_support_count"),
+                }
+                export_support: list[str] = []
+                export_penalties: list[str] = []
+                if hint.get("micro_semantic_family_hint"):
+                    if export.get("micro_semantic_family") == hint.get("micro_semantic_family_hint"):
+                        export_support.append("micro_semantic_family_matches")
+                    elif export.get("micro_semantic_family") and export.get("micro_semantic_family") != hint.get("micro_semantic_family_hint"):
+                        export_penalties.append("micro_semantic_family_mismatch_vs_family")
+                        conflict_reason_counts["micro_semantic_family_mismatch_vs_family"] += 1
+                if hint.get("micro_semantic_kind_hint"):
+                    if export.get("micro_semantic_kind") == hint.get("micro_semantic_kind_hint"):
+                        export_support.append("micro_semantic_matches_family")
+                    elif export.get("micro_semantic_kind") and export.get("micro_semantic_family") == hint.get("micro_semantic_family_hint"):
+                        export_support.append("micro_semantic_variant_matches_family")
+                    elif export.get("micro_semantic_kind") and export.get("micro_semantic_kind") != hint.get("micro_semantic_kind_hint"):
+                        export_penalties.append("micro_semantic_mismatch_vs_family")
+                        conflict_reason_counts["micro_semantic_mismatch_vs_family"] += 1
+                    elif export.get("evidence_level") in {"weak", "unresolved"} and not export.get("micro_semantic_kind"):
+                        export["family_inferred_micro_semantic_kind"] = hint.get("micro_semantic_kind_hint")
+                elif hint.get("micro_semantic_family_hint") and export.get("evidence_level") in {"weak", "unresolved"} and not export.get("micro_semantic_kind"):
+                    export["family_inferred_micro_semantic_family"] = hint.get("micro_semantic_family_hint")
+                if hint.get("data_like_hint"):
+                    if export.get("data_like"):
+                        export_support.append("data_like_matches_family")
+                    elif export.get("evidence_level") in {"weak", "unresolved"}:
+                        export["family_inferred_data_like"] = True
+                if export_support:
+                    export["adb_family_support"] = export_support
+                if export_penalties:
+                    export["adb_family_penalties"] = export_penalties
+
+            module["attention_reasons"] = module_attention_reasons(module)
             annotated_count += 1
 
     summary_clusters.sort(key=lambda x: (-x["module_count"], x["interface_name_pattern_hint"] or "", x["adb_signature"]))
     return {
         "group_count": len(groups),
+        "stable_group_count": stable_group_count,
         "annotated_module_count": annotated_count,
-        "resolved_interface_module_count": 0,
+        "resolved_interface_module_count": resolved_interface_count,
+        "export_semantic_hint_count": export_semantic_hint_count,
+        "conflict_reason_counts": dict(conflict_reason_counts),
         "top_family_clusters": summary_clusters[:25],
     }
 
@@ -669,6 +832,98 @@ def summarize_many(modules: list[dict]) -> dict:
         "lowest_evidence_modules": low_evidence_modules[:25],
         "modules_requiring_attention": modules_requiring_attention[:25],
     }
+
+
+
+def _mutate_bytes(raw: bytes, mutation_rate: float, seed: int) -> bytes:
+    if not raw:
+        return raw
+    rnd = random.Random(seed)
+    out = bytearray(raw)
+    mutation_count = max(1, int(round(len(out) * mutation_rate)))
+    mutation_count = min(mutation_count, len(out))
+    for idx in rnd.sample(range(len(out)), mutation_count):
+        out[idx] = rnd.randrange(256)
+    return bytes(out)
+
+
+
+def run_mutation_regression_from_reports(module_reports: list[dict], overrides: dict | None = None, sample_size: int = 128, mutation_rates: tuple[float, ...] = (0.10, 0.20), trials_per_export: int = 1, seed: int = 1337, min_raw_size: int = 24, strong_only: bool = True) -> dict:
+    candidates: list[tuple[str, str, bytes]] = []
+    for module_report in module_reports:
+        path = Path(module_report["path"])
+        override_entry = overrides.get(path.name) if overrides else None
+        mod = MBCModule(path, overrides=overrides)
+        for export in module_report.get("export_analysis", []):
+            if strong_only and export.get("evidence_level") != "strong":
+                continue
+            raw, _ = _select_export_slice(mod, export["name"], override_entry)
+            if len(raw) < min_raw_size:
+                continue
+            candidates.append((str(path), export["name"], raw))
+
+    rnd = random.Random(seed)
+    if sample_size > 0 and len(candidates) > sample_size:
+        candidates = rnd.sample(candidates, sample_size)
+
+    rate_summaries: dict[str, dict] = {}
+    for mutation_rate in mutation_rates:
+        trials = 0
+        strong_survivors = 0
+        moderate_or_higher = 0
+        hard_sem_sum = 0.0
+        survivor_examples = []
+
+        for export_index, (path_str, export_name, raw) in enumerate(candidates):
+            for trial_index in range(trials_per_export):
+                mutated = _mutate_bytes(raw, mutation_rate, seed + (export_index * 1009) + trial_index)
+                analysis = _analyze_raw_slice(mutated, "mutation_probe")
+                trials += 1
+                hard_sem_sum += analysis["hard_semantic_ratio"]
+                if analysis["evidence_level"] in {"strong", "moderate"}:
+                    moderate_or_higher += 1
+                if analysis["evidence_level"] == "strong":
+                    strong_survivors += 1
+                    if len(survivor_examples) < 12:
+                        survivor_examples.append({
+                            "path": path_str,
+                            "export": export_name,
+                            "hard_semantic_ratio": analysis["hard_semantic_ratio"],
+                            "recognized_nonpadding_ratio": analysis["recognized_nonpadding_ratio"],
+                            "tokenizer_recognition_ratio": analysis["tokenizer_recognition_ratio"],
+                        })
+
+        rate_summaries[f"{mutation_rate:.2f}"] = {
+            "trial_count": trials,
+            "strong_survival_rate": _ratio(strong_survivors, trials),
+            "moderate_or_higher_rate": _ratio(moderate_or_higher, trials),
+            "mean_hard_semantic_ratio": (hard_sem_sum / trials) if trials else None,
+            "survivor_examples": survivor_examples,
+        }
+
+    return {
+        "sampled_export_count": len(candidates),
+        "mutation_rates": rate_summaries,
+        "strong_only": strong_only,
+        "min_raw_size": min_raw_size,
+        "trials_per_export": trials_per_export,
+        "seed": seed,
+    }
+
+
+
+def run_mutation_regression(paths: list[str | Path], overrides: dict | None = None, sample_size: int = 128, mutation_rates: tuple[float, ...] = (0.10, 0.20), trials_per_export: int = 1, seed: int = 1337, min_raw_size: int = 24, strong_only: bool = True) -> dict:
+    module_reports = [analyze_module(path, overrides=overrides) for path in paths]
+    return run_mutation_regression_from_reports(
+        module_reports,
+        overrides=overrides,
+        sample_size=sample_size,
+        mutation_rates=mutation_rates,
+        trials_per_export=trials_per_export,
+        seed=seed,
+        min_raw_size=min_raw_size,
+        strong_only=strong_only,
+    )
 
 
 
