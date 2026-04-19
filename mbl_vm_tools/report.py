@@ -16,7 +16,7 @@ HARD_SEMANTIC_TOKEN_KINDS = {
     "REF", "REF16",
     "REC41", "REC61", "REC62",
     "CALL66", "CALL63A", "CALL63B",
-    "IMM", "IMM16", "IMM24S", "IMM24U", "IMM32",
+    "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32",
     "F32", "BR", "OPU16",
     "SIG_USEOWNER_HEAD", "SIG_USECLIENT_HEAD", "SIG_UNIQUEGEN_HEAD",
     "SIG_USEOFF_HEAD", "SIG_INPUTDONE_HEAD",
@@ -148,7 +148,7 @@ def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
         return "agg0_ref_wrapper"
     if filtered in (["AGG0", "OPU16"], ["AGG0", "OPU16", "IMM"], ["AGG0", "OPU16", "REF"], ["AGG0", "OPU16", "REF16"]):
         return "agg0_u16_wrapper"
-    if first == "AGG0" and all(kind in {"IMM", "REF", "REF16", "OPU16", "CALL66", "CALL63A", "CALL63B", "BR", "SIG_U32_U8_CALL66_TAIL"} for kind in filtered[1:]):
+    if first == "AGG0" and all(kind in {"IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "REF", "REF16", "OPU16", "CALL66", "CALL63A", "CALL63B", "BR", "SIG_U32_U8_CALL66_TAIL"} for kind in filtered[1:]):
         return "agg0_head_wrapper"
     if filtered and all(kind == "REF" for kind in filtered):
         return "ref_chain"
@@ -204,9 +204,29 @@ def _filler_reasons(profile: dict, op_stats: dict, hard_sem_ratio: float, pad_ra
 
 
 
-def _classify_evidence_level(slice_status: str, hard_sem_ratio: float, recognized_nonpadding_ratio: float, suspicious_reasons: list[str], tokenizer_recognition_ratio: float) -> str:
+def _wrapper_confident_exact_match(slice_status: str, raw_size: int, hard_sem_ratio: float, recognized_nonpadding_ratio: float, suspicious_reasons: list[str], tokenizer_recognition_ratio: float, micro_semantic_family: str | None) -> bool:
+    exact_slice = slice_status in {"definition_exact", "vm_definition_exact"}
+    if not exact_slice or suspicious_reasons:
+        return False
+    if micro_semantic_family not in {"aggregate_wrapper_family", "call66_wrapper_family", "context_use_wrapper_family"}:
+        return False
+    if recognized_nonpadding_ratio < 0.95 or tokenizer_recognition_ratio < 0.95:
+        return False
+    if raw_size <= 16:
+        return hard_sem_ratio >= 0.62
+    if raw_size <= 32:
+        return hard_sem_ratio >= 0.66
+    return hard_sem_ratio >= 0.70
+
+
+
+def _classify_evidence_level(slice_status: str, raw_size: int, hard_sem_ratio: float, recognized_nonpadding_ratio: float, suspicious_reasons: list[str], tokenizer_recognition_ratio: float, micro_semantic_family: str | None = None) -> str:
     exact_slice = slice_status in {"definition_exact", "vm_definition_exact"}
     if exact_slice and hard_sem_ratio >= 0.82 and recognized_nonpadding_ratio >= 0.97 and tokenizer_recognition_ratio >= 0.97 and not suspicious_reasons:
+        return "strong"
+    if exact_slice and hard_sem_ratio >= 0.79 and recognized_nonpadding_ratio >= 1.0 and tokenizer_recognition_ratio >= 1.0 and not suspicious_reasons:
+        return "strong"
+    if _wrapper_confident_exact_match(slice_status, raw_size, hard_sem_ratio, recognized_nonpadding_ratio, suspicious_reasons, tokenizer_recognition_ratio, micro_semantic_family):
         return "strong"
     if hard_sem_ratio >= 0.55 and recognized_nonpadding_ratio >= 0.80 and len(suspicious_reasons) <= 1:
         return "moderate"
@@ -456,10 +476,10 @@ def _analyze_raw_slice(raw: bytes, slice_status: str) -> dict:
     profile = _byte_profile(raw)
     op_stats = _op_stats(tokens)
     suspicious_reasons = _filler_reasons(profile, op_stats, hard_sem_ratio, pad_ratio)
-    evidence_level = _classify_evidence_level(slice_status, hard_sem_ratio, recognized_nonpadding_ratio, suspicious_reasons, raw_cov["coverage_ratio"])
-    ir_readiness = _classify_ir_readiness(slice_status, evidence_level, suspicious_reasons, hard_sem_ratio)
     micro_semantic_kind = _infer_micro_semantic_kind(tokens)
     micro_semantic_family = _normalize_micro_semantic_kind(micro_semantic_kind)
+    evidence_level = _classify_evidence_level(slice_status, len(raw), hard_sem_ratio, recognized_nonpadding_ratio, suspicious_reasons, raw_cov["coverage_ratio"], micro_semantic_family)
+    ir_readiness = _classify_ir_readiness(slice_status, evidence_level, suspicious_reasons, hard_sem_ratio)
 
     return {
         "raw_size": len(raw),

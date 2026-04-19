@@ -42,13 +42,14 @@ class Token:
 
 
 SINGLE_BYTE_OPS = {
-    0x00, 0x23, 0x27, 0x28, 0x30, 0x31, 0x32, 0x48, 0x72, 0x7C,
+    0x00, 0x21, 0x23, 0x27, 0x28, 0x2B, 0x2E, 0x30, 0x31, 0x32, 0x3A, 0x48, 0x72, 0x7C,
     0x3D, 0x2A, 0x2D, 0x2F, 0x25,
-    0xF0, 0xF1, 0xE1, 0xED, 0x5E, 0xEB, 0x3C, 0x3E,
+    0xF0, 0xF1, 0xF3, 0xE1, 0xE8, 0xEC, 0xED, 0xEF, 0x5E, 0xEB, 0x3C, 0x3E, 0x26,
 }
-SHORT_U16_OPS = {0x52, 0x53, 0xCF}
+SHORT_U16_OPS = {0x01, 0x20, 0x52, 0x53, 0x5B, 0x80, 0xCF}
 SIGNED_IMM24_OPS = {0x6D}
-UNSIGNED_IMM24_OPS = {0x67}
+UNSIGNED_IMM24_OPS = {0x67, 0x68, 0xA0, 0xD0, 0xE8}
+GENERIC_ZERO_IMM24_OPS = {0x03, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x38, 0x40, 0x50, 0x5C, 0x98, 0xC8, 0xE8}
 
 
 def _is_printable_ascii(b: int) -> bool:
@@ -148,6 +149,16 @@ def _parse_children(data: bytes, start: int, arity: int) -> list[dict[str, int]]
     return children
 
 
+def _aggregate_arity_candidates(raw_arity: int) -> list[int]:
+    candidates: list[int] = []
+    if 0 <= raw_arity <= 64:
+        candidates.append(raw_arity)
+    complement = (256 - raw_arity) & 0xFF
+    if raw_arity >= 0xE0 and 0 < complement <= 64 and complement not in candidates:
+        candidates.append(complement)
+    return candidates
+
+
 def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
     size = len(data) if limit is None else min(len(data), limit)
     out: list[Token] = []
@@ -158,44 +169,71 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
 
         # aggregate families: 23 4f N, 74 4f N
         # children=(tag + ref32)
-        # close is usually 31 30, but some stubs use a single-byte terminator (observed: 0x72, 0x30)
+        # close is usually 31 30, but stable wrapper families also use the
+        # paired trailer 72 23. Treating only 72 as the terminator leaves a
+        # spurious trailing 23 and systematically under-scores compact wrappers.
         if i + 2 < size and data[i + 1] == 0x4F and op in (0x23, 0x74):
-            arity = data[i + 2]
-            body = 3 + 5 * arity
-            end = i + body
-            # normal two-byte close
-            if end + 2 <= size and data[end] == 0x31 and data[end + 1] == 0x30:
-                out.append(Token(i, "AGG", body + 2, {"op": op, "arity": arity, "children": _parse_children(data, i + 3, arity)}))
-                i += body + 2
-                continue
+            raw_arity = data[i + 2]
+            matched_agg = False
+            for arity in _aggregate_arity_candidates(raw_arity):
+                body = 3 + 5 * arity
+                end = i + body
+                # normal two-byte close
+                if end + 2 <= size and data[end] == 0x31 and data[end + 1] == 0x30:
+                    out.append(Token(i, "AGG", body + 2, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 3, arity), "term2": 0x3130}))
+                    i += body + 2
+                    matched_agg = True
+                    break
 
-            # alternate single-byte close (covers common micro-dispatch stubs)
-            if end + 1 <= size and data[end] in (0x72, 0x30):
-                out.append(Token(i, "AGG", body + 1, {"op": op, "arity": arity, "children": _parse_children(data, i + 3, arity), "term": data[end]}))
-                i += body + 1
+                # alternate paired close used by compact wrapper exports
+                if end + 2 <= size and data[end] == 0x72 and data[end + 1] == 0x23:
+                    out.append(Token(i, "AGG", body + 2, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 3, arity), "term2": 0x7223}))
+                    i += body + 2
+                    matched_agg = True
+                    break
+
+                # fallback single-byte close (covers legacy / partial stubs)
+                if end + 1 <= size and data[end] in (0x72, 0x30):
+                    out.append(Token(i, "AGG", body + 1, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 3, arity), "term": data[end]}))
+                    i += body + 1
+                    matched_agg = True
+                    break
+            if matched_agg:
                 continue
 
         # bare aggregate micro-pattern: 4f N <tag ref32>*
         # observed in many short wrapper exports where the leading selector op is absent
         # or has already been consumed by the previous export boundary.
         if op == 0x4F and i + 2 < size:
-            arity = data[i + 1]
-            if 0 <= arity <= 8:
+            raw_arity = data[i + 1]
+            matched_agg0 = False
+            for arity in _aggregate_arity_candidates(raw_arity):
                 body = 2 + 5 * arity
                 end = i + body
-                if end <= size:
-                    payload = {"op": op, "arity": arity, "children": _parse_children(data, i + 2, arity)}
-                    if end + 2 <= size and data[end] == 0x31 and data[end + 1] == 0x30:
-                        out.append(Token(i, "AGG0", body + 2, {**payload, "term2": 0x3130}))
-                        i += body + 2
-                        continue
-                    if end + 1 <= size and data[end] in (0x31, 0x72, 0x30):
-                        out.append(Token(i, "AGG0", body + 1, {**payload, "term": data[end]}))
-                        i += body + 1
-                        continue
-                    out.append(Token(i, "AGG0", body, payload))
-                    i += body
+                if end > size:
                     continue
+                payload = {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 2, arity)}
+                if end + 2 <= size and data[end] == 0x31 and data[end + 1] == 0x30:
+                    out.append(Token(i, "AGG0", body + 2, {**payload, "term2": 0x3130}))
+                    i += body + 2
+                    matched_agg0 = True
+                    break
+                if end + 2 <= size and data[end] == 0x72 and data[end + 1] == 0x23:
+                    out.append(Token(i, "AGG0", body + 2, {**payload, "term2": 0x7223}))
+                    i += body + 2
+                    matched_agg0 = True
+                    break
+                if end + 1 <= size and data[end] in (0x31, 0x72, 0x30):
+                    out.append(Token(i, "AGG0", body + 1, {**payload, "term": data[end]}))
+                    i += body + 1
+                    matched_agg0 = True
+                    break
+                out.append(Token(i, "AGG0", body, payload))
+                i += body
+                matched_agg0 = True
+                break
+            if matched_agg0:
+                continue
 
         if i + 10 <= size and data[i + 5] == 0x00 and data[i + 6:i + 10] == b"\x2c\x00\x66\x27":
             out.append(Token(i, "SIG_U32_U8_CALL66_TAIL", 10, {
@@ -352,6 +390,16 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 17
             continue
 
+        if i + 4 <= size and data[i:i + 4] == b"\x41\x00\x00\x00":
+            out.append(Token(i, "IMM24Z", 4, {"op": 0x41, "imm": 0}))
+            i += 4
+            continue
+
+        if i + 4 <= size and data[i:i + 4] == b"\x00\x10\x00\x00":
+            out.append(Token(i, "IMM24U", 4, {"op": 0x00, "imm": 0x10}))
+            i += 4
+            continue
+
         if i + 18 <= size and data[i:i + 18] == b"\xff\x23\x4f\x00\x31\x30\x32\x6c\x01\x08\x00\x00\x00\x14\x00\x00\x00\x72":
             out.append(Token(i, "SIG_GETCASTLENUM_HEAD", 18, {}))
             i += 18
@@ -361,6 +409,11 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             bits = u32(data, i + 2)
             value = struct.unpack('<f', struct.pack('<I', bits))[0]
             out.append(Token(i, "F32", 6, {"op": 0x39, "mode": 0x20, "bits": bits, "value": value if math.isfinite(value) else None}))
+            i += 6
+            continue
+
+        if i + 6 <= size and data[i] == 0x39 and data[i + 1] == 0x10:
+            out.append(Token(i, "IMM32", 6, {"op": 0x39, "mode": 0x10, "value": u32(data, i + 2)}))
             i += 6
             continue
 
@@ -378,6 +431,14 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
 
         if op in UNSIGNED_IMM24_OPS and i + 4 <= size:
             out.append(Token(i, "IMM24U", 4, {"op": op, "imm": u24(data, i + 1)}))
+            i += 4
+            continue
+
+        # generic compact op + zero-imm24 form. This shows up repeatedly in still-moderate
+        # long bodies such as InitObj/GetParam, usually as small structural arguments between
+        # recognized refs/calls. Keep it conservative: only accept the exact zero-imm shape.
+        if op in GENERIC_ZERO_IMM24_OPS and i + 4 <= size and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 0:
+            out.append(Token(i, "IMM24Z", 4, {"op": op, "imm": 0}))
             i += 4
             continue
 
