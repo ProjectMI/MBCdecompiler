@@ -5,7 +5,7 @@ from pathlib import Path
 import json
 import math
 
-from .parser import MBCModule, MAGIC_HEADER
+from .parser import MBCModule
 from .tokenizer import Token, tokenize_stream, coverage
 
 # These are token kinds that provide relatively strong evidence that we matched a real
@@ -111,7 +111,12 @@ def _op_stats(tokens: list[Token]) -> dict:
 
 
 def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
-    filtered = [tok.kind for tok in tokens if tok.kind not in PAD_DRIVEN_TOKEN_KINDS and tok.kind not in DATA_TOKEN_KINDS]
+    filtered = [
+        tok.kind for tok in tokens
+        if tok.kind not in PAD_DRIVEN_TOKEN_KINDS
+        and tok.kind not in DATA_TOKEN_KINDS
+        and tok.kind not in {"OP", "UNK"}
+    ]
     if not filtered:
         return None
     first = filtered[0]
@@ -119,6 +124,14 @@ def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
         return SAFE_MICRO_KIND_BY_FIRST_TOKEN[first]
     if filtered == ["AGG"] or filtered == ["AGG0"]:
         return "aggregate_wrapper"
+    if filtered == ["AGG0", "IMM"]:
+        return "agg0_const_wrapper"
+    if filtered == ["AGG0", "REF"] or filtered == ["AGG0", "REF16"]:
+        return "agg0_ref_wrapper"
+    if filtered in (["AGG0", "OPU16"], ["AGG0", "OPU16", "IMM"], ["AGG0", "OPU16", "REF"], ["AGG0", "OPU16", "REF16"]):
+        return "agg0_u16_wrapper"
+    if first == "AGG0" and all(kind in {"IMM", "REF", "REF16", "OPU16", "CALL66", "CALL63A", "CALL63B", "BR", "SIG_U32_U8_CALL66_TAIL"} for kind in filtered[1:]):
+        return "agg0_head_wrapper"
     if filtered and all(kind == "REF" for kind in filtered):
         return "ref_chain"
     return None
@@ -173,7 +186,7 @@ def _classify_evidence_level(slice_status: str, hard_sem_ratio: float, recognize
         return "moderate"
     if hard_sem_ratio >= 0.20 or recognized_nonpadding_ratio >= 0.50:
         return "weak"
-    return "none"
+    return "unresolved"
 
 
 
@@ -671,6 +684,18 @@ def analyze_module(path: str | Path, overrides: dict | None = None) -> dict:
 
     export_analysis = [_analyze_export(mod, name, override_entry) for name in mod.export_names()]
 
+    requested_override_code_base = int(override_entry["code_base"]) if override_entry and "code_base" in override_entry else None
+    slice_proofs = {x.get("slice_proof") for x in export_analysis if x.get("slice_proof")}
+    if slice_proofs == {"override_code_base"}:
+        export_address_mode = "override_vm_code_base"
+        vm_code_base = requested_override_code_base
+    elif "override_code_base" in slice_proofs:
+        export_address_mode = "mixed_override_and_header_relative"
+        vm_code_base = requested_override_code_base
+    else:
+        export_address_mode = "header_code_relative"
+        vm_code_base = mod.code_base
+
     result = {
         "path": str(path),
         "has_magic_header": mod.has_magic_header,
@@ -683,17 +708,13 @@ def analyze_module(path: str | Path, overrides: dict | None = None) -> dict:
         "interface_signature_type": interface_signature_type,
         "resolved_interface_signature_type": interface_signature_type,
         "resolved_interface_source": "names_only_pattern" if interface_signature_type else None,
-        "export_address_mode": (
-            "override_vm_code_base"
-            if override_entry and "code_base" in override_entry else
-            "header_code_relative"
-        ),
-        "vm_code_base": int(override_entry["code_base"]) if override_entry and "code_base" in override_entry else mod.code_base,
+        "export_address_mode": export_address_mode,
+        "requested_override_code_base": requested_override_code_base,
+        "vm_code_base": vm_code_base,
         "code_base": mod.code_base,
         "code_size": mod.code_size,
         "data_blob_size": mod.data_blob_size,
         "code_prefix_exports": [r.name for r in mod.exports if r.a < 16],
-        "header_overlap_exports": [],
         "export_analysis": export_analysis,
     }
 

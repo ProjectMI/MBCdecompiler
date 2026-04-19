@@ -46,7 +46,7 @@ SINGLE_BYTE_OPS = {
     0x3D, 0x2A, 0x2D, 0x2F, 0x25,
     0xF0, 0xF1, 0xE1, 0xED, 0x5E, 0xEB, 0x3C, 0x3E,
 }
-SHORT_U16_OPS = {0x52, 0xCF}
+SHORT_U16_OPS = {0x52, 0x53, 0xCF}
 SIGNED_IMM24_OPS = {0x6D}
 UNSIGNED_IMM24_OPS = {0x67}
 
@@ -180,7 +180,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
         # or has already been consumed by the previous export boundary.
         if op == 0x4F and i + 2 < size:
             arity = data[i + 1]
-            if 0 < arity <= 8:
+            if 0 <= arity <= 8:
                 body = 2 + 5 * arity
                 end = i + body
                 if end <= size:
@@ -189,7 +189,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
                         out.append(Token(i, "AGG0", body + 2, {**payload, "term2": 0x3130}))
                         i += body + 2
                         continue
-                    if end + 1 <= size and data[end] in (0x72, 0x30):
+                    if end + 1 <= size and data[end] in (0x31, 0x72, 0x30):
                         out.append(Token(i, "AGG0", body + 1, {**payload, "term": data[end]}))
                         i += body + 1
                         continue

@@ -499,7 +499,7 @@ class MBCModule:
         self.data_blob_size = (self.header[3] + 1) if self.has_magic_header else 0
         self.adb_info = read_adb_info(self.path)
 
-        layout = {"definitions": None, "globals": None, "exports": None, "candidates": []}
+        layout = detect_module_layout(self.data)
         entry = overrides.get(self.path.name) if overrides else None
         if entry:
             if "definitions" in entry:
@@ -514,8 +514,6 @@ class MBCModule:
                 estart = int(entry["exports"])
                 recs, end = parse_table_with_padding(self.data, estart, globals_mode=False)
                 layout["exports"] = TableCandidate(estart, end, "exports", 1e9, recs)
-        else:
-            layout = detect_module_layout(self.data)
 
         self.definition_table: Optional[TableCandidate] = layout["definitions"]
         self.globals_table: Optional[TableCandidate] = layout["globals"]
@@ -529,6 +527,8 @@ class MBCModule:
         self.normal_exports: list[TableRecord] = [
             r for r in raw_exports if not (r.b == 0xFFFFFFFF and r.c == 0)
         ]
+        self._export_index_by_name = {r.name: idx for idx, r in enumerate(self.normal_exports)}
+        self._definition_by_name = {r.name: r for r in self.definitions}
 
     @property
     def exports(self) -> list[TableRecord]:
@@ -545,31 +545,57 @@ class MBCModule:
     def export_names(self) -> list[str]:
         return [r.name for r in self.exports]
 
-    def header_overlap_exports(self, header_size: int = len(MAGIC_HEADER)) -> list[TableRecord]:
-        return [r for r in self.exports if r.a < header_size]
-
-    def get_export_body(self, name: str) -> bytes:
-        names = self.export_names()
-        if name not in names:
+    def _export_index(self, name: str) -> int:
+        idx = self._export_index_by_name.get(name)
+        if idx is None:
             raise KeyError(f"Export not found: {name}")
-        idx = names.index(name)
+        return idx
+
+    def get_export_record(self, name: str) -> TableRecord:
+        return self.exports[self._export_index(name)]
+
+    def get_definition_record(self, name: str) -> Optional[TableRecord]:
+        return self._definition_by_name.get(name)
+
+    def get_export_public_code_span(self, name: str) -> tuple[int, int]:
+        idx = self._export_index(name)
         start = self.exports[idx].a
         if idx + 1 < len(self.exports):
             end = self.exports[idx + 1].a
-        elif self.definition_table is not None:
-            end = self.definition_table.start
-        elif self.globals_table is not None:
-            end = self.globals_table.start
+        elif self.code_size:
+            end = self.code_size
         else:
-            end = len(self.data)
-        return self.data[start:end]
+            end = max(start, len(self.data) - self.code_base)
+        return start, end
+
+    def get_export_exact_code_span(self, name: str) -> Optional[tuple[int, int]]:
+        rec = self.get_definition_record(name)
+        if rec is None or rec.b < rec.a:
+            return None
+        if self.code_size and rec.b + 1 > self.code_size:
+            return None
+        return rec.a, rec.b + 1
+
+    def _slice_code_span(self, start: int, end: int) -> bytes:
+        file_start = self.code_base + start
+        file_end = self.code_base + end
+        code_limit = self.code_base + (self.code_size or max(0, len(self.data) - self.code_base))
+        if file_start < 0 or file_end > min(code_limit, len(self.data)) or file_start >= file_end:
+            return b""
+        return self.data[file_start:file_end]
+
+    def get_export_body(self, name: str, exact: bool = True) -> bytes:
+        span = self.get_export_exact_code_span(name) if exact else None
+        if span is None:
+            span = self.get_export_public_code_span(name)
+        start, end = span
+        return self._slice_code_span(start, end)
 
     def stitch_export_body(self, name: str, next_head_bytes: int = 16) -> bytes:
-        names = self.export_names()
-        idx = names.index(name)
-        body = self.get_export_body(name)
-        if idx + 1 < len(self.exports):
-            body += self.get_export_body(names[idx + 1])[:next_head_bytes]
+        idx = self._export_index(name)
+        body = self.get_export_body(name, exact=True)
+        if next_head_bytes > 0 and idx + 1 < len(self.exports):
+            body += self.get_export_body(self.exports[idx + 1].name, exact=True)[:next_head_bytes]
         return body
 
     def to_dict(self) -> dict:
