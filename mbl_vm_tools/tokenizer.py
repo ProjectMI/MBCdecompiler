@@ -172,6 +172,11 @@ def _match_atomic_semantic(data: bytes, start: int, limit: int) -> tuple[str, in
         return "IMM24U", 4, {"op": 0x00, "imm": 0x10}
     if start + 18 <= limit and data[start:start + 18] == b"\xff\x23\x4f\x00\x31\x30\x32\x6c\x01\x08\x00\x00\x00\x14\x00\x00\x00\x72":
         return "SIG_GETCASTLENUM_HEAD", 18, {}
+    if op == 0x32 and start + 6 <= limit and data[start + 1] == 0x29 and data[start + 2] == 0x10:
+        if data[start + 4:start + 6] == b"\x72\x23":
+            return "SIG_RETURN_TAIL", 6, {"imm": data[start + 3], "has_f1_prefix": False, "tail_form": "pair72_23"}
+        if start + 7 <= limit and data[start + 4] == 0xF1 and data[start + 5:start + 7] == b"\x72\x23":
+            return "SIG_RETURN_TAIL", 7, {"imm": data[start + 3], "has_f1_prefix": True, "tail_form": "f1_pair72_23"}
     if start + 10 <= limit and data[start + 5] == 0x00 and data[start + 6:start + 10] == b"\x2c\x00\x66\x27":
         return "SIG_U32_U8_CALL66_TAIL", 10, {"value": u32(data, start), "arg": data[start + 4]}
     if start + 6 <= limit and op == 0x39 and data[start + 1] == 0x20:
@@ -1152,12 +1157,3 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
 
     return out
 
-
-def coverage(tokens: list[Token], total_size: int) -> dict:
-    covered = sum(tok.size for tok in tokens if tok.kind != "UNK")
-    return {
-        "covered_bytes": covered,
-        "total_bytes": total_size,
-        "coverage_ratio": (covered / total_size) if total_size else 0.0,
-        "token_counts": dict(__import__("collections").Counter(tok.kind for tok in tokens)),
-    }

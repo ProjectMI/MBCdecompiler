@@ -534,7 +534,7 @@ def read_adb_info(mbc_path: str | Path) -> ADBInfo:
 
 
 class MBCModule:
-    def __init__(self, path: str | Path, overrides: dict | None = None):
+    def __init__(self, path: str | Path, collect_auxiliary: bool = True):
         self.path = Path(path)
         self.data = self.path.read_bytes()
         self.has_magic_header = self.data.startswith(MAGIC_HEADER)
@@ -542,28 +542,14 @@ class MBCModule:
         self.code_base = FIXED_CODE_BASE if self.has_magic_header and len(self.data) >= FIXED_CODE_BASE else 0
         self.code_size = self.header[2] if self.has_magic_header else 0
         self.data_blob_size = (self.header[3] + 1) if self.has_magic_header else 0
-        self.adb_info = read_adb_info(self.path)
+        self.adb_info = read_adb_info(self.path) if collect_auxiliary else EMPTY_ADB_INFO
 
         layout = detect_module_layout(self.data)
-        entry = overrides.get(self.path.name) if overrides else None
-        if entry:
-            if "definitions" in entry:
-                dstart = int(entry["definitions"])
-                recs, end = parse_table_with_padding(self.data, dstart, globals_mode=False)
-                layout["definitions"] = TableCandidate(dstart, end, "definitions", 1e9, recs)
-            if "globals" in entry:
-                gstart = int(entry["globals"])
-                recs, end = parse_table_with_padding(self.data, gstart, globals_mode=True)
-                layout["globals"] = TableCandidate(gstart, end, "globals", 1e9, recs)
-            if "exports" in entry:
-                estart = int(entry["exports"])
-                recs, end = parse_table_with_padding(self.data, estart, globals_mode=False)
-                layout["exports"] = TableCandidate(estart, end, "exports", 1e9, recs)
 
         self.definition_table: Optional[TableCandidate] = layout["definitions"]
         self.globals_table: Optional[TableCandidate] = layout["globals"]
         self.exports_table: Optional[TableCandidate] = layout["exports"]
-        self.candidates: list[TableCandidate] = layout["candidates"]
+        self.candidates: list[TableCandidate] = layout["candidates"] if collect_auxiliary else []
 
         raw_exports = self.exports_table.records if self.exports_table else []
         self.embedded_import_like_exports: list[TableRecord] = [
