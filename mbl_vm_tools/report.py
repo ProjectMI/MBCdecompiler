@@ -24,6 +24,11 @@ HARD_SEMANTIC_TOKEN_KINDS = {
     "SIG_USECLIENT_ALT_HEAD", "SIG_CALL66_REFPAIR_HEAD", "SIG_CALL66_SMALLIMM",
     "SIG_CONST_U32_TRAILER", "SIG_SLOT_CONST", "SIG_SETOSST_HEAD",
     "SIG_GETPLAYERID_HEAD", "SIG_USEOFF_CONST_CHAIN", "SIG_GETCASTLENUM_HEAD",
+    "SIG_GETWEAR_WRAPPER", "SIG_GETP_WRAPPER", "SIG_INPUTDONE_SHORT",
+    "SIG_CONST_U32_REF16", "SIG_CONST_U32_IMM", "SIG_CONST_U32_CALL66", "SIG_CONST_U32_CALL63A", "SIG_CONST_U32_5E_IMM", "SIG_CONST_U32_26_CALL66", "SIG_CONST_U32_26_REF",
+    "SIG_CONST_0100", "SIG_CONST_U32_REC41", "SIG_CONST_U32_REC62", "SIG_CONST_U32_REF", "SIG_CONST_U32_PFX72",
+    "SIG_CONST_U32_PFX_3D_30_REF", "SIG_CONST_U32_PFX_5E_REF", "SIG_CONST_U32_PFX_3D_PAIR72_23", "SIG_CONST_U32_PFX_3D_REF", "SIG_CONST_U32_IMM16",
+    "SIG_TELEP_CREATEINFOPICTURE_TAIL", "SIG_PLAYER_GETLEADER_TAIL", "SIG_PLAYER_LOSTITEM2_TAIL", "SIG_MAIN_PARSECOMMAND_TAIL",
 }
 
 PAD_DRIVEN_TOKEN_KINDS = {
@@ -56,6 +61,9 @@ SAFE_MICRO_KIND_BY_FIRST_TOKEN = {
     "SIG_GETPLAYERID_HEAD": "getplayerid_wrapper",
     "SIG_USEOFF_CONST_CHAIN": "useoff_const_chain",
     "SIG_GETCASTLENUM_HEAD": "getcastlenum_wrapper",
+    "SIG_GETWEAR_WRAPPER": "getwear_wrapper",
+    "SIG_GETP_WRAPPER": "getp_wrapper",
+    "SIG_INPUTDONE_SHORT": "inputdone_wrapper_short",
 }
 
 
@@ -82,6 +90,10 @@ def _ratio(part: int, whole: int) -> float:
 
 def _token_bytes(tokens: list[Token], include: set[str]) -> int:
     return sum(tok.size for tok in tokens if tok.kind in include)
+
+
+def _is_heuristic_semantic_token_kind(kind: str) -> bool:
+    return kind.startswith("PFX_") or kind == "PAIR72_23"
 
 
 
@@ -134,6 +146,7 @@ def _infer_micro_semantic_kind(tokens: list[Token]) -> str | None:
         if tok.kind not in PAD_DRIVEN_TOKEN_KINDS
         and tok.kind not in DATA_TOKEN_KINDS
         and tok.kind not in {"OP", "UNK"}
+        and not _is_heuristic_semantic_token_kind(tok.kind)
     ]
     if not filtered:
         return None
@@ -461,7 +474,7 @@ def _analyze_raw_slice(raw: bytes, slice_status: str) -> dict:
     tokens = tokenize_stream(raw) if raw else []
     raw_cov = coverage(tokens, len(raw)) if raw else {"coverage_ratio": 0.0, "covered_bytes": 0, "total_bytes": len(raw), "token_counts": {}}
 
-    hard_sem_bytes = _token_bytes(tokens, HARD_SEMANTIC_TOKEN_KINDS)
+    hard_sem_bytes = sum(tok.size for tok in tokens if tok.kind in HARD_SEMANTIC_TOKEN_KINDS or _is_heuristic_semantic_token_kind(tok.kind))
     pad_bytes = _token_bytes(tokens, PAD_DRIVEN_TOKEN_KINDS)
     data_bytes = _token_bytes(tokens, DATA_TOKEN_KINDS)
     op_bytes = _token_bytes(tokens, {"OP"})

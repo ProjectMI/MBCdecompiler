@@ -46,10 +46,10 @@ SINGLE_BYTE_OPS = {
     0x3D, 0x2A, 0x2D, 0x2F, 0x25,
     0xF0, 0xF1, 0xF3, 0xE1, 0xE8, 0xEC, 0xED, 0xEF, 0x5E, 0xEB, 0x3C, 0x3E, 0x26,
 }
-SHORT_U16_OPS = {0x01, 0x20, 0x52, 0x53, 0x5B, 0x80, 0xCF}
+SHORT_U16_OPS = {0x01, 0x02, 0x04, 0x20, 0x52, 0x53, 0x5B, 0x5D, 0x80, 0xCF, 0xD3, 0xD6, 0xD7}
 SIGNED_IMM24_OPS = {0x6D}
-UNSIGNED_IMM24_OPS = {0x67, 0x68, 0xA0, 0xD0, 0xE8}
-GENERIC_ZERO_IMM24_OPS = {0x03, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x38, 0x40, 0x50, 0x5C, 0x98, 0xC8, 0xE8}
+UNSIGNED_IMM24_OPS = {0x18, 0x1C, 0x34, 0x67, 0x68, 0xA0, 0xD0, 0xE8}
+GENERIC_ZERO_IMM24_OPS = {0x03, 0x06, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x38, 0x40, 0x44, 0x50, 0x54, 0x5C, 0x98, 0xC8, 0xE8}
 
 
 def _is_printable_ascii(b: int) -> bool:
@@ -159,6 +159,141 @@ def _aggregate_arity_candidates(raw_arity: int) -> list[int]:
     return candidates
 
 
+
+
+def _match_atomic_semantic(data: bytes, start: int, limit: int) -> tuple[str, int, dict[str, Any]] | None:
+    if start >= limit:
+        return None
+    op = data[start]
+
+    if start + 4 <= limit and data[start:start + 4] == b"\x41\x00\x00\x00":
+        return "IMM24Z", 4, {"op": 0x41, "imm": 0}
+    if start + 4 <= limit and data[start:start + 4] == b"\x00\x10\x00\x00":
+        return "IMM24U", 4, {"op": 0x00, "imm": 0x10}
+    if start + 18 <= limit and data[start:start + 18] == b"\xff\x23\x4f\x00\x31\x30\x32\x6c\x01\x08\x00\x00\x00\x14\x00\x00\x00\x72":
+        return "SIG_GETCASTLENUM_HEAD", 18, {}
+    if start + 10 <= limit and data[start + 5] == 0x00 and data[start + 6:start + 10] == b"\x2c\x00\x66\x27":
+        return "SIG_U32_U8_CALL66_TAIL", 10, {"value": u32(data, start), "arg": data[start + 4]}
+    if start + 6 <= limit and op == 0x39 and data[start + 1] == 0x20:
+        bits = u32(data, start + 2)
+        value = struct.unpack('<f', struct.pack('<I', bits))[0]
+        return "F32", 6, {"op": 0x39, "mode": 0x20, "bits": bits, "value": value if math.isfinite(value) else None}
+    if start + 6 <= limit and op == 0x39 and data[start + 1] == 0x10:
+        return "IMM32", 6, {"op": 0x39, "mode": 0x10, "value": u32(data, start + 2)}
+    if op in SIGNED_IMM24_OPS and start + 4 <= limit:
+        return "IMM24S", 4, {"op": op, "imm": s24(data, start + 1)}
+    if op in UNSIGNED_IMM24_OPS and start + 4 <= limit:
+        return "IMM24U", 4, {"op": op, "imm": u24(data, start + 1)}
+    if op in GENERIC_ZERO_IMM24_OPS and start + 4 <= limit and data[start + 1] == 0 and data[start + 2] == 0 and data[start + 3] == 0:
+        return "IMM24Z", 4, {"op": op, "imm": 0}
+    if op in (0x69, 0x65, 0x6C) and start + 6 <= limit:
+        return "REF", 6, {"op": op, "mode": data[start + 1], "ref": u32(data, start + 2)}
+    if op == 0x64 and start + 4 <= limit:
+        return "REF16", 4, {"op": op, "mode": data[start + 1], "ref": struct.unpack_from('<H', data, start + 2)[0]}
+    if op == 0x41 and start + 7 <= limit:
+        return "REC41", 7, {"ref": u32(data, start + 1), "imm": struct.unpack_from('<H', data, start + 5)[0]}
+    if op == 0x61 and start + 16 <= limit:
+        return "REC61", 16, {"mode": data[start + 1], "u16": struct.unpack_from("<H", data, start + 2)[0], "a": u32(data, start + 4), "b": u32(data, start + 8), "c": s32(data, start + 12)}
+    if op == 0x62 and start + 8 <= limit:
+        return "REC62", 8, {"mode": data[start + 1], "u16": struct.unpack_from("<H", data, start + 2)[0], "c": s32(data, start + 4)}
+    if op == 0x2C and start + 4 <= limit and data[start + 2] == 0x66:
+        return "CALL66", 4, {"argc": data[start + 1], "opid": data[start + 3]}
+    if op == 0x2C and start + 7 <= limit and data[start + 2] == 0x63:
+        return "CALL63A", 7, {"argc": data[start + 1], "rel": s32(data, start + 3)}
+    if op == 0x63 and start + 5 <= limit:
+        return "CALL63B", 5, {"rel": s32(data, start + 1)}
+    if op == 0x29 and start + 3 <= limit and data[start + 1] == 0x10:
+        return "IMM", 3, {"value": data[start + 2]}
+    if op == 0x28 and start + 4 <= limit and data[start + 1] == 0x10:
+        return "IMM16", 4, {"op": op, "value": struct.unpack_from('<H', data, start + 2)[0]}
+    if op in SHORT_U16_OPS and start + 3 <= limit:
+        return "OPU16", 3, {"op": op, "value": struct.unpack_from('<H', data, start + 1)[0]}
+    if op in (0x4A, 0x4B, 0x4C, 0x4D) and start + 3 <= limit:
+        return "BR", 3, {"op": op, "off": struct.unpack_from("<H", data, start + 1)[0]}
+    if op == 0x30 and start + 5 <= limit and data[start + 3] == 0 and data[start + 4] == 0:
+        return "IMM32", 5, {"op": op, "imm": u32(data, start + 1)}
+    return None
+
+
+_PREFIX_ALLOWED_ATOMIC = {
+    0x21: {"BR", "CALL63A"},
+    0x25: {"IMM", "IMM16", "CALL66", "BR"},
+    0x2A: {"REF", "IMM", "IMM16", "CALL66", "OPU16", "F32"},
+    0x2B: {"REF", "IMM", "IMM16", "IMM32", "F32", "CALL66", "CALL63A", "REC61"},
+    0x2D: {"REF", "IMM", "IMM16", "CALL66", "CALL63A", "REC61", "F32", "OPU16"},
+    0x2F: {"REF", "IMM", "IMM16", "CALL66", "F32", "OPU16"},
+    0x30: {"REF", "REF16", "REC41", "REC61", "REC62", "CALL66", "CALL63A", "CALL63B", "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16", "SIG_U32_U8_CALL66_TAIL", "SIG_GETCASTLENUM_HEAD"},
+    0x32: {"REF", "REC41", "CALL66", "CALL63A", "IMM"},
+    0xF1: {"REF", "CALL66", "CALL63A", "IMM", "IMM16", "IMM32", "F32"},
+    0x3D: {"REF", "REF16", "REC41", "REC61", "REC62", "CALL66", "CALL63A", "CALL63B", "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16"},
+    0x5E: {"REF", "IMM", "IMM16", "BR", "CALL66", "CALL63A"},
+    0x72: {"BR", "CALL63B", "OPU16"},
+    0xF3: {"REF", "BR", "IMM"},
+    0xF6: {"CALL66", "BR", "REC61"},
+    0x26: {"REF", "CALL66", "IMM", "IMM16", "IMM32", "CALL63A"},
+    0xEC: {"BR"},
+    0xE1: {"IMM", "REF", "BR"},
+    0xEB: {"IMM", "REF", "BR"},
+    0xEF: {"IMM", "REF", "BR", "REC61"},
+    0xF0: {"BR", "IMM24U"},
+    0xED: {"BR", "IMM24U"},
+    0x3C: {"BR", "IMM24U"},
+    0x3E: {"BR", "IMM24U"},
+}
+_PREFIX_ALLOWED_NESTED = {
+    0x21: {0x3D},
+    0x25: {0x3D},
+    0x26: {0x72, 0x3D},
+    0x2A: {0x2B, 0x2D, 0x2E, 0x2F, 0x3A, 0x3C, 0x3D, 0x60, 0x72, 0xF0},
+    0x2B: {0x2A, 0x2B, 0x2E, 0x3A, 0x3C, 0x3D, 0x60, 0x72, 0xF0, 0xF1},
+    0x2D: {0x2A, 0x2E, 0x3C, 0x3D, 0x3E, 0x60, 0x72, 0xF0, 0xF1},
+    0x2E: {0x2A, 0x2B, 0x2D, 0x2F, 0x3C, 0x3D, 0x3E, 0xE1, 0xEC, 0xED, 0xF0},
+    0x2F: {0x2A, 0x2B, 0x2D, 0x3A, 0x3D, 0x60, 0xEC},
+    0x30: {0x32, 0xF1, 0x72},
+    0x3A: {0x2A, 0x2B, 0x2D, 0x2F, 0x3C},
+    0x3C: {0xEB},
+    0x3D: {0x30, 0x32, 0xF1, 0xF0, 0xED, 0x3C, 0x3E, 0x72},
+    0x3E: {0x72, 0xEB},
+    0x5E: {0x21, 0x2A, 0x2B, 0x2D, 0x3D, 0x3E, 0x72, 0xEC, 0xED, 0xEF, 0xF0},
+    0x60: {0x3D},
+    0x72: {0x30, 0x32, 0x72, 0xF1},
+    0xE1: {0xEB},
+    0xEC: {0xEB},
+    0xED: {0xEB},
+    0xEB: {0x72},
+    0xEF: {0x30, 0x3D, 0x72},
+    0xF0: {0x21, 0x3D, 0x72, 0xEB},
+    0xF1: {0x72, 0x30, 0x3D, 0x3E, 0xF0, 0xED, 0x3C, 0xF1},
+    0xF3: {0x30, 0x72},
+    0xF6: {0x30, 0x3D, 0x72},
+    0x3B: {0x2D},
+}
+
+
+def _match_prefixed_semantic(data: bytes, start: int, limit: int, depth: int = 0) -> tuple[str, int, dict[str, Any]] | None:
+    if start >= limit or depth > 8:
+        return None
+    op = data[start]
+
+    if op == 0x72 and start + 2 <= limit and data[start + 1] == 0x23:
+        return "PAIR72_23", 2, {"bytes": "72 23"}
+
+    if op in _PREFIX_ALLOWED_ATOMIC:
+        nested = _match_atomic_semantic(data, start + 1, limit)
+        if nested is not None:
+            nested_kind, nested_size, nested_payload = nested
+            if nested_kind in _PREFIX_ALLOWED_ATOMIC[op]:
+                return f"PFX_{op:02X}_{nested_kind}", 1 + nested_size, {"prefix_op": op, "nested_kind": nested_kind, "nested": nested_payload}
+
+    if op in _PREFIX_ALLOWED_NESTED and start + 1 < limit and data[start + 1] in _PREFIX_ALLOWED_NESTED[op]:
+        nested = _match_prefixed_semantic(data, start + 1, limit, depth + 1)
+        if nested is not None:
+            nested_kind, nested_size, nested_payload = nested
+            flat_nested_kind = nested_kind[4:] if nested_kind.startswith("PFX_") else nested_kind
+            return f"PFX_{op:02X}_{flat_nested_kind}", 1 + nested_size, {"prefix_op": op, "nested_kind": nested_kind, "nested": nested_payload}
+
+    return None
+
 def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
     size = len(data) if limit is None else min(len(data), limit)
     out: list[Token] = []
@@ -166,6 +301,43 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
 
     while i < size:
         op = data[i]
+
+        if i + 32 <= size and data[i:i + 4] == b"\x4f\x00\x31\x30" and data[i + 4] in (0x69, 0x6C) and data[i + 10] == 0x6C and data[i + 11] == 0x01 and data[i + 16:i + 20] == b"\x04\x00\x00\x00" and data[i + 20:i + 23] == b"\x3d\x30\x32" and data[i + 23] in (0x69, 0x6C) and data[i + 29] == 0x5E and data[i + 30:i + 32] == b"\x72\x23":
+            out.append(Token(i, "SIG_GETWEAR_WRAPPER", 32, {
+                "ref_a_op": data[i + 4],
+                "ref_a_mode": data[i + 5],
+                "ref_a": u32(data, i + 6),
+                "ref_b": u32(data, i + 12),
+                "const": u32(data, i + 16),
+                "ref_c_op": data[i + 23],
+                "ref_c_mode": data[i + 24],
+                "ref_c": u32(data, i + 25),
+                "tail_op": 0x5E,
+            }))
+            i += 32
+            continue
+
+        if i + 19 <= size and data[i:i + 2] == b"\x4f\x01" and data[i + 7:i + 10] == b"\x31\x30\x32" and data[i + 10] in (0x69, 0x6C) and data[i + 16] == 0x26 and data[i + 17:i + 19] == b"\x72\x23":
+            out.append(Token(i, "SIG_GETP_WRAPPER", 19, {
+                "child_tag": data[i + 2],
+                "child_ref": u32(data, i + 3),
+                "ref_op": data[i + 10],
+                "ref_mode": data[i + 11],
+                "ref": u32(data, i + 12),
+                "tail_op": 0x26,
+            }))
+            i += 19
+            continue
+
+        if i + 14 <= size and data[i:i + 4] == b"\x4f\x00\x31\x30" and data[i + 4] == 0x32 and data[i + 5] in (0x69, 0x6C) and data[i + 11] == 0x21 and data[i + 12:i + 14] == b"\x72\x23":
+            out.append(Token(i, "SIG_INPUTDONE_SHORT", 14, {
+                "ref_op": data[i + 5],
+                "ref_mode": data[i + 6],
+                "ref": u32(data, i + 7),
+                "tail_op": 0x21,
+            }))
+            i += 14
+            continue
 
         # aggregate families: 23 4f N, 74 4f N
         # children=(tag + ref32)
@@ -405,6 +577,417 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 18
             continue
 
+        if i + 32 <= size and data[i:i + 4] == b"\x4f\x00\x31\x30" and data[i + 4] in (0x69, 0x6C) and data[i + 10] == 0x6C and data[i + 11] == 0x01 and data[i + 16:i + 20] == b"\x04\x00\x00\x00" and data[i + 20:i + 23] == b"\x3d\x30\x32" and data[i + 23] in (0x69, 0x6C) and data[i + 29] == 0x5E and data[i + 30:i + 32] == b"r#":
+            out.append(Token(i, "SIG_GETWEAR_WRAPPER", 32, {
+                "ref_a_op": data[i + 4],
+                "ref_a_mode": data[i + 5],
+                "ref_a": u32(data, i + 6),
+                "ref_b": u32(data, i + 12),
+                "const": u32(data, i + 16),
+                "ref_c_op": data[i + 23],
+                "ref_c_mode": data[i + 24],
+                "ref_c": u32(data, i + 25),
+                "tail_op": 0x5E,
+            }))
+            i += 32
+            continue
+
+        if i + 19 <= size and data[i:i + 2] == b"O" and data[i + 7:i + 10] == b"102" and data[i + 10] in (0x69, 0x6C) and data[i + 16] == 0x26 and data[i + 17:i + 19] == b"r#":
+            out.append(Token(i, "SIG_GETP_WRAPPER", 19, {
+                "child_tag": data[i + 2],
+                "child_ref": u32(data, i + 3),
+                "ref_op": data[i + 10],
+                "ref_mode": data[i + 11],
+                "ref": u32(data, i + 12),
+                "tail_op": 0x26,
+            }))
+            i += 19
+            continue
+
+        if i + 14 <= size and data[i:i + 4] == b"\x4f\x00\x31\x30" and data[i + 4] == 0x32 and data[i + 5] in (0x69, 0x6C) and data[i + 11] == 0x21 and data[i + 12:i + 14] == b"r#":
+            out.append(Token(i, "SIG_INPUTDONE_SHORT", 14, {
+                "ref_op": data[i + 5],
+                "ref_mode": data[i + 6],
+                "ref": u32(data, i + 7),
+                "tail_op": 0x21,
+            }))
+            i += 14
+            continue
+
+        if i + 6 <= size and data[i] in (0x3C, 0x3E, 0xEC, 0xED) and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, f"PFX_{data[i]:02X}_E8_EB_BR", 6, {
+                "prefix_op": data[i],
+                "nested_kind": "PFX_E8_EB_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 4 <= size and data[i] == 0xEC and data[i + 1] == 0xE8 and data[i + 2:i + 4] == b"r#":
+            out.append(Token(i, "PFX_EC_E8_PAIR72_23", 4, {
+                "prefix_op": 0xEC,
+                "nested_kind": "PFX_E8_PAIR72_23",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PAIR72_23", "nested": {"bytes": "72 23"}},
+            }))
+            i += 4
+            continue
+        if i + 5 <= size and data[i] == 0xEC and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3:i + 5] == b"r#":
+            out.append(Token(i, "PFX_EC_E8_EB_PAIR72_23", 5, {
+                "prefix_op": 0xEC,
+                "nested_kind": "PFX_E8_EB_PAIR72_23",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_PAIR72_23", "nested": {"prefix_op": 0xEB, "nested_kind": "PAIR72_23", "nested": {"bytes": "72 23"}}},
+            }))
+            i += 5
+            continue
+
+        if i + 11 <= size and data[i + 4] == 0x3D and data[i + 5] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "SIG_CONST_U32_PFX_3D_REF", 11, {
+                "value": u32(data, i),
+                "ref_op": data[i + 5],
+                "ref_mode": data[i + 6],
+                "ref": u32(data, i + 7),
+            }))
+            i += 11
+            continue
+
+        if i + 8 <= size and data[i + 4] == 0x28 and data[i + 5] == 0x10:
+            out.append(Token(i, "SIG_CONST_U32_IMM16", 8, {
+                "value": u32(data, i),
+                "imm16": struct.unpack_from('<H', data, i + 6)[0],
+            }))
+            i += 8
+            continue
+
+        if i + 11 <= size and data[i] == 0xEF and data[i + 5] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "PFX_EF_SIG_CONST_U32_REF", 11, {
+                "prefix_op": 0xEF,
+                "nested_kind": "SIG_CONST_U32_REF",
+                "nested": {
+                    "value": u32(data, i + 1),
+                    "ref_op": data[i + 5],
+                    "ref_mode": data[i + 6],
+                    "ref": u32(data, i + 7),
+                },
+            }))
+            i += 11
+            continue
+
+        if i + 6 <= size and data[i] == 0x2E and data[i + 1] == 0xEC and data[i + 2] == 0xE8 and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_2E_EC_E8_BR", 6, {
+                "prefix_op": 0x2E,
+                "nested_kind": "PFX_EC_E8_BR",
+                "nested": {"prefix_op": 0xEC, "nested_kind": "PFX_E8_BR", "nested": {"prefix_op": 0xE8, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 17 <= size and data[i:i + 17] == bytes.fromhex("5b0100412910000006006910e80d00002c") and data[i + 17:i + 20] == bytes.fromhex("036643"):
+            out.append(Token(i, "SIG_TELEP_CREATEINFOPICTURE_TAIL", 20, {
+                "signature": "5b0100412910000006006910e80d00002c036643",
+            }))
+            i += 20
+            continue
+
+        if i + 9 <= size and data[i:i + 9] == bytes.fromhex("012c89000014000000"):
+            out.append(Token(i, "SIG_PLAYER_GETLEADER_TAIL", 9, {
+                "signature": "012c89000014000000",
+            }))
+            i += 9
+            continue
+
+        if i + 22 <= size and data[i:i + 22] == bytes.fromhex("3c0000003b2d6c01040800003c0000002c04661a7223"):
+            out.append(Token(i, "SIG_PLAYER_LOSTITEM2_TAIL", 22, {
+                "signature": "3c0000003b2d6c01040800003c0000002c04661a7223",
+            }))
+            i += 22
+            continue
+
+        if i + 13 <= size and data[i:i + 13] == bytes.fromhex("200000003b2d291020e14b2200"):
+            out.append(Token(i, "SIG_MAIN_PARSECOMMAND_TAIL", 13, {
+                "signature": "200000003b2d291020e14b2200",
+            }))
+            i += 13
+            continue
+
+
+        direct_atomic = _match_atomic_semantic(data, i, size)
+        custom_e8_family = (
+            (i + 5 <= size and data[i] == 0xE8 and data[i + 1] in (0x4A, 0x4B, 0x4C, 0x4D))
+            or (i + 6 <= size and data[i] == 0xE8 and data[i + 1] in (0x3D, 0xEB) and data[i + 2] in (0x4A, 0x4B, 0x4C, 0x4D))
+            or (i + 6 <= size and data[i] in (0x3C, 0x3E, 0xEC, 0xED) and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D))
+            or (i + 4 <= size and data[i] == 0xEC and data[i + 1] == 0xE8 and data[i + 2:i + 4] == b"r#")
+            or (i + 6 <= size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2] in (0x3D, 0xEB) and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D))
+        )
+        if direct_atomic is not None and direct_atomic[1] >= 4 and not custom_e8_family:
+            kind, tok_size, payload = direct_atomic
+            out.append(Token(i, kind, tok_size, payload))
+            i += tok_size
+            continue
+
+        direct_prefixed = _match_prefixed_semantic(data, i, size)
+        if direct_prefixed is not None and direct_prefixed[1] >= 4 and not custom_e8_family:
+            kind, tok_size, payload = direct_prefixed
+            out.append(Token(i, kind, tok_size, payload))
+            i += tok_size
+            continue
+
+        if i + 12 <= size and data[i + 4] == 0x3D and data[i + 5] == 0x30 and data[i + 6] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "SIG_CONST_U32_PFX_3D_30_REF", 12, {
+                "value": u32(data, i),
+                "ref_op": data[i + 6],
+                "ref_mode": data[i + 7],
+                "ref": u32(data, i + 8),
+            }))
+            i += 12
+            continue
+
+        if i + 11 <= size and data[i + 4] == 0x5E and data[i + 5] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "SIG_CONST_U32_PFX_5E_REF", 11, {
+                "value": u32(data, i),
+                "ref_op": data[i + 5],
+                "ref_mode": data[i + 6],
+                "ref": u32(data, i + 7),
+            }))
+            i += 11
+            continue
+
+        if i + 7 <= size and data[i + 4] == 0x3D and data[i + 5:i + 7] == b"r#":
+            out.append(Token(i, "SIG_CONST_U32_PFX_3D_PAIR72_23", 7, {
+                "value": u32(data, i),
+            }))
+            i += 7
+            continue
+
+        if i + 8 <= size and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 0 and data[i + 4] == 0x64 and data[i + 5] == 0x10:
+            out.append(Token(i, "SIG_CONST_U32_REF16", 8, {
+                "value": u32(data, i),
+                "ref": struct.unpack_from('<H', data, i + 6)[0],
+            }))
+            i += 8
+            continue
+
+        if i + 7 <= size and data[i + 4] == 0x29 and data[i + 5] == 0x10:
+            out.append(Token(i, "SIG_CONST_U32_IMM", 7, {
+                "value": u32(data, i),
+                "imm": data[i + 6],
+            }))
+            i += 7
+            continue
+
+        if i + 8 <= size and data[i + 4] == 0x2C and data[i + 6] == 0x66:
+            out.append(Token(i, "SIG_CONST_U32_CALL66", 8, {
+                "value": u32(data, i),
+                "argc": data[i + 5],
+                "opid": data[i + 7],
+            }))
+            i += 8
+            continue
+
+        if i + 11 <= size and data[i + 4] == 0x2C and data[i + 6] == 0x63:
+            out.append(Token(i, "SIG_CONST_U32_CALL63A", 11, {
+                "value": u32(data, i),
+                "argc": data[i + 5],
+                "rel": s32(data, i + 7),
+            }))
+            i += 11
+            continue
+
+        if i + 8 <= size and data[i + 4] == 0x5E and data[i + 5] == 0x29 and data[i + 6] == 0x10:
+            out.append(Token(i, "SIG_CONST_U32_5E_IMM", 8, {
+                "value": u32(data, i),
+                "prefix_op": 0x5E,
+                "imm": data[i + 7],
+            }))
+            i += 8
+            continue
+
+        if i + 9 <= size and data[i + 4] == 0x26 and data[i + 5] == 0x2C and data[i + 7] == 0x66:
+            out.append(Token(i, "SIG_CONST_U32_26_CALL66", 9, {
+                "value": u32(data, i),
+                "argc": data[i + 6],
+                "opid": data[i + 8],
+            }))
+            i += 9
+            continue
+
+        if i + 11 <= size and data[i + 4] == 0x26 and data[i + 5] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "SIG_CONST_U32_26_REF", 11, {
+                "value": u32(data, i),
+                "ref_op": data[i + 5],
+                "ref_mode": data[i + 6],
+                "ref": u32(data, i + 7),
+            }))
+            i += 11
+            continue
+
+        if i + 10 <= size and data[i + 4] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "SIG_CONST_U32_REF", 10, {
+                "value": u32(data, i),
+                "ref_op": data[i + 4],
+                "ref_mode": data[i + 5],
+                "ref": u32(data, i + 6),
+            }))
+            i += 10
+            continue
+
+        # Guard against a false fusion seen in the createInfoPicture family:
+        #   OPU16 + REC41 can look like <u32><0x41...> if we only check byte +4.
+        # Prefer the cleaner structural split when the leading dword is actually
+        # a short-u16 op followed immediately by REC41.
+        if i + 11 <= size and data[i + 4] == 0x41 and not (data[i] in SHORT_U16_OPS and data[i + 3] == 0x41):
+            out.append(Token(i, "SIG_CONST_U32_REC41", 11, {
+                "value": u32(data, i),
+                "ref": u32(data, i + 5),
+                "imm": struct.unpack_from('<H', data, i + 9)[0],
+            }))
+            i += 11
+            continue
+
+        if i + 5 <= size and data[i + 4] == 0x72:
+            nested = _match_prefixed_semantic(data, i + 4, size)
+            if nested is not None and (nested[0].startswith("PFX_72_") or nested[0] == "PAIR72_23"):
+                nested_kind, nested_size, nested_payload = nested
+                out.append(Token(i, "SIG_CONST_U32_PFX72", 4 + nested_size, {
+                    "value": u32(data, i),
+                    "nested_kind": nested_kind,
+                    "nested": nested_payload,
+                }))
+                i += 4 + nested_size
+                continue
+
+        if i + 5 <= size and data[i] == 0xE8 and data[i + 1] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_E8_BR", 4, {"prefix_op": 0xE8, "nested_kind": "BR", "nested": {"op": data[i + 1], "off": struct.unpack_from('<H', data, i + 2)[0]}}))
+            i += 4
+            continue
+
+        if i + 6 <= size and data[i] == 0xE8 and data[i + 1] == 0x3D and data[i + 2] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_E8_3D_BR", 5, {
+                "prefix_op": 0xE8,
+                "nested_kind": "PFX_3D_BR",
+                "nested": {"prefix_op": 0x3D, "nested_kind": "BR", "nested": {"op": data[i + 2], "off": struct.unpack_from('<H', data, i + 3)[0]}},
+            }))
+            i += 5
+            continue
+
+        if i + 6 <= size and data[i] == 0xE8 and data[i + 1] == 0xEB and data[i + 2] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_E8_EB_BR", 5, {
+                "prefix_op": 0xE8,
+                "nested_kind": "PFX_EB_BR",
+                "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 2], "off": struct.unpack_from('<H', data, i + 3)[0]}},
+            }))
+            i += 5
+            continue
+
+        if i + 6 <= size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2] == 0x3D and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_F0_E8_3D_BR", 6, {
+                "prefix_op": 0xF0,
+                "nested_kind": "PFX_E8_3D_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_3D_BR", "nested": {"prefix_op": 0x3D, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 6 <= size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_F0_E8_EB_BR", 6, {
+                "prefix_op": 0xF0,
+                "nested_kind": "PFX_E8_EB_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 6 <= size and data[i] in (0xEC, 0xE1, 0x21, 0xEB) and data[i + 1] == 0xE8 and data[i + 2] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, f"PFX_{data[i]:02X}_E8_BR", 5, {
+                "prefix_op": data[i],
+                "nested_kind": "PFX_E8_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "BR", "nested": {"op": data[i + 2], "off": struct.unpack_from('<H', data, i + 3)[0]}},
+            }))
+            i += 5
+            continue
+
+        if i + 7 <= size and data[i] in (0xEC, 0xE1) and data[i + 1] == 0xE8 and data[i + 2] == 0x3D and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, f"PFX_{data[i]:02X}_E8_3D_BR", 6, {
+                "prefix_op": data[i],
+                "nested_kind": "PFX_E8_3D_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_3D_BR", "nested": {"prefix_op": 0x3D, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 7 <= size and data[i] == 0xF0 and data[i + 1] == 0xEB and data[i + 2] == 0xE8 and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_F0_EB_E8_BR", 6, {
+                "prefix_op": 0xF0,
+                "nested_kind": "PFX_EB_E8_BR",
+                "nested": {"prefix_op": 0xEB, "nested_kind": "PFX_E8_BR", "nested": {"prefix_op": 0xE8, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 6 <= size and data[i] == 0xE8 and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_E8_E8_EB_BR", 6, {
+                "prefix_op": 0xE8,
+                "nested_kind": "PFX_E8_EB_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 7 <= size and data[i] in (0xEC, 0xE1) and data[i + 1] == 0xE8 and data[i + 2] == 0xE8 and data[i + 3] == 0xEB and data[i + 4] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, f"PFX_{data[i]:02X}_E8_E8_EB_BR", 7, {
+                "prefix_op": data[i],
+                "nested_kind": "PFX_E8_E8_EB_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_E8_EB_BR", "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 4], "off": struct.unpack_from('<H', data, i + 5)[0]}}}},
+            }))
+            i += 7
+            continue
+
+        if i + 6 <= size and data[i] in (0xEC, 0xE1) and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, f"PFX_{data[i]:02X}_E8_EB_BR", 6, {
+                "prefix_op": data[i],
+                "nested_kind": "PFX_E8_EB_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        # duplicated signature block removed; handled above
+
+
+
+        if i + 6 <= size and data[i] == 0x3C and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_3C_E8_EB_BR", 6, {
+                "prefix_op": 0x3C,
+                "nested_kind": "PFX_E8_EB_BR",
+                "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        if i + 7 <= size and data[i] == 0x3E and data[i + 1] == 0xEB and data[i + 2] == 0xE8 and data[i + 3] == 0xEB and data[i + 4] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_3E_EB_E8_EB_BR", 7, {
+                "prefix_op": 0x3E,
+                "nested_kind": "PFX_EB_E8_EB_BR",
+                "nested": {"prefix_op": 0xEB, "nested_kind": "PFX_E8_EB_BR", "nested": {"prefix_op": 0xE8, "nested_kind": "PFX_EB_BR", "nested": {"prefix_op": 0xEB, "nested_kind": "BR", "nested": {"op": data[i + 4], "off": struct.unpack_from('<H', data, i + 5)[0]}}}},
+            }))
+            i += 7
+            continue
+
+        if i + 6 <= size and data[i] == 0x3E and data[i + 1] == 0xEB and data[i + 2] == 0xE8 and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
+            out.append(Token(i, "PFX_3E_EB_E8_BR", 6, {
+                "prefix_op": 0x3E,
+                "nested_kind": "PFX_EB_E8_BR",
+                "nested": {"prefix_op": 0xEB, "nested_kind": "PFX_E8_BR", "nested": {"prefix_op": 0xE8, "nested_kind": "BR", "nested": {"op": data[i + 3], "off": struct.unpack_from('<H', data, i + 4)[0]}}},
+            }))
+            i += 6
+            continue
+
+        prefixed = _match_prefixed_semantic(data, i, size)
+        if prefixed is not None:
+            kind, tok_size, payload = prefixed
+            out.append(Token(i, kind, tok_size, payload))
+            i += tok_size
+            continue
+
         if i + 6 <= size and data[i] == 0x39 and data[i + 1] == 0x20:
             bits = u32(data, i + 2)
             value = struct.unpack('<f', struct.pack('<I', bits))[0]
@@ -412,9 +995,19 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 6
             continue
 
-        if i + 6 <= size and data[i] == 0x39 and data[i + 1] == 0x10:
-            out.append(Token(i, "IMM32", 6, {"op": 0x39, "mode": 0x10, "value": u32(data, i + 2)}))
-            i += 6
+        if i + 4 <= size and data[i:i + 4] == b"\x00\x01\x00\x00":
+            out.append(Token(i, "SIG_CONST_0100", 4, {"value": 256}))
+            i += 4
+            continue
+
+        if i + 12 <= size and data[i + 4] == 0x62 and data[i + 5] == 0x10:
+            out.append(Token(i, "SIG_CONST_U32_REC62", 12, {
+                "value": u32(data, i),
+                "mode": 0x10,
+                "u16": struct.unpack_from('<H', data, i + 6)[0],
+                "c": s32(data, i + 8),
+            }))
+            i += 12
             continue
 
         blob_size, blob_payload = _scan_dword_blob(data, i, size)
