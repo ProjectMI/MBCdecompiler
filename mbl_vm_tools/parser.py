@@ -3,8 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import hashlib
+import re
 import struct
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Optional
 
 
@@ -12,6 +13,7 @@ KNOWN_FLAGS = {0, 1, 255, 257, 511, 767, 0x101, 0x1FF, 0x201, 0x2FF}
 MAGIC_HEADER = b"MBL script v4.0\x00"
 FIXED_CODE_BASE = 0x20
 MAX_INTER_RECORD_ZERO_RUN = 16
+SYMBOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,63}$")
 
 
 def u32(data: bytes, offset: int) -> int:
@@ -50,8 +52,10 @@ def _looks_like_filler_name(name: str) -> bool:
 
 def _is_symbolish_name(name: str) -> bool:
     """
-    Table names in this corpus are overwhelmingly ASCII-like identifiers.
-    Reject short non-ASCII garbage that may arise from filler patterns.
+    Table names in this corpus are overwhelmingly ASCII identifiers.
+    Be intentionally strict here: false negatives are cheaper than accepting
+    header strings / magic text as pseudo-symbols and derailing layout
+    detection.
     """
     if not name:
         return False
@@ -59,9 +63,9 @@ def _is_symbolish_name(name: str) -> bool:
         return False
     if any(ord(ch) < 32 for ch in name):
         return False
-    if not any(('A' <= ch <= 'Z') or ('a' <= ch <= 'z') or ch == '_' for ch in name):
+    if name.startswith("MBL script v"):
         return False
-    return True
+    return bool(SYMBOL_NAME_RE.fullmatch(name))
 
 
 @dataclass
@@ -402,11 +406,8 @@ def find_table_candidates(data: bytes, min_records: int = 3) -> list[TableCandid
     return merged
 
 
-def detect_module_layout(data: bytes) -> dict:
-    cands = find_table_candidates(data)
-    if not cands:
-        cands = find_table_candidates(data, min_records=1)
-
+def detect_module_layout(data: bytes, *, collect_candidates: bool = True, allow_fallback_scan: bool = True) -> dict:
+    cands: list[TableCandidate] = []
     definitions_best = _find_header_guided_definition(data)
     globals_best = None
     exports_best = None
@@ -428,13 +429,34 @@ def detect_module_layout(data: bytes) -> dict:
         else:
             exports_best = first_exports
 
-    if definitions_best is None:
+    need_full_sweep = collect_candidates or definitions_best is None or exports_best is None
+    if need_full_sweep and allow_fallback_scan:
+        cands = find_table_candidates(data)
+        if not cands:
+            cands = find_table_candidates(data, min_records=1)
+
+    if cands:
         globals_cands = [c for c in cands if c.kind == "globals"]
         export_cands = [c for c in cands if c.kind == "exports"]
         def_cands = [c for c in cands if c.kind == "definitions"]
 
-        globals_best = max(globals_cands, key=lambda c: (c.score, -c.start), default=None)
-        exports_best = max(export_cands, key=lambda c: (c.score, -c.start), default=None)
+        if globals_best is None:
+            if definitions_best is not None:
+                globals_after_defs = [c for c in globals_cands if c.start >= definitions_best.end]
+                if exports_best is not None:
+                    globals_after_defs = [c for c in globals_after_defs if c.start < exports_best.start]
+                globals_best = max(globals_after_defs or globals_cands, key=lambda c: (c.score, -c.start), default=None)
+            else:
+                globals_best = max(globals_cands, key=lambda c: (c.score, -c.start), default=None)
+
+        if exports_best is None:
+            if globals_best is not None:
+                exports_after_anchor = [c for c in export_cands if c.start >= globals_best.end]
+            elif definitions_best is not None:
+                exports_after_anchor = [c for c in export_cands if c.start >= definitions_best.end]
+            else:
+                exports_after_anchor = []
+            exports_best = max(exports_after_anchor or export_cands, key=lambda c: (c.score, -c.start), default=None)
 
         if globals_best is not None:
             defs_before = [c for c in def_cands if c.start < globals_best.start]
@@ -544,7 +566,11 @@ class MBCModule:
         self.data_blob_size = (self.header[3] + 1) if self.has_magic_header else 0
         self.adb_info = read_adb_info(self.path) if collect_auxiliary else EMPTY_ADB_INFO
 
-        layout = detect_module_layout(self.data)
+        layout = detect_module_layout(
+            self.data,
+            collect_candidates=collect_auxiliary,
+            allow_fallback_scan=True,
+        )
 
         self.definition_table: Optional[TableCandidate] = layout["definitions"]
         self.globals_table: Optional[TableCandidate] = layout["globals"]
@@ -559,7 +585,19 @@ class MBCModule:
             r for r in raw_exports if not (r.b == 0xFFFFFFFF and r.c == 0)
         ]
         self._export_index_by_name = {r.name: idx for idx, r in enumerate(self.normal_exports)}
-        self._definition_by_name = {r.name: r for r in self.definitions}
+        self._definition_records_by_name: dict[str, list[TableRecord]] = defaultdict(list)
+        for record in self.definitions:
+            self._definition_records_by_name[record.name].append(record)
+        self.definition_name_collisions: dict[str, list[TableRecord]] = {
+            name: records
+            for name, records in self._definition_records_by_name.items()
+            if len(records) > 1
+        }
+        self._definition_by_name = {
+            name: records[0]
+            for name, records in self._definition_records_by_name.items()
+            if len(records) == 1
+        }
 
     @property
     def exports(self) -> list[TableRecord]:
@@ -588,29 +626,56 @@ class MBCModule:
     def get_definition_record(self, name: str) -> Optional[TableRecord]:
         return self._definition_by_name.get(name)
 
+    def get_definition_records(self, name: str) -> list[TableRecord]:
+        return list(self._definition_records_by_name.get(name, []))
+
+    def get_real_code_size(self) -> int:
+        real_limit = max(0, len(self.data) - self.code_base)
+        if self.code_size:
+            return min(self.code_size, real_limit)
+        return real_limit
+
+    def get_export_exact_code_span_with_reason(self, name: str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        definition_records = self.get_definition_records(name)
+        if not definition_records:
+            return None, "definition_missing"
+        if len(definition_records) > 1:
+            return None, "definition_ambiguous"
+
+        rec = definition_records[0]
+        if rec.b < rec.a:
+            return None, "definition_inverted"
+
+        code_limit = self.get_real_code_size()
+        start = max(0, rec.a)
+        end = rec.b + 1
+        if start >= code_limit:
+            return None, "definition_start_oob"
+        if end > code_limit:
+            return None, "definition_end_oob"
+        if end <= start:
+            return None, "definition_empty"
+        return (start, end), None
+
     def get_export_public_code_span(self, name: str) -> tuple[int, int]:
         idx = self._export_index(name)
-        start = self.exports[idx].a
+        code_limit = self.get_real_code_size()
+        start = max(0, min(self.exports[idx].a, code_limit))
         if idx + 1 < len(self.exports):
             end = self.exports[idx + 1].a
-        elif self.code_size:
-            end = self.code_size
         else:
-            end = max(start, len(self.data) - self.code_base)
+            end = code_limit
+        end = max(start, min(end, code_limit))
         return start, end
 
     def get_export_exact_code_span(self, name: str) -> Optional[tuple[int, int]]:
-        rec = self.get_definition_record(name)
-        if rec is None or rec.b < rec.a:
-            return None
-        if self.code_size and rec.b + 1 > self.code_size:
-            return None
-        return rec.a, rec.b + 1
+        span, _ = self.get_export_exact_code_span_with_reason(name)
+        return span
 
     def _slice_code_span(self, start: int, end: int) -> bytes:
         file_start = self.code_base + start
         file_end = self.code_base + end
-        code_limit = self.code_base + (self.code_size or max(0, len(self.data) - self.code_base))
+        code_limit = self.code_base + self.get_real_code_size()
         if file_start < 0 or file_end > min(code_limit, len(self.data)) or file_start >= file_end:
             return b""
         return self.data[file_start:file_end]
@@ -641,5 +706,9 @@ class MBCModule:
             "globals": [r.to_dict() for r in self.globals],
             "exports": [r.to_dict() for r in self.exports],
             "embedded_import_like_exports": [r.to_dict() for r in self.embedded_import_like_exports],
+            "definition_name_collisions": {
+                name: [record.to_dict() for record in records]
+                for name, records in self.definition_name_collisions.items()
+            },
             "adb_info": self.adb_info.to_dict(),
         }

@@ -710,6 +710,10 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
         if i + 13 <= size and data[i:i + 13] == bytes.fromhex("200000003b2d291020e14b2200"):
             out.append(Token(i, "SIG_MAIN_PARSECOMMAND_TAIL", 13, {
                 "signature": "200000003b2d291020e14b2200",
+                "word_u32": u32(data, i),
+                "cmp_value": data[i + 8],
+                "branch_op": data[i + 10],
+                "offset": struct.unpack_from('<H', data, i + 11)[0],
             }))
             i += 13
             continue

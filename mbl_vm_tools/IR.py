@@ -221,6 +221,33 @@ class IRFunction:
         return asdict(self)
 
 
+@dataclass
+class ExportBodySelection:
+    name: str
+    slice_mode: str
+    used_fallback: bool
+    reason: str
+    span: dict[str, int]
+    public_span: dict[str, int]
+    exact_span: dict[str, int] | None
+    candidates: list[dict[str, Any]]
+    raw: bytes = field(repr=False, default=b"")
+    tokens: list[Token] = field(repr=False, default_factory=list)
+    nodes: list[IRNode] = field(repr=False, default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "slice_mode": self.slice_mode,
+            "used_fallback": self.used_fallback,
+            "reason": self.reason,
+            "span": self.span,
+            "public_span": self.public_span,
+            "exact_span": self.exact_span,
+            "candidates": self.candidates,
+        }
+
+
 def _record_to_dict(record: TableRecord) -> dict[str, Any]:
     return {
         "offset": record.offset,
@@ -677,6 +704,21 @@ def _resolve_branch_target(
         }
 
     best_formula, best_target = matched[0]
+    immediate_fallthrough = node_offset + node_size
+    degenerate_targets = {immediate_fallthrough, node_offset}
+    if best_target in degenerate_targets and len(matched) > 1:
+        relative_preference = [
+            (formula, target)
+            for formula, target in matched
+            if target not in degenerate_targets and (formula.startswith("start+") or formula.startswith("end+") or formula.startswith("signed_start+") or formula.startswith("signed_end+"))
+        ]
+        if relative_preference:
+            best_formula, best_target = relative_preference[0]
+        else:
+            for formula, target in matched:
+                if target not in degenerate_targets:
+                    best_formula, best_target = formula, target
+                    break
     if len(matched) == 1:
         confidence = 0.94 if best_formula in {"start+0", "end+0", "absolute+0", "signed_start+0", "signed_start+1", "signed_start+2"} else 0.74
     else:
@@ -968,20 +1010,174 @@ def _build_validation(nodes: list[IRNode], cfg: dict[str, Any]) -> dict[str, Any
     }
 
 
-def build_function_ir(mod: MBCModule, export_name: str) -> IRFunction:
-    exact_span = mod.get_export_exact_code_span(export_name)
-    public_span = mod.get_export_public_code_span(export_name)
-    using_exact = exact_span is not None
-    start, end = exact_span if using_exact else public_span
-
-    raw = mod.get_export_body(export_name, exact=True)
-    if not raw:
-        raw = mod.get_export_body(export_name, exact=False)
-
+def _summarize_body_candidate(mode: str, span: tuple[int, int], raw: bytes) -> tuple[dict[str, Any], list[Token], list[IRNode]]:
     tokens = tokenize_stream(raw)
     nodes = [normalize_token(token, index=idx) for idx, token in enumerate(tokens)]
+
+    node_count = len(nodes)
+    unknown_count = sum(1 for node in nodes if node.semantic_op == "unknown")
+    data_count = sum(1 for node in nodes if node.semantic_op in {"data", "opaque_data"})
+    opaque_count = sum(1 for node in nodes if node.semantic_op.startswith("opaque_"))
+    return_count = sum(1 for node in nodes if node.semantic_op == "return")
+    branch_count = sum(1 for node in nodes if node.semantic_op in {"branch", "opaque_branch"})
+    call_count = sum(1 for node in nodes if node.semantic_op in {"call", "syscall", "opaque_call"})
+    mean_confidence = statistics.mean([node.confidence for node in nodes]) if nodes else 0.0
+    unknown_ratio = (unknown_count / node_count) if node_count else 1.0
+    data_ratio = (data_count / node_count) if node_count else 1.0
+    opaque_ratio = (opaque_count / node_count) if node_count else 1.0
+
+    quality_score = (
+        (mean_confidence * 100.0)
+        - (unknown_ratio * 80.0)
+        - (opaque_ratio * 24.0)
+        - (data_ratio * 18.0)
+        + (min(return_count, 1) * 6.0)
+        + (min(call_count, 4) * 2.0)
+        + (min(branch_count, 4) * 1.0)
+        + min(math.log2(node_count + 1) * 6.0, 18.0)
+        + (2.5 if mode == "definition_exact" else 0.0)
+        - (10.0 if node_count <= 1 else 0.0)
+        - (4.0 if raw and len(raw) < 12 else 0.0)
+    )
+
+    stats = {
+        "slice_mode": mode,
+        "span": {"start": span[0], "end": span[1]},
+        "byte_size": len(raw),
+        "token_count": len(tokens),
+        "node_count": node_count,
+        "mean_confidence": mean_confidence,
+        "unknown_ratio": unknown_ratio,
+        "data_ratio": data_ratio,
+        "opaque_ratio": opaque_ratio,
+        "return_count": return_count,
+        "branch_count": branch_count,
+        "call_count": call_count,
+        "quality_score": quality_score,
+    }
+    return stats, tokens, nodes
+
+
+def select_export_body(mod: MBCModule, export_name: str) -> ExportBodySelection:
+    public_span = mod.get_export_public_code_span(export_name)
+    public_raw = mod._slice_code_span(*public_span)
+    public_stats: dict[str, Any] | None = None
+    public_tokens: list[Token] = []
+    public_nodes: list[IRNode] = []
+    if public_raw:
+        public_stats, public_tokens, public_nodes = _summarize_body_candidate("export_public", public_span, public_raw)
+
+    exact_span, exact_reason = mod.get_export_exact_code_span_with_reason(export_name)
+    exact_raw = mod._slice_code_span(*exact_span) if exact_span is not None else b""
+    exact_stats: dict[str, Any] | None = None
+    exact_tokens: list[Token] = []
+    exact_nodes: list[IRNode] = []
+    if exact_span is not None and exact_raw:
+        exact_stats, exact_tokens, exact_nodes = _summarize_body_candidate("definition_exact", exact_span, exact_raw)
+
+    candidate_stats = [candidate for candidate in (exact_stats, public_stats) if candidate is not None]
+
+    if exact_stats is None and public_stats is None:
+        empty_mode = "export_public"
+        empty_span = public_span
+        if exact_span is not None:
+            empty_mode = "definition_exact"
+            empty_span = exact_span
+        return ExportBodySelection(
+            name=export_name,
+            slice_mode=empty_mode,
+            used_fallback=(empty_mode == "export_public"),
+            reason=exact_reason or "empty_slice",
+            span={"start": empty_span[0], "end": empty_span[1]},
+            public_span={"start": public_span[0], "end": public_span[1]},
+            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            candidates=candidate_stats,
+            raw=b"",
+            tokens=[],
+            nodes=[],
+        )
+
+    if exact_stats is None:
+        return ExportBodySelection(
+            name=export_name,
+            slice_mode="export_public",
+            used_fallback=True,
+            reason=exact_reason or "definition_unavailable",
+            span=public_stats["span"],
+            public_span={"start": public_span[0], "end": public_span[1]},
+            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            candidates=candidate_stats,
+            raw=public_raw,
+            tokens=public_tokens,
+            nodes=public_nodes,
+        )
+
+    if public_stats is None or exact_raw == public_raw:
+        return ExportBodySelection(
+            name=export_name,
+            slice_mode="definition_exact",
+            used_fallback=False,
+            reason="definition_exact",
+            span=exact_stats["span"],
+            public_span={"start": public_span[0], "end": public_span[1]},
+            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            candidates=candidate_stats,
+            raw=exact_raw,
+            tokens=exact_tokens,
+            nodes=exact_nodes,
+        )
+
+    exact_delta = public_stats["quality_score"] - exact_stats["quality_score"]
+    exact_stable = (
+        exact_stats["node_count"] >= 2
+        and exact_stats["mean_confidence"] >= 0.85
+        and exact_stats["unknown_ratio"] <= 0.10
+        and exact_stats["opaque_ratio"] <= 0.20
+    )
+    exact_tiny = exact_stats["node_count"] <= 1
+    public_substantially_better = (
+        exact_delta >= 12.0
+        and public_stats["node_count"] >= max(exact_stats["node_count"] + 3, 4)
+    )
+
+    if public_substantially_better and (exact_tiny or not exact_stable):
+        return ExportBodySelection(
+            name=export_name,
+            slice_mode="export_public",
+            used_fallback=True,
+            reason="fallback_public_better_tokenization",
+            span=public_stats["span"],
+            public_span={"start": public_span[0], "end": public_span[1]},
+            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            candidates=candidate_stats,
+            raw=public_raw,
+            tokens=public_tokens,
+            nodes=public_nodes,
+        )
+
+    return ExportBodySelection(
+        name=export_name,
+        slice_mode="definition_exact",
+        used_fallback=False,
+        reason="definition_exact_preferred",
+        span=exact_stats["span"],
+        public_span={"start": public_span[0], "end": public_span[1]},
+        exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+        candidates=candidate_stats,
+        raw=exact_raw,
+        tokens=exact_tokens,
+        nodes=exact_nodes,
+    )
+
+
+def build_function_ir(mod: MBCModule, export_name: str) -> IRFunction:
+    selection = select_export_body(mod, export_name)
+    raw = selection.raw
+    tokens = selection.tokens
+    nodes = selection.nodes
     basic_blocks, cfg = _compute_basic_blocks(nodes, len(raw))
     validation = _build_validation(nodes, cfg)
+    validation["body_selection"] = selection.to_dict()
 
     category_hist = Counter(node.category for node in nodes)
     opcode_hist = Counter(node.opcode for node in nodes)
@@ -996,9 +1192,9 @@ def build_function_ir(mod: MBCModule, export_name: str) -> IRFunction:
 
     summary = IRFunctionSummary(
         name=export_name,
-        slice_mode="definition_exact" if using_exact else "export_public",
-        span={"start": start, "end": end},
-        public_span={"start": public_span[0], "end": public_span[1]},
+        slice_mode=selection.slice_mode,
+        span=selection.span,
+        public_span=selection.public_span,
         byte_size=len(raw),
         token_count=len(tokens),
         node_count=node_count,
@@ -1099,6 +1295,10 @@ def build_module_ir(path: str | Path, include_nodes: bool = True) -> dict[str, A
         "exports_count": len(mod.exports),
         "semantic_vocabulary": list(SEMANTIC_VOCABULARY),
         "definitions": [_record_to_dict(record) for record in mod.definitions],
+        "definition_name_collisions": {
+            name: [_record_to_dict(record) for record in records]
+            for name, records in mod.definition_name_collisions.items()
+        },
         "globals": [_record_to_dict(record) for record in mod.globals],
         "summary": _module_summary(functions),
         "exports": exports_payload,
