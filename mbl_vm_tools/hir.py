@@ -1446,7 +1446,7 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
         hir_blocks=hir_blocks,
         structured_hir=structured_meta,
         hir_text=hir_text,
-        body_selection=ir_function.validation.get("body_selection", {}),
+        body_selection=ir_function.body_selection,
     )
 
 
