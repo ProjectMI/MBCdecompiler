@@ -10,7 +10,7 @@ from mbl_vm_tools.IR import IRFunction, IRNode, build_function_ir
 from mbl_vm_tools.parser import MBCModule
 
 
-HIR_CONTRACT_VERSION = "hir-v2"
+HIR_CONTRACT_VERSION = "hir-v5"
 
 
 @dataclass
@@ -1076,12 +1076,152 @@ def build_hir_blocks(
 # --- structuring ----------------------------------------------------------
 
 
+def _clone_block(block: HIRBlock, **updates: Any) -> HIRBlock:
+    payload = {
+        "id": block.id,
+        "index": block.index,
+        "start_offset": block.start_offset,
+        "end_offset": block.end_offset,
+        "instruction_indices": list(block.instruction_indices),
+        "entry_stack": list(block.entry_stack),
+        "exit_stack": list(block.exit_stack),
+        "phi_bindings": list(block.phi_bindings),
+        "statements": list(block.statements),
+        "terminator": dict(block.terminator),
+        "branch_target": block.branch_target,
+        "fallthrough_target": block.fallthrough_target,
+        "successors": list(block.successors),
+        "predecessors": list(block.predecessors),
+        "flags": list(block.flags),
+    }
+    payload.update(updates)
+    return HIRBlock(**payload)
+
+
 def _block_maps(hir_blocks: list[HIRBlock]) -> tuple[dict[str, HIRBlock], dict[str, int], dict[str, list[str]], dict[str, list[str]]]:
     by_id = {block.id: block for block in hir_blocks}
     index_by_id = {block.id: block.index for block in hir_blocks}
     succs = {block.id: list(block.successors) for block in hir_blocks}
     preds = {block.id: list(block.predecessors) for block in hir_blocks}
     return by_id, index_by_id, succs, preds
+
+
+def _reindex_hir_blocks(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
+    return [_clone_block(block, index=index) for index, block in enumerate(hir_blocks)]
+
+
+def _sanitize_hir_blocks(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
+    valid_ids = {block.id for block in hir_blocks}
+
+    def _clean_edge_list(items: list[str]) -> list[str]:
+        return [item for item in _ordered_unique(items) if item in valid_ids]
+
+    return _reindex_hir_blocks(
+        [
+            _clone_block(
+                block,
+                branch_target=block.branch_target if block.branch_target in valid_ids else None,
+                fallthrough_target=block.fallthrough_target if block.fallthrough_target in valid_ids else None,
+                successors=_clean_edge_list(list(block.successors)),
+                predecessors=_clean_edge_list(list(block.predecessors)),
+            )
+            for block in hir_blocks
+        ]
+    )
+
+
+def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock]]:
+    by_id = {block.id: block for block in blocks}
+    for block in blocks:
+        if block.index == 0:
+            continue
+        if block.statements or block.phi_bindings:
+            continue
+        if len(block.successors) != 1:
+            continue
+        if block.terminator.get("kind") == "return":
+            continue
+        succ_id = block.successors[0]
+        succ = by_id.get(succ_id)
+        if succ is None or succ.id == block.id:
+            continue
+
+        rewritten: list[HIRBlock] = []
+        for current in blocks:
+            if current.id == block.id:
+                continue
+            preds = [succ_id if item == block.id else item for item in current.predecessors]
+            succs = [succ_id if item == block.id else item for item in current.successors]
+            if current.id == succ_id:
+                preds = list(block.predecessors) + preds
+            rewritten.append(
+                _clone_block(
+                    current,
+                    branch_target=succ_id if current.branch_target == block.id else current.branch_target,
+                    fallthrough_target=succ_id if current.fallthrough_target == block.id else current.fallthrough_target,
+                    successors=_ordered_unique(succs),
+                    predecessors=_ordered_unique(preds),
+                )
+            )
+        return _sanitize_hir_blocks(rewritten)
+    return None
+
+
+def _rewrite_linear_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock]]:
+    by_id = {block.id: block for block in blocks}
+    for block in blocks:
+        if block.terminator.get("kind") != "fallthrough" or len(block.successors) != 1:
+            continue
+        succ_id = block.successors[0]
+        succ = by_id.get(succ_id)
+        if succ is None or succ.id == block.id:
+            continue
+        if succ.predecessors != [block.id]:
+            continue
+
+        merged = _clone_block(
+            block,
+            end_offset=succ.end_offset,
+            instruction_indices=list(block.instruction_indices) + list(succ.instruction_indices),
+            exit_stack=list(succ.exit_stack),
+            phi_bindings=list(block.phi_bindings) + list(succ.phi_bindings),
+            statements=list(block.statements) + list(succ.statements),
+            terminator=dict(succ.terminator),
+            branch_target=succ.branch_target,
+            fallthrough_target=succ.fallthrough_target,
+            successors=list(succ.successors),
+            flags=_ordered_unique(list(block.flags) + list(succ.flags)),
+        )
+
+        rewritten: list[HIRBlock] = []
+        for current in blocks:
+            if current.id == succ.id:
+                continue
+            if current.id == block.id:
+                rewritten.append(merged)
+                continue
+            rewritten.append(
+                _clone_block(
+                    current,
+                    branch_target=block.id if current.branch_target == succ.id else current.branch_target,
+                    fallthrough_target=block.id if current.fallthrough_target == succ.id else current.fallthrough_target,
+                    successors=[block.id if item == succ.id else item for item in current.successors],
+                    predecessors=[block.id if item == succ.id else item for item in current.predecessors],
+                )
+            )
+        return _sanitize_hir_blocks(rewritten)
+    return None
+
+
+def _normalize_hir_blocks(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
+    blocks = _sanitize_hir_blocks(hir_blocks)
+    while True:
+        rewritten = _rewrite_empty_fallthrough(blocks)
+        if rewritten is None:
+            rewritten = _rewrite_linear_fallthrough(blocks)
+        if rewritten is None:
+            return blocks
+        blocks = rewritten
 
 
 def _indent(lines: list[str], level: int) -> list[str]:
@@ -1093,7 +1233,7 @@ def _compute_dominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
     if not hir_blocks:
         return {}
     ids = [block.id for block in hir_blocks]
-    by_id, _, _, preds = _block_maps(hir_blocks)
+    _, _, _, preds = _block_maps(hir_blocks)
     entry = hir_blocks[0].id
     dom: dict[str, set[str]] = {block.id: set(ids) for block in hir_blocks}
     dom[entry] = {entry}
@@ -1123,15 +1263,15 @@ def _compute_postdominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
     changed = True
     while changed:
         changed = False
-        for block in reversed(hir_blocks):
+        for block in hir_blocks:
             if block.id in exits:
                 continue
             succ_sets = [postdom[succ] for succ in succs[block.id] if succ in postdom]
-            new_post = {block.id}
+            new_postdom = {block.id}
             if succ_sets:
-                new_post |= set.intersection(*succ_sets)
-            if new_post != postdom[block.id]:
-                postdom[block.id] = new_post
+                new_postdom |= set.intersection(*succ_sets)
+            if new_postdom != postdom[block.id]:
+                postdom[block.id] = new_postdom
                 changed = True
     return postdom
 
@@ -1142,7 +1282,7 @@ def _immediate_postdom(block_id: str, postdom: dict[str, set[str]], index_by_id:
         return None
     candidates.sort(key=lambda item: index_by_id.get(item, 10 ** 6))
     for candidate in candidates:
-        if all(candidate == other or candidate not in postdom.get(other, set()) for other in candidates):
+        if all(candidate not in postdom.get(other, set()) for other in candidates if other != candidate):
             return candidate
     return candidates[0]
 
@@ -1160,7 +1300,7 @@ def _edge_targets(block: HIRBlock, index_by_id: dict[str, int]) -> tuple[Optiona
 
 
 def _natural_loops(hir_blocks: list[HIRBlock], dom: dict[str, set[str]]) -> dict[str, dict[str, Any]]:
-    by_id, index_by_id, succs, preds = _block_maps(hir_blocks)
+    _, index_by_id, succs, preds = _block_maps(hir_blocks)
     loops: dict[str, dict[str, Any]] = {}
     for block in hir_blocks:
         for succ in succs[block.id]:
@@ -1179,7 +1319,6 @@ def _natural_loops(hir_blocks: list[HIRBlock], dom: dict[str, set[str]]) -> dict
     for header_id, loop in loops.items():
         node_indices = sorted(index_by_id[node] for node in loop["nodes"])
         loop["index_range"] = (node_indices[0], node_indices[-1]) if node_indices else (index_by_id[header_id], index_by_id[header_id])
-        header = by_id[header_id]
         body_succs = [succ for succ in succs[header_id] if succ in loop["nodes"]]
         exit_succs = [succ for succ in succs[header_id] if succ not in loop["nodes"]]
         loop["body_succ"] = body_succs[0] if len(body_succs) == 1 else None
@@ -1187,20 +1326,191 @@ def _natural_loops(hir_blocks: list[HIRBlock], dom: dict[str, set[str]]) -> dict
         idx0, idx1 = loop["index_range"]
         contiguous_ids = {hir_blocks[idx].id for idx in range(idx0, idx1 + 1)}
         loop["contiguous"] = contiguous_ids == set(loop["nodes"])
-        loop["safe"] = header.terminator.get("kind") == "branch" and loop["body_succ"] is not None and loop["exit_succ"] is not None and loop["contiguous"]
+        exit_idx = index_by_id.get(loop["exit_succ"], -1) if loop["exit_succ"] is not None else -1
+        body_idx = index_by_id.get(loop["body_succ"], -1) if loop["body_succ"] is not None else -1
+        loop["safe"] = (
+            hir_blocks[index_by_id[header_id]].terminator.get("kind") == "branch"
+            and loop["body_succ"] is not None
+            and loop["exit_succ"] is not None
+            and loop["contiguous"]
+            and body_idx >= idx0
+            and exit_idx > idx1
+        )
     return loops
 
 
-def _fallback_block_lines(block: HIRBlock, index_by_id: dict[str, int]) -> list[str]:
-    lines = [f"{block.id}:" ]
+def _next_allowed_block_id(blocks: list[HIRBlock], start_idx: int, limit: int, allowed_ids: Optional[set[str]]) -> Optional[str]:
+    for idx in range(start_idx + 1, min(limit, len(blocks))):
+        candidate = blocks[idx]
+        if allowed_ids is None or candidate.id in allowed_ids:
+            return candidate.id
+    return None
+
+
+def _label_needed(block: HIRBlock, by_id: dict[str, HIRBlock], index_by_id: dict[str, int], allowed_ids: Optional[set[str]]) -> bool:
+    if block.index == 0:
+        return False
+    preds = list(block.predecessors)
+    if not preds:
+        return True
+    if len(preds) != 1:
+        return True
+    pred_id = preds[0]
+    if allowed_ids is not None and pred_id not in allowed_ids:
+        return True
+    pred = by_id.get(pred_id)
+    if pred is None:
+        return True
+    return index_by_id.get(pred_id, -1) != block.index - 1
+
+
+def _jump_stmt(target: Optional[str], jump_aliases: Optional[dict[str, str]]) -> tuple[Optional[str], int]:
+    if target is None:
+        return None, 0
+    if jump_aliases and target in jump_aliases:
+        return jump_aliases[target], 0
+    return f"goto {target}", 1
+
+
+def _conditional_jump(cond: str, target: Optional[str], *, negate: bool, jump_aliases: Optional[dict[str, str]]) -> tuple[list[str], int]:
+    stmt, cost = _jump_stmt(target, jump_aliases)
+    if stmt is None:
+        return [], 0
+    if negate:
+        return [f"if (!({cond})) {stmt}"], cost
+    return [f"if ({cond}) {stmt}"], cost
+
+
+def _generic_terminator_lines(
+    block: HIRBlock,
+    next_id: Optional[str],
+    index_by_id: dict[str, int],
+    jump_aliases: Optional[dict[str, str]],
+) -> tuple[list[str], int]:
+    kind = block.terminator.get("kind")
+    if kind == "return":
+        return [], 0
+    if kind == "branch":
+        branch_target, fallthrough_target = _edge_targets(block, index_by_id)
+        cond = block.terminator.get("condition") or f"cond_{block.id}"
+        if branch_target and fallthrough_target:
+            if fallthrough_target == next_id and branch_target != next_id:
+                return _conditional_jump(cond, branch_target, negate=False, jump_aliases=jump_aliases)
+            if branch_target == next_id and fallthrough_target != next_id:
+                return _conditional_jump(cond, fallthrough_target, negate=True, jump_aliases=jump_aliases)
+            if branch_target == fallthrough_target:
+                stmt, cost = _jump_stmt(branch_target, jump_aliases)
+                return ([stmt] if stmt else []), cost
+            first_lines, first_cost = _conditional_jump(cond, branch_target, negate=False, jump_aliases=jump_aliases)
+            second_stmt, second_cost = _jump_stmt(fallthrough_target, jump_aliases)
+            lines = list(first_lines)
+            if second_stmt is not None:
+                lines.append(second_stmt)
+            return lines, first_cost + second_cost
+        if branch_target:
+            return _conditional_jump(cond, branch_target, negate=False, jump_aliases=jump_aliases)
+        if fallthrough_target and fallthrough_target != next_id:
+            return _conditional_jump(cond, fallthrough_target, negate=True, jump_aliases=jump_aliases)
+        return [f"if ({cond}) {{ /* unresolved edge */ }}"], 0
+    successor = block.successors[0] if block.successors else None
+    if successor and successor != next_id:
+        stmt, cost = _jump_stmt(successor, jump_aliases)
+        return ([stmt] if stmt else []), cost
+    return [], 0
+
+
+def _generic_block_lines(
+    block: HIRBlock,
+    *,
+    by_id: dict[str, HIRBlock],
+    index_by_id: dict[str, int],
+    next_id: Optional[str],
+    allowed_ids: Optional[set[str]],
+    jump_aliases: Optional[dict[str, str]],
+) -> tuple[list[str], int, int]:
+    lines: list[str] = []
+    label_count = 0
+    goto_count = 0
+    stmt_indent = ""
+    if _label_needed(block, by_id, index_by_id, allowed_ids):
+        lines.append(f"{block.id}:")
+        stmt_indent = "    "
+        label_count = 1
     for stmt in block.statements:
-        lines.append(f"    {stmt}")
-    if block.terminator.get("kind") == "branch":
-        true_succ = block.branch_target or "<unresolved>"
-        false_succ = block.fallthrough_target
-        lines.append(f"    if {block.terminator['condition']}: goto {true_succ}")
-        if false_succ:
-            lines.append(f"    else: goto {false_succ}")
+        lines.append(f"{stmt_indent}{stmt}")
+    term_lines, term_gotos = _generic_terminator_lines(block, next_id, index_by_id, jump_aliases)
+    goto_count += term_gotos
+    for line in term_lines:
+        lines.append(f"{stmt_indent}{line}")
+    return lines, label_count, goto_count
+
+
+def _collect_linear_chain(
+    start_id: Optional[str],
+    *,
+    join_id: Optional[str],
+    entry_id: str,
+    by_id: dict[str, HIRBlock],
+    index_by_id: dict[str, int],
+    limit: int,
+    allowed_ids: Optional[set[str]],
+    blocked_ids: set[str],
+) -> Optional[dict[str, Any]]:
+    if start_id is None:
+        return None
+    if join_id is not None and start_id == join_id:
+        return {"ids": [], "end": "join"}
+
+    chain: list[str] = []
+    local_seen = set(blocked_ids)
+    prev_id = entry_id
+    current_id = start_id
+    join_index = index_by_id.get(join_id, 10 ** 6) if join_id is not None else 10 ** 6
+
+    while True:
+        if current_id in local_seen:
+            return None
+        block = by_id.get(current_id)
+        if block is None:
+            return None
+        if allowed_ids is not None and current_id not in allowed_ids:
+            return None
+        current_index = index_by_id.get(current_id, 10 ** 6)
+        if current_index >= limit:
+            return None
+        if join_id is not None and current_index >= join_index:
+            return None
+        if chain and current_index <= index_by_id.get(chain[-1], -1):
+            return None
+        if set(block.predecessors) != {prev_id}:
+            return None
+        if block.terminator.get("kind") == "branch":
+            return None
+
+        chain.append(current_id)
+        local_seen.add(current_id)
+
+        kind = block.terminator.get("kind")
+        if kind == "return":
+            return {"ids": chain, "end": "return"}
+        if not block.successors:
+            return {"ids": chain, "end": "exit"}
+        if len(block.successors) != 1:
+            return None
+        successor = block.successors[0]
+        if join_id is not None and successor == join_id:
+            return {"ids": chain, "end": "join"}
+        prev_id = current_id
+        current_id = successor
+
+
+def _render_linear_chain(chain_info: dict[str, Any], by_id: dict[str, HIRBlock], indent: int) -> list[str]:
+    lines: list[str] = []
+    for block_id in chain_info.get("ids", []):
+        block = by_id[block_id]
+        lines.extend(_indent(block.statements, indent))
+        if block.terminator.get("kind") == "return":
+            lines.extend(_indent([block.terminator.get("text") or "return"], indent))
     return lines
 
 
@@ -1230,27 +1540,253 @@ def _collect_switch_like(start_index: int, hir_blocks: list[HIRBlock], index_by_
     return {"blocks": chain, "join": join, "end_index": i}
 
 
+def _contiguous_span(ids: list[str], index_by_id: dict[str, int]) -> Optional[tuple[int, int]]:
+    if not ids:
+        return None
+    indices = sorted(index_by_id[block_id] for block_id in ids)
+    if indices != list(range(indices[0], indices[-1] + 1)):
+        return None
+    return indices[0], indices[-1] + 1
+
+
+def _dominance_arm(
+    before_join: list[str],
+    primary_succ: Optional[str],
+    other_succ: Optional[str],
+    dom: dict[str, set[str]],
+    index_by_id: dict[str, int],
+) -> Optional[dict[str, Any]]:
+    if primary_succ is None:
+        return None
+    ids = [
+        block_id
+        for block_id in before_join
+        if primary_succ in dom.get(block_id, set()) and not (other_succ and other_succ in dom.get(block_id, set()))
+    ]
+    span = _contiguous_span(ids, index_by_id)
+    if span is None:
+        return None
+    start, stop = span
+    return {"mode": "range", "ids": set(ids), "start": start, "stop": stop}
+
+
+def _linear_arm(
+    start_id: Optional[str],
+    *,
+    join_id: Optional[str],
+    entry_id: str,
+    by_id: dict[str, HIRBlock],
+    index_by_id: dict[str, int],
+    limit: int,
+    allowed_ids: Optional[set[str]],
+    blocked_ids: set[str],
+    allowed_endings: set[str],
+) -> Optional[dict[str, Any]]:
+    chain = _collect_linear_chain(
+        start_id,
+        join_id=join_id,
+        entry_id=entry_id,
+        by_id=by_id,
+        index_by_id=index_by_id,
+        limit=limit,
+        allowed_ids=allowed_ids,
+        blocked_ids=blocked_ids,
+    )
+    if chain is None or chain.get("end") not in allowed_endings:
+        return None
+    return {"mode": "linear", "ids": set(chain.get("ids", [])), "chain": chain, "end": chain.get("end")}
+
+
+def _render_arm(
+    arm: dict[str, Any],
+    *,
+    render_range: Any,
+    by_id: dict[str, HIRBlock],
+    indent: int,
+    jump_aliases: Optional[dict[str, str]],
+) -> list[str]:
+    if arm.get("mode") == "linear":
+        return _render_linear_chain(arm["chain"], by_id, indent)
+    return render_range(arm["start"], arm["stop"], indent, set(arm["ids"]), jump_aliases)
+
+
+def _match_branch_region(
+    *,
+    block: HIRBlock,
+    blocks: list[HIRBlock],
+    limit: int,
+    allowed_ids: Optional[set[str]],
+    visited: set[str],
+    loops: dict[str, dict[str, Any]],
+    by_id: dict[str, HIRBlock],
+    index_by_id: dict[str, int],
+    dom: dict[str, set[str]],
+    ipdom: dict[str, Optional[str]],
+) -> Optional[dict[str, Any]]:
+    if block.terminator.get("kind") != "branch" or block.id in loops:
+        return None
+
+    succ_a, succ_b = _edge_targets(block, index_by_id)
+    join_id = ipdom.get(block.id)
+    join_idx = index_by_id.get(join_id, limit) if join_id is not None else limit
+
+    def _prefer_linear(primary: Optional[dict[str, Any]], linear: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        if primary is None:
+            return None
+        if linear is not None and set(linear.get("ids", [])) == set(primary.get("ids", [])):
+            return linear
+        return primary
+
+    if join_id is not None and join_id in index_by_id and join_idx < limit:
+        before_join = [candidate.id for candidate in blocks[block.index + 1:join_idx] if allowed_ids is None or candidate.id in allowed_ids]
+        dom_arm_a = _dominance_arm(before_join, succ_a, succ_b, dom, index_by_id)
+        dom_arm_b = _dominance_arm(before_join, succ_b, succ_a, dom, index_by_id)
+        linear_arm_a = _linear_arm(
+            succ_a,
+            join_id=join_id,
+            entry_id=block.id,
+            by_id=by_id,
+            index_by_id=index_by_id,
+            limit=limit,
+            allowed_ids=allowed_ids,
+            blocked_ids=visited | {block.id},
+            allowed_endings={"join"},
+        )
+        linear_arm_b = _linear_arm(
+            succ_b,
+            join_id=join_id,
+            entry_id=block.id,
+            by_id=by_id,
+            index_by_id=index_by_id,
+            limit=limit,
+            allowed_ids=allowed_ids,
+            blocked_ids=visited | {block.id},
+            allowed_endings={"join"},
+        )
+
+        if succ_b == join_id and dom_arm_a is not None:
+            then_arm = _prefer_linear(dom_arm_a, linear_arm_a)
+            return {"kind": "if", "negate": False, "then_arm": then_arm, "else_arm": None, "resume_idx": join_idx, "consumed": set(then_arm["ids"])}
+        if succ_a == join_id and dom_arm_b is not None:
+            then_arm = _prefer_linear(dom_arm_b, linear_arm_b)
+            return {"kind": "if", "negate": True, "then_arm": then_arm, "else_arm": None, "resume_idx": join_idx, "consumed": set(then_arm["ids"])}
+        if dom_arm_a is not None and dom_arm_b is not None and dom_arm_a["ids"].isdisjoint(dom_arm_b["ids"]):
+            then_arm = _prefer_linear(dom_arm_a, linear_arm_a)
+            else_arm = _prefer_linear(dom_arm_b, linear_arm_b)
+            return {
+                "kind": "if_else",
+                "negate": False,
+                "then_arm": then_arm,
+                "else_arm": else_arm,
+                "resume_idx": join_idx,
+                "consumed": set(then_arm["ids"]) | set(else_arm["ids"]),
+            }
+
+        if linear_arm_a is not None and linear_arm_b is not None:
+            ids_a = set(linear_arm_a["ids"])
+            ids_b = set(linear_arm_b["ids"])
+            if not ids_a.isdisjoint(ids_b):
+                return None
+            if ids_a and not ids_b:
+                return {"kind": "if", "negate": False, "then_arm": linear_arm_a, "else_arm": None, "resume_idx": join_idx, "consumed": ids_a}
+            if ids_b and not ids_a:
+                return {"kind": "if", "negate": True, "then_arm": linear_arm_b, "else_arm": None, "resume_idx": join_idx, "consumed": ids_b}
+            if ids_a and ids_b:
+                return {
+                    "kind": "if_else",
+                    "negate": False,
+                    "then_arm": linear_arm_a,
+                    "else_arm": linear_arm_b,
+                    "resume_idx": join_idx,
+                    "consumed": ids_a | ids_b,
+                }
+
+    next_id = _next_allowed_block_id(blocks, block.index, limit, allowed_ids)
+    next_idx = index_by_id.get(next_id, limit) if next_id is not None else limit
+    return_arm_a = _linear_arm(
+        succ_a,
+        join_id=None,
+        entry_id=block.id,
+        by_id=by_id,
+        index_by_id=index_by_id,
+        limit=limit,
+        allowed_ids=allowed_ids,
+        blocked_ids=visited | {block.id},
+        allowed_endings={"return", "exit"},
+    )
+    return_arm_b = _linear_arm(
+        succ_b,
+        join_id=None,
+        entry_id=block.id,
+        by_id=by_id,
+        index_by_id=index_by_id,
+        limit=limit,
+        allowed_ids=allowed_ids,
+        blocked_ids=visited | {block.id},
+        allowed_endings={"return", "exit"},
+    )
+    if succ_b == next_id and return_arm_a is not None and return_arm_a["ids"]:
+        return {"kind": "if", "negate": False, "then_arm": return_arm_a, "else_arm": None, "resume_idx": next_idx, "consumed": set(return_arm_a["ids"])}
+    if succ_a == next_id and return_arm_b is not None and return_arm_b["ids"]:
+        return {"kind": "if", "negate": True, "then_arm": return_arm_b, "else_arm": None, "resume_idx": next_idx, "consumed": set(return_arm_b["ids"])}
+    return None
+
+
+def _render_branch_region(
+    block: HIRBlock,
+    region: dict[str, Any],
+    *,
+    render_range: Any,
+    by_id: dict[str, HIRBlock],
+    constructs: Counter[str],
+    visited: set[str],
+    indent: int,
+    jump_aliases: Optional[dict[str, str]],
+) -> list[str]:
+    constructs[region["kind"]] += 1
+    visited.add(block.id)
+    cond = block.terminator.get("condition") or f"cond_{block.id}"
+    if region.get("negate"):
+        cond = f"!({cond})"
+
+    lines = _indent(block.statements, indent)
+    lines.extend(_indent([f"if ({cond}) {{"], indent))
+    lines.extend(_render_arm(region["then_arm"], render_range=render_range, by_id=by_id, indent=indent + 1, jump_aliases=jump_aliases))
+    if region["kind"] == "if_else" and region.get("else_arm") is not None:
+        lines.extend(_indent(["} else {"], indent))
+        lines.extend(_render_arm(region["else_arm"], render_range=render_range, by_id=by_id, indent=indent + 1, jump_aliases=jump_aliases))
+    lines.extend(_indent(["}"], indent))
+    visited.update(region["consumed"])
+    return lines
+
+
 def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
     if not blocks:
-        return "", {"constructs": {}, "fallback_block_count": 0}
+        return "", {"constructs": {}, "fallback_block_count": 0, "residual_label_count": 0, "residual_goto_count": 0}
 
-    by_id, index_by_id, succs, _ = _block_maps(blocks)
+    by_id, index_by_id, _, _ = _block_maps(blocks)
     dom = _compute_dominators(blocks)
     postdom = _compute_postdominators(blocks)
     ipdom = {block.id: _immediate_postdom(block.id, postdom, index_by_id) for block in blocks}
     loops = _natural_loops(blocks, dom)
     constructs: Counter[str] = Counter()
     visited: set[str] = set()
-    fallback_blocks = 0
+    residual_labels = 0
+    residual_gotos = 0
+    switches = {
+        idx: info
+        for idx in range(len(blocks))
+        if (info := _collect_switch_like(idx, blocks, index_by_id, ipdom)) is not None
+    }
 
-    switches: dict[int, dict[str, Any]] = {}
-    for idx in range(len(blocks)):
-        info = _collect_switch_like(idx, blocks, index_by_id, ipdom)
-        if info:
-            switches[idx] = info
-
-    def render_range(start_idx: int, stop_idx: Optional[int], indent: int, allowed_ids: Optional[set[str]] = None) -> list[str]:
-        nonlocal fallback_blocks
+    def render_range(
+        start_idx: int,
+        stop_idx: Optional[int],
+        indent: int,
+        allowed_ids: Optional[set[str]] = None,
+        jump_aliases: Optional[dict[str, str]] = None,
+    ) -> list[str]:
+        nonlocal residual_labels, residual_gotos
         lines: list[str] = []
         limit = stop_idx if stop_idx is not None else len(blocks)
         i = start_idx
@@ -1267,21 +1803,22 @@ def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
             if loop and loop.get("safe") and loop["index_range"][1] < limit and (allowed_ids is None or set(loop["nodes"]).issubset(allowed_ids | {block.id})):
                 constructs["while"] += 1
                 visited.add(block.id)
-                header_lines = [line for line in block.statements]
+                header_lines = list(block.statements)
                 cond = block.terminator.get("condition") or f"cond_{block.id}"
                 body_ids = set(loop["nodes"]) - {block.id}
-                body_start = index_by_id.get(loop["body_succ"], i + 1) if loop.get("body_succ") else i + 1
+                body_start = index_by_id.get(loop.get("body_succ"), i + 1)
                 body_end = loop["index_range"][1] + 1
                 if header_lines:
                     lines.extend(_indent(["while (true) {"], indent))
                     lines.extend(_indent(header_lines, indent + 1))
                     lines.extend(_indent([f"if (!({cond})) break"], indent + 1))
-                    lines.extend(render_range(body_start, body_end, indent + 1, body_ids))
-                    lines.extend(_indent(["}"], indent))
                 else:
                     lines.extend(_indent([f"while ({cond}) {{"], indent))
-                    lines.extend(render_range(body_start, body_end, indent + 1, body_ids))
-                    lines.extend(_indent(["}"], indent))
+                loop_aliases = dict(jump_aliases or {})
+                loop_aliases[loop["header"]] = "continue"
+                loop_aliases[loop["exit_succ"]] = "break"
+                lines.extend(render_range(body_start, body_end, indent + 1, body_ids, loop_aliases))
+                lines.extend(_indent(["}"], indent))
                 visited.update(body_ids)
                 i = loop["index_range"][1] + 1
                 continue
@@ -1296,7 +1833,7 @@ def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
                     lines.extend(_indent([f"when ({case_block.terminator.get('condition')}) -> {case_target or '<unresolved>'} {{"], indent + 1))
                     if case_target in by_id and case_target not in visited:
                         target_block = by_id[case_target]
-                        case_lines = [line for line in target_block.statements]
+                        case_lines = list(target_block.statements)
                         if target_block.terminator.get("kind") == "return":
                             case_lines.append(target_block.terminator["text"])
                             visited.add(case_target)
@@ -1306,54 +1843,47 @@ def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
                 i = switch_info["end_index"]
                 continue
 
-            join = ipdom.get(block.id)
-            succ_a, succ_b = _edge_targets(block, index_by_id)
-            if block.terminator.get("kind") == "branch" and join and join in index_by_id and index_by_id[join] < limit and block.id not in loops:
-                join_idx = index_by_id[join]
-                before_join = [candidate.id for candidate in blocks[i + 1:join_idx] if allowed_ids is None or candidate.id in allowed_ids]
-                arm_a = [bid for bid in before_join if succ_a and succ_a in dom.get(bid, set()) and not (succ_b and succ_b in dom.get(bid, set()))]
-                arm_b = [bid for bid in before_join if succ_b and succ_b in dom.get(bid, set()) and not (succ_a and succ_a in dom.get(bid, set()))]
-                arm_a_idx = [index_by_id[bid] for bid in arm_a]
-                arm_b_idx = [index_by_id[bid] for bid in arm_b]
-                arm_a_contig = not arm_a_idx or arm_a_idx == list(range(min(arm_a_idx), max(arm_a_idx) + 1))
-                arm_b_contig = not arm_b_idx or arm_b_idx == list(range(min(arm_b_idx), max(arm_b_idx) + 1))
-                if succ_b == join and arm_a and arm_a_contig:
-                    constructs["if"] += 1
-                    visited.add(block.id)
-                    lines.extend(_indent(block.statements, indent))
-                    lines.extend(_indent([f"if ({block.terminator['condition']}) {{"], indent))
-                    lines.extend(render_range(min(arm_a_idx), max(arm_a_idx) + 1, indent + 1, set(arm_a)))
-                    lines.extend(_indent(["}"], indent))
-                    visited.update(arm_a)
-                    i = join_idx
-                    continue
-                if succ_a == join and arm_b and arm_b_contig:
-                    constructs["if"] += 1
-                    visited.add(block.id)
-                    lines.extend(_indent(block.statements, indent))
-                    lines.extend(_indent([f"if (!({block.terminator['condition']})) {{"], indent))
-                    lines.extend(render_range(min(arm_b_idx), max(arm_b_idx) + 1, indent + 1, set(arm_b)))
-                    lines.extend(_indent(["}"], indent))
-                    visited.update(arm_b)
-                    i = join_idx
-                    continue
-                if arm_a and arm_b and arm_a_contig and arm_b_contig and set(arm_a).isdisjoint(arm_b):
-                    constructs["if_else"] += 1
-                    visited.add(block.id)
-                    lines.extend(_indent(block.statements, indent))
-                    lines.extend(_indent([f"if ({block.terminator['condition']}) {{"], indent))
-                    lines.extend(render_range(min(arm_a_idx), max(arm_a_idx) + 1, indent + 1, set(arm_a)))
-                    lines.extend(_indent(["} else {"], indent))
-                    lines.extend(render_range(min(arm_b_idx), max(arm_b_idx) + 1, indent + 1, set(arm_b)))
-                    lines.extend(_indent(["}"], indent))
-                    visited.update(arm_a)
-                    visited.update(arm_b)
-                    i = join_idx
-                    continue
+            next_id = _next_allowed_block_id(blocks, i, limit, allowed_ids)
+            region = _match_branch_region(
+                block=block,
+                blocks=blocks,
+                limit=limit,
+                allowed_ids=allowed_ids,
+                visited=visited,
+                loops=loops,
+                by_id=by_id,
+                index_by_id=index_by_id,
+                dom=dom,
+                ipdom=ipdom,
+            )
+            if region is not None:
+                lines.extend(
+                    _render_branch_region(
+                        block,
+                        region,
+                        render_range=render_range,
+                        by_id=by_id,
+                        constructs=constructs,
+                        visited=visited,
+                        indent=indent,
+                        jump_aliases=jump_aliases,
+                    )
+                )
+                i = region["resume_idx"]
+                continue
 
             visited.add(block.id)
-            fallback_blocks += 1
-            lines.extend(_indent(_fallback_block_lines(block, index_by_id), indent))
+            block_lines, label_count, goto_count = _generic_block_lines(
+                block,
+                by_id=by_id,
+                index_by_id=index_by_id,
+                next_id=next_id,
+                allowed_ids=allowed_ids,
+                jump_aliases=jump_aliases,
+            )
+            residual_labels += label_count
+            residual_gotos += goto_count
+            lines.extend(_indent(block_lines, indent))
             i += 1
         return lines
 
@@ -1361,7 +1891,9 @@ def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
     text = "\n".join(body_lines)
     meta = {
         "constructs": dict(constructs),
-        "fallback_block_count": fallback_blocks,
+        "fallback_block_count": 0,
+        "residual_label_count": residual_labels,
+        "residual_goto_count": residual_gotos,
         "loop_header_count": sum(1 for loop in loops.values() if loop.get("safe")),
     }
     return text, meta
@@ -1382,6 +1914,8 @@ def _function_summary(canonical: list[CanonicalInstruction], values: list[Datafl
         "return_count": canonical_hist.get("return", 0),
         "constructs": structured_meta.get("constructs", {}),
         "fallback_block_count": structured_meta.get("fallback_block_count", 0),
+        "residual_label_count": structured_meta.get("residual_label_count", 0),
+        "residual_goto_count": structured_meta.get("residual_goto_count", 0),
         "cfg_anomaly_count": len(cfg.get("anomalies", [])),
         "unresolved_branch_count": int(cfg.get("stats", {}).get("unresolved_targets", 0)),
         "mean_confidence": (sum(inst.confidence for inst in canonical) / len(canonical)) if canonical else 0.0,
@@ -1424,6 +1958,7 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
     _build_instruction_control(canonical, hir_nodes)
     canonical_blocks, canonical_cfg = _compute_canonical_blocks(canonical)
     hir_blocks, values, dataflow_metrics = build_hir_blocks(canonical_blocks, canonical_cfg, canonical, entry_seed=entry_seed)
+    hir_blocks = _normalize_hir_blocks(hir_blocks)
     hir_text_body, structured_meta = _render_structured(hir_blocks)
     structured_meta = dict(structured_meta)
     if prologue_meta is not None:
@@ -1465,6 +2000,8 @@ def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
         "total_macro_lowered": sum(fn.summary["macro_lowered_count"] for fn in functions),
         "total_placeholders": sum(fn.summary.get("placeholder_count", 0) for fn in functions),
         "total_phi": sum(fn.summary.get("phi_count", 0) for fn in functions),
+        "total_residual_labels": sum(fn.summary.get("residual_label_count", 0) for fn in functions),
+        "total_residual_gotos": sum(fn.summary.get("residual_goto_count", 0) for fn in functions),
         "construct_histogram": dict(constructs),
     }
 
@@ -1488,7 +2025,10 @@ def build_module_hir(path: str | Path, include_canonical: bool = True, include_t
                 "CFG is rebuilt after canonical lowering, not reused from pre-lowered IR nodes",
                 "macro signatures are lowered conservatively to avoid inventing false returns",
                 "branch predicates are rendered as cond[opcode](value) to avoid inventing exact VM truth semantics",
-                "structuring is conservative and falls back to labeled CFG blocks when a safe reconstruction is unavailable",
+                "when source-like reconstruction is unsafe, HIR keeps explicit labels and gotos instead of opaque fallback blocks",
+                "linear single-entry branch arms are collapsed into inline if/if-else bodies before falling back to label/goto rendering",
+                "single-arm return chains are lifted into guard-style if bodies when the other branch is the natural fallthrough",
+                "inside normalized while-regions, jumps to the loop header/exit are rendered as continue/break where safe",
             ],
         },
         "path": str(path),
@@ -1515,6 +2055,8 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     macro_lowered = 0
     placeholders = 0
     phi_total = 0
+    residual_labels = 0
+    residual_gotos = 0
     heaviest_functions: list[dict[str, Any]] = []
 
     for module in module_payloads:
@@ -1527,6 +2069,8 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
         macro_lowered += int(summary.get("total_macro_lowered", 0))
         placeholders += int(summary.get("total_placeholders", 0))
         phi_total += int(summary.get("total_phi", 0))
+        residual_labels += int(summary.get("total_residual_labels", 0))
+        residual_gotos += int(summary.get("total_residual_gotos", 0))
         for fn in module.get("functions", []):
             fn_summary = fn.get("summary", {})
             heaviest_functions.append(
@@ -1552,6 +2096,8 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             "total_macro_lowered": macro_lowered,
             "total_placeholders": placeholders,
             "total_phi": phi_total,
+            "total_residual_labels": residual_labels,
+            "total_residual_gotos": residual_gotos,
             "construct_histogram": dict(construct_hist),
         },
         "heaviest_functions": heaviest_functions[:32],
