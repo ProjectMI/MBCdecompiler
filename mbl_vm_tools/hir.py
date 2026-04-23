@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+import time
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -10,7 +12,62 @@ from mbl_vm_tools.IR import IRFunction, IRNode, build_function_ir
 from mbl_vm_tools.parser import MBCModule
 
 
-HIR_CONTRACT_VERSION = "hir-v5"
+HIR_CONTRACT_VERSION = "hir-v10"
+
+
+def _coerce_hir_block(payload: dict[str, Any]) -> "HIRBlock":
+    return HIRBlock(
+        id=payload.get("id", ""),
+        index=int(payload.get("index", 0)),
+        start_offset=int(payload.get("start_offset", 0)),
+        end_offset=int(payload.get("end_offset", 0)),
+        instruction_indices=list(payload.get("instruction_indices", [])),
+        entry_stack=list(payload.get("entry_stack", [])),
+        exit_stack=list(payload.get("exit_stack", [])),
+        phi_bindings=list(payload.get("phi_bindings", [])),
+        block_params=list(payload.get("block_params", [])),
+        incoming_args={str(key): list(value) for key, value in dict(payload.get("incoming_args", {})).items()},
+        statements=list(payload.get("statements", [])),
+        terminator=dict(payload.get("terminator", {})),
+        branch_target=payload.get("branch_target"),
+        fallthrough_target=payload.get("fallthrough_target"),
+        successors=list(payload.get("successors", [])),
+        predecessors=list(payload.get("predecessors", [])),
+        flags=list(payload.get("flags", [])),
+    )
+
+
+def render_function_hir_text_from_payload(function_payload: dict[str, Any]) -> str:
+    hir_text = function_payload.get("hir_text") or function_payload.get("surface_hir", {}).get("hir_text") or ""
+    if hir_text:
+        return str(hir_text).rstrip()
+
+    surface = function_payload.get("surface_hir", {})
+    raw_blocks = surface.get("hir_blocks") or []
+    if not raw_blocks:
+        return ""
+
+    blocks = [_coerce_hir_block(raw) for raw in raw_blocks]
+    _, body, _ = _analyze_structured_surface(blocks, emit_text=True, emit_tree=False)
+    entry_args = blocks[0].entry_stack if blocks else []
+    name = str(function_payload.get("name") or "<function>")
+    header = f"function {name}({', '.join(entry_args)}) {{" if entry_args else f"function {name}() {{"
+    if body:
+        return "\n".join([header, body, "}"]).rstrip()
+    return "\n".join([header, "", "}"]).rstrip()
+
+
+def render_module_hir_text_from_payload(module_payload: dict[str, Any]) -> str:
+    lines: list[str] = []
+    lines.append(f"// {module_payload['script_name']}")
+    lines.append(f"// contract: {module_payload['contract']['version']}")
+    lines.append("")
+    for fn in module_payload.get("functions", []):
+        hir_text = render_function_hir_text_from_payload(fn)
+        if hir_text:
+            lines.append(hir_text)
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 @dataclass
@@ -61,6 +118,8 @@ class HIRBlock:
     entry_stack: list[str]
     exit_stack: list[str]
     phi_bindings: list[str]
+    block_params: list[str]
+    incoming_args: dict[str, list[str]]
     statements: list[str]
     terminator: dict[str, Any]
     branch_target: Optional[str]
@@ -81,10 +140,12 @@ class HIRFunction:
     summary: dict[str, Any]
     cfg: dict[str, Any]
     canonical_instructions: list[CanonicalInstruction]
-    dataflow_values: list[DataflowValue]
-    hir_blocks: list[HIRBlock]
+    core_dataflow_values: list[DataflowValue]
+    core_hir_blocks: list[HIRBlock]
+    surface_hir_blocks: list[HIRBlock]
     structured_hir: dict[str, Any]
     hir_text: str
+    report: dict[str, Any]
     body_selection: dict[str, Any]
 
     def to_dict(self, include_canonical: bool = True, include_text: bool = True) -> dict[str, Any]:
@@ -94,14 +155,21 @@ class HIRFunction:
             "slice_mode": self.slice_mode,
             "summary": self.summary,
             "cfg": self.cfg,
-            "dataflow_values": [value.to_dict() for value in self.dataflow_values],
-            "hir_blocks": [block.to_dict() for block in self.hir_blocks],
-            "structured_hir": self.structured_hir,
             "body_selection": self.body_selection,
+            "core_hir": {
+                "dataflow_values": [value.to_dict() for value in self.core_dataflow_values],
+                "hir_blocks": [block.to_dict() for block in self.core_hir_blocks],
+            },
+            "surface_hir": {
+                "hir_blocks": [block.to_dict() for block in self.surface_hir_blocks],
+                "structured_hir": self.structured_hir,
+            },
+            "report": self.report,
         }
         if include_canonical:
             payload["canonical_instructions"] = [inst.to_dict() for inst in self.canonical_instructions]
         if include_text:
+            payload["surface_hir"]["hir_text"] = self.hir_text
             payload["hir_text"] = self.hir_text
         return payload
 
@@ -125,6 +193,30 @@ def _ordered_unique(items: list[str]) -> list[str]:
 
 def _is_placeholder_value(name: str) -> bool:
     return isinstance(name, str) and name.startswith(("in_", "undef_"))
+
+
+_TEMP_LIKE_RE = re.compile(r"\b(?:t\d+|phi_[A-Za-z0-9_]+|m_[A-Za-z0-9_]+|arg\d+|in_[A-Za-z0-9_]+|undef_[A-Za-z0-9_]+)\b")
+_ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+
+
+def _replace_vars(text: Optional[str], mapping: dict[str, str]) -> Optional[str]:
+    updated = text
+    for old_name, new_name in mapping.items():
+        updated = _replace_var(updated, old_name, new_name)
+    return updated
+
+
+def _iter_temp_like_refs(text: Optional[str]) -> list[str]:
+    if not text:
+        return []
+    return _TEMP_LIKE_RE.findall(text)
+
+
+def _match_assignment(stmt: str) -> Optional[tuple[str, str]]:
+    match = _ASSIGNMENT_RE.match(stmt)
+    if match is None:
+        return None
+    return match.group(1), match.group(2)
 
 
 # --- canonical lowering ---------------------------------------------------
@@ -973,9 +1065,15 @@ def build_hir_blocks(
                     if _is_placeholder_value(source):
                         placeholder_count += 1
 
+        param_positions = [pos for pos, name in enumerate(entry_stack) if name in phi_defs.get(block_id, {})]
+        block_params = [entry_stack[pos] for pos in param_positions]
+        incoming_args_map = {
+            pred_id: [stack[pos] if pos < len(stack) else f"in_{block_id}_{pos}" for pos in param_positions]
+            for pred_id, stack in incoming.get(block_id, {}).items()
+        }
+
         statements: list[str] = []
         terminator: dict[str, Any] = {"kind": "fallthrough", "text": None, "condition": None}
-        statements.extend(phi_bindings)
 
         for inst_index in block["instruction_indices"]:
             inst = instructions[inst_index]
@@ -1052,6 +1150,8 @@ def build_hir_blocks(
                 entry_stack=list(entry_stack),
                 exit_stack=list(exit_stack),
                 phi_bindings=phi_bindings,
+                block_params=block_params,
+                incoming_args=incoming_args_map,
                 statements=statements,
                 terminator=terminator,
                 branch_target=edge_kinds[block_id].get("branch"),
@@ -1073,6 +1173,202 @@ def build_hir_blocks(
     return hir_blocks, dataflow_values, metrics
 
 
+def _replace_var(text: Optional[str], name: str, replacement: str) -> Optional[str]:
+    if text is None or name not in text:
+        return text
+    pattern = rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])"
+    return re.sub(pattern, replacement, text)
+
+
+def _substitute_block_values(block: HIRBlock, mapping: dict[str, str], *, replace_block_params: bool = False) -> HIRBlock:
+    incoming_args = {
+        pred: [_replace_vars(arg, mapping) or arg for arg in args]
+        for pred, args in block.incoming_args.items()
+    }
+    statements = [_replace_vars(stmt, mapping) or stmt for stmt in block.statements]
+    terminator = dict(block.terminator)
+    terminator["text"] = _replace_vars(terminator.get("text"), mapping)
+    terminator["condition"] = _replace_vars(terminator.get("condition"), mapping)
+    updates: dict[str, Any] = {
+        "entry_stack": [_replace_vars(item, mapping) or item for item in block.entry_stack],
+        "exit_stack": [_replace_vars(item, mapping) or item for item in block.exit_stack],
+        "phi_bindings": [_replace_vars(item, mapping) or item for item in block.phi_bindings],
+        "incoming_args": incoming_args,
+        "statements": statements,
+        "terminator": terminator,
+    }
+    if replace_block_params:
+        updates["block_params"] = [mapping.get(item, item) for item in block.block_params]
+    return _clone_block(block, **updates)
+
+
+def _substitute_blocks(hir_blocks: list[HIRBlock], mapping: dict[str, str], *, replace_block_params: bool = False) -> list[HIRBlock]:
+    if not mapping:
+        return list(hir_blocks)
+    return [_substitute_block_values(block, mapping, replace_block_params=replace_block_params) for block in hir_blocks]
+
+
+def _find_assignment_expr(hir_blocks: list[HIRBlock], name: str) -> Optional[str]:
+    prefix = f"{name} = "
+    for block in hir_blocks:
+        for stmt in block.statements:
+            if stmt.startswith(prefix):
+                return stmt[len(prefix):]
+    return None
+
+
+def _drop_assignment_statement(block: HIRBlock, name: str) -> HIRBlock:
+    prefix = f"{name} = "
+    kept = [stmt for stmt in block.statements if not stmt.startswith(prefix)]
+    if len(kept) == len(block.statements):
+        return block
+    return _clone_block(block, statements=kept)
+
+
+def _substitute_text_map(text: Optional[str], mapping: dict[str, str]) -> Optional[str]:
+    if text is None or not mapping:
+        return text
+    refs = _iter_temp_like_refs(text)
+    if not refs:
+        return text
+    seen = set(refs)
+    if not any(ref in mapping for ref in seen):
+        return text
+    return _TEMP_LIKE_RE.sub(lambda match: mapping.get(match.group(0), match.group(0)), text)
+
+
+def _expand_inline_expr(name: str, inline_candidates: dict[str, str], *, max_len: int = 96, cache: Optional[dict[str, str]] = None, active: Optional[set[str]] = None) -> Optional[str]:
+    if cache is None:
+        cache = {}
+    if active is None:
+        active = set()
+    if name in cache:
+        return cache[name]
+    expr = inline_candidates.get(name)
+    if expr is None:
+        return None
+    if len(expr) > max_len or name in expr:
+        return None
+    if name in active:
+        return None
+    active.add(name)
+    mapping: dict[str, str] = {}
+    for ref in _ordered_unique(_iter_temp_like_refs(expr)):
+        if ref == name or ref not in inline_candidates:
+            continue
+        replacement = _expand_inline_expr(ref, inline_candidates, max_len=max_len, cache=cache, active=active)
+        if replacement is None:
+            continue
+        candidate = _replace_var(expr, ref, replacement)
+        if candidate is None or len(candidate) > max_len:
+            continue
+        expr = candidate
+        mapping[ref] = replacement
+    active.remove(name)
+    if len(expr) > max_len or name in expr:
+        return None
+    cache[name] = expr
+    return expr
+
+
+def _collect_surface_assignments(blocks: list[HIRBlock]) -> tuple[dict[str, str], dict[str, str]]:
+    expr_by_name: dict[str, str] = {}
+    owner_by_name: dict[str, str] = {}
+    for block in blocks:
+        for stmt in block.statements:
+            matched = _match_assignment(stmt)
+            if matched is None:
+                continue
+            name, expr = matched
+            if name in expr_by_name:
+                continue
+            expr_by_name[name] = expr
+            owner_by_name[name] = block.id
+    return expr_by_name, owner_by_name
+
+
+def _cleanup_surface_hir(
+    hir_blocks: list[HIRBlock],
+    canonical: list[CanonicalInstruction],
+    values: list[DataflowValue],
+) -> tuple[list[HIRBlock], list[DataflowValue], dict[str, int]]:
+    producer_semantic: dict[str, str] = {}
+    for inst in canonical:
+        for out in inst.outputs:
+            producer_semantic[out] = inst.semantic_op
+
+    def is_inlinable(value: DataflowValue, current_expr: Optional[str]) -> bool:
+        if not value.name.startswith("t"):
+            return False
+        if value.use_count != 1:
+            return False
+        if current_expr is None or current_expr == value.name or value.name in current_expr:
+            return False
+        semantic = producer_semantic.get(value.name)
+        if semantic not in {"const", "load", "read_field", "make_record", "aggregate", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate"}:
+            return False
+        if len(current_expr) > 96:
+            return False
+        return True
+
+    blocks = list(hir_blocks)
+    expr_by_name, _ = _collect_surface_assignments(blocks)
+    inline_candidates = {
+        value.name: expr_by_name[value.name]
+        for value in sorted(values, key=lambda item: (item.producer_instruction < 0, item.producer_instruction, item.name))
+        if value.name in expr_by_name and is_inlinable(value, expr_by_name[value.name])
+    }
+    expanded_cache: dict[str, str] = {}
+    inline_map = {
+        name: expanded
+        for name in inline_candidates
+        if (expanded := _expand_inline_expr(name, inline_candidates, cache=expanded_cache)) is not None
+    }
+    if not inline_map:
+        return blocks, values, {"inlined_value_count": 0, "removed_assignment_count": 0}
+
+    inlined_count = 0
+    removed_assignments = 0
+    cleaned: list[HIRBlock] = []
+    for block in blocks:
+        statements: list[str] = []
+        dropped = 0
+        for stmt in block.statements:
+            matched = _match_assignment(stmt)
+            if matched is not None and matched[0] in inline_map:
+                dropped += 1
+                continue
+            statements.append(_substitute_text_map(stmt, inline_map) or stmt)
+        if dropped:
+            removed_assignments += dropped
+        incoming_args = {
+            pred: [_substitute_text_map(arg, inline_map) or arg for arg in args]
+            for pred, args in block.incoming_args.items()
+        }
+        terminator = dict(block.terminator)
+        terminator["text"] = _substitute_text_map(terminator.get("text"), inline_map)
+        terminator["condition"] = _substitute_text_map(terminator.get("condition"), inline_map)
+        cleaned.append(
+            _clone_block(
+                block,
+                entry_stack=[_substitute_text_map(item, inline_map) or item for item in block.entry_stack],
+                exit_stack=[_substitute_text_map(item, inline_map) or item for item in block.exit_stack],
+                phi_bindings=[_substitute_text_map(item, inline_map) or item for item in block.phi_bindings],
+                incoming_args=incoming_args,
+                statements=statements,
+                terminator=terminator,
+            )
+        )
+
+    blocks = cleaned
+    inlined_count = len(inline_map)
+
+    debug = {"inlined_value_count": inlined_count, "removed_assignment_count": removed_assignments}
+    return blocks, values, debug
+
+
+
+
 # --- structuring ----------------------------------------------------------
 
 
@@ -1086,6 +1382,8 @@ def _clone_block(block: HIRBlock, **updates: Any) -> HIRBlock:
         "entry_stack": list(block.entry_stack),
         "exit_stack": list(block.exit_stack),
         "phi_bindings": list(block.phi_bindings),
+        "block_params": list(block.block_params),
+        "incoming_args": {pred: list(args) for pred, args in block.incoming_args.items()},
         "statements": list(block.statements),
         "terminator": dict(block.terminator),
         "branch_target": block.branch_target,
@@ -1116,18 +1414,154 @@ def _sanitize_hir_blocks(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
     def _clean_edge_list(items: list[str]) -> list[str]:
         return [item for item in _ordered_unique(items) if item in valid_ids]
 
+    cleaned = [
+        _clone_block(
+            block,
+            branch_target=block.branch_target if block.branch_target in valid_ids else None,
+            fallthrough_target=block.fallthrough_target if block.fallthrough_target in valid_ids else None,
+            successors=_clean_edge_list(list(block.successors)),
+            predecessors=[],
+        )
+        for block in hir_blocks
+    ]
+    predecessor_map: dict[str, list[str]] = defaultdict(list)
+    for block in cleaned:
+        for succ in block.successors:
+            predecessor_map[succ].append(block.id)
     return _reindex_hir_blocks(
         [
-            _clone_block(
-                block,
-                branch_target=block.branch_target if block.branch_target in valid_ids else None,
-                fallthrough_target=block.fallthrough_target if block.fallthrough_target in valid_ids else None,
-                successors=_clean_edge_list(list(block.successors)),
-                predecessors=_clean_edge_list(list(block.predecessors)),
-            )
-            for block in hir_blocks
+            _clone_block(block, predecessors=_ordered_unique(predecessor_map.get(block.id, [])))
+            for block in cleaned
         ]
     )
+
+
+def _collect_hir_defs(blocks: list[HIRBlock]) -> set[str]:
+    defs: set[str] = set()
+    if blocks:
+        defs.update(item for item in blocks[0].entry_stack if isinstance(item, str) and item.startswith("arg"))
+    for block in blocks:
+        defs.update(item for item in block.block_params if isinstance(item, str))
+        for binding in block.phi_bindings:
+            matched = _match_assignment(binding)
+            if matched is not None:
+                defs.add(matched[0])
+        for stmt in block.statements:
+            matched = _match_assignment(stmt)
+            if matched is not None:
+                defs.add(matched[0])
+    return defs
+
+
+def validate_hir_blocks(blocks: list[HIRBlock], values: list[DataflowValue], stage: str) -> dict[str, Any]:
+    valid_ids = {block.id for block in blocks}
+    _, _, succs, preds = _block_maps(blocks) if blocks else ({}, {}, {}, {})
+    known_defs = _collect_hir_defs(blocks)
+    value_names = {value.name for value in values}
+    known_defs.update(name for name in value_names if name.startswith(("arg", "phi_", "m_", "t")))
+    errors: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+
+    def push(kind: str, block_id: Optional[str], detail: str) -> None:
+        counts[kind] += 1
+        if len(errors) < 16:
+            item = {"kind": kind, "detail": detail}
+            if block_id is not None:
+                item["block_id"] = block_id
+            errors.append(item)
+
+    seen_ids: set[str] = set()
+    for expected_index, block in enumerate(blocks):
+        if block.id in seen_ids:
+            push("duplicate_block_id", block.id, f"duplicate block id {block.id}")
+        seen_ids.add(block.id)
+        if block.index != expected_index:
+            push("non_contiguous_index", block.id, f"expected index {expected_index}, got {block.index}")
+        if block.branch_target is not None and block.branch_target not in valid_ids:
+            push("dangling_branch_target", block.id, f"unknown branch target {block.branch_target}")
+        if block.fallthrough_target is not None and block.fallthrough_target not in valid_ids:
+            push("dangling_fallthrough_target", block.id, f"unknown fallthrough target {block.fallthrough_target}")
+        for succ in block.successors:
+            if succ not in valid_ids:
+                push("dangling_successor", block.id, f"unknown successor {succ}")
+                continue
+            if block.id not in preds.get(succ, []):
+                push("cfg_asymmetry", block.id, f"{succ} missing predecessor {block.id}")
+        for pred in block.predecessors:
+            if pred not in valid_ids:
+                push("dangling_predecessor", block.id, f"unknown predecessor {pred}")
+                continue
+            if block.id not in succs.get(pred, []):
+                push("cfg_asymmetry", block.id, f"{pred} missing successor {block.id}")
+        if set(block.incoming_args.keys()) - set(block.predecessors):
+            extra = sorted(set(block.incoming_args.keys()) - set(block.predecessors))
+            push("incoming_without_pred", block.id, f"incoming args for non-predecessors: {extra}")
+        if block.block_params:
+            missing = [pred for pred in block.predecessors if pred not in block.incoming_args]
+            if missing:
+                push("missing_incoming_args", block.id, f"missing incoming args for predecessors: {missing}")
+        for pred, args in block.incoming_args.items():
+            if len(args) != len(block.block_params):
+                push("incoming_arity_mismatch", block.id, f"{pred} arity {len(args)} != params {len(block.block_params)}")
+
+    def check_text_refs(block: HIRBlock, text: Optional[str], *, label: str, strip_lhs: bool = False) -> None:
+        if not text:
+            return
+        source = text
+        if strip_lhs:
+            matched = _match_assignment(text)
+            if matched is not None:
+                source = matched[1]
+        for ref in _iter_temp_like_refs(source):
+            if ref in known_defs:
+                continue
+            if ref.startswith(("arg", "in_", "undef_")):
+                continue
+            push("dangling_ref", block.id, f"{label} references undefined {ref}")
+
+    for block in blocks:
+        for item in block.entry_stack:
+            check_text_refs(block, item, label="entry_stack")
+        for item in block.exit_stack:
+            check_text_refs(block, item, label="exit_stack")
+        for item in block.phi_bindings:
+            check_text_refs(block, item, label="phi_binding", strip_lhs=True)
+        for pred, args in block.incoming_args.items():
+            for arg in args:
+                check_text_refs(block, arg, label=f"incoming[{pred}]")
+        for stmt in block.statements:
+            check_text_refs(block, stmt, label="statement", strip_lhs=True)
+        check_text_refs(block, block.terminator.get("text"), label="terminator")
+        check_text_refs(block, block.terminator.get("condition"), label="condition")
+
+    return {
+        "stage": stage,
+        "ok": not errors,
+        "error_count": sum(counts.values()),
+        "kind_histogram": dict(counts),
+        "samples": errors,
+    }
+
+
+def _compose_forwarded_incoming_args(block: HIRBlock, succ: HIRBlock) -> Optional[dict[str, list[str]]]:
+    forwarded_args = list(succ.incoming_args.get(block.id, []))
+    param_names = list(block.block_params)
+    incoming = {pred: list(args) for pred, args in succ.incoming_args.items() if pred != block.id}
+    for pred_id in block.predecessors:
+        if pred_id == succ.id or pred_id in incoming:
+            return None
+        pred_args = list(block.incoming_args.get(pred_id, []))
+        if param_names and len(pred_args) != len(param_names):
+            return None
+        composed: list[str] = []
+        for arg in forwarded_args:
+            rewritten = arg
+            for idx, param_name in enumerate(param_names):
+                replacement = pred_args[idx] if idx < len(pred_args) else param_name
+                rewritten = _replace_var(rewritten, param_name, replacement) or rewritten
+            composed.append(rewritten)
+        incoming[pred_id] = composed
+    return incoming
 
 
 def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock]]:
@@ -1135,15 +1569,29 @@ def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock
     for block in blocks:
         if block.index == 0:
             continue
-        if block.statements or block.phi_bindings:
+        if block.statements or block.phi_bindings or block.block_params:
+            continue
+        if block.entry_stack or block.exit_stack:
+            continue
+        if any(args for args in block.incoming_args.values()):
+            continue
+        if block.terminator.get("kind") != "fallthrough":
             continue
         if len(block.successors) != 1:
-            continue
-        if block.terminator.get("kind") == "return":
             continue
         succ_id = block.successors[0]
         succ = by_id.get(succ_id)
         if succ is None or succ.id == block.id:
+            continue
+
+        forwarded_incoming = {pred: list(args) for pred, args in succ.incoming_args.items() if pred != block.id}
+        forwarded_tail = list(succ.incoming_args.get(block.id, []))
+        for pred_id in block.predecessors:
+            if pred_id == succ.id or pred_id in forwarded_incoming:
+                forwarded_incoming = {}
+                break
+            forwarded_incoming[pred_id] = list(forwarded_tail)
+        if not forwarded_incoming and (block.predecessors or succ.incoming_args.get(block.id)):
             continue
 
         rewritten: list[HIRBlock] = []
@@ -1152,8 +1600,12 @@ def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock
                 continue
             preds = [succ_id if item == block.id else item for item in current.predecessors]
             succs = [succ_id if item == block.id else item for item in current.successors]
+            incoming_args = {pred: list(args) for pred, args in current.incoming_args.items()}
             if current.id == succ_id:
-                preds = list(block.predecessors) + preds
+                preds = list(block.predecessors) + [item for item in preds if item != block.id]
+                incoming_args = forwarded_incoming
+            else:
+                incoming_args.pop(block.id, None)
             rewritten.append(
                 _clone_block(
                     current,
@@ -1161,6 +1613,7 @@ def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock
                     fallthrough_target=succ_id if current.fallthrough_target == block.id else current.fallthrough_target,
                     successors=_ordered_unique(succs),
                     predecessors=_ordered_unique(preds),
+                    incoming_args=incoming_args,
                 )
             )
         return _sanitize_hir_blocks(rewritten)
@@ -1179,18 +1632,38 @@ def _rewrite_linear_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBloc
         if succ.predecessors != [block.id]:
             continue
 
+        succ_ready = succ
+        if succ_ready.block_params:
+            incoming_args = list(succ_ready.incoming_args.get(block.id, []))
+            if len(incoming_args) != len(succ_ready.block_params):
+                continue
+            mapping = {name: incoming_args[idx] for idx, name in enumerate(succ_ready.block_params)}
+            succ_ready = _substitute_block_values(succ_ready, mapping)
+            succ_ready = _clone_block(succ_ready, block_params=[], phi_bindings=[], incoming_args={})
+
+        if succ_ready.entry_stack:
+            if len(succ_ready.entry_stack) != len(block.exit_stack):
+                continue
+            positional_mapping = {
+                succ_name: block_name
+                for succ_name, block_name in zip(succ_ready.entry_stack, block.exit_stack)
+                if succ_name != block_name
+            }
+            if positional_mapping:
+                succ_ready = _substitute_block_values(succ_ready, positional_mapping)
+
         merged = _clone_block(
             block,
-            end_offset=succ.end_offset,
-            instruction_indices=list(block.instruction_indices) + list(succ.instruction_indices),
-            exit_stack=list(succ.exit_stack),
-            phi_bindings=list(block.phi_bindings) + list(succ.phi_bindings),
-            statements=list(block.statements) + list(succ.statements),
-            terminator=dict(succ.terminator),
-            branch_target=succ.branch_target,
-            fallthrough_target=succ.fallthrough_target,
-            successors=list(succ.successors),
-            flags=_ordered_unique(list(block.flags) + list(succ.flags)),
+            end_offset=succ_ready.end_offset,
+            instruction_indices=list(block.instruction_indices) + list(succ_ready.instruction_indices),
+            exit_stack=list(succ_ready.exit_stack),
+            phi_bindings=list(block.phi_bindings) + list(succ_ready.phi_bindings),
+            statements=list(block.statements) + list(succ_ready.statements),
+            terminator=dict(succ_ready.terminator),
+            branch_target=succ_ready.branch_target,
+            fallthrough_target=succ_ready.fallthrough_target,
+            successors=list(succ_ready.successors),
+            flags=_ordered_unique(list(block.flags) + list(succ_ready.flags)),
         )
 
         rewritten: list[HIRBlock] = []
@@ -1222,6 +1695,33 @@ def _normalize_hir_blocks(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
         if rewritten is None:
             return blocks
         blocks = rewritten
+
+
+def _rename_merge_params(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
+    mapping: dict[str, str] = {}
+    for block in hir_blocks:
+        for name in block.block_params:
+            if name.startswith("phi_"):
+                mapping[name] = f"m_{name[4:]}"
+    if not mapping:
+        return hir_blocks
+    return _substitute_blocks(hir_blocks, mapping, replace_block_params=True)
+
+
+@dataclass
+class _StructuredContext:
+    blocks: list[HIRBlock]
+    by_id: dict[str, HIRBlock]
+    index_by_id: dict[str, int]
+    dom: dict[str, set[str]]
+    postdom: dict[str, set[str]]
+    ipdom: dict[str, Optional[str]]
+    loops: dict[str, dict[str, Any]]
+    switches: dict[int, dict[str, Any]]
+
+
+def _sequence_region(regions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {"kind": "sequence", "regions": regions}
 
 
 def _indent(lines: list[str], level: int) -> list[str]:
@@ -1349,7 +1849,7 @@ def _next_allowed_block_id(blocks: list[HIRBlock], start_idx: int, limit: int, a
 
 def _label_needed(block: HIRBlock, by_id: dict[str, HIRBlock], index_by_id: dict[str, int], allowed_ids: Optional[set[str]]) -> bool:
     if block.index == 0:
-        return False
+        return bool(block.predecessors)
     preds = list(block.predecessors)
     if not preds:
         return True
@@ -1357,6 +1857,9 @@ def _label_needed(block: HIRBlock, by_id: dict[str, HIRBlock], index_by_id: dict
         return True
     pred_id = preds[0]
     if allowed_ids is not None and pred_id not in allowed_ids:
+        allowed_indices = [index_by_id[item] for item in allowed_ids if item in index_by_id]
+        if allowed_indices and block.index == min(allowed_indices):
+            return False
         return True
     pred = by_id.get(pred_id)
     if pred is None:
@@ -1364,16 +1867,41 @@ def _label_needed(block: HIRBlock, by_id: dict[str, HIRBlock], index_by_id: dict
     return index_by_id.get(pred_id, -1) != block.index - 1
 
 
-def _jump_stmt(target: Optional[str], jump_aliases: Optional[dict[str, str]]) -> tuple[Optional[str], int]:
+def _format_block_label(block: HIRBlock) -> str:
+    if block.block_params:
+        return f"{block.id}({', '.join(block.block_params)})"
+    return block.id
+
+
+def _format_jump_target(source: Optional[HIRBlock], target: Optional[str], by_id: dict[str, HIRBlock], jump_aliases: Optional[dict[str, str]]) -> Optional[str]:
     if target is None:
+        return None
+    if jump_aliases and target in jump_aliases:
+        return jump_aliases[target]
+    target_block = by_id.get(target)
+    if target_block is None:
+        return target
+    if not target_block.block_params:
+        return target
+    if source is None:
+        return _format_block_label(target_block)
+    args = target_block.incoming_args.get(source.id)
+    if not args:
+        return _format_block_label(target_block)
+    return f"{target}({', '.join(args)})"
+
+
+def _jump_stmt(source: Optional[HIRBlock], target: Optional[str], by_id: dict[str, HIRBlock], jump_aliases: Optional[dict[str, str]]) -> tuple[Optional[str], int]:
+    formatted = _format_jump_target(source, target, by_id, jump_aliases)
+    if formatted is None:
         return None, 0
     if jump_aliases and target in jump_aliases:
-        return jump_aliases[target], 0
-    return f"goto {target}", 1
+        return formatted, 0
+    return f"goto {formatted}", 1
 
 
-def _conditional_jump(cond: str, target: Optional[str], *, negate: bool, jump_aliases: Optional[dict[str, str]]) -> tuple[list[str], int]:
-    stmt, cost = _jump_stmt(target, jump_aliases)
+def _conditional_jump(cond: str, source: Optional[HIRBlock], target: Optional[str], *, negate: bool, by_id: dict[str, HIRBlock], jump_aliases: Optional[dict[str, str]]) -> tuple[list[str], int]:
+    stmt, cost = _jump_stmt(source, target, by_id, jump_aliases)
     if stmt is None:
         return [], 0
     if negate:
@@ -1384,6 +1912,7 @@ def _conditional_jump(cond: str, target: Optional[str], *, negate: bool, jump_al
 def _generic_terminator_lines(
     block: HIRBlock,
     next_id: Optional[str],
+    by_id: dict[str, HIRBlock],
     index_by_id: dict[str, int],
     jump_aliases: Optional[dict[str, str]],
 ) -> tuple[list[str], int]:
@@ -1395,26 +1924,26 @@ def _generic_terminator_lines(
         cond = block.terminator.get("condition") or f"cond_{block.id}"
         if branch_target and fallthrough_target:
             if fallthrough_target == next_id and branch_target != next_id:
-                return _conditional_jump(cond, branch_target, negate=False, jump_aliases=jump_aliases)
+                return _conditional_jump(cond, block, branch_target, negate=False, by_id=by_id, jump_aliases=jump_aliases)
             if branch_target == next_id and fallthrough_target != next_id:
-                return _conditional_jump(cond, fallthrough_target, negate=True, jump_aliases=jump_aliases)
+                return _conditional_jump(cond, block, fallthrough_target, negate=True, by_id=by_id, jump_aliases=jump_aliases)
             if branch_target == fallthrough_target:
-                stmt, cost = _jump_stmt(branch_target, jump_aliases)
+                stmt, cost = _jump_stmt(block, branch_target, by_id, jump_aliases)
                 return ([stmt] if stmt else []), cost
-            first_lines, first_cost = _conditional_jump(cond, branch_target, negate=False, jump_aliases=jump_aliases)
-            second_stmt, second_cost = _jump_stmt(fallthrough_target, jump_aliases)
+            first_lines, first_cost = _conditional_jump(cond, block, branch_target, negate=False, by_id=by_id, jump_aliases=jump_aliases)
+            second_stmt, second_cost = _jump_stmt(block, fallthrough_target, by_id, jump_aliases)
             lines = list(first_lines)
             if second_stmt is not None:
                 lines.append(second_stmt)
             return lines, first_cost + second_cost
         if branch_target:
-            return _conditional_jump(cond, branch_target, negate=False, jump_aliases=jump_aliases)
+            return _conditional_jump(cond, block, branch_target, negate=False, by_id=by_id, jump_aliases=jump_aliases)
         if fallthrough_target and fallthrough_target != next_id:
-            return _conditional_jump(cond, fallthrough_target, negate=True, jump_aliases=jump_aliases)
+            return _conditional_jump(cond, block, fallthrough_target, negate=True, by_id=by_id, jump_aliases=jump_aliases)
         return [f"if ({cond}) {{ /* unresolved edge */ }}"], 0
     successor = block.successors[0] if block.successors else None
     if successor and successor != next_id:
-        stmt, cost = _jump_stmt(successor, jump_aliases)
+        stmt, cost = _jump_stmt(block, successor, by_id, jump_aliases)
         return ([stmt] if stmt else []), cost
     return [], 0
 
@@ -1433,12 +1962,12 @@ def _generic_block_lines(
     goto_count = 0
     stmt_indent = ""
     if _label_needed(block, by_id, index_by_id, allowed_ids):
-        lines.append(f"{block.id}:")
+        lines.append(f"{_format_block_label(block)}:")
         stmt_indent = "    "
         label_count = 1
     for stmt in block.statements:
         lines.append(f"{stmt_indent}{stmt}")
-    term_lines, term_gotos = _generic_terminator_lines(block, next_id, index_by_id, jump_aliases)
+    term_lines, term_gotos = _generic_terminator_lines(block, next_id, by_id, index_by_id, jump_aliases)
     goto_count += term_gotos
     for line in term_lines:
         lines.append(f"{stmt_indent}{line}")
@@ -1508,9 +2037,13 @@ def _render_linear_chain(chain_info: dict[str, Any], by_id: dict[str, HIRBlock],
     lines: list[str] = []
     for block_id in chain_info.get("ids", []):
         block = by_id[block_id]
-        lines.extend(_indent(block.statements, indent))
+        stmt_indent = indent
+        if block.block_params:
+            lines.extend(_indent([f"{_format_block_label(block)}:"], indent))
+            stmt_indent = indent + 1
+        lines.extend(_indent(block.statements, stmt_indent))
         if block.terminator.get("kind") == "return":
-            lines.extend(_indent([block.terminator.get("text") or "return"], indent))
+            lines.extend(_indent([block.terminator.get("text") or "return"], stmt_indent))
     return lines
 
 
@@ -1749,97 +2282,355 @@ def _render_branch_region(
     if region.get("negate"):
         cond = f"!({cond})"
 
-    lines = _indent(block.statements, indent)
-    lines.extend(_indent([f"if ({cond}) {{"], indent))
-    lines.extend(_render_arm(region["then_arm"], render_range=render_range, by_id=by_id, indent=indent + 1, jump_aliases=jump_aliases))
+    lines: list[str] = []
+    stmt_indent = indent
+    if block.block_params:
+        lines.extend(_indent([f"{_format_block_label(block)}:"], indent))
+        stmt_indent = indent + 1
+    lines.extend(_indent(block.statements, stmt_indent))
+    lines.extend(_indent([f"if ({cond}) {{"], stmt_indent))
+    lines.extend(_render_arm(region["then_arm"], render_range=render_range, by_id=by_id, indent=stmt_indent + 1, jump_aliases=jump_aliases))
     if region["kind"] == "if_else" and region.get("else_arm") is not None:
-        lines.extend(_indent(["} else {"], indent))
-        lines.extend(_render_arm(region["else_arm"], render_range=render_range, by_id=by_id, indent=indent + 1, jump_aliases=jump_aliases))
-    lines.extend(_indent(["}"], indent))
+        lines.extend(_indent(["} else {"], stmt_indent))
+        lines.extend(_render_arm(region["else_arm"], render_range=render_range, by_id=by_id, indent=stmt_indent + 1, jump_aliases=jump_aliases))
+    lines.extend(_indent(["}"], stmt_indent))
     visited.update(region["consumed"])
     return lines
 
 
-def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
-    if not blocks:
-        return "", {"constructs": {}, "fallback_block_count": 0, "residual_label_count": 0, "residual_goto_count": 0}
-
+def _build_structured_context(blocks: list[HIRBlock]) -> _StructuredContext:
     by_id, index_by_id, _, _ = _block_maps(blocks)
     dom = _compute_dominators(blocks)
     postdom = _compute_postdominators(blocks)
     ipdom = {block.id: _immediate_postdom(block.id, postdom, index_by_id) for block in blocks}
     loops = _natural_loops(blocks, dom)
-    constructs: Counter[str] = Counter()
-    visited: set[str] = set()
-    residual_labels = 0
-    residual_gotos = 0
     switches = {
         idx: info
         for idx in range(len(blocks))
         if (info := _collect_switch_like(idx, blocks, index_by_id, ipdom)) is not None
     }
+    return _StructuredContext(
+        blocks=blocks,
+        by_id=by_id,
+        index_by_id=index_by_id,
+        dom=dom,
+        postdom=postdom,
+        ipdom=ipdom,
+        loops=loops,
+        switches=switches,
+    )
 
-    def render_range(
+
+def _generic_block_region(
+    block: HIRBlock,
+    *,
+    by_id: dict[str, HIRBlock],
+    index_by_id: dict[str, int],
+    next_id: Optional[str],
+    allowed_ids: Optional[set[str]],
+    jump_aliases: Optional[dict[str, str]],
+) -> tuple[dict[str, Any], list[str], int, int]:
+    block_lines, label_count, goto_count = _generic_block_lines(
+        block,
+        by_id=by_id,
+        index_by_id=index_by_id,
+        next_id=next_id,
+        allowed_ids=allowed_ids,
+        jump_aliases=jump_aliases,
+    )
+    label = _format_block_label(block) if _label_needed(block, by_id, index_by_id, allowed_ids) else None
+    term_lines, _ = _generic_terminator_lines(block, next_id, by_id, index_by_id, jump_aliases)
+    region = {
+        "kind": "block",
+        "block_id": block.id,
+        "label": label,
+        "block_params": list(block.block_params),
+        "statements": list(block.statements),
+        "terminator": {
+            "kind": block.terminator.get("kind"),
+            "text": block.terminator.get("text"),
+            "condition": block.terminator.get("condition"),
+            "rendered_lines": term_lines,
+            "successors": list(block.successors),
+            "branch_target": block.branch_target,
+            "fallthrough_target": block.fallthrough_target,
+        },
+    }
+    return region, block_lines, label_count, goto_count
+
+
+def _generic_block_counts(
+    block: HIRBlock,
+    *,
+    by_id: dict[str, HIRBlock],
+    index_by_id: dict[str, int],
+    next_id: Optional[str],
+    allowed_ids: Optional[set[str]],
+    jump_aliases: Optional[dict[str, str]],
+) -> tuple[int, int]:
+    label_count = 1 if _label_needed(block, by_id, index_by_id, allowed_ids) else 0
+    _, goto_count = _generic_terminator_lines(block, next_id, by_id, index_by_id, jump_aliases)
+    return label_count, goto_count
+
+
+def _linear_chain_region(chain_info: dict[str, Any], by_id: dict[str, HIRBlock]) -> dict[str, Any]:
+    regions: list[dict[str, Any]] = []
+    for block_id in chain_info.get("ids", []):
+        block = by_id[block_id]
+        rendered_lines = [block.terminator.get("text") or "return"] if block.terminator.get("kind") == "return" else []
+        regions.append(
+            {
+                "kind": "block",
+                "block_id": block.id,
+                "label": _format_block_label(block) if block.block_params else None,
+                "block_params": list(block.block_params),
+                "statements": list(block.statements),
+                "terminator": {
+                    "kind": block.terminator.get("kind"),
+                    "text": block.terminator.get("text"),
+                    "condition": block.terminator.get("condition"),
+                    "rendered_lines": rendered_lines,
+                    "successors": list(block.successors),
+                    "branch_target": block.branch_target,
+                    "fallthrough_target": block.fallthrough_target,
+                },
+            }
+        )
+    return {"kind": "sequence", "regions": regions, "end": chain_info.get("end")}
+
+
+def _requires_goto_region(block: HIRBlock, label_count: int, goto_count: int) -> bool:
+    if label_count or goto_count:
+        return True
+    if block.block_params:
+        return True
+    if block.terminator.get("kind") == "branch":
+        return True
+    return len(block.successors) > 1
+
+
+def _build_goto_region(
+    block_regions: list[dict[str, Any]],
+    *,
+    block_ids: list[str],
+    by_id: dict[str, HIRBlock],
+    label_count: int,
+    goto_count: int,
+) -> dict[str, Any]:
+    member_ids = set(block_ids)
+    external_successors = _ordered_unique(
+        succ
+        for block_id in block_ids
+        for succ in by_id[block_id].successors
+        if succ not in member_ids
+    )
+    external_predecessors = _ordered_unique(
+        pred
+        for block_id in block_ids
+        for pred in by_id[block_id].predecessors
+        if pred not in member_ids
+    )
+    return {
+        "kind": "goto_region",
+        "style": "explicit_cfg",
+        "entry_block": block_ids[0] if block_ids else None,
+        "block_ids": list(block_ids),
+        "blocks": list(block_regions),
+        "external_predecessors": external_predecessors,
+        "external_successors": external_successors,
+        "residual": {
+            "label_count": label_count,
+            "goto_count": goto_count,
+        },
+    }
+
+
+def _analyze_structured_surface(
+    blocks: list[HIRBlock],
+    *,
+    emit_text: bool,
+    emit_tree: bool,
+) -> tuple[dict[str, Any], str, dict[str, Any]]:
+    if not blocks:
+        tree = _sequence_region([]) if emit_tree else {}
+        return tree, "", {"constructs": {}, "fallback_block_count": 0, "residual_label_count": 0, "residual_goto_count": 0, "loop_header_count": 0}
+
+    ctx = _build_structured_context(blocks)
+    constructs: Counter[str] = Counter()
+    visited: set[str] = set()
+    residual_labels = 0
+    residual_gotos = 0
+    fallback_regions_total = 0
+    fallback_blocks_total = 0
+
+    def build_arm(
+        arm: dict[str, Any],
+        *,
+        indent: int,
+        jump_aliases: Optional[dict[str, str]],
+    ) -> tuple[Optional[dict[str, Any]], list[str]]:
+        if arm.get("mode") == "linear":
+            region = _linear_chain_region(arm["chain"], ctx.by_id) if emit_tree else None
+            lines = _render_linear_chain(arm["chain"], ctx.by_id, indent) if emit_text else []
+            return region, lines
+        arm_regions, arm_lines = walk_range(arm["start"], arm["stop"], indent, set(arm["ids"]), jump_aliases)
+        return (_sequence_region(arm_regions) if emit_tree else None), arm_lines
+
+    def walk_range(
         start_idx: int,
         stop_idx: Optional[int],
         indent: int,
         allowed_ids: Optional[set[str]] = None,
         jump_aliases: Optional[dict[str, str]] = None,
-    ) -> list[str]:
-        nonlocal residual_labels, residual_gotos
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        nonlocal residual_labels, residual_gotos, fallback_regions_total, fallback_blocks_total
+        regions: list[dict[str, Any]] = []
         lines: list[str] = []
         limit = stop_idx if stop_idx is not None else len(blocks)
         i = start_idx
+
+        pending_block_regions: list[dict[str, Any]] = []
+        pending_block_lines: list[str] = []
+        pending_block_ids: list[str] = []
+        pending_label_count = 0
+        pending_goto_count = 0
+
+        def flush_pending_goto_region() -> None:
+            nonlocal pending_label_count, pending_goto_count, fallback_regions_total, fallback_blocks_total
+            if not pending_block_ids:
+                return
+            fallback_regions_total += 1
+            fallback_blocks_total += len(pending_block_ids)
+            if emit_tree:
+                regions.append(
+                    _build_goto_region(
+                        pending_block_regions,
+                        block_ids=pending_block_ids,
+                        by_id=ctx.by_id,
+                        label_count=pending_label_count,
+                        goto_count=pending_goto_count,
+                    )
+                )
+            if emit_text:
+                lines.extend(_indent(pending_block_lines, indent))
+            pending_block_regions.clear()
+            pending_block_lines.clear()
+            pending_block_ids.clear()
+            pending_label_count = 0
+            pending_goto_count = 0
+
         while i < limit and i < len(blocks):
             block = blocks[i]
             if allowed_ids is not None and block.id not in allowed_ids:
+                flush_pending_goto_region()
                 i += 1
                 continue
             if block.id in visited:
+                flush_pending_goto_region()
                 i += 1
                 continue
 
-            loop = loops.get(block.id)
+            loop = ctx.loops.get(block.id)
             if loop and loop.get("safe") and loop["index_range"][1] < limit and (allowed_ids is None or set(loop["nodes"]).issubset(allowed_ids | {block.id})):
+                flush_pending_goto_region()
                 constructs["while"] += 1
                 visited.add(block.id)
                 header_lines = list(block.statements)
                 cond = block.terminator.get("condition") or f"cond_{block.id}"
                 body_ids = set(loop["nodes"]) - {block.id}
-                body_start = index_by_id.get(loop.get("body_succ"), i + 1)
+                body_start = ctx.index_by_id.get(loop.get("body_succ"), i + 1)
                 body_end = loop["index_range"][1] + 1
-                if header_lines:
-                    lines.extend(_indent(["while (true) {"], indent))
-                    lines.extend(_indent(header_lines, indent + 1))
-                    lines.extend(_indent([f"if (!({cond})) break"], indent + 1))
-                else:
-                    lines.extend(_indent([f"while ({cond}) {{"], indent))
                 loop_aliases = dict(jump_aliases or {})
                 loop_aliases[loop["header"]] = "continue"
                 loop_aliases[loop["exit_succ"]] = "break"
-                lines.extend(render_range(body_start, body_end, indent + 1, body_ids, loop_aliases))
-                lines.extend(_indent(["}"], indent))
+                body_regions, body_lines = walk_range(body_start, body_end, indent + 1, body_ids, loop_aliases)
+                if emit_tree:
+                    regions.append(
+                        {
+                            "kind": "while",
+                            "header_block": block.id,
+                            "block_params": list(block.block_params),
+                            "condition": cond,
+                            "prologue": header_lines,
+                            "rendering": "guarded_loop" if header_lines else "direct_while",
+                            "body": _sequence_region(body_regions),
+                            "continue_target": loop["header"],
+                            "break_target": loop["exit_succ"],
+                        }
+                    )
+                if emit_text:
+                    if header_lines:
+                        lines.extend(_indent(["while (true) {"], indent))
+                        lines.extend(_indent(header_lines, indent + 1))
+                        lines.extend(_indent([f"if (!({cond})) break"], indent + 1))
+                    else:
+                        lines.extend(_indent([f"while ({cond}) {{"], indent))
+                    lines.extend(body_lines)
+                    lines.extend(_indent(["}"], indent))
                 visited.update(body_ids)
                 i = loop["index_range"][1] + 1
                 continue
 
-            switch_info = switches.get(i)
+            switch_info = ctx.switches.get(i)
             if switch_info and switch_info["end_index"] <= limit:
+                flush_pending_goto_region()
                 constructs["switch_like"] += 1
-                lines.extend(_indent(["switch_like {"], indent))
+                case_regions: list[dict[str, Any]] = []
+                if emit_text:
+                    lines.extend(_indent(["switch_like {"], indent))
                 for case_block in switch_info["blocks"]:
                     visited.add(case_block.id)
-                    case_target, _ = _edge_targets(case_block, index_by_id)
-                    lines.extend(_indent([f"when ({case_block.terminator.get('condition')}) -> {case_target or '<unresolved>'} {{"], indent + 1))
-                    if case_target in by_id and case_target not in visited:
-                        target_block = by_id[case_target]
-                        case_lines = list(target_block.statements)
+                    case_target, _ = _edge_targets(case_block, ctx.index_by_id)
+                    inline_regions: list[dict[str, Any]] = []
+                    inline_lines: list[str] = []
+                    if case_target in ctx.by_id and case_target not in visited:
+                        target_block = ctx.by_id[case_target]
                         if target_block.terminator.get("kind") == "return":
-                            case_lines.append(target_block.terminator["text"])
+                            inline_regions.append(
+                                {
+                                    "kind": "block",
+                                    "block_id": target_block.id,
+                                    "label": None,
+                                    "block_params": list(target_block.block_params),
+                                    "statements": list(target_block.statements),
+                                    "terminator": {
+                                        "kind": target_block.terminator.get("kind"),
+                                        "text": target_block.terminator.get("text"),
+                                        "condition": target_block.terminator.get("condition"),
+                                        "rendered_lines": [target_block.terminator.get("text") or "return"],
+                                        "successors": list(target_block.successors),
+                                        "branch_target": target_block.branch_target,
+                                        "fallthrough_target": target_block.fallthrough_target,
+                                    },
+                                }
+                            )
+                            inline_lines = list(target_block.statements) + [target_block.terminator.get("text") or "return"]
                             visited.add(case_target)
-                        lines.extend(_indent(case_lines, indent + 2))
-                    lines.extend(_indent(["}"], indent + 1))
-                lines.extend(_indent(["default: { /* dispatch fallthrough */ }", "}"], indent))
+                    if emit_tree:
+                        case_regions.append(
+                            {
+                                "kind": "case",
+                                "dispatch_block": case_block.id,
+                                "condition": case_block.terminator.get("condition"),
+                                "target": case_target,
+                                "body": _sequence_region(inline_regions),
+                            }
+                        )
+                    if emit_text:
+                        lines.extend(_indent([f"when ({case_block.terminator.get('condition')}) -> {case_target or '<unresolved>'} {{"], indent + 1))
+                        lines.extend(_indent(inline_lines, indent + 2))
+                        lines.extend(_indent(["}"], indent + 1))
+                if emit_tree:
+                    regions.append(
+                        {
+                            "kind": "switch_like",
+                            "join_block": switch_info.get("join"),
+                            "cases": case_regions,
+                            "default": "dispatch_fallthrough",
+                        }
+                    )
+                if emit_text:
+                    lines.extend(_indent(["default: { /* dispatch fallthrough */ }", "}"], indent))
                 i = switch_info["end_index"]
                 continue
 
@@ -1850,69 +2641,137 @@ def _render_structured(blocks: list[HIRBlock]) -> tuple[str, dict[str, Any]]:
                 limit=limit,
                 allowed_ids=allowed_ids,
                 visited=visited,
-                loops=loops,
-                by_id=by_id,
-                index_by_id=index_by_id,
-                dom=dom,
-                ipdom=ipdom,
+                loops=ctx.loops,
+                by_id=ctx.by_id,
+                index_by_id=ctx.index_by_id,
+                dom=ctx.dom,
+                ipdom=ctx.ipdom,
             )
             if region is not None:
-                lines.extend(
-                    _render_branch_region(
-                        block,
-                        region,
-                        render_range=render_range,
-                        by_id=by_id,
-                        constructs=constructs,
-                        visited=visited,
-                        indent=indent,
-                        jump_aliases=jump_aliases,
+                flush_pending_goto_region()
+                constructs[region["kind"]] += 1
+                visited.add(block.id)
+                cond = block.terminator.get("condition") or f"cond_{block.id}"
+                then_region, then_lines = build_arm(region["then_arm"], indent=indent + 1, jump_aliases=jump_aliases)
+                else_region: Optional[dict[str, Any]] = None
+                else_lines: list[str] = []
+                if region["kind"] == "if_else" and region.get("else_arm") is not None:
+                    else_region, else_lines = build_arm(region["else_arm"], indent=indent + 1, jump_aliases=jump_aliases)
+                if emit_tree:
+                    regions.append(
+                        {
+                            "kind": region["kind"],
+                            "header_block": block.id,
+                            "block_params": list(block.block_params),
+                            "condition": cond,
+                            "negated": bool(region.get("negate")),
+                            "prologue": list(block.statements),
+                            "then": then_region or _sequence_region([]),
+                            "else": else_region,
+                            "resume_block": blocks[region["resume_idx"]].id if region.get("resume_idx", len(blocks)) < len(blocks) else None,
+                        }
                     )
-                )
+                if emit_text:
+                    rendered_cond = f"!({cond})" if region.get("negate") else cond
+                    stmt_indent = indent
+                    if block.block_params:
+                        lines.extend(_indent([f"{_format_block_label(block)}:"], indent))
+                        stmt_indent = indent + 1
+                    lines.extend(_indent(block.statements, stmt_indent))
+                    lines.extend(_indent([f"if ({rendered_cond}) {{"], stmt_indent))
+                    lines.extend(then_lines)
+                    if region["kind"] == "if_else" and region.get("else_arm") is not None:
+                        lines.extend(_indent(["} else {"], stmt_indent))
+                        lines.extend(else_lines)
+                    lines.extend(_indent(["}"], stmt_indent))
+                visited.update(region["consumed"])
                 i = region["resume_idx"]
                 continue
 
             visited.add(block.id)
-            block_lines, label_count, goto_count = _generic_block_lines(
-                block,
-                by_id=by_id,
-                index_by_id=index_by_id,
-                next_id=next_id,
-                allowed_ids=allowed_ids,
-                jump_aliases=jump_aliases,
-            )
+            block_region: Optional[dict[str, Any]] = None
+            block_lines: list[str] = []
+            if emit_tree or emit_text:
+                block_region, block_lines, label_count, goto_count = _generic_block_region(
+                    block,
+                    by_id=ctx.by_id,
+                    index_by_id=ctx.index_by_id,
+                    next_id=next_id,
+                    allowed_ids=allowed_ids,
+                    jump_aliases=jump_aliases,
+                )
+            else:
+                label_count, goto_count = _generic_block_counts(
+                    block,
+                    by_id=ctx.by_id,
+                    index_by_id=ctx.index_by_id,
+                    next_id=next_id,
+                    allowed_ids=allowed_ids,
+                    jump_aliases=jump_aliases,
+                )
             residual_labels += label_count
             residual_gotos += goto_count
-            lines.extend(_indent(block_lines, indent))
-            i += 1
-        return lines
 
-    body_lines = render_range(0, None, 1)
-    text = "\n".join(body_lines)
+            if pending_block_ids or _requires_goto_region(block, label_count, goto_count):
+                pending_block_ids.append(block.id)
+                pending_label_count += label_count
+                pending_goto_count += goto_count
+                if emit_tree and block_region is not None:
+                    pending_block_regions.append(block_region)
+                if emit_text:
+                    pending_block_lines.extend(block_lines)
+            else:
+                if emit_tree and block_region is not None:
+                    regions.append(block_region)
+                if emit_text:
+                    lines.extend(_indent(block_lines, indent))
+            i += 1
+
+        flush_pending_goto_region()
+        return regions, lines
+
+    body_regions, body_lines = walk_range(0, None, 1)
+    tree = _sequence_region(body_regions) if emit_tree else {}
+    text = "\n".join(body_lines) if emit_text else ""
     meta = {
         "constructs": dict(constructs),
-        "fallback_block_count": 0,
+        "fallback_region_count": fallback_regions_total,
+        "fallback_block_count": fallback_blocks_total,
         "residual_label_count": residual_labels,
         "residual_goto_count": residual_gotos,
-        "loop_header_count": sum(1 for loop in loops.values() if loop.get("safe")),
+        "loop_header_count": sum(1 for loop in ctx.loops.values() if loop.get("safe")),
     }
-    return text, meta
+    return tree, text, meta
 
 
 # --- public builders ------------------------------------------------------
 
 
-def _function_summary(canonical: list[CanonicalInstruction], values: list[DataflowValue], blocks: list[HIRBlock], cfg: dict[str, Any], structured_meta: dict[str, Any], dataflow_metrics: dict[str, int]) -> dict[str, Any]:
+def _function_summary(
+    canonical: list[CanonicalInstruction],
+    core_values: list[DataflowValue],
+    core_blocks: list[HIRBlock],
+    surface_blocks: list[HIRBlock],
+    cfg: dict[str, Any],
+    structured_meta: dict[str, Any],
+    dataflow_metrics: dict[str, int],
+    report: dict[str, Any],
+) -> dict[str, Any]:
     canonical_hist = Counter(inst.semantic_op for inst in canonical)
+    validation = report.get("validation", {})
+    core_validation = validation.get("core_raw", {})
+    final_validation = validation.get("surface_final", {})
     return {
         "canonical_instruction_count": len(canonical),
-        "basic_block_count": len(blocks),
-        "value_count": len(values),
+        "basic_block_count": len(core_blocks),
+        "surface_basic_block_count": len(surface_blocks),
+        "value_count": len(core_values),
         "macro_lowered_count": sum(1 for inst in canonical if inst.macro_kind),
         "call_count": canonical_hist.get("call", 0) + canonical_hist.get("syscall", 0) + canonical_hist.get("opaque_call", 0),
         "branch_count": canonical_hist.get("branch", 0),
         "return_count": canonical_hist.get("return", 0),
         "constructs": structured_meta.get("constructs", {}),
+        "fallback_region_count": structured_meta.get("fallback_region_count", 0),
         "fallback_block_count": structured_meta.get("fallback_block_count", 0),
         "residual_label_count": structured_meta.get("residual_label_count", 0),
         "residual_goto_count": structured_meta.get("residual_goto_count", 0),
@@ -1921,6 +2780,10 @@ def _function_summary(canonical: list[CanonicalInstruction], values: list[Datafl
         "mean_confidence": (sum(inst.confidence for inst in canonical) / len(canonical)) if canonical else 0.0,
         "placeholder_count": dataflow_metrics.get("placeholder_count", 0),
         "phi_count": dataflow_metrics.get("phi_count", 0),
+        "inlined_value_count": structured_meta.get("inlined_value_count", 0),
+        "removed_assignment_count": structured_meta.get("removed_assignment_count", 0),
+        "core_validation_error_count": int(core_validation.get("error_count", 0)),
+        "validation_error_count": int(final_validation.get("error_count", 0)),
     }
 
 
@@ -1939,6 +2802,7 @@ def _looks_like_aggregate_prologue(nodes: list[IRNode]) -> bool:
 
 
 def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool = True, include_text: bool = True) -> HIRFunction:
+    t0 = time.perf_counter()
     ir_function = build_function_ir(mod, export_name)
     hir_nodes = list(ir_function.nodes)
     prologue_meta: dict[str, Any] | None = None
@@ -1954,18 +2818,74 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
         entry_seed = [_slot_name(child.get("ref")) for child in first.operands.get("children") or [] if child.get("ref") is not None] or None
         hir_nodes = hir_nodes[1:]
 
+    t_lower0 = time.perf_counter()
     canonical, _ = lower_ir_nodes(hir_nodes)
     _build_instruction_control(canonical, hir_nodes)
     canonical_blocks, canonical_cfg = _compute_canonical_blocks(canonical)
-    hir_blocks, values, dataflow_metrics = build_hir_blocks(canonical_blocks, canonical_cfg, canonical, entry_seed=entry_seed)
-    hir_blocks = _normalize_hir_blocks(hir_blocks)
-    hir_text_body, structured_meta = _render_structured(hir_blocks)
+    t_lower1 = time.perf_counter()
+
+    t_core0 = time.perf_counter()
+    core_hir_blocks, core_values, dataflow_metrics = build_hir_blocks(canonical_blocks, canonical_cfg, canonical, entry_seed=entry_seed)
+    t_core1 = time.perf_counter()
+
+    run_validation = include_text or include_canonical
+    validation: dict[str, Any] = {}
+    if run_validation:
+        validation["core_raw"] = validate_hir_blocks(core_hir_blocks, core_values, "core_raw")
+
+    t_surface0 = time.perf_counter()
+    surface_seed_blocks = [_clone_block(block) for block in core_hir_blocks]
+    surface_cleaned_blocks, _, cleanup_debug = _cleanup_surface_hir(surface_seed_blocks, canonical, core_values)
+    if run_validation:
+        validation["surface_cleaned"] = validate_hir_blocks(surface_cleaned_blocks, core_values, "surface_cleaned")
+
+    surface_normalized_blocks = _normalize_hir_blocks(surface_cleaned_blocks)
+    if run_validation:
+        validation["surface_normalized"] = validate_hir_blocks(surface_normalized_blocks, core_values, "surface_normalized")
+
+    surface_hir_blocks = _rename_merge_params(surface_normalized_blocks)
+    if run_validation:
+        validation["surface_final"] = validate_hir_blocks(surface_hir_blocks, core_values, "surface_final")
+    t_surface1 = time.perf_counter()
+
+    t_struct0 = time.perf_counter()
+    emit_structured_tree = include_text or include_canonical
+    structured_hir, hir_text_body, structured_meta = _analyze_structured_surface(
+        surface_hir_blocks,
+        emit_text=include_text,
+        emit_tree=emit_structured_tree,
+    )
+    t_struct1 = time.perf_counter()
+
     structured_meta = dict(structured_meta)
+    structured_meta.update(cleanup_debug)
     if prologue_meta is not None:
         structured_meta["prologue"] = prologue_meta
-    summary = _function_summary(canonical, values, hir_blocks, canonical_cfg, structured_meta, dataflow_metrics)
 
-    entry_args: list[str] = hir_blocks[0].entry_stack if hir_blocks else []
+    pipeline = {
+        "core_block_count": len(core_hir_blocks),
+        "surface_cleaned_block_count": len(surface_cleaned_blocks),
+        "surface_normalized_block_count": len(surface_normalized_blocks),
+        "surface_block_count": len(surface_hir_blocks),
+        **dataflow_metrics,
+        **cleanup_debug,
+    }
+    timings_ms = {
+        "total": round((time.perf_counter() - t0) * 1000.0, 3),
+        "canonical_lowering": round((t_lower1 - t_lower0) * 1000.0, 3),
+        "core_hir": round((t_core1 - t_core0) * 1000.0, 3),
+        "surface_pipeline": round((t_surface1 - t_surface0) * 1000.0, 3),
+        "structuring": round((t_struct1 - t_struct0) * 1000.0, 3),
+    }
+    report = {
+        "validation": validation,
+        "pipeline": pipeline,
+        "structured": structured_meta,
+        "timings_ms": timings_ms,
+    }
+    summary = _function_summary(canonical, core_values, core_hir_blocks, surface_hir_blocks, canonical_cfg, structured_meta, dataflow_metrics, report)
+
+    entry_args: list[str] = surface_hir_blocks[0].entry_stack if surface_hir_blocks else []
     function_header = f"function {export_name}({', '.join(entry_args)}) {{" if entry_args else f"function {export_name}() {{"
     function_footer = "}"
     hir_text = "\n".join([function_header, hir_text_body, function_footer]) if include_text else ""
@@ -1977,10 +2897,12 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
         summary=summary,
         cfg=canonical_cfg,
         canonical_instructions=canonical if include_canonical else [],
-        dataflow_values=values,
-        hir_blocks=hir_blocks,
-        structured_hir=structured_meta,
+        core_dataflow_values=core_values,
+        core_hir_blocks=core_hir_blocks,
+        surface_hir_blocks=surface_hir_blocks,
+        structured_hir=structured_hir,
         hir_text=hir_text,
+        report=report,
         body_selection=ir_function.body_selection,
     )
 
@@ -2000,8 +2922,14 @@ def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
         "total_macro_lowered": sum(fn.summary["macro_lowered_count"] for fn in functions),
         "total_placeholders": sum(fn.summary.get("placeholder_count", 0) for fn in functions),
         "total_phi": sum(fn.summary.get("phi_count", 0) for fn in functions),
+        "total_inlined_values": sum(fn.summary.get("inlined_value_count", 0) for fn in functions),
+        "total_removed_assignments": sum(fn.summary.get("removed_assignment_count", 0) for fn in functions),
+        "total_fallback_regions": sum(fn.summary.get("fallback_region_count", 0) for fn in functions),
+        "total_fallback_blocks": sum(fn.summary.get("fallback_block_count", 0) for fn in functions),
         "total_residual_labels": sum(fn.summary.get("residual_label_count", 0) for fn in functions),
         "total_residual_gotos": sum(fn.summary.get("residual_goto_count", 0) for fn in functions),
+        "total_core_validation_errors": sum(fn.summary.get("core_validation_error_count", 0) for fn in functions),
+        "total_validation_errors": sum(fn.summary.get("validation_error_count", 0) for fn in functions),
         "construct_histogram": dict(constructs),
     }
 
@@ -2010,6 +2938,13 @@ def build_module_hir(path: str | Path, include_canonical: bool = True, include_t
     path = Path(path)
     mod = MBCModule(path, collect_auxiliary=False)
     functions = [build_function_hir(mod, name, include_canonical=include_canonical, include_text=include_text) for name in mod.export_names()]
+    summary_only_layout = not include_canonical and not include_text
+    functions_payload = [
+        {"name": fn.name, "summary": fn.summary}
+        if summary_only_layout
+        else fn.to_dict(include_canonical=include_canonical, include_text=include_text)
+        for fn in functions
+    ]
     return {
         "contract": {
             "version": HIR_CONTRACT_VERSION,
@@ -2018,17 +2953,26 @@ def build_module_hir(path: str | Path, include_canonical: bool = True, include_t
                 "normalized_ir_nodes",
                 "canonical_instructions",
                 "canonical_cfg",
-                "stack_dataflow",
-                "structured_hir",
+                "core_hir",
+                "surface_hir",
+                "report",
             ],
             "notes": [
                 "CFG is rebuilt after canonical lowering, not reused from pre-lowered IR nodes",
                 "macro signatures are lowered conservatively to avoid inventing false returns",
                 "branch predicates are rendered as cond[opcode](value) to avoid inventing exact VM truth semantics",
-                "when source-like reconstruction is unsafe, HIR keeps explicit labels and gotos instead of opaque fallback blocks",
+                "when source-like reconstruction is unsafe, surface_hir.structured_hir groups residual explicit-CFG slices into goto_region nodes instead of pretending they are source-shaped constructs",
                 "linear single-entry branch arms are collapsed into inline if/if-else bodies before falling back to label/goto rendering",
                 "single-arm return chains are lifted into guard-style if bodies when the other branch is the natural fallthrough",
                 "inside normalized while-regions, jumps to the loop header/exit are rendered as continue/break where safe",
+                "core HIR is kept separate from surface rendering/report data so downstream AST work can consume the stable graph directly",
+                "surface HIR now uses block parameters on merge points and passes arguments through gotos instead of printing standalone phi assignments",
+                "merge-block parameter names are normalized from raw phi_* identifiers to stable m_* surface names before rendering",
+                "single-use pure temporaries are inlined from current surface definitions with memoized expansion instead of stale value.expr snapshots",
+                "stateful fallthrough rewrites are conservative and keep bridge blocks unless stack/block-param substitution is provably safe",
+                "surface_hir.structured_hir is a region tree (if/if_else/while/switch_like/block/goto_region) that stays below AST and keeps residual label/goto CFG explicit for later fallback lowering",
+                "validation runs on core_raw, surface_cleaned, surface_normalized, and surface_final in detailed mode and is recorded in the report section",
+                "summary-only mode skips text/tree emission and only computes structured metrics needed for corpus reporting",
             ],
         },
         "path": str(path),
@@ -2041,7 +2985,7 @@ def build_module_hir(path: str | Path, include_canonical: bool = True, include_t
         "globals_count": len(mod.globals),
         "exports_count": len(mod.exports),
         "summary": _module_summary(functions),
-        "functions": [fn.to_dict(include_canonical=include_canonical, include_text=include_text) for fn in functions],
+        "functions": functions_payload,
     }
 
 
@@ -2055,6 +2999,10 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     macro_lowered = 0
     placeholders = 0
     phi_total = 0
+    total_inlined_values = 0
+    total_removed_assignments = 0
+    fallback_regions = 0
+    fallback_blocks = 0
     residual_labels = 0
     residual_gotos = 0
     heaviest_functions: list[dict[str, Any]] = []
@@ -2069,6 +3017,10 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
         macro_lowered += int(summary.get("total_macro_lowered", 0))
         placeholders += int(summary.get("total_placeholders", 0))
         phi_total += int(summary.get("total_phi", 0))
+        total_inlined_values += int(summary.get("total_inlined_values", 0))
+        total_removed_assignments += int(summary.get("total_removed_assignments", 0))
+        fallback_regions += int(summary.get("total_fallback_regions", 0))
+        fallback_blocks += int(summary.get("total_fallback_blocks", 0))
         residual_labels += int(summary.get("total_residual_labels", 0))
         residual_gotos += int(summary.get("total_residual_gotos", 0))
         for fn in module.get("functions", []):
@@ -2096,8 +3048,14 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             "total_macro_lowered": macro_lowered,
             "total_placeholders": placeholders,
             "total_phi": phi_total,
+            "total_inlined_values": total_inlined_values,
+            "total_removed_assignments": total_removed_assignments,
+            "total_fallback_regions": fallback_regions,
+            "total_fallback_blocks": fallback_blocks,
             "total_residual_labels": residual_labels,
             "total_residual_gotos": residual_gotos,
+            "total_core_validation_errors": sum(int(module.get("summary", {}).get("total_core_validation_errors", 0)) for module in module_payloads),
+            "total_validation_errors": sum(int(module.get("summary", {}).get("total_validation_errors", 0)) for module in module_payloads),
             "construct_histogram": dict(construct_hist),
         },
         "heaviest_functions": heaviest_functions[:32],
