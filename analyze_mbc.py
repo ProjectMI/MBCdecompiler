@@ -5,6 +5,7 @@ import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+from mbl_vm_tools.ast import build_module_ast, render_module_ast_text_from_payload
 from mbl_vm_tools.hir import build_module_hir, summarize_corpus, write_json, write_text
 
 
@@ -79,27 +80,13 @@ def _default_single_json_out(script_path: Path) -> Path:
 
 
 def _default_single_text_out(script_path: Path) -> Path:
-    return HIR_OUT_DIR / f"{script_path.stem}.hir.txt"
-
-
-
-def _render_module_text(module_payload: dict[str, object]) -> str:
-    lines: list[str] = []
-    lines.append(f"// {module_payload['script_name']}")
-    lines.append(f"// contract: {module_payload['contract']['version']}")
-    lines.append("")
-    for fn in module_payload.get("functions", []):
-        hir_text = fn.get("hir_text", "")
-        if hir_text:
-            lines.append(hir_text)
-            lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    return HIR_OUT_DIR / f"{script_path.stem}.ast.txt"
 
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build structured HIR for one MBC script or emit a corpus-wide summary."
+        description="Build HIR for one MBC script or emit a corpus-wide summary. Optional text output is generated from AST."
     )
     parser.add_argument(
         "script",
@@ -107,26 +94,27 @@ def main() -> None:
         help="Optional script path or name. Example: door1.mbc or door1",
     )
     parser.add_argument("--out", help="Output JSON path. In single-script mode this is the JSON file; in corpus mode this is the report file.")
-    parser.add_argument("--text-out", help="Optional text output path for single-script mode. Defaults to hir/<script>.hir.txt")
+    parser.add_argument("--text-out", help="Optional AST text output path for single-script mode. Defaults to hir/<script>.ast.txt")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Max workers for corpus mode (default: {DEFAULT_WORKERS})")
-    parser.add_argument("--summary-only", action="store_true", help="In single-script mode omit canonical instructions and text from the JSON payload.")
+    parser.add_argument("--summary-only", action="store_true", help="In single-script mode omit canonical instructions from the JSON payload.")
     args = parser.parse_args()
 
     if args.script:
         script_path = _resolve_script_path(args.script)
         include_details = not args.summary_only
-        payload = build_module_hir(script_path, include_canonical=include_details, include_text=include_details)
+        payload = build_module_hir(script_path, include_canonical=include_details, include_text=False)
         json_out = Path(args.out) if args.out else _default_single_json_out(script_path)
         write_json(payload, json_out)
         if include_details:
-            text_out = Path(args.text_out) if args.text_out else _default_single_text_out(script_path)
-            write_text(_render_module_text(payload), text_out)
-            print(f"Built structured HIR for {script_path.name}")
+            print(f"Built HIR for {script_path.name}")
             print(f"Exports: {payload['summary']['export_count']}, canonical instructions: {payload['summary']['total_canonical_instructions']}")
             print(f"JSON: {json_out}")
-            print(f"Text: {text_out}")
+            text_out = Path(args.text_out) if args.text_out else _default_single_text_out(script_path)
+            ast_payload = build_module_ast(script_path, include_canonical=False, include_hir=False, include_text=True)
+            write_text(render_module_ast_text_from_payload(ast_payload), text_out)
+            print(f"AST text: {text_out}")
         else:
-            print(f"Built structured HIR summary for {script_path.name}")
+            print(f"Built HIR summary for {script_path.name}")
             print(f"JSON: {json_out}")
         return
 
