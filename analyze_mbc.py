@@ -34,21 +34,60 @@ def _resolve_script_path(script_arg: str) -> Path:
 
 
 
-def _build_module_hir_one(path: str) -> dict:
-    return build_module_hir(path, include_canonical=False, include_text=False)
+def _build_module_hir_one(path: str, include_definitions: bool, include_exports: bool, validate: bool) -> dict:
+    return build_module_hir(
+        path,
+        include_canonical=False,
+        include_text=False,
+        include_definitions=include_definitions,
+        include_exports=include_exports,
+        validate=validate,
+    )
 
 
 
-def build_corpus_report(paths: list[Path], workers: int = DEFAULT_WORKERS) -> dict:
+def build_corpus_report(
+    paths: list[Path],
+    workers: int = DEFAULT_WORKERS,
+    *,
+    include_definitions: bool = True,
+    include_exports: bool = True,
+    validate: bool = False,
+) -> dict:
     if not paths:
-        return {"summary": {"module_count": 0, "export_count": 0, "total_canonical_instructions": 0}, "heaviest_functions": []}
+        return {
+            "summary": {
+                "module_count": 0,
+                "function_count": 0,
+                "total_canonical_instructions": 0,
+            },
+            "token_coverage": {},
+            "heaviest_functions": [],
+        }
 
     worker_count = min(max(1, workers), len(paths))
     module_payloads: list[dict | None] = [None] * len(paths)
 
+    if worker_count == 1:
+        failed: list[str] = []
+        for idx, path in enumerate(paths):
+            try:
+                module_payloads[idx] = _build_module_hir_one(str(path), include_definitions, include_exports, validate)
+            except Exception as exc:  # pragma: no cover - CLI fallback path
+                failed.append(f"{path.name}: {exc}")
+            completed = idx + 1
+            if completed % 25 == 0 or completed == len(paths):
+                print(f"HIR corpus: {completed}/{len(paths)}")
+        if failed:
+            print(f"HIR corpus warnings: {len(failed)} module(s) failed")
+            for item in failed[:8]:
+                print(f"  - {item}")
+        ready_modules = [module for module in module_payloads if module is not None]
+        return summarize_corpus(ready_modules)
+
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         future_to_index = {
-            executor.submit(_build_module_hir_one, str(path)): idx
+            executor.submit(_build_module_hir_one, str(path), include_definitions, include_exports, validate): idx
             for idx, path in enumerate(paths)
         }
         completed = 0
@@ -97,20 +136,52 @@ def main() -> None:
     parser.add_argument("--text-out", help="Optional AST text output path for single-script mode. Defaults to hir/<script>.ast.txt")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Max workers for corpus mode (default: {DEFAULT_WORKERS})")
     parser.add_argument("--summary-only", action="store_true", help="In single-script mode omit canonical instructions from the JSON payload.")
+    parser.add_argument("--validate", action="store_true", help="Run HIR validation in single-script mode.")
+    parser.add_argument("--validate-corpus", action="store_true", help="Run HIR validation for every analyzed function in corpus mode.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--exports-only", action="store_true", help="Analyze only export records. Default analyzes definitions plus export-only records.")
+    mode_group.add_argument("--definitions-only", action="store_true", help="Analyze only definition records.")
     args = parser.parse_args()
+
+    include_definitions = not args.exports_only
+    include_exports = not args.definitions_only
 
     if args.script:
         script_path = _resolve_script_path(args.script)
         include_details = not args.summary_only
-        payload = build_module_hir(script_path, include_canonical=include_details, include_text=False)
+        payload = build_module_hir(
+            script_path,
+            include_canonical=include_details,
+            include_text=False,
+            include_definitions=include_definitions,
+            include_exports=include_exports,
+            validate=args.validate,
+        )
         json_out = Path(args.out) if args.out else _default_single_json_out(script_path)
         write_json(payload, json_out)
         if include_details:
             print(f"Built HIR for {script_path.name}")
-            print(f"Exports: {payload['summary']['export_count']}, canonical instructions: {payload['summary']['total_canonical_instructions']}")
+            print(
+                f"Functions: {payload['summary']['function_count']} "
+                f"(definitions: {payload['summary']['definition_function_count']}, "
+                f"export-only: {payload['summary']['export_only_function_count']}), "
+                f"canonical instructions: {payload['summary']['total_canonical_instructions']}"
+            )
+            print(
+                f"Token coverage: {payload['summary']['known_token_ratio']:.4%} known "
+                f"({payload['summary']['total_unknown_tokens']} unknown token(s))"
+            )
             print(f"JSON: {json_out}")
             text_out = Path(args.text_out) if args.text_out else _default_single_text_out(script_path)
-            ast_payload = build_module_ast(script_path, include_canonical=False, include_hir=False, include_text=True)
+            ast_payload = build_module_ast(
+                script_path,
+                include_canonical=False,
+                include_hir=False,
+                include_text=True,
+                include_definitions=include_definitions,
+                include_exports=include_exports,
+                validate=args.validate,
+            )
             write_text(render_module_ast_text_from_payload(ast_payload), text_out)
             print(f"AST text: {text_out}")
         else:
@@ -119,7 +190,13 @@ def main() -> None:
         return
 
     paths = sorted(MBC_DIR.glob("*.mbc"))
-    report = build_corpus_report(paths, workers=args.workers)
+    report = build_corpus_report(
+        paths,
+        workers=args.workers,
+        include_definitions=include_definitions,
+        include_exports=include_exports,
+        validate=args.validate_corpus,
+    )
     if args.out:
         out_path = write_json(report, args.out)
         print(f"Wrote HIR corpus report to {out_path}")

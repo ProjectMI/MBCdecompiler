@@ -18,7 +18,7 @@ from mbl_vm_tools.hir import (
     _ordered_unique,
     _rename_merge_params,
 )
-from mbl_vm_tools.parser import MBCModule
+from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
 AST_CONTRACT_VERSION = "ast-v1"
@@ -1324,13 +1324,29 @@ def build_function_ast_from_payload(function_payload: dict[str, Any], *, include
     )
 
 
-def build_function_ast(mod: MBCModule, export_name: str, *, include_canonical: bool = False, include_hir: bool = False, include_text: bool = True) -> ASTFunction:
-    hir = build_function_hir(mod, export_name, include_canonical=include_canonical, include_text=False)
+def build_function_ast(mod: MBCModule, entry_or_name: FunctionEntry | str, *, include_canonical: bool = False, include_hir: bool = False, include_text: bool = True, validate: bool = False) -> ASTFunction:
+    hir = build_function_hir(mod, entry_or_name, include_canonical=include_canonical, include_text=False, validate=validate)
     return build_function_ast_from_payload(hir.to_dict(include_canonical=include_canonical, include_text=False), include_hir=include_hir, include_text=include_text)
 
 
-def build_module_ast(path: str | Path, *, include_canonical: bool = False, include_hir: bool = False, include_text: bool = True) -> dict[str, Any]:
-    hir_payload = build_module_hir(path, include_canonical=include_canonical, include_text=True)
+def build_module_ast(
+    path: str | Path,
+    *,
+    include_canonical: bool = False,
+    include_hir: bool = False,
+    include_text: bool = True,
+    include_definitions: bool = True,
+    include_exports: bool = True,
+    validate: bool = False,
+) -> dict[str, Any]:
+    hir_payload = build_module_hir(
+        path,
+        include_canonical=include_canonical,
+        include_text=True,
+        include_definitions=include_definitions,
+        include_exports=include_exports,
+        validate=validate,
+    )
     functions = [
         build_function_ast_from_payload(fn, include_hir=include_hir, include_text=include_text)
         for fn in hir_payload.get("functions", [])
@@ -1353,7 +1369,7 @@ def build_module_ast(path: str | Path, *, include_canonical: bool = False, inclu
         "path": hir_payload.get("path"),
         "script_name": hir_payload.get("script_name"),
         "summary": {
-            "export_count": len(functions_payload),
+            "function_count": len(functions_payload),
             "total_normalized_basic_blocks": sum(fn.summary.get("normalized_basic_block_count", 0) for fn in functions),
             "total_fallback_regions": sum(fn.summary.get("fallback_region_count", 0) for fn in functions),
             "total_fallback_blocks": sum(fn.summary.get("fallback_block_count", 0) for fn in functions),

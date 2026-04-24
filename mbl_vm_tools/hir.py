@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from mbl_vm_tools.IR import IRFunction, IRNode, build_function_ir
-from mbl_vm_tools.parser import MBCModule
+from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
 HIR_CONTRACT_VERSION = "hir-v11"
@@ -904,7 +904,12 @@ def _compose_entry_stack(
                 values.append(f"in_{block_id}_{pos}")
         phi_name = f"phi_{block_id}_{pos}"
         unique = _ordered_unique([value for value in values if value != phi_name] or values)
-        if len(unique) == 1:
+
+        # Treat real merge points as stable SSA boundaries even when the current
+        # iteration temporarily sees the same value from every predecessor.  In
+        # loop-heavy bytecode the old "collapse single unique source" rule could
+        # oscillate between a predecessor phi and a concrete temp forever.
+        if len(unique) == 1 and len(effective_incoming) <= 1:
             entry.append(unique[0])
         else:
             entry.append(phi_name)
@@ -939,6 +944,12 @@ def build_hir_blocks(
     phi_defs: dict[str, dict[str, list[str]]] = defaultdict(dict)
     exit_stacks: dict[str, list[str]] = {}
     work = deque([entry_block_id] if entry_block_id else [])
+    work_iterations = 0
+    # Keep the solver bounded so malformed bytecode cannot hang corpus runs.
+    # Merge blocks are stabilized in _compose_entry_stack; the limit is now a
+    # safety net rather than a normal termination path.
+    worklist_iteration_limit = max(128, len(blocks) * 64 + len(instructions) * 8)
+    worklist_iteration_limit_hit = False
 
     entry_plan = plans.get(entry_block_id) if entry_block_id else None
     if entry_block_id and entry_plan is not None:
@@ -948,6 +959,10 @@ def build_hir_blocks(
             entry_stacks[entry_block_id] = [f"arg{i}" for i in range(entry_plan.entry_depth)]
 
     while work:
+        work_iterations += 1
+        if work_iterations > worklist_iteration_limit:
+            worklist_iteration_limit_hit = True
+            break
         block_id = work.popleft()
         block = by_id[block_id]
         plan = plans[block_id]
@@ -1134,6 +1149,9 @@ def build_hir_blocks(
     metrics = {
         "placeholder_count": placeholder_count,
         "phi_count": sum(1 for name in value_map if name.startswith("phi_")),
+        "worklist_iteration_count": work_iterations,
+        "worklist_iteration_limit": worklist_iteration_limit,
+        "worklist_iteration_limit_hit": int(worklist_iteration_limit_hit),
     }
     return hir_blocks, dataflow_values, metrics
 
@@ -1812,6 +1830,51 @@ def _collect_switch_like(start_index: int, hir_blocks: list[HIRBlock], index_by_
 
 
 
+def _token_coverage_from_ir(ir_function: IRFunction) -> dict[str, Any]:
+    nodes = list(ir_function.nodes)
+    token_count = len(nodes)
+    byte_count = sum(max(0, int(node.size)) for node in nodes)
+    unknown_nodes = [node for node in nodes if node.raw_kind == "UNK" or node.semantic_op == "unknown"]
+    unknown_count = len(unknown_nodes)
+    unknown_bytes = sum(max(0, int(node.size)) for node in unknown_nodes)
+    opaque_count = sum(1 for node in nodes if node.semantic_op.startswith("opaque_"))
+    data_count = sum(1 for node in nodes if node.semantic_op in {"data", "opaque_data"})
+    known_count = token_count - unknown_count
+    known_bytes = byte_count - unknown_bytes
+
+    raw_kind_hist = Counter(node.raw_kind for node in nodes)
+    semantic_hist = Counter(node.semantic_op for node in nodes)
+    unknown_opcode_hist: Counter[str] = Counter()
+    for node in unknown_nodes:
+        op = node.operands.get("op")
+        if isinstance(op, int):
+            unknown_opcode_hist[f"0x{op:02X}"] += 1
+        elif op is not None:
+            unknown_opcode_hist[str(op)] += 1
+        else:
+            unknown_opcode_hist[node.raw_kind] += 1
+
+    return {
+        "token_count": token_count,
+        "token_byte_size": byte_count,
+        "known_token_count": known_count,
+        "unknown_token_count": unknown_count,
+        "known_token_ratio": (known_count / token_count) if token_count else 1.0,
+        "unknown_token_ratio": (unknown_count / token_count) if token_count else 0.0,
+        "known_byte_size": known_bytes,
+        "unknown_byte_size": unknown_bytes,
+        "known_byte_ratio": (known_bytes / byte_count) if byte_count else 1.0,
+        "unknown_byte_ratio": (unknown_bytes / byte_count) if byte_count else 0.0,
+        "opaque_node_count": opaque_count,
+        "opaque_node_ratio": (opaque_count / token_count) if token_count else 0.0,
+        "data_node_count": data_count,
+        "data_node_ratio": (data_count / token_count) if token_count else 0.0,
+        "token_kind_histogram": dict(raw_kind_hist.most_common(32)),
+        "semantic_histogram": dict(semantic_hist.most_common(32)),
+        "unknown_opcode_histogram": dict(unknown_opcode_hist.most_common(32)),
+    }
+
+
 def _function_summary(
     canonical: list[CanonicalInstruction],
     core_values: list[DataflowValue],
@@ -1826,6 +1889,7 @@ def _function_summary(
     validation = report.get("validation", {})
     core_validation = validation.get("core_raw", {})
     normalized_validation = validation.get("normalized_final", {})
+    token_coverage = report.get("token_coverage", {})
     return {
         "canonical_instruction_count": len(canonical),
         "basic_block_count": len(core_blocks),
@@ -1845,8 +1909,21 @@ def _function_summary(
         "switch_candidate_count": len(analysis_hints.get("switch_candidates", [])),
         "core_validation_error_count": int(core_validation.get("error_count", 0)),
         "validation_error_count": int(normalized_validation.get("error_count", 0)),
+        "token_count": int(token_coverage.get("token_count", 0)),
+        "token_byte_size": int(token_coverage.get("token_byte_size", 0)),
+        "known_token_count": int(token_coverage.get("known_token_count", 0)),
+        "unknown_token_count": int(token_coverage.get("unknown_token_count", 0)),
+        "known_token_ratio": float(token_coverage.get("known_token_ratio", 1.0)),
+        "unknown_token_ratio": float(token_coverage.get("unknown_token_ratio", 0.0)),
+        "known_byte_ratio": float(token_coverage.get("known_byte_ratio", 1.0)),
+        "unknown_byte_ratio": float(token_coverage.get("unknown_byte_ratio", 0.0)),
+        "opaque_node_count": int(token_coverage.get("opaque_node_count", 0)),
+        "opaque_node_ratio": float(token_coverage.get("opaque_node_ratio", 0.0)),
+        "data_node_count": int(token_coverage.get("data_node_count", 0)),
+        "data_node_ratio": float(token_coverage.get("data_node_ratio", 0.0)),
+        "dataflow_worklist_iteration_count": int(dataflow_metrics.get("worklist_iteration_count", 0)),
+        "dataflow_worklist_iteration_limit_hit": int(dataflow_metrics.get("worklist_iteration_limit_hit", 0)),
     }
-
 
 def _looks_like_aggregate_prologue(nodes: list[IRNode]) -> bool:
     if not nodes:
@@ -1958,9 +2035,9 @@ def _build_hir_analysis_hints(blocks: list[HIRBlock]) -> dict[str, Any]:
     }
 
 
-def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool = True, include_text: bool = True) -> HIRFunction:
+def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, include_canonical: bool = True, include_text: bool = True, validate: bool = False) -> HIRFunction:
     t0 = time.perf_counter()
-    ir_function = build_function_ir(mod, export_name)
+    ir_function = build_function_ir(mod, entry_or_name)
     hir_nodes = list(ir_function.nodes)
     prologue_meta: dict[str, Any] | None = None
     entry_seed: list[str] | None = None
@@ -1985,7 +2062,7 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
     core_hir_blocks, core_values, dataflow_metrics = build_hir_blocks(canonical_blocks, canonical_cfg, canonical, entry_seed=entry_seed)
     t_core1 = time.perf_counter()
 
-    run_validation = include_canonical or include_text
+    run_validation = validate or include_canonical or include_text
     validation: dict[str, Any] = {}
     if run_validation:
         validation["core_raw"] = validate_hir_blocks(core_hir_blocks, core_values, "core_raw")
@@ -2019,15 +2096,17 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
         "normalization": round((t_norm1 - t_norm0) * 1000.0, 3),
         "analysis_hints": round((t_hints1 - t_hints0) * 1000.0, 3),
     }
+    token_coverage = _token_coverage_from_ir(ir_function)
     report = {
         "validation": validation,
         "pipeline": pipeline,
         "timings_ms": timings_ms,
+        "token_coverage": token_coverage,
     }
     summary = _function_summary(canonical, core_values, core_hir_blocks, normalized_blocks, canonical_cfg, analysis_hints, dataflow_metrics, report)
 
     return HIRFunction(
-        name=export_name,
+        name=ir_function.name,
         span=ir_function.span,
         slice_mode=ir_function.slice_mode,
         summary=summary,
@@ -2044,10 +2123,33 @@ def build_function_hir(mod: MBCModule, export_name: str, include_canonical: bool
 
 def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
     total_canonical = sum(fn.summary["canonical_instruction_count"] for fn in functions)
+    function_count = len(functions)
+
+    entry_payloads = [
+        (fn.body_selection.get("entry") or {})
+        for fn in functions
+    ]
+    definition_function_count = sum(1 for entry in entry_payloads if entry.get("is_definition"))
+    exported_function_count = sum(1 for entry in entry_payloads if entry.get("is_exported"))
+    export_only_function_count = sum(1 for entry in entry_payloads if entry.get("source_kind") == "export")
+
+    total_tokens = sum(fn.summary.get("token_count", 0) for fn in functions)
+    total_unknown_tokens = sum(fn.summary.get("unknown_token_count", 0) for fn in functions)
+    total_token_bytes = sum(fn.summary.get("token_byte_size", 0) for fn in functions)
+    total_unknown_bytes = sum(int(round(fn.summary.get("unknown_byte_ratio", 0.0) * fn.summary.get("token_byte_size", 0))) for fn in functions)
+
     return {
-        "export_count": len(functions),
+        "function_count": function_count,
+        "entry_count": function_count,
+        # Backward-compatible field name.  New callers should prefer
+        # function_count/public_export_count where the distinction matters.
+        "export_count": exported_function_count,
+        "definition_function_count": definition_function_count,
+        "exported_function_count": exported_function_count,
+        "export_only_function_count": export_only_function_count,
         "total_canonical_instructions": total_canonical,
-        "avg_canonical_instructions_per_export": (total_canonical / len(functions)) if functions else 0.0,
+        "avg_canonical_instructions_per_function": (total_canonical / function_count) if function_count else 0.0,
+        "avg_canonical_instructions_per_export": (total_canonical / function_count) if function_count else 0.0,
         "total_values": sum(fn.summary["value_count"] for fn in functions),
         "total_cfg_anomalies": sum(fn.summary["cfg_anomaly_count"] for fn in functions),
         "total_unresolved_branches": sum(fn.summary["unresolved_branch_count"] for fn in functions),
@@ -2059,16 +2161,49 @@ def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
         "total_switch_candidates": sum(fn.summary.get("switch_candidate_count", 0) for fn in functions),
         "total_core_validation_errors": sum(fn.summary.get("core_validation_error_count", 0) for fn in functions),
         "total_validation_errors": sum(fn.summary.get("validation_error_count", 0) for fn in functions),
+        "total_tokens": total_tokens,
+        "total_unknown_tokens": total_unknown_tokens,
+        "known_token_ratio": ((total_tokens - total_unknown_tokens) / total_tokens) if total_tokens else 1.0,
+        "unknown_token_ratio": (total_unknown_tokens / total_tokens) if total_tokens else 0.0,
+        "total_token_bytes": total_token_bytes,
+        "total_unknown_token_bytes": total_unknown_bytes,
+        "known_byte_ratio": ((total_token_bytes - total_unknown_bytes) / total_token_bytes) if total_token_bytes else 1.0,
+        "unknown_byte_ratio": (total_unknown_bytes / total_token_bytes) if total_token_bytes else 0.0,
+        "total_opaque_nodes": sum(fn.summary.get("opaque_node_count", 0) for fn in functions),
+        "total_data_nodes": sum(fn.summary.get("data_node_count", 0) for fn in functions),
+        "total_dataflow_worklist_limit_hits": sum(fn.summary.get("dataflow_worklist_iteration_limit_hit", 0) for fn in functions),
     }
 
 
-def build_module_hir(path: str | Path, include_canonical: bool = True, include_text: bool = True) -> dict[str, Any]:
+def build_module_hir(
+    path: str | Path,
+    include_canonical: bool = True,
+    include_text: bool = True,
+    *,
+    include_definitions: bool = True,
+    include_exports: bool = True,
+    validate: bool = False,
+) -> dict[str, Any]:
     path = Path(path)
     mod = MBCModule(path, collect_auxiliary=False)
-    functions = [build_function_hir(mod, name, include_canonical=include_canonical, include_text=False) for name in mod.export_names()]
+    entries = mod.function_entries(include_definitions=include_definitions, include_exports=include_exports, dedupe=True)
+    functions = [
+        build_function_hir(mod, entry, include_canonical=include_canonical, include_text=False, validate=validate)
+        for entry in entries
+    ]
     summary_only_layout = (not include_canonical) and (not include_text)
     functions_payload = [
-        {"name": fn.name, "summary": fn.summary, "analysis_hints": fn.analysis_hints}
+        {
+            "name": fn.name,
+            "summary": fn.summary,
+            "body_selection": fn.body_selection,
+            "analysis_hints": fn.analysis_hints,
+            "report": {
+                "token_coverage": fn.report.get("token_coverage", {}),
+                "validation": fn.report.get("validation", {}),
+                "pipeline": fn.report.get("pipeline", {}),
+            },
+        }
         if summary_only_layout
         else fn.to_dict(include_canonical=include_canonical, include_text=False)
         for fn in functions
@@ -2088,6 +2223,8 @@ def build_module_hir(path: str | Path, include_canonical: bool = True, include_t
             ],
             "notes": [
                 "HIR ends at a normalized CFG-like IR and does not try to be the final source-shaped tree",
+                "Default module analysis covers de-duplicated definitions plus export-only records",
+                "Definitions provide exact spans; export records are preserved as public metadata",
                 "CFG is rebuilt after canonical lowering, not reused from pre-lowered IR nodes",
                 "macro signatures are lowered conservatively to avoid inventing false returns",
                 "branch predicates are rendered as cond[opcode](value) to avoid inventing exact VM truth semantics",
@@ -2105,14 +2242,37 @@ def build_module_hir(path: str | Path, include_canonical: bool = True, include_t
         "definition_count": len(mod.definitions),
         "globals_count": len(mod.globals),
         "exports_count": len(mod.exports),
+        "function_entry_count": len(entries),
+        "analysis_mode": {
+            "include_definitions": include_definitions,
+            "include_exports": include_exports,
+            "dedupe_exports_with_definitions": True,
+            "validate": validate,
+        },
+        "function_entries": [entry.to_dict() for entry in entries],
         "summary": _module_summary(functions),
         "functions": functions_payload,
     }
 
 
+def _merge_counter_from_mapping(counter: Counter, payload: dict[str, Any] | None) -> None:
+    if not payload:
+        return
+    for key, value in payload.items():
+        try:
+            counter[str(key)] += int(value)
+        except Exception:
+            continue
+
+
 def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     module_count = len(module_payloads)
-    export_count = 0
+    function_count = 0
+    public_export_count = 0
+    definition_count = 0
+    analyzed_definition_count = 0
+    analyzed_exported_count = 0
+    export_only_count = 0
     total_instructions = 0
     unresolved = 0
     cfg_anomalies = 0
@@ -2122,11 +2282,35 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     total_loop_hints = 0
     total_branch_region_hints = 0
     total_switch_candidates = 0
+    total_core_validation_errors = 0
+    total_validation_errors = 0
+    total_dataflow_worklist_limit_hits = 0
+
+    token_count = 0
+    known_token_count = 0
+    unknown_token_count = 0
+    token_bytes = 0
+    known_token_bytes = 0
+    unknown_token_bytes = 0
+    opaque_nodes = 0
+    data_nodes = 0
+    token_kind_hist: Counter[str] = Counter()
+    semantic_hist: Counter[str] = Counter()
+    unknown_opcode_hist: Counter[str] = Counter()
+
     heaviest_functions: list[dict[str, Any]] = []
+    lowest_token_coverage_functions: list[dict[str, Any]] = []
+    pipeline_deviations: list[dict[str, Any]] = []
 
     for module in module_payloads:
         summary = module.get("summary", {})
-        export_count += int(summary.get("export_count", 0))
+        module_function_count = int(summary.get("function_count", summary.get("export_count", 0)))
+        function_count += module_function_count
+        public_export_count += int(module.get("exports_count", 0))
+        definition_count += int(module.get("definition_count", 0))
+        analyzed_definition_count += int(summary.get("definition_function_count", 0))
+        analyzed_exported_count += int(summary.get("exported_function_count", 0))
+        export_only_count += int(summary.get("export_only_function_count", 0))
         total_instructions += int(summary.get("total_canonical_instructions", 0))
         unresolved += int(summary.get("total_unresolved_branches", 0))
         cfg_anomalies += int(summary.get("total_cfg_anomalies", 0))
@@ -2136,12 +2320,47 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
         total_loop_hints += int(summary.get("total_loop_hints", 0))
         total_branch_region_hints += int(summary.get("total_branch_region_hints", 0))
         total_switch_candidates += int(summary.get("total_switch_candidates", 0))
+        total_core_validation_errors += int(summary.get("total_core_validation_errors", 0))
+        total_validation_errors += int(summary.get("total_validation_errors", 0))
+        total_dataflow_worklist_limit_hits += int(summary.get("total_dataflow_worklist_limit_hits", 0))
+
         for fn in module.get("functions", []):
             fn_summary = fn.get("summary", {})
+            coverage = (fn.get("report", {}) or {}).get("token_coverage", {}) or {}
+
+            fn_token_count = int(coverage.get("token_count", fn_summary.get("token_count", 0)))
+            fn_known_token_count = int(coverage.get("known_token_count", fn_summary.get("known_token_count", 0)))
+            fn_unknown_token_count = int(coverage.get("unknown_token_count", fn_summary.get("unknown_token_count", 0)))
+            fn_token_bytes = int(coverage.get("token_byte_size", fn_summary.get("token_byte_size", 0)))
+            fn_known_token_bytes = int(coverage.get("known_byte_size", round(fn_summary.get("known_byte_ratio", 1.0) * fn_token_bytes)))
+            fn_unknown_token_bytes = int(coverage.get("unknown_byte_size", fn_token_bytes - fn_known_token_bytes))
+            fn_opaque_nodes = int(coverage.get("opaque_node_count", fn_summary.get("opaque_node_count", 0)))
+            fn_data_nodes = int(coverage.get("data_node_count", fn_summary.get("data_node_count", 0)))
+
+            token_count += fn_token_count
+            known_token_count += fn_known_token_count
+            unknown_token_count += fn_unknown_token_count
+            token_bytes += fn_token_bytes
+            known_token_bytes += fn_known_token_bytes
+            unknown_token_bytes += fn_unknown_token_bytes
+            opaque_nodes += fn_opaque_nodes
+            data_nodes += fn_data_nodes
+
+            _merge_counter_from_mapping(token_kind_hist, coverage.get("token_kind_histogram"))
+            _merge_counter_from_mapping(semantic_hist, coverage.get("semantic_histogram"))
+            _merge_counter_from_mapping(unknown_opcode_hist, coverage.get("unknown_opcode_histogram"))
+
+            entry = (fn.get("body_selection", {}) or {}).get("entry", {}) or {}
+            function_ref = {
+                "script_name": module.get("script_name"),
+                "function": fn.get("name"),
+                "symbol": entry.get("symbol"),
+                "source_kind": entry.get("source_kind"),
+                "is_exported": bool(entry.get("is_exported")),
+            }
             heaviest_functions.append(
                 {
-                    "script_name": module.get("script_name"),
-                    "function": fn.get("name"),
+                    **function_ref,
                     "canonical_instruction_count": int(fn_summary.get("canonical_instruction_count", 0)),
                     "cfg_anomaly_count": int(fn_summary.get("cfg_anomaly_count", 0)),
                     "placeholder_count": int(fn_summary.get("placeholder_count", 0)),
@@ -2149,13 +2368,54 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
                 }
             )
 
-    heaviest_functions.sort(key=lambda item: (-item["canonical_instruction_count"], item["placeholder_count"], item["script_name"], item["function"]))
+            known_ratio = float(coverage.get("known_token_ratio", fn_summary.get("known_token_ratio", 1.0)))
+            if fn_token_count and (fn_unknown_token_count > 0 or known_ratio < 1.0 or fn_opaque_nodes > 0):
+                lowest_token_coverage_functions.append(
+                    {
+                        **function_ref,
+                        "known_token_ratio": known_ratio,
+                        "unknown_token_count": fn_unknown_token_count,
+                        "token_count": fn_token_count,
+                        "opaque_node_count": fn_opaque_nodes,
+                        "unknown_opcode_histogram": coverage.get("unknown_opcode_histogram", {}),
+                    }
+                )
+
+            deviation_score = (
+                int(fn_summary.get("cfg_anomaly_count", 0))
+                + int(fn_summary.get("unresolved_branch_count", 0))
+                + int(fn_summary.get("core_validation_error_count", 0))
+                + int(fn_summary.get("validation_error_count", 0))
+                + int(fn_summary.get("dataflow_worklist_iteration_limit_hit", 0))
+            )
+            if deviation_score:
+                pipeline_deviations.append(
+                    {
+                        **function_ref,
+                        "cfg_anomaly_count": int(fn_summary.get("cfg_anomaly_count", 0)),
+                        "unresolved_branch_count": int(fn_summary.get("unresolved_branch_count", 0)),
+                        "core_validation_error_count": int(fn_summary.get("core_validation_error_count", 0)),
+                        "validation_error_count": int(fn_summary.get("validation_error_count", 0)),
+                        "dataflow_worklist_iteration_limit_hit": int(fn_summary.get("dataflow_worklist_iteration_limit_hit", 0)),
+                        "canonical_instruction_count": int(fn_summary.get("canonical_instruction_count", 0)),
+                    }
+                )
+
+    heaviest_functions.sort(key=lambda item: (-item["canonical_instruction_count"], item["placeholder_count"], str(item["script_name"]), str(item["function"])))
+    lowest_token_coverage_functions.sort(key=lambda item: (item["known_token_ratio"], -item["unknown_token_count"], str(item["script_name"]), str(item["function"])))
+    pipeline_deviations.sort(key=lambda item: (-(item["cfg_anomaly_count"] + item["unresolved_branch_count"] + item["core_validation_error_count"] + item["validation_error_count"]), str(item["script_name"]), str(item["function"])))
+
     return {
         "summary": {
             "module_count": module_count,
-            "export_count": export_count,
+            "function_count": function_count,
+            "public_export_count": public_export_count,
+            "definition_count": definition_count,
+            "analyzed_definition_count": analyzed_definition_count,
+            "analyzed_exported_count": analyzed_exported_count,
+            "export_only_function_count": export_only_count,
             "total_canonical_instructions": total_instructions,
-            "avg_canonical_instructions_per_export": (total_instructions / export_count) if export_count else 0.0,
+            "avg_canonical_instructions_per_function": (total_instructions / function_count) if function_count else 0.0,
             "total_cfg_anomalies": cfg_anomalies,
             "total_unresolved_branches": unresolved,
             "total_macro_lowered": macro_lowered,
@@ -2164,11 +2424,32 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             "total_loop_hints": total_loop_hints,
             "total_branch_region_hints": total_branch_region_hints,
             "total_switch_candidates": total_switch_candidates,
-            "total_core_validation_errors": sum(int(module.get("summary", {}).get("total_core_validation_errors", 0)) for module in module_payloads),
-            "total_validation_errors": sum(int(module.get("summary", {}).get("total_validation_errors", 0)) for module in module_payloads),
+            "total_core_validation_errors": total_core_validation_errors,
+            "total_validation_errors": total_validation_errors,
+            "total_dataflow_worklist_limit_hits": total_dataflow_worklist_limit_hits,
         },
+        "token_coverage": {
+            "token_count": token_count,
+            "known_token_count": known_token_count,
+            "unknown_token_count": unknown_token_count,
+            "known_token_ratio": (known_token_count / token_count) if token_count else 1.0,
+            "unknown_token_ratio": (unknown_token_count / token_count) if token_count else 0.0,
+            "token_byte_size": token_bytes,
+            "known_byte_size": known_token_bytes,
+            "unknown_byte_size": unknown_token_bytes,
+            "known_byte_ratio": (known_token_bytes / token_bytes) if token_bytes else 1.0,
+            "unknown_byte_ratio": (unknown_token_bytes / token_bytes) if token_bytes else 0.0,
+            "opaque_node_count": opaque_nodes,
+            "data_node_count": data_nodes,
+            "token_kind_histogram": dict(token_kind_hist.most_common(64)),
+            "semantic_histogram": dict(semantic_hist.most_common(64)),
+            "unknown_opcode_histogram": dict(unknown_opcode_hist.most_common(64)),
+            "lowest_token_coverage_functions": lowest_token_coverage_functions[:64],
+        },
+        "pipeline_deviations": pipeline_deviations[:64],
         "heaviest_functions": heaviest_functions[:32],
     }
+
 
 
 def write_json(payload: dict[str, Any], out_path: str | Path) -> Path:

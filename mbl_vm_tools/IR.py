@@ -5,7 +5,7 @@ import statistics
 from dataclasses import asdict, dataclass, field
 from typing import Any, Optional
 
-from mbl_vm_tools.parser import MBCModule
+from mbl_vm_tools.parser import FunctionEntry, MBCModule
 from mbl_vm_tools.tokenizer import Token, tokenize_stream
 
 
@@ -137,15 +137,16 @@ class ExportBodySelection:
     used_fallback: bool
     reason: str
     span: dict[str, int]
-    public_span: dict[str, int]
+    public_span: dict[str, int] | None
     exact_span: dict[str, int] | None
     candidates: list[dict[str, Any]]
+    entry: dict[str, Any] | None = None
     raw: bytes = field(repr=False, default=b"")
     tokens: list[Token] = field(repr=False, default_factory=list)
     nodes: list[IRNode] = field(repr=False, default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "name": self.name,
             "slice_mode": self.slice_mode,
             "used_fallback": self.used_fallback,
@@ -155,6 +156,9 @@ class ExportBodySelection:
             "exact_span": self.exact_span,
             "candidates": self.candidates,
         }
+        if self.entry is not None:
+            payload["entry"] = self.entry
+        return payload
 
 
 def _hex_byte(value: int) -> str:
@@ -760,15 +764,74 @@ def _summarize_body_candidate(mode: str, span: tuple[int, int], raw: bytes) -> t
     return stats, tokens, nodes
 
 
-def select_export_body(mod: MBCModule, export_name: str) -> ExportBodySelection:
-    public_span = mod.get_export_public_code_span(export_name)
-    public_raw = mod._slice_code_span(*public_span)
-    public_stats: dict[str, Any] | None = None
-    public_tokens: list[Token] = []
-    public_nodes: list[IRNode] = []
-    if public_raw:
-        public_stats, public_tokens, public_nodes = _summarize_body_candidate("export_public", public_span, public_raw)
+def _span_dict(span: tuple[int, int] | None) -> dict[str, int] | None:
+    if span is None:
+        return None
+    return {"start": span[0], "end": span[1]}
 
+
+def _exact_body_is_stable(stats: dict[str, Any] | None) -> bool:
+    if stats is None:
+        return False
+    return (
+        stats["node_count"] >= 2
+        and stats["mean_confidence"] >= 0.85
+        and stats["unknown_ratio"] <= 0.10
+        and stats["opaque_ratio"] <= 0.20
+    )
+
+
+def _entry_payload(entry: FunctionEntry | None) -> dict[str, Any] | None:
+    return entry.to_dict() if entry is not None else None
+
+
+def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySelection:
+    exact_span, exact_reason = mod.get_function_exact_code_span_with_reason(entry)
+    exact_raw = mod._slice_code_span(*exact_span) if exact_span is not None else b""
+    exact_stats: dict[str, Any] | None = None
+    exact_tokens: list[Token] = []
+    exact_nodes: list[IRNode] = []
+    if exact_span is not None and exact_raw:
+        exact_stats, exact_tokens, exact_nodes = _summarize_body_candidate("definition_exact", exact_span, exact_raw)
+
+    if exact_stats is None:
+        return ExportBodySelection(
+            name=entry.name,
+            slice_mode="definition_exact",
+            used_fallback=False,
+            reason=exact_reason or "empty_definition_slice",
+            span=_span_dict(exact_span) or {"start": 0, "end": 0},
+            public_span=_span_dict(exact_span),
+            exact_span=_span_dict(exact_span),
+            candidates=[],
+            entry=_entry_payload(entry),
+            raw=b"",
+            tokens=[],
+            nodes=[],
+        )
+
+    return ExportBodySelection(
+        name=entry.name,
+        slice_mode="definition_exact",
+        used_fallback=False,
+        reason="definition_exact",
+        span=exact_stats["span"],
+        public_span=exact_stats["span"],
+        exact_span=_span_dict(exact_span),
+        candidates=[exact_stats],
+        entry=_entry_payload(entry),
+        raw=exact_raw,
+        tokens=exact_tokens,
+        nodes=exact_nodes,
+    )
+
+
+def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | None = None) -> ExportBodySelection:
+    public_span = mod.get_export_public_code_span(export_name)
+
+    # Fast path: exact definitions are usually the best slice and avoid the old
+    # public+exact double tokenization for every export.  Public slicing is now
+    # only evaluated when exact slicing is missing or suspicious.
     exact_span, exact_reason = mod.get_export_exact_code_span_with_reason(export_name)
     exact_raw = mod._slice_code_span(*exact_span) if exact_span is not None else b""
     exact_stats: dict[str, Any] | None = None
@@ -776,6 +839,29 @@ def select_export_body(mod: MBCModule, export_name: str) -> ExportBodySelection:
     exact_nodes: list[IRNode] = []
     if exact_span is not None and exact_raw:
         exact_stats, exact_tokens, exact_nodes = _summarize_body_candidate("definition_exact", exact_span, exact_raw)
+
+    if _exact_body_is_stable(exact_stats):
+        return ExportBodySelection(
+            name=entry.name if entry is not None else export_name,
+            slice_mode="definition_exact",
+            used_fallback=False,
+            reason="definition_exact_fast_path",
+            span=exact_stats["span"],
+            public_span=_span_dict(public_span),
+            exact_span=_span_dict(exact_span),
+            candidates=[exact_stats],
+            entry=_entry_payload(entry),
+            raw=exact_raw,
+            tokens=exact_tokens,
+            nodes=exact_nodes,
+        )
+
+    public_raw = mod._slice_code_span(*public_span)
+    public_stats: dict[str, Any] | None = None
+    public_tokens: list[Token] = []
+    public_nodes: list[IRNode] = []
+    if public_raw:
+        public_stats, public_tokens, public_nodes = _summarize_body_candidate("export_public", public_span, public_raw)
 
     candidate_stats = [candidate for candidate in (exact_stats, public_stats) if candidate is not None]
 
@@ -786,14 +872,15 @@ def select_export_body(mod: MBCModule, export_name: str) -> ExportBodySelection:
             empty_mode = "definition_exact"
             empty_span = exact_span
         return ExportBodySelection(
-            name=export_name,
+            name=entry.name if entry is not None else export_name,
             slice_mode=empty_mode,
             used_fallback=(empty_mode == "export_public"),
             reason=exact_reason or "empty_slice",
-            span={"start": empty_span[0], "end": empty_span[1]},
-            public_span={"start": public_span[0], "end": public_span[1]},
-            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            span=_span_dict(empty_span) or {"start": 0, "end": 0},
+            public_span=_span_dict(public_span),
+            exact_span=_span_dict(exact_span),
             candidates=candidate_stats,
+            entry=_entry_payload(entry),
             raw=b"",
             tokens=[],
             nodes=[],
@@ -801,14 +888,15 @@ def select_export_body(mod: MBCModule, export_name: str) -> ExportBodySelection:
 
     if exact_stats is None:
         return ExportBodySelection(
-            name=export_name,
+            name=entry.name if entry is not None else export_name,
             slice_mode="export_public",
             used_fallback=True,
             reason=exact_reason or "definition_unavailable",
             span=public_stats["span"],
-            public_span={"start": public_span[0], "end": public_span[1]},
-            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            public_span=_span_dict(public_span),
+            exact_span=_span_dict(exact_span),
             candidates=candidate_stats,
+            entry=_entry_payload(entry),
             raw=public_raw,
             tokens=public_tokens,
             nodes=public_nodes,
@@ -816,71 +904,86 @@ def select_export_body(mod: MBCModule, export_name: str) -> ExportBodySelection:
 
     if public_stats is None or exact_raw == public_raw:
         return ExportBodySelection(
-            name=export_name,
+            name=entry.name if entry is not None else export_name,
             slice_mode="definition_exact",
             used_fallback=False,
             reason="definition_exact",
             span=exact_stats["span"],
-            public_span={"start": public_span[0], "end": public_span[1]},
-            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            public_span=_span_dict(public_span),
+            exact_span=_span_dict(exact_span),
             candidates=candidate_stats,
+            entry=_entry_payload(entry),
             raw=exact_raw,
             tokens=exact_tokens,
             nodes=exact_nodes,
         )
 
     exact_delta = public_stats["quality_score"] - exact_stats["quality_score"]
-    exact_stable = (
-        exact_stats["node_count"] >= 2
-        and exact_stats["mean_confidence"] >= 0.85
-        and exact_stats["unknown_ratio"] <= 0.10
-        and exact_stats["opaque_ratio"] <= 0.20
-    )
     exact_tiny = exact_stats["node_count"] <= 1
     public_substantially_better = (
         exact_delta >= 12.0
         and public_stats["node_count"] >= max(exact_stats["node_count"] + 3, 4)
     )
 
-    if public_substantially_better and (exact_tiny or not exact_stable):
+    if public_substantially_better and (exact_tiny or not _exact_body_is_stable(exact_stats)):
         return ExportBodySelection(
-            name=export_name,
+            name=entry.name if entry is not None else export_name,
             slice_mode="export_public",
             used_fallback=True,
             reason="fallback_public_better_tokenization",
             span=public_stats["span"],
-            public_span={"start": public_span[0], "end": public_span[1]},
-            exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+            public_span=_span_dict(public_span),
+            exact_span=_span_dict(exact_span),
             candidates=candidate_stats,
+            entry=_entry_payload(entry),
             raw=public_raw,
             tokens=public_tokens,
             nodes=public_nodes,
         )
 
     return ExportBodySelection(
-        name=export_name,
+        name=entry.name if entry is not None else export_name,
         slice_mode="definition_exact",
         used_fallback=False,
         reason="definition_exact_preferred",
         span=exact_stats["span"],
-        public_span={"start": public_span[0], "end": public_span[1]},
-        exact_span={"start": exact_span[0], "end": exact_span[1]} if exact_span is not None else None,
+        public_span=_span_dict(public_span),
+        exact_span=_span_dict(exact_span),
         candidates=candidate_stats,
+        entry=_entry_payload(entry),
         raw=exact_raw,
         tokens=exact_tokens,
         nodes=exact_nodes,
     )
 
 
-def build_function_ir(mod: MBCModule, export_name: str) -> IRFunction:
-    selection = select_export_body(mod, export_name)
+def select_function_body(mod: MBCModule, entry_or_name: FunctionEntry | str) -> ExportBodySelection:
+    if isinstance(entry_or_name, FunctionEntry):
+        entry = entry_or_name
+    else:
+        entry = mod.get_function_entry(entry_or_name)
+
+    if entry.source_kind == "definition":
+        return select_definition_body(mod, entry)
+    return select_export_body(mod, entry.symbol, entry=entry)
+
+
+def build_function_ir(mod: MBCModule, entry_or_name: FunctionEntry | str) -> IRFunction:
+    try:
+        selection = select_function_body(mod, entry_or_name)
+    except KeyError:
+        # Compatibility with the old API, where only export names existed.
+        if not isinstance(entry_or_name, str):
+            raise
+        selection = select_export_body(mod, entry_or_name)
+
     nodes = list(selection.nodes)
     valid_offsets = {node.offset for node in nodes}
     for node in nodes:
         node.control = _build_control(node, valid_offsets)
 
     return IRFunction(
-        name=export_name,
+        name=selection.name,
         slice_mode=selection.slice_mode,
         span=selection.span,
         body_selection=selection.to_dict(),

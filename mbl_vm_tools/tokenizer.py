@@ -42,11 +42,11 @@ class Token:
 
 
 SINGLE_BYTE_OPS = {
-    0x00, 0x21, 0x23, 0x27, 0x28, 0x2B, 0x2E, 0x30, 0x31, 0x32, 0x3A, 0x48, 0x72, 0x7C,
+    0x00, 0x21, 0x23, 0x27, 0x28, 0x2B, 0x2E, 0x30, 0x31, 0x32, 0x3A, 0x48, 0x63, 0x72, 0x7C,
     0x3D, 0x2A, 0x2D, 0x2F, 0x25,
     0xF0, 0xF1, 0xF3, 0xE1, 0xE8, 0xEC, 0xED, 0xEF, 0x5E, 0xEB, 0x3C, 0x3E, 0x26,
 }
-SHORT_U16_OPS = {0x01, 0x02, 0x04, 0x20, 0x52, 0x53, 0x5B, 0x5D, 0x80, 0xCF, 0xD3, 0xD6, 0xD7}
+SHORT_U16_OPS = {0x01, 0x02, 0x04, 0x0B, 0x20, 0x50, 0x52, 0x53, 0x55, 0x5B, 0x5D, 0x80, 0xCF, 0xD3, 0xD6, 0xD7}
 SIGNED_IMM24_OPS = {0x6D}
 UNSIGNED_IMM24_OPS = {0x18, 0x1C, 0x34, 0x67, 0x68, 0xA0, 0xD0, 0xE8}
 GENERIC_ZERO_IMM24_OPS = {0x03, 0x06, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x38, 0x40, 0x44, 0x50, 0x54, 0x5C, 0x98, 0xC8, 0xE8}
@@ -191,6 +191,8 @@ def _match_atomic_semantic(data: bytes, start: int, limit: int) -> tuple[str, in
         return "IMM24U", 4, {"op": op, "imm": u24(data, start + 1)}
     if op in GENERIC_ZERO_IMM24_OPS and start + 4 <= limit and data[start + 1] == 0 and data[start + 2] == 0 and data[start + 3] == 0:
         return "IMM24Z", 4, {"op": op, "imm": 0}
+    if op == 0x08 and start + 2 <= limit and data[start + 1] == 0:
+        return "OP", 2, {"op": op, "arg": 0}
     if op in (0x69, 0x65, 0x6C) and start + 6 <= limit:
         return "REF", 6, {"op": op, "mode": data[start + 1], "ref": u32(data, start + 2)}
     if op == 0x64 and start + 4 <= limit:
@@ -235,6 +237,7 @@ _PREFIX_ALLOWED_ATOMIC = {
     0x72: {"BR", "CALL63B", "OPU16"},
     0xF3: {"REF", "BR", "IMM"},
     0xF6: {"CALL66", "BR", "REC61"},
+    0xF7: {"BR", "CALL66"},
     0x26: {"REF", "CALL66", "IMM", "IMM16", "IMM32", "CALL63A"},
     0xEC: {"BR"},
     0xE1: {"IMM", "REF", "BR"},
@@ -271,6 +274,7 @@ _PREFIX_ALLOWED_NESTED = {
     0xF1: {0x72, 0x30, 0x3D, 0x3E, 0xF0, 0xED, 0x3C, 0xF1},
     0xF3: {0x30, 0x72},
     0xF6: {0x30, 0x3D, 0x72},
+    0xF7: {0x30, 0x3D, 0x72},
     0x3B: {0x2D},
 }
 
@@ -719,6 +723,36 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             continue
 
 
+        # Rare high-prefix ref family observed in definition bodies:
+        #   F0 E8 3D 30 <REF>
+        # Without this explicit guard, F0+E8 is greedily misread as an
+        # unsigned-imm24 prefix and leaves the REF payload as unknown bytes.
+        if i + 10 <= size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2:i + 4] == b"\x3d\x30" and data[i + 4] in (0x69, 0x65, 0x6C):
+            out.append(Token(i, "PFX_F0_E8_3D_30_REF", 10, {
+                "prefix_op": 0xF0,
+                "nested_kind": "PFX_E8_3D_30_REF",
+                "nested": {
+                    "prefix_op": 0xE8,
+                    "nested_kind": "PFX_3D_30_REF",
+                    "nested": {
+                        "prefix_op": 0x3D,
+                        "nested_kind": "PFX_30_REF",
+                        "nested": {
+                            "prefix_op": 0x30,
+                            "nested_kind": "REF",
+                            "nested": {
+                                "op": data[i + 4],
+                                "mode": data[i + 5],
+                                "ref": u32(data, i + 6),
+                            },
+                        },
+                    },
+                },
+            }))
+            i += 10
+            continue
+
+
         direct_atomic = _match_atomic_semantic(data, i, size)
         custom_e8_family = (
             (i + 5 <= size and data[i] == 0xE8 and data[i + 1] in (0x4A, 0x4B, 0x4C, 0x4D))
@@ -1042,6 +1076,11 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
         if op in GENERIC_ZERO_IMM24_OPS and i + 4 <= size and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 0:
             out.append(Token(i, "IMM24Z", 4, {"op": op, "imm": 0}))
             i += 4
+            continue
+
+        if op == 0x08 and i + 2 <= size and data[i + 1] == 0:
+            out.append(Token(i, "OP", 2, {"op": op, "arg": 0}))
+            i += 2
             continue
 
         # long / short ref families

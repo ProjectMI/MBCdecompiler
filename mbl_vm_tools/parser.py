@@ -99,6 +99,44 @@ class TableCandidate:
 
 
 @dataclass
+class FunctionEntry:
+    """
+    Stable analysis entry point built from definitions and exports.
+
+    Definitions carry exact code spans; exports carry public API order.  The
+    IR/HIR pipeline consumes this de-duplicated view so default corpus runs can
+    cover local definitions without doing the same exported definition twice.
+    """
+
+    name: str
+    symbol: str
+    source_kind: str
+    definition_index: Optional[int]
+    export_index: Optional[int]
+    is_definition: bool
+    is_exported: bool
+    duplicate_definition_symbol: bool
+    duplicate_export_symbol: bool
+    definition_record: Optional[TableRecord]
+    export_record: Optional[TableRecord]
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "symbol": self.symbol,
+            "source_kind": self.source_kind,
+            "definition_index": self.definition_index,
+            "export_index": self.export_index,
+            "is_definition": self.is_definition,
+            "is_exported": self.is_exported,
+            "duplicate_definition_symbol": self.duplicate_definition_symbol,
+            "duplicate_export_symbol": self.duplicate_export_symbol,
+            "definition_record": self.definition_record.to_dict() if self.definition_record else None,
+            "export_record": self.export_record.to_dict() if self.export_record else None,
+        }
+
+
+@dataclass
 class ADBInfo:
     present: bool
     path: str | None
@@ -584,13 +622,27 @@ class MBCModule:
         self.normal_exports: list[TableRecord] = [
             r for r in raw_exports if not (r.b == 0xFFFFFFFF and r.c == 0)
         ]
-        self._export_index_by_name = {r.name: idx for idx, r in enumerate(self.normal_exports)}
+
+        self._export_index_by_name: dict[str, int] = {}
+        self._export_records_by_name: dict[str, list[tuple[int, TableRecord]]] = defaultdict(list)
+        for idx, record in enumerate(self.normal_exports):
+            self._export_index_by_name.setdefault(record.name, idx)
+            self._export_records_by_name[record.name].append((idx, record))
+
         self._definition_records_by_name: dict[str, list[TableRecord]] = defaultdict(list)
-        for record in self.definitions:
+        self._definition_indices_by_name: dict[str, list[int]] = defaultdict(list)
+        for idx, record in enumerate(self.definitions):
             self._definition_records_by_name[record.name].append(record)
+            self._definition_indices_by_name[record.name].append(idx)
+
         self.definition_name_collisions: dict[str, list[TableRecord]] = {
             name: records
             for name, records in self._definition_records_by_name.items()
+            if len(records) > 1
+        }
+        self.export_name_collisions: dict[str, list[TableRecord]] = {
+            name: [record for _, record in records]
+            for name, records in self._export_records_by_name.items()
             if len(records) > 1
         }
         self._definition_by_name = {
@@ -598,6 +650,96 @@ class MBCModule:
             for name, records in self._definition_records_by_name.items()
             if len(records) == 1
         }
+
+        self._definition_function_entries: list[FunctionEntry] = []
+        self._export_function_entries: list[FunctionEntry] = []
+        self._function_entries: list[FunctionEntry] = []
+        self._function_entry_by_name: dict[str, FunctionEntry] = {}
+        self._build_function_entries()
+
+    def _build_function_entries(self) -> None:
+        definition_occurrences: Counter[str] = Counter()
+        export_occurrences: Counter[str] = Counter()
+
+        for definition_index, record in enumerate(self.definitions):
+            definition_occurrences[record.name] += 1
+            duplicate_definition_symbol = len(self._definition_records_by_name.get(record.name, [])) > 1
+            export_refs = self._export_records_by_name.get(record.name, [])
+            duplicate_export_symbol = len(export_refs) > 1
+            export_index = export_refs[0][0] if export_refs and not duplicate_export_symbol else None
+            export_record = export_refs[0][1] if export_refs and not duplicate_export_symbol else None
+            unique_name = (
+                record.name
+                if not duplicate_definition_symbol
+                else f"{record.name}#def{definition_occurrences[record.name]}"
+            )
+            entry = FunctionEntry(
+                name=unique_name,
+                symbol=record.name,
+                source_kind="definition",
+                definition_index=definition_index,
+                export_index=export_index,
+                is_definition=True,
+                is_exported=bool(export_refs),
+                duplicate_definition_symbol=duplicate_definition_symbol,
+                duplicate_export_symbol=duplicate_export_symbol,
+                definition_record=record,
+                export_record=export_record,
+            )
+            self._definition_function_entries.append(entry)
+            self._function_entries.append(entry)
+
+        definition_symbols = set(self._definition_records_by_name.keys())
+        for export_index, record in enumerate(self.normal_exports):
+            export_occurrences[record.name] += 1
+            duplicate_export_symbol = len(self._export_records_by_name.get(record.name, [])) > 1
+            duplicate_definition_symbol = len(self._definition_records_by_name.get(record.name, [])) > 1
+            unique_name = (
+                record.name
+                if not duplicate_export_symbol
+                else f"{record.name}#export{export_occurrences[record.name]}"
+            )
+            export_entry = FunctionEntry(
+                name=unique_name,
+                symbol=record.name,
+                source_kind="export",
+                definition_index=None,
+                export_index=export_index,
+                is_definition=False,
+                is_exported=True,
+                duplicate_definition_symbol=duplicate_definition_symbol,
+                duplicate_export_symbol=duplicate_export_symbol,
+                definition_record=None,
+                export_record=record,
+            )
+            self._export_function_entries.append(export_entry)
+
+            # Default mode is de-duplicated: if a function has a definition,
+            # the definition entry already gives the exact body and carries the
+            # export marker.  Only export-only records are appended here.
+            if record.name not in definition_symbols:
+                default_name = unique_name
+                if default_name in self._function_entry_by_name or any(e.name == default_name for e in self._function_entries):
+                    default_name = f"{record.name}#export{export_index + 1}"
+                    export_entry = FunctionEntry(
+                        name=default_name,
+                        symbol=record.name,
+                        source_kind="export",
+                        definition_index=None,
+                        export_index=export_index,
+                        is_definition=False,
+                        is_exported=True,
+                        duplicate_definition_symbol=duplicate_definition_symbol,
+                        duplicate_export_symbol=True,
+                        definition_record=None,
+                        export_record=record,
+                    )
+                self._function_entries.append(export_entry)
+
+        for entry in self._function_entries:
+            self._function_entry_by_name.setdefault(entry.name, entry)
+        for entry in self._export_function_entries:
+            self._function_entry_by_name.setdefault(entry.name, entry)
 
     @property
     def exports(self) -> list[TableRecord]:
@@ -613,6 +755,55 @@ class MBCModule:
 
     def export_names(self) -> list[str]:
         return [r.name for r in self.exports]
+
+    def function_entries(
+        self,
+        *,
+        include_definitions: bool = True,
+        include_exports: bool = True,
+        dedupe: bool = True,
+    ) -> list[FunctionEntry]:
+        if include_definitions and include_exports and dedupe:
+            return list(self._function_entries)
+        entries: list[FunctionEntry] = []
+        if include_definitions:
+            entries.extend(self._definition_function_entries)
+        if include_exports:
+            if include_definitions and dedupe:
+                definition_symbols = {entry.symbol for entry in self._definition_function_entries}
+                entries.extend(entry for entry in self._export_function_entries if entry.symbol not in definition_symbols)
+            else:
+                entries.extend(self._export_function_entries)
+        return list(entries)
+
+    def function_names(
+        self,
+        *,
+        include_definitions: bool = True,
+        include_exports: bool = True,
+        dedupe: bool = True,
+    ) -> list[str]:
+        return [
+            entry.name
+            for entry in self.function_entries(
+                include_definitions=include_definitions,
+                include_exports=include_exports,
+                dedupe=dedupe,
+            )
+        ]
+
+    def get_function_entry(self, name: str) -> FunctionEntry:
+        entry = self._function_entry_by_name.get(name)
+        if entry is not None:
+            return entry
+        # Backward-compatible convenience: a unique definition can be requested
+        # by its raw symbol even if the exported view was used before.
+        records = self._definition_records_by_name.get(name)
+        if records and len(records) == 1:
+            for candidate in self._definition_function_entries:
+                if candidate.symbol == name:
+                    return candidate
+        raise KeyError(f"Function entry not found: {name}")
 
     def _export_index(self, name: str) -> int:
         idx = self._export_index_by_name.get(name)
@@ -635,14 +826,7 @@ class MBCModule:
             return min(self.code_size, real_limit)
         return real_limit
 
-    def get_export_exact_code_span_with_reason(self, name: str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
-        definition_records = self.get_definition_records(name)
-        if not definition_records:
-            return None, "definition_missing"
-        if len(definition_records) > 1:
-            return None, "definition_ambiguous"
-
-        rec = definition_records[0]
+    def get_definition_record_code_span_with_reason(self, rec: TableRecord) -> tuple[Optional[tuple[int, int]], Optional[str]]:
         if rec.b < rec.a:
             return None, "definition_inverted"
 
@@ -656,6 +840,24 @@ class MBCModule:
         if end <= start:
             return None, "definition_empty"
         return (start, end), None
+
+    def get_function_exact_code_span_with_reason(self, entry: FunctionEntry | str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        if isinstance(entry, str):
+            entry = self.get_function_entry(entry)
+        if entry.definition_record is None:
+            if entry.symbol in self._definition_records_by_name:
+                return self.get_export_exact_code_span_with_reason(entry.symbol)
+            return None, "definition_missing"
+        return self.get_definition_record_code_span_with_reason(entry.definition_record)
+
+    def get_export_exact_code_span_with_reason(self, name: str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        definition_records = self.get_definition_records(name)
+        if not definition_records:
+            return None, "definition_missing"
+        if len(definition_records) > 1:
+            return None, "definition_ambiguous"
+
+        return self.get_definition_record_code_span_with_reason(definition_records[0])
 
     def get_export_public_code_span(self, name: str) -> tuple[int, int]:
         idx = self._export_index(name)
@@ -687,6 +889,17 @@ class MBCModule:
         start, end = span
         return self._slice_code_span(start, end)
 
+    def get_function_body(self, entry: FunctionEntry | str) -> bytes:
+        if isinstance(entry, str):
+            entry = self.get_function_entry(entry)
+        if entry.source_kind == "export" and entry.definition_record is None:
+            start, end = self.get_export_public_code_span(entry.symbol)
+            return self._slice_code_span(start, end)
+        span, _ = self.get_function_exact_code_span_with_reason(entry)
+        if span is None:
+            return b""
+        return self._slice_code_span(*span)
+
     def stitch_export_body(self, name: str, next_head_bytes: int = 16) -> bytes:
         idx = self._export_index(name)
         body = self.get_export_body(name, exact=True)
@@ -705,10 +918,16 @@ class MBCModule:
             "definitions": [r.to_dict() for r in self.definitions],
             "globals": [r.to_dict() for r in self.globals],
             "exports": [r.to_dict() for r in self.exports],
+            "function_entries": [entry.to_dict() for entry in self._function_entries],
             "embedded_import_like_exports": [r.to_dict() for r in self.embedded_import_like_exports],
             "definition_name_collisions": {
                 name: [record.to_dict() for record in records]
                 for name, records in self.definition_name_collisions.items()
             },
+            "export_name_collisions": {
+                name: [record.to_dict() for record in records]
+                for name, records in self.export_name_collisions.items()
+            },
             "adb_info": self.adb_info.to_dict(),
         }
+
