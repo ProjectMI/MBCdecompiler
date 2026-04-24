@@ -279,6 +279,9 @@ def _canonical_expr(inst: CanonicalInstruction, args: list[str]) -> str:
         return f"{_format_call_target(inst)}({', '.join(args)})"
     if inst.semantic_op == "cmp":
         return f"cmp({', '.join(args)})"
+    if inst.semantic_op == "vm_op":
+        op = inst.operands.get("op", inst.raw_kind)
+        return f"vm_op<{op}>({', '.join(args)})"
     if inst.semantic_op.startswith("opaque_"):
         raw = inst.macro_kind or inst.raw_kind
         return f"{inst.semantic_op}<{raw}>({', '.join(args)})"
@@ -292,7 +295,7 @@ def _infer_stack_io(inst: CanonicalInstruction) -> tuple[int, int]:
         forced_in = int(operands.get("stack_inputs_required") or 0)
         forced_out = int(operands.get("stack_outputs", 0) or 0)
         return forced_in, forced_out
-    if op in {"const", "load", "read_field", "make_record", "aggregate", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op"}:
+    if op in {"const", "load", "read_field", "make_record", "aggregate", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op", "vm_op"}:
         if op in {"call", "syscall", "opaque_call"}:
             return int(operands.get("argc", 0) or 0), 1
         if op == "cmp":
@@ -568,7 +571,7 @@ def _signature_to_steps(node: IRNode) -> list[tuple[str, str, dict[str, Any]]]:
         return [("return", "return", {"family": family})]
     if node.semantic_op == "branch":
         return [("branch", "branch", dict(operands))]
-    if node.semantic_op in {"call", "syscall", "opaque_call", "const", "load", "read_field", "make_record", "aggregate", "store", "write_field", "cmp"}:
+    if node.semantic_op in {"call", "syscall", "opaque_call", "const", "load", "read_field", "make_record", "aggregate", "store", "write_field", "cmp", "vm_op"}:
         return [(node.semantic_op, node.semantic_op, dict(operands))]
     if node.semantic_op.startswith("opaque_"):
         return [(node.semantic_op, node.semantic_op, dict(operands))]
@@ -1068,7 +1071,7 @@ def build_hir_blocks(
                         placeholder_count += 1
             expr = _canonical_expr(inst, args)
 
-            if inst.semantic_op in {"const", "load", "read_field", "make_record", "aggregate", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op"}:
+            if inst.semantic_op in {"const", "load", "read_field", "make_record", "aggregate", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op", "vm_op"}:
                 if outputs:
                     out_name = outputs[0]
                     value_map[out_name] = DataflowValue(name=out_name, producer_instruction=inst.index, expr=expr)
@@ -1837,13 +1840,21 @@ def _token_coverage_from_ir(ir_function: IRFunction) -> dict[str, Any]:
     unknown_nodes = [node for node in nodes if node.raw_kind == "UNK" or node.semantic_op == "unknown"]
     unknown_count = len(unknown_nodes)
     unknown_bytes = sum(max(0, int(node.size)) for node in unknown_nodes)
-    opaque_count = sum(1 for node in nodes if node.semantic_op.startswith("opaque_"))
+    opaque_nodes = [node for node in nodes if node.semantic_op.startswith("opaque_")]
+    opaque_count = len(opaque_nodes)
+    vm_op_nodes = [node for node in nodes if node.semantic_op == "vm_op"]
+    vm_op_count = len(vm_op_nodes)
     data_count = sum(1 for node in nodes if node.semantic_op in {"data", "opaque_data"})
     known_count = token_count - unknown_count
     known_bytes = byte_count - unknown_bytes
 
     raw_kind_hist = Counter(node.raw_kind for node in nodes)
     semantic_hist = Counter(node.semantic_op for node in nodes)
+    vm_op_hist = Counter(str(node.operands.get("op", node.raw_kind)) for node in vm_op_nodes)
+    opaque_opcode_hist = Counter(str(node.operands.get("op", node.raw_kind)) for node in opaque_nodes)
+    opaque_lowering_rule_hist = Counter(node.lowering_rule for node in opaque_nodes)
+    opaque_raw_kind_hist = Counter(node.raw_kind for node in opaque_nodes)
+    opaque_terminal_kind_hist = Counter(node.terminal_kind for node in opaque_nodes)
     unknown_opcode_hist: Counter[str] = Counter()
     for node in unknown_nodes:
         op = node.operands.get("op")
@@ -1867,6 +1878,13 @@ def _token_coverage_from_ir(ir_function: IRFunction) -> dict[str, Any]:
         "unknown_byte_ratio": (unknown_bytes / byte_count) if byte_count else 0.0,
         "opaque_node_count": opaque_count,
         "opaque_node_ratio": (opaque_count / token_count) if token_count else 0.0,
+        "opaque_opcode_histogram": dict(opaque_opcode_hist.most_common(32)),
+        "opaque_lowering_rule_histogram": dict(opaque_lowering_rule_hist.most_common(32)),
+        "opaque_raw_kind_histogram": dict(opaque_raw_kind_hist.most_common(32)),
+        "opaque_terminal_kind_histogram": dict(opaque_terminal_kind_hist.most_common(32)),
+        "known_low_semantic_op_count": vm_op_count,
+        "known_low_semantic_op_ratio": (vm_op_count / token_count) if token_count else 0.0,
+        "known_low_semantic_op_histogram": dict(vm_op_hist.most_common(32)),
         "data_node_count": data_count,
         "data_node_ratio": (data_count / token_count) if token_count else 0.0,
         "token_kind_histogram": dict(raw_kind_hist.most_common(32)),
@@ -1919,6 +1937,8 @@ def _function_summary(
         "unknown_byte_ratio": float(token_coverage.get("unknown_byte_ratio", 0.0)),
         "opaque_node_count": int(token_coverage.get("opaque_node_count", 0)),
         "opaque_node_ratio": float(token_coverage.get("opaque_node_ratio", 0.0)),
+        "known_low_semantic_op_count": int(token_coverage.get("known_low_semantic_op_count", 0)),
+        "known_low_semantic_op_ratio": float(token_coverage.get("known_low_semantic_op_ratio", 0.0)),
         "data_node_count": int(token_coverage.get("data_node_count", 0)),
         "data_node_ratio": float(token_coverage.get("data_node_ratio", 0.0)),
         "dataflow_worklist_iteration_count": int(dataflow_metrics.get("worklist_iteration_count", 0)),
@@ -1936,7 +1956,7 @@ def _looks_like_aggregate_prologue(nodes: list[IRNode]) -> bool:
     if len(nodes) == 1:
         return True
     next_node = nodes[1]
-    return next_node.semantic_op in {"const", "load", "read_field", "call", "syscall", "opaque_call", "branch", "return", "cmp", "make_record"}
+    return next_node.semantic_op in {"const", "load", "read_field", "call", "syscall", "opaque_call", "branch", "return", "cmp", "make_record", "vm_op"}
 
 
 
@@ -2170,6 +2190,7 @@ def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
         "known_byte_ratio": ((total_token_bytes - total_unknown_bytes) / total_token_bytes) if total_token_bytes else 1.0,
         "unknown_byte_ratio": (total_unknown_bytes / total_token_bytes) if total_token_bytes else 0.0,
         "total_opaque_nodes": sum(fn.summary.get("opaque_node_count", 0) for fn in functions),
+        "total_known_low_semantic_ops": sum(fn.summary.get("known_low_semantic_op_count", 0) for fn in functions),
         "total_data_nodes": sum(fn.summary.get("data_node_count", 0) for fn in functions),
         "total_dataflow_worklist_limit_hits": sum(fn.summary.get("dataflow_worklist_iteration_limit_hit", 0) for fn in functions),
     }
@@ -2293,13 +2314,20 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
     known_token_bytes = 0
     unknown_token_bytes = 0
     opaque_nodes = 0
+    known_low_semantic_ops = 0
     data_nodes = 0
     token_kind_hist: Counter[str] = Counter()
     semantic_hist: Counter[str] = Counter()
     unknown_opcode_hist: Counter[str] = Counter()
+    opaque_opcode_hist: Counter[str] = Counter()
+    opaque_lowering_rule_hist: Counter[str] = Counter()
+    opaque_raw_kind_hist: Counter[str] = Counter()
+    opaque_terminal_kind_hist: Counter[str] = Counter()
+    known_low_semantic_op_hist: Counter[str] = Counter()
 
     heaviest_functions: list[dict[str, Any]] = []
     lowest_token_coverage_functions: list[dict[str, Any]] = []
+    low_semantic_op_functions: list[dict[str, Any]] = []
     pipeline_deviations: list[dict[str, Any]] = []
 
     for module in module_payloads:
@@ -2336,6 +2364,7 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             fn_unknown_token_bytes = int(coverage.get("unknown_byte_size", fn_token_bytes - fn_known_token_bytes))
             fn_opaque_nodes = int(coverage.get("opaque_node_count", fn_summary.get("opaque_node_count", 0)))
             fn_data_nodes = int(coverage.get("data_node_count", fn_summary.get("data_node_count", 0)))
+            fn_low_semantic_ops = int(coverage.get("known_low_semantic_op_count", fn_summary.get("known_low_semantic_op_count", 0)))
 
             token_count += fn_token_count
             known_token_count += fn_known_token_count
@@ -2344,11 +2373,17 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             known_token_bytes += fn_known_token_bytes
             unknown_token_bytes += fn_unknown_token_bytes
             opaque_nodes += fn_opaque_nodes
+            known_low_semantic_ops += fn_low_semantic_ops
             data_nodes += fn_data_nodes
 
             _merge_counter_from_mapping(token_kind_hist, coverage.get("token_kind_histogram"))
             _merge_counter_from_mapping(semantic_hist, coverage.get("semantic_histogram"))
             _merge_counter_from_mapping(unknown_opcode_hist, coverage.get("unknown_opcode_histogram"))
+            _merge_counter_from_mapping(opaque_opcode_hist, coverage.get("opaque_opcode_histogram"))
+            _merge_counter_from_mapping(opaque_lowering_rule_hist, coverage.get("opaque_lowering_rule_histogram"))
+            _merge_counter_from_mapping(opaque_raw_kind_hist, coverage.get("opaque_raw_kind_histogram"))
+            _merge_counter_from_mapping(opaque_terminal_kind_hist, coverage.get("opaque_terminal_kind_histogram"))
+            _merge_counter_from_mapping(known_low_semantic_op_hist, coverage.get("known_low_semantic_op_histogram"))
 
             entry = (fn.get("body_selection", {}) or {}).get("entry", {}) or {}
             function_ref = {
@@ -2369,6 +2404,17 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             )
 
             known_ratio = float(coverage.get("known_token_ratio", fn_summary.get("known_token_ratio", 1.0)))
+            if fn_low_semantic_ops > 0:
+                low_semantic_op_functions.append(
+                    {
+                        **function_ref,
+                        "known_low_semantic_op_count": fn_low_semantic_ops,
+                        "token_count": fn_token_count,
+                        "known_low_semantic_op_ratio": (fn_low_semantic_ops / fn_token_count) if fn_token_count else 0.0,
+                        "known_low_semantic_op_histogram": coverage.get("known_low_semantic_op_histogram", {}),
+                    }
+                )
+
             if fn_token_count and (fn_unknown_token_count > 0 or known_ratio < 1.0 or fn_opaque_nodes > 0):
                 lowest_token_coverage_functions.append(
                     {
@@ -2377,6 +2423,8 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
                         "unknown_token_count": fn_unknown_token_count,
                         "token_count": fn_token_count,
                         "opaque_node_count": fn_opaque_nodes,
+                        "known_low_semantic_op_count": fn_low_semantic_ops,
+                        "known_low_semantic_op_histogram": coverage.get("known_low_semantic_op_histogram", {}),
                         "unknown_opcode_histogram": coverage.get("unknown_opcode_histogram", {}),
                     }
                 )
@@ -2403,6 +2451,7 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
 
     heaviest_functions.sort(key=lambda item: (-item["canonical_instruction_count"], item["placeholder_count"], str(item["script_name"]), str(item["function"])))
     lowest_token_coverage_functions.sort(key=lambda item: (item["known_token_ratio"], -item["unknown_token_count"], str(item["script_name"]), str(item["function"])))
+    low_semantic_op_functions.sort(key=lambda item: (-item["known_low_semantic_op_count"], -item["known_low_semantic_op_ratio"], str(item["script_name"]), str(item["function"])))
     pipeline_deviations.sort(key=lambda item: (-(item["cfg_anomaly_count"] + item["unresolved_branch_count"] + item["core_validation_error_count"] + item["validation_error_count"]), str(item["script_name"]), str(item["function"])))
 
     return {
@@ -2440,11 +2489,20 @@ def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
             "known_byte_ratio": (known_token_bytes / token_bytes) if token_bytes else 1.0,
             "unknown_byte_ratio": (unknown_token_bytes / token_bytes) if token_bytes else 0.0,
             "opaque_node_count": opaque_nodes,
+            "opaque_node_ratio": (opaque_nodes / token_count) if token_count else 0.0,
+            "opaque_opcode_histogram": dict(opaque_opcode_hist.most_common(64)),
+            "opaque_lowering_rule_histogram": dict(opaque_lowering_rule_hist.most_common(64)),
+            "opaque_raw_kind_histogram": dict(opaque_raw_kind_hist.most_common(64)),
+            "opaque_terminal_kind_histogram": dict(opaque_terminal_kind_hist.most_common(64)),
+            "known_low_semantic_op_count": known_low_semantic_ops,
+            "known_low_semantic_op_ratio": (known_low_semantic_ops / token_count) if token_count else 0.0,
+            "known_low_semantic_op_histogram": dict(known_low_semantic_op_hist.most_common(64)),
             "data_node_count": data_nodes,
             "token_kind_histogram": dict(token_kind_hist.most_common(64)),
             "semantic_histogram": dict(semantic_hist.most_common(64)),
             "unknown_opcode_histogram": dict(unknown_opcode_hist.most_common(64)),
             "lowest_token_coverage_functions": lowest_token_coverage_functions[:64],
+            "low_semantic_op_functions": low_semantic_op_functions[:64],
         },
         "pipeline_deviations": pipeline_deviations[:64],
         "heaviest_functions": heaviest_functions[:32],

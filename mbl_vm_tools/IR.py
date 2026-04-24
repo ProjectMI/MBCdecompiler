@@ -32,8 +32,9 @@ SEMANTIC_PRECEDENCE = {
     "opaque_record": 19,
     "opaque_aggregate": 20,
     "opaque_data": 21,
-    "opaque_op": 22,
-    "unknown": 23,
+    "vm_op": 22,
+    "opaque_op": 23,
+    "unknown": 24,
 }
 
 CONST_KINDS = {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "F32", "OPU16"}
@@ -41,8 +42,8 @@ REF_KINDS = {"REF", "REF16"}
 RECORD_KINDS = {"REC41", "REC61", "REC62"}
 CALL_KINDS = {"CALL66", "CALL63A", "CALL63B"}
 BRANCH_KINDS = {"BR"}
-RETURN_KINDS = {"PAIR72_23", "SIG_RETURN_TAIL"}
-DATA_KINDS = {"PAD", "ASCII", "DWBLOB"}
+RETURN_KINDS = {"PAIR72_23", "SIG_RETURN_TAIL", "END"}
+DATA_KINDS = {"PAD", "ASCII", "DWBLOB", "NOP", "MARK"}
 AGGREGATE_KINDS = {"AGG", "AGG0"}
 RAW_OP_KINDS = {"OP"}
 UNKNOWN_KINDS = {"UNK"}
@@ -435,8 +436,12 @@ def _lower_prefixed_basic(terminal_kind: str, prefix_chain: list[str]) -> tuple[
         return "aggregate", ["aggregate"], _clamp(1.0 - depth_penalty, 0.60, 1.0), "basic.aggregate"
     if terminal_kind in DATA_KINDS:
         return "data", ["data"], 1.0, "basic.data"
+    if terminal_kind == "END":
+        return "return", ["return"], _clamp(0.98 - depth_penalty, 0.60, 0.98), "basic.end"
     if terminal_kind == "OP":
-        return "opaque_op", ["opaque_op"], _clamp(0.18 - depth_penalty, 0.05, 0.18), "basic.op"
+        # Legacy fallback only. New tokenizer output should use END/NOP/MARK or
+        # a structured prefixed/atomic token instead of generic OP.
+        return "vm_op", ["vm_op"], _clamp(0.38 - depth_penalty, 0.12, 0.38), "basic.vm_op"
     if terminal_kind == "UNK":
         return "unknown", ["unknown"], 0.0, "basic.unknown"
     return "opaque_op", ["opaque_op"], _clamp(0.20 - depth_penalty, 0.05, 0.20), "basic.fallback"
@@ -716,8 +721,15 @@ def normalize_token(token: Token, index: int) -> IRNode:
     )
 
 
-def _summarize_body_candidate(mode: str, span: tuple[int, int], raw: bytes) -> tuple[dict[str, Any], list[Token], list[IRNode]]:
-    tokens = tokenize_stream(raw)
+def _summarize_body_candidate(mode: str, span: tuple[int, int], raw: bytes, body_limit: int | None = None) -> tuple[dict[str, Any], list[Token], list[IRNode], bytes]:
+    logical_limit = len(raw) if body_limit is None else min(len(raw), body_limit)
+    tokens = tokenize_stream(raw, limit=body_limit)
+    consumed = max((token.offset + token.size for token in tokens), default=0)
+    if body_limit is not None:
+        consumed = max(logical_limit, min(consumed, len(raw)))
+    else:
+        consumed = len(raw)
+    effective_raw = raw[:consumed]
     nodes = [normalize_token(token, index=idx) for idx, token in enumerate(tokens)]
 
     node_count = len(nodes)
@@ -743,13 +755,16 @@ def _summarize_body_candidate(mode: str, span: tuple[int, int], raw: bytes) -> t
         + min(math.log2(node_count + 1) * 6.0, 18.0)
         + (2.5 if mode == "definition_exact" else 0.0)
         - (10.0 if node_count <= 1 else 0.0)
-        - (4.0 if raw and len(raw) < 12 else 0.0)
+        - (4.0 if effective_raw and len(effective_raw) < 12 else 0.0)
     )
 
     stats = {
         "slice_mode": mode,
-        "span": {"start": span[0], "end": span[1]},
-        "byte_size": len(raw),
+        "span": {"start": span[0], "end": span[0] + consumed},
+        "original_span": {"start": span[0], "end": span[1]},
+        "byte_size": len(effective_raw),
+        "logical_byte_size": logical_limit,
+        "tail_repair_bytes": max(0, consumed - logical_limit),
         "token_count": len(tokens),
         "node_count": node_count,
         "mean_confidence": mean_confidence,
@@ -761,7 +776,7 @@ def _summarize_body_candidate(mode: str, span: tuple[int, int], raw: bytes) -> t
         "call_count": call_count,
         "quality_score": quality_score,
     }
-    return stats, tokens, nodes
+    return stats, tokens, nodes, effective_raw
 
 
 def _span_dict(span: tuple[int, int] | None) -> dict[str, int] | None:
@@ -785,14 +800,24 @@ def _entry_payload(entry: FunctionEntry | None) -> dict[str, Any] | None:
     return entry.to_dict() if entry is not None else None
 
 
+def _slice_code_span_with_lookahead(mod: MBCModule, span: tuple[int, int], lookahead: int = 16) -> tuple[bytes, int]:
+    start, end = span
+    code_limit = mod.get_real_code_size()
+    tail_end = min(code_limit, end + max(0, lookahead))
+    return mod._slice_code_span(start, tail_end), max(0, end - start)
+
+
 def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySelection:
     exact_span, exact_reason = mod.get_function_exact_code_span_with_reason(entry)
-    exact_raw = mod._slice_code_span(*exact_span) if exact_span is not None else b""
+    exact_raw = b""
+    exact_limit: int | None = None
+    if exact_span is not None:
+        exact_raw, exact_limit = _slice_code_span_with_lookahead(mod, exact_span)
     exact_stats: dict[str, Any] | None = None
     exact_tokens: list[Token] = []
     exact_nodes: list[IRNode] = []
     if exact_span is not None and exact_raw:
-        exact_stats, exact_tokens, exact_nodes = _summarize_body_candidate("definition_exact", exact_span, exact_raw)
+        exact_stats, exact_tokens, exact_nodes, exact_raw = _summarize_body_candidate("definition_exact", exact_span, exact_raw, body_limit=exact_limit)
 
     if exact_stats is None:
         return ExportBodySelection(
@@ -833,12 +858,15 @@ def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | 
     # public+exact double tokenization for every export.  Public slicing is now
     # only evaluated when exact slicing is missing or suspicious.
     exact_span, exact_reason = mod.get_export_exact_code_span_with_reason(export_name)
-    exact_raw = mod._slice_code_span(*exact_span) if exact_span is not None else b""
+    exact_raw = b""
+    exact_limit: int | None = None
+    if exact_span is not None:
+        exact_raw, exact_limit = _slice_code_span_with_lookahead(mod, exact_span)
     exact_stats: dict[str, Any] | None = None
     exact_tokens: list[Token] = []
     exact_nodes: list[IRNode] = []
     if exact_span is not None and exact_raw:
-        exact_stats, exact_tokens, exact_nodes = _summarize_body_candidate("definition_exact", exact_span, exact_raw)
+        exact_stats, exact_tokens, exact_nodes, exact_raw = _summarize_body_candidate("definition_exact", exact_span, exact_raw, body_limit=exact_limit)
 
     if _exact_body_is_stable(exact_stats):
         return ExportBodySelection(
@@ -861,7 +889,7 @@ def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | 
     public_tokens: list[Token] = []
     public_nodes: list[IRNode] = []
     if public_raw:
-        public_stats, public_tokens, public_nodes = _summarize_body_candidate("export_public", public_span, public_raw)
+        public_stats, public_tokens, public_nodes, public_raw = _summarize_body_candidate("export_public", public_span, public_raw)
 
     candidate_stats = [candidate for candidate in (exact_stats, public_stats) if candidate is not None]
 
