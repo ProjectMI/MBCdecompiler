@@ -21,7 +21,7 @@ from mbl_vm_tools.hir import (
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-AST_CONTRACT_VERSION = "ast-v4"
+AST_CONTRACT_VERSION = "ast-v5"
 
 
 @dataclass
@@ -69,7 +69,6 @@ _EXPR_CALL_RE = re.compile(r"^(?P<target>[A-Za-z_][A-Za-z0-9_]*)\((?P<args>.*)\)
 _MEMBER_RE = re.compile(r"^(?P<base>[A-Za-z_][A-Za-z0-9_]*)\.(?P<field>[A-Za-z_][A-Za-z0-9_]*)$")
 _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?(?:\d+\.\d*|\d*\.\d+)$")
-_CONTROL_TARGET_RE = re.compile(r"^(?:goto|break|continue)\s+([^\s(]+)")
 
 
 def _split_top_level(payload: str, separator: str = ",") -> list[str]:
@@ -94,7 +93,7 @@ def _split_top_level(payload: str, separator: str = ",") -> list[str]:
             quote = ch
             current.append(ch)
             continue
-        if ch in "([{" :
+        if ch in "([{":
             depth += 1
         elif ch in ")]}":
             depth = max(0, depth - 1)
@@ -111,170 +110,153 @@ def _split_top_level(payload: str, separator: str = ",") -> list[str]:
     return parts
 
 
-def _lift_expr(text: Optional[str]) -> Optional[dict[str, Any]]:
+def _expr_node(text: Optional[str]) -> Optional[dict[str, Any]]:
     if text is None:
         return None
     source = str(text).strip()
     if not source:
-        return {"kind": "empty", "text": ""}
-    if source in {"break", "continue"}:
-        return {"kind": source, "text": source}
+        return {"kind": "empty"}
     if source.startswith("'") or source.startswith('"'):
-        return {"kind": "literal", "literal_type": "string", "value": source, "text": source}
+        return {"kind": "literal", "literal_type": "string", "value": source}
     if _INT_RE.match(source):
-        return {"kind": "literal", "literal_type": "int", "value": int(source), "text": source}
+        return {"kind": "literal", "literal_type": "int", "value": int(source)}
     if _FLOAT_RE.match(source):
-        return {"kind": "literal", "literal_type": "float", "value": float(source), "text": source}
+        return {"kind": "literal", "literal_type": "float", "value": float(source)}
     member = _MEMBER_RE.match(source)
     if member is not None:
-        return {"kind": "member", "base": member.group("base"), "field": member.group("field"), "text": source}
+        return {"kind": "member", "base": {"kind": "symbol", "name": member.group("base")}, "field": member.group("field")}
     call = _EXPR_CALL_RE.match(source)
     if call is not None:
         return {
             "kind": "call_expr",
             "callee": call.group("target"),
-            "args": [_lift_expr(item) for item in _split_top_level(call.group("args"))],
-            "text": source,
+            "args": [_expr_node(item) for item in _split_top_level(call.group("args"))],
         }
     if source.startswith("cond[") and source.endswith(")"):
-        return {"kind": "predicate", "text": source}
-    return {"kind": "symbol", "name": source, "text": source}
+        return {"kind": "predicate", "source": source}
+    return {"kind": "symbol", "name": source}
 
 
-def _split_inline_if(text: str) -> Optional[tuple[str, str]]:
-    if not text.startswith("if ("):
-        return None
-    depth = 1
-    buf: list[str] = []
-    for idx, ch in enumerate(text[len("if ("):], start=len("if (")):
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth == 0:
-                rest = text[idx + 1 :].strip()
-                cond = "".join(buf).strip()
-                return (cond, rest) if rest else None
-        buf.append(ch)
-    return None
-
-
-def _lift_statement(stmt: str) -> dict[str, Any]:
+def _statement_node(stmt: Any) -> dict[str, Any]:
+    if isinstance(stmt, dict):
+        return stmt
     text = str(stmt).strip()
     if not text:
-        return {"kind": "empty", "text": str(stmt)}
-    inline = _split_inline_if(text)
-    if inline is not None:
-        cond, action = inline
-        if action.startswith("{") and action.endswith("}"):
-            body = [_lift_statement(item) for item in _split_top_level(action[1:-1], ";")]
-            return {"kind": "conditional_block", "condition": _lift_expr(cond), "body": body, "text": text}
-        return {"kind": "conditional_jump", "condition": _lift_expr(cond), "jump": _lift_statement(action), "text": text}
+        return {"kind": "empty"}
     if text == "break" or text.startswith("break "):
-        return {"kind": "break", "target": text[6:].strip() or None, "text": text}
+        return {"kind": "break", "target": text[6:].strip() or None}
     if text == "continue" or text.startswith("continue "):
-        return {"kind": "continue", "target": text[9:].strip() or None, "text": text}
+        return {"kind": "continue", "target": text[9:].strip() or None}
     if text.startswith("goto "):
-        return {"kind": "goto", "target": text[5:].strip(), "text": text}
+        return {"kind": "goto", "target": text[5:].strip()}
     if text.startswith("return"):
         value = text[6:].strip()
-        return {"kind": "return", "value": _lift_expr(value) if value else None, "text": text}
+        return {"kind": "return", "value": _expr_node(value) if value else None}
     matched = _match_assignment(text)
     if matched is not None:
         lhs, rhs = matched
-        value = _lift_expr(rhs)
+        value = _expr_node(rhs)
         kind = "field_store" if "." in lhs else "assign_call" if value and value.get("kind") == "call_expr" else "assign"
-        return {"kind": kind, "target": _lift_expr(lhs), "value": value, "text": text}
-    expr = _lift_expr(text)
+        return {"kind": kind, "target": _expr_node(lhs), "value": value}
+    expr = _expr_node(text)
     if expr and expr.get("kind") == "call_expr":
-        return {"kind": "call", "expr": expr, "text": text}
-    return {"kind": "expr", "expr": expr, "text": text}
+        return {"kind": "call", "expr": expr}
+    return {"kind": "expr", "expr": expr}
 
 
-def _lift_terminator(terminator: dict[str, Any]) -> dict[str, Any]:
-    rendered_lines = list(terminator.get("rendered_lines") or [])
-    return {
-        "kind": terminator.get("kind") or "unknown",
-        "text": terminator.get("text"),
-        "condition": _lift_expr(terminator.get("condition")),
-        "rendered_lines": rendered_lines,
-        "rendered": [_lift_statement(line) for line in rendered_lines],
-        "successors": list(terminator.get("successors") or []),
-        "branch_target": terminator.get("branch_target"),
-        "fallthrough_target": terminator.get("fallthrough_target"),
-    }
+def _assignment_node(lhs: str, rhs: str) -> dict[str, Any]:
+    value = _expr_node(rhs)
+    kind = "field_store" if "." in lhs else "assign_call" if value and value.get("kind") == "call_expr" else "assign"
+    return {"kind": kind, "target": _expr_node(lhs), "value": value}
 
 
-def _lift_region(region: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    if region is None:
+def _conditional_node(condition: Any, body: list[dict[str, Any]], *, negate: bool = False) -> Optional[dict[str, Any]]:
+    if not body:
         return None
-    kind = region.get("kind")
-    if kind == "sequence":
-        return {"kind": "sequence", "regions": [_lift_region(item) for item in region.get("regions", []) if item is not None]}
-    if kind == "goto_region":
-        return {
-            "kind": "goto_region",
-            "label_count": int(region.get("label_count", 0)),
-            "goto_count": int(region.get("goto_count", 0)),
-            "blocks": [_lift_region(item) for item in region.get("blocks", []) if item is not None],
-        }
-    if kind == "block":
-        return {
-            "kind": "block",
-            "block_id": region.get("block_id"),
-            "label": region.get("label"),
-            "block_params": list(region.get("block_params") or []),
-            "prelabel": [_lift_statement(stmt) for stmt in region.get("prelabel", [])],
-            "body": [_lift_statement(stmt) for stmt in region.get("statements", [])],
-            "terminator": _lift_terminator(region.get("terminator") or {}),
-        }
-    if kind in {"if", "if_else"}:
-        return {
-            "kind": kind,
-            "header_block": region.get("header_block"),
-            "label": region.get("label"),
-            "block_params": list(region.get("block_params") or []),
-            "condition": _lift_expr(region.get("condition")),
-            "prologue": [_lift_statement(stmt) for stmt in region.get("prologue", [])],
-            "then": _lift_region(region.get("then")),
-            "else": _lift_region(region.get("else")),
-            "resume_block": region.get("resume_block"),
-            "resume_param_merge": [_lift_statement(stmt) for stmt in region.get("resume_param_merge", [])],
-        }
-    if kind == "while":
-        return {
-            "kind": "while",
-            "header_block": region.get("header_block"),
-            "label": region.get("label"),
-            "block_params": list(region.get("block_params") or []),
-            "preheader": [_lift_statement(stmt) for stmt in region.get("preheader", [])],
-            "condition": _lift_expr(region.get("condition")),
-            "prologue": [_lift_statement(stmt) for stmt in region.get("prologue", [])],
-            "guard_exit": [_lift_statement(stmt) for stmt in region.get("guard_exit", [])],
-            "rendering": region.get("rendering"),
-            "body": _lift_region(region.get("body")),
-            "continue_target": region.get("continue_target"),
-            "break_target": region.get("break_target"),
-            "break_targets": list(region.get("break_targets") or []),
-        }
-    if kind == "switch_like":
-        return {
-            "kind": "switch_like",
-            "join_block": region.get("join_block"),
-            "cases": [
-                {
-                    "kind": "case",
-                    "dispatch_block": case.get("dispatch_block"),
-                    "condition": _lift_expr(case.get("condition")),
-                    "target": case.get("target"),
-                    "body": _lift_region(case.get("body")),
-                }
-                for case in region.get("cases", [])
-            ],
-            "default": region.get("default"),
-        }
-    return {"kind": str(kind or "unknown"), "raw": region}
+    cond_expr = condition if isinstance(condition, dict) else _expr_node(str(condition))
+    if negate:
+        cond_expr = {"kind": "not", "expr": cond_expr}
+    if len(body) == 1:
+        return {"kind": "conditional_jump", "condition": cond_expr, "jump": body[0]}
+    return {"kind": "conditional_block", "condition": cond_expr, "body": body}
 
+
+def _render_expr(expr: Any) -> str:
+    if expr is None:
+        return ""
+    if not isinstance(expr, dict):
+        return str(expr)
+    kind = expr.get("kind")
+    if kind == "empty":
+        return ""
+    if kind == "literal":
+        return str(expr.get("value"))
+    if kind == "symbol":
+        return str(expr.get("name") or "")
+    if kind == "member":
+        base = _render_expr(expr.get("base"))
+        return f"{base}.{expr.get('field')}" if base else str(expr.get("field") or "")
+    if kind == "call_expr":
+        return f"{expr.get('callee')}({', '.join(_render_expr(arg) for arg in expr.get('args') or [])})"
+    if kind == "predicate":
+        return str(expr.get("source") or "")
+    if kind == "not":
+        return f"!({_render_expr(expr.get('expr'))})"
+    return str(expr.get("source") or expr.get("name") or kind or "")
+
+
+def _render_statement(stmt: Any) -> str:
+    if not isinstance(stmt, dict):
+        return str(stmt).strip()
+    kind = stmt.get("kind")
+    if kind == "empty":
+        return ""
+    if kind == "call":
+        return _render_expr(stmt.get("expr"))
+    if kind == "expr":
+        return _render_expr(stmt.get("expr"))
+    if kind in {"assign", "assign_call", "field_store"}:
+        return f"{_render_expr(stmt.get('target'))} = {_render_expr(stmt.get('value'))}"
+    if kind == "return":
+        value = _render_expr(stmt.get("value"))
+        return f"return {value}" if value else "return"
+    if kind == "goto":
+        return f"goto {stmt.get('target')}"
+    if kind == "break":
+        target = stmt.get("target")
+        return f"break {target}" if target else "break"
+    if kind == "continue":
+        target = stmt.get("target")
+        return f"continue {target}" if target else "continue"
+    if kind in {"conditional_jump", "conditional_block"}:
+        return f"if ({_render_expr(stmt.get('condition'))}) {{ ... }}"
+    return str(stmt.get("source") or kind or "")
+
+
+def _render_statement_lines(stmt: Any) -> list[str]:
+    if not isinstance(stmt, dict):
+        text = str(stmt).strip()
+        return [text] if text else []
+    kind = stmt.get("kind")
+    if kind == "conditional_jump":
+        body = _render_statement_lines(stmt.get("jump"))
+        return [f"if ({_render_expr(stmt.get('condition'))}) {{", *(f"    {line}" for line in body), "}"]
+    if kind == "conditional_block":
+        lines: list[str] = [f"if ({_render_expr(stmt.get('condition'))}) {{"]
+        for child in stmt.get("body") or []:
+            lines.extend(f"    {line}" for line in _render_statement_lines(child))
+        lines.append("}")
+        return lines
+    rendered = _render_statement(stmt)
+    return [rendered] if rendered else []
+
+
+def _render_statement_list(statements: list[dict[str, Any]], indent: int) -> list[str]:
+    prefix = "    " * indent
+    lines: list[str] = []
+    for stmt in statements:
+        lines.extend(prefix + line for line in _render_statement_lines(stmt))
+    return lines
 
 def _base_label(text: Optional[str]) -> Optional[str]:
     if text is None:
@@ -288,11 +270,11 @@ def _base_label(text: Optional[str]) -> Optional[str]:
 
 def _statement_target(stmt: dict[str, Any]) -> Optional[str]:
     target = stmt.get("target")
-    if target:
-        return _base_label(str(target))
-    text = str(stmt.get("text") or "")
-    match = _CONTROL_TARGET_RE.match(text)
-    return _base_label(match.group(1)) if match else None
+    if isinstance(target, dict):
+        target = _render_expr(target)
+    if not target:
+        return None
+    return _base_label(str(target))
 
 
 def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
@@ -314,7 +296,7 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
         expression_hist[str(expr.get("kind") or "unknown")] += 1
         for arg in expr.get("args") or []:
             visit_expr(arg)
-        for key in ("condition", "value", "target", "expr"):
+        for key in ("condition", "value", "target", "expr", "base"):
             visit_expr(expr.get(key))
 
     def visit_stmt(stmt: Any) -> None:
@@ -420,14 +402,14 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
 
 
 def _statement_text(stmt: dict[str, Any]) -> str:
-    return str(stmt.get("text") or "").strip()
+    return _render_statement(stmt).strip()
 
 
 def _is_data_nop_statement(stmt: dict[str, Any]) -> bool:
     expr = stmt.get("expr") if isinstance(stmt, dict) and stmt.get("kind") in {"call", "expr"} else None
     if not isinstance(expr, dict) or expr.get("kind") != "call_expr" or expr.get("callee") != "data":
         return bool(isinstance(stmt, dict) and stmt.get("kind") == "empty")
-    payload = " ".join(str(arg.get("text") or arg.get("name") or arg.get("value") or "") for arg in expr.get("args") or [])
+    payload = " ".join(_render_expr(arg) for arg in expr.get("args") or [])
     return '"role": "nop"' in payload or "'role': 'nop'" in payload
 
 
@@ -447,7 +429,7 @@ def _collect_simple_body_statements(region: Any) -> Optional[list[dict[str, Any]
     if region.get("label") or region.get("block_params") or region.get("prelabel"):
         return None
     term = region.get("terminator") or {}
-    if term.get("rendered") or term.get("rendered_lines"):
+    if term.get("rendered"):
         return None
     if term.get("kind") not in {None, "return", "fallthrough"}:
         return None
@@ -465,7 +447,7 @@ def _classify_trivial_function_body(ast_root: dict[str, Any], entry_args: list[s
         return {**base, "kind": "empty", "is_trivial": True, "reason": "no_semantic_statements"}
     if len(significant) == 1 and significant[0].get("kind") == "return":
         value = significant[0].get("value")
-        value_text = str((value or {}).get("text") or _statement_text(significant[0])[6:].strip()) if value is not None else ""
+        value_text = _render_expr(value) if value is not None else ""
         if isinstance(value, dict) and value.get("kind") == "literal" and value.get("literal_type") == "int" and value.get("value") == 0:
             return {**base, "kind": "return_zero", "is_trivial": True, "reason": "single_zero_return_after_noops", "return_value_text": value_text}
         if isinstance(value, dict) and value.get("kind") == "symbol" and value.get("name") in entry_args:
@@ -475,7 +457,7 @@ def _classify_trivial_function_body(ast_root: dict[str, Any], entry_args: list[s
     return {**base, "kind": "nontrivial", "reason": "semantic_statements_before_or_after_return", "sample_statements": [_statement_text(stmt) for stmt in significant[:4]]}
 
 
-def _validate_lifted_ast_semantics(ast_root: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+def _validate_ast_semantics(ast_root: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     targets = list(metrics.get("ast_dangling_jump_targets") or [])
     if targets:
@@ -681,13 +663,13 @@ def _format_block_label(block: HIRBlock) -> str:
     return f"{block.id}({', '.join(block.block_params)})" if block.block_params else block.id
 
 
-def _incoming_assignments(target: Optional[HIRBlock], source_id: Optional[str]) -> list[str]:
+def _incoming_assignments(target: Optional[HIRBlock], source_id: Optional[str]) -> list[dict[str, Any]]:
     if target is None or source_id is None or not target.block_params:
         return []
     args = list(target.incoming_args.get(source_id) or [])
     if len(args) != len(target.block_params):
         return []
-    return [f"{param} = {arg}" for param, arg in zip(target.block_params, args) if param != arg]
+    return [_assignment_node(param, arg) for param, arg in zip(target.block_params, args) if param != arg]
 
 
 def _target_call(target: Optional[HIRBlock], source: Optional[HIRBlock]) -> Optional[str]:
@@ -803,37 +785,33 @@ class _SurfaceBuilder:
             current = nxt
         return current
 
-    def _jump_lines(self, source: Optional[HIRBlock], target_id: Optional[str], aliases: dict[str, Any]) -> tuple[list[str], int]:
+    def _jump_nodes(self, source: Optional[HIRBlock], target_id: Optional[str], aliases: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
         if target_id is None:
             return [], 0
         target = self.cfg.by_id.get(target_id)
         alias = aliases.get(target_id)
         if alias is None:
-            rendered = _target_call(target, source) or target_id
-            return [f"goto {rendered}"], 1
+            return [{"kind": "goto", "target": _target_call(target, source) or target_id}], 1
         if isinstance(alias, dict):
             source_key = source.id if source is not None else None
             by_source = alias.get("prelude_by_source") or {}
             prelude = list(by_source.get(source_key) or [])
-            text = str(alias.get("text") or "").strip()
-            if not text:
-                return prelude, 0
-            return prelude + [text], 0 if text.startswith(("break", "continue")) else 1
-        text = str(alias).strip()
-        return ([text] if text else []), 0 if text.startswith(("break", "continue")) else 1
+            jump = alias.get("jump")
+            return prelude + ([jump] if isinstance(jump, dict) else []), int(isinstance(jump, dict) and jump.get("kind") == "goto")
+        node = _statement_node(alias)
+        return ([node] if node.get("kind") != "empty" else []), int(node.get("kind") == "goto")
 
-    def _terminator_lines(
+    def _terminator_nodes(
         self,
         block: HIRBlock,
         next_id: Optional[str],
         aliases: dict[str, Any],
-    ) -> tuple[list[str], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         kind = block.terminator.get("kind")
         if kind == "return":
-            return ([str(block.terminator.get("text") or "return").strip()], 0)
+            return ([_statement_node(block.terminator.get("text") or "return")], 0)
         if kind == "stop":
-            text = str(block.terminator.get("text") or "stop").strip()
-            return ([text], 0)
+            return ([{"kind": "stop", "source": str(block.terminator.get("text") or "stop").strip()}], 0)
         if kind == "fallthrough":
             target_id = block.fallthrough_target or (block.successors[0] if block.successors else None)
             if target_id is None:
@@ -843,53 +821,48 @@ class _SurfaceBuilder:
                     return [], 0
                 if next_id is not None and self._transparent_fallthrough_target(next_id) == target_id:
                     return [], 0
-            return self._jump_lines(block, target_id, aliases)
+            return self._jump_nodes(block, target_id, aliases)
         if kind == "branch":
-            cond = block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}"
+            cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
             branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
             if branch == fallthrough:
                 if branch is None or branch == next_id:
                     return [], 0
-                return self._jump_lines(block, branch, aliases)
+                return self._jump_nodes(block, branch, aliases)
             if branch not in aliases and fallthrough not in aliases:
                 branch_final = self._transparent_fallthrough_target(branch)
                 fallthrough_final = self._transparent_fallthrough_target(fallthrough)
                 next_final = self._transparent_fallthrough_target(next_id)
                 if branch_final is not None and branch_final == fallthrough_final and next_final == branch_final:
                     return [], 0
-            lines: list[str] = []
+            nodes: list[dict[str, Any]] = []
             goto_count = 0
             if branch == next_id and fallthrough is not None:
-                edge_lines, edge_gotos = self._jump_lines(block, fallthrough, aliases)
-                if edge_lines:
-                    lines.append(f"if (!({cond})) {{")
-                    lines.extend(f"    {line}" for line in edge_lines)
-                    lines.append("}")
-                goto_count += edge_gotos
-                return lines, goto_count
+                edge_nodes, edge_gotos = self._jump_nodes(block, fallthrough, aliases)
+                conditional = _conditional_node(cond, edge_nodes, negate=True)
+                if conditional is not None:
+                    nodes.append(conditional)
+                return nodes, edge_gotos
             if fallthrough == next_id and branch is not None:
-                edge_lines, edge_gotos = self._jump_lines(block, branch, aliases)
-                if edge_lines:
-                    lines.append(f"if ({cond}) {{")
-                    lines.extend(f"    {line}" for line in edge_lines)
-                    lines.append("}")
-                goto_count += edge_gotos
-                return lines, goto_count
+                edge_nodes, edge_gotos = self._jump_nodes(block, branch, aliases)
+                conditional = _conditional_node(cond, edge_nodes)
+                if conditional is not None:
+                    nodes.append(conditional)
+                return nodes, edge_gotos
             if branch is not None:
-                edge_lines, edge_gotos = self._jump_lines(block, branch, aliases)
-                if edge_lines:
-                    lines.append(f"if ({cond}) {{")
-                    lines.extend(f"    {line}" for line in edge_lines)
-                    lines.append("}")
+                edge_nodes, edge_gotos = self._jump_nodes(block, branch, aliases)
+                conditional = _conditional_node(cond, edge_nodes)
+                if conditional is not None:
+                    nodes.append(conditional)
                 goto_count += edge_gotos
             if fallthrough is not None:
-                edge_lines, edge_gotos = self._jump_lines(block, fallthrough, aliases)
-                lines.extend(edge_lines)
+                edge_nodes, edge_gotos = self._jump_nodes(block, fallthrough, aliases)
+                nodes.extend(edge_nodes)
                 goto_count += edge_gotos
-            return lines, goto_count
+            return nodes, goto_count
         if not block.successors:
             return [], 0
-        return self._jump_lines(block, block.successors[0], aliases)
+        return self._jump_nodes(block, block.successors[0], aliases)
 
     def _block_region(
         self,
@@ -901,12 +874,12 @@ class _SurfaceBuilder:
     ) -> tuple[dict[str, Any], Optional[str]]:
         label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
         prelabel = _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors and block.id not in aliases else []
-        statements = list(block.statements)
-        term_lines, goto_count = self._terminator_lines(block, next_id, aliases)
-        if len(term_lines) == 1 and statements and statements[-1].strip() == term_lines[0].strip():
-            if term_lines[0].startswith("goto ") and goto_count:
+        statements = [_statement_node(stmt) for stmt in block.statements]
+        term_nodes, goto_count = self._terminator_nodes(block, next_id, aliases)
+        if len(term_nodes) == 1 and statements and _render_statement(statements[-1]) == _render_statement(term_nodes[0]):
+            if term_nodes[0].get("kind") == "goto" and goto_count:
                 goto_count = 0
-            term_lines = []
+            term_nodes = []
         label_count = 1 if label and block.id not in self.needed_label_ids else 0
         self.residual_labels += label_count
         self.residual_gotos += goto_count
@@ -916,12 +889,11 @@ class _SurfaceBuilder:
             "label": label,
             "block_params": list(block.block_params),
             "prelabel": prelabel,
-            "statements": statements,
+            "body": statements,
             "terminator": {
                 "kind": block.terminator.get("kind"),
-                "text": block.terminator.get("text"),
-                "condition": block.terminator.get("condition"),
-                "rendered_lines": term_lines,
+                "condition": _expr_node(block.terminator.get("condition")),
+                "rendered": term_nodes,
                 "successors": list(block.successors),
                 "branch_target": block.branch_target,
                 "fallthrough_target": block.fallthrough_target,
@@ -936,7 +908,7 @@ class _SurfaceBuilder:
     def _edge_alias_to_join(self, join_id: str, source_ids: set[str]) -> dict[str, Any]:
         join_block = self.cfg.by_id.get(join_id)
         return {
-            "text": "",
+            "jump": None,
             "prelude_by_source": {
                 source_id: _incoming_assignments(join_block, source_id)
                 for source_id in source_ids
@@ -983,7 +955,7 @@ class _SurfaceBuilder:
             return {direct_source}
         return {block_id for block_id in ids if join_id in self.cfg.succs.get(block_id, [])}
 
-    def _edge_statement_block(self, block_id: str, statements: list[str]) -> Optional[dict[str, Any]]:
+    def _edge_statement_block(self, block_id: str, statements: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
         if not statements:
             return None
         return {
@@ -992,8 +964,8 @@ class _SurfaceBuilder:
             "label": None,
             "block_params": [],
             "prelabel": [],
-            "statements": statements,
-            "terminator": {"kind": "fallthrough", "text": None, "condition": None, "rendered_lines": [], "successors": [], "branch_target": None, "fallthrough_target": None},
+            "body": statements,
+            "terminator": {"kind": "fallthrough", "condition": None, "rendered": [], "successors": [], "branch_target": None, "fallthrough_target": None},
         }
 
     def _try_switch_like(
@@ -1028,7 +1000,7 @@ class _SurfaceBuilder:
                 {
                     "kind": "case",
                     "dispatch_block": case_block.id,
-                    "condition": case_block.terminator.get("condition"),
+                    "condition": _expr_node(case_block.terminator.get("condition")),
                     "target": case_target,
                     "body": {"kind": "sequence", "regions": []},
                 }
@@ -1079,10 +1051,10 @@ class _SurfaceBuilder:
         self.settled_preds_by_block[join_id].update(join_sources)
         arm_aliases = dict(aliases)
         arm_aliases[join_id] = join_alias
-        cond = str(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
+        cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
         label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
         prologue = _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors else []
-        prologue.extend(block.statements)
+        prologue.extend(_statement_node(stmt) for stmt in block.statements)
 
         def build_arm(ids: set[str], direct_edge: bool, suffix: str) -> list[dict[str, Any]]:
             if ids:
@@ -1109,8 +1081,8 @@ class _SurfaceBuilder:
                     "label": label,
                     "block_params": list(block.block_params),
                     "prelabel": [],
-                    "statements": prologue,
-                    "terminator": {"kind": "fallthrough", "text": None, "condition": None, "rendered_lines": [], "successors": [], "branch_target": None, "fallthrough_target": None},
+                    "body": prologue,
+                    "terminator": {"kind": "fallthrough", "condition": None, "rendered": [], "successors": [], "branch_target": None, "fallthrough_target": None},
                 }
                 return region, join_idx
             return {"kind": "sequence", "regions": []}, join_idx
@@ -1136,11 +1108,11 @@ class _SurfaceBuilder:
         aliases: dict[str, Any] = {}
         for target_id, sources in _loopback_edges(loop, self.cfg).items():
             target = self.cfg.by_id.get(target_id)
-            text = "continue" if target_id == header_id else f"continue {target_id}"
+            jump = {"kind": "continue", "target": None if target_id == header_id else target_id}
             if target_id != header_id:
                 self.needed_label_ids.add(target_id)
             aliases[target_id] = {
-                "text": text,
+                "jump": jump,
                 "prelude_by_source": {source_id: _incoming_assignments(target, source_id) for source_id in sources},
             }
         exits = list(exit_ids) if exit_ids is not None else _external_successors(loop, self.cfg)
@@ -1152,11 +1124,11 @@ class _SurfaceBuilder:
         for pos, exit_id in enumerate(exits):
             exit_block = self.cfg.by_id.get(exit_id)
             sources = [source_id for source_id in nodes if exit_id in self.cfg.succs.get(source_id, [])]
-            text = "break" if pos == 0 else f"break {exit_id}"
+            jump = {"kind": "break", "target": None if pos == 0 else exit_id}
             if pos != 0:
                 self.needed_label_ids.add(exit_id)
             aliases[exit_id] = {
-                "text": text,
+                "jump": jump,
                 "prelude_by_source": {source_id: _incoming_assignments(exit_block, source_id) for source_id in sources},
             }
         return aliases
@@ -1188,8 +1160,8 @@ class _SurfaceBuilder:
         exit_succ = loop.get("exit_succ")
         if body_succ not in self.cfg.index_by_id or exit_succ is None:
             return None
-        cond = str(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
-        body_cond = cond if branch == body_succ else f"!({cond})" if fallthrough == body_succ else cond
+        cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
+        body_cond = cond if branch == body_succ else {"kind": "not", "expr": cond} if fallthrough == body_succ else cond
         loop_aliases = dict(aliases)
         local_aliases = self._loop_aliases(loop)
         self._settle_alias_predecessors(local_aliases)
@@ -1212,8 +1184,8 @@ class _SurfaceBuilder:
             "label": label,
             "block_params": list(block.block_params),
             "preheader": preheader,
-            "condition": "true" if guarded else body_cond,
-            "prologue": list(block.statements),
+            "condition": _expr_node("true") if guarded else body_cond,
+            "prologue": [_statement_node(stmt) for stmt in block.statements],
             "guard_condition": body_cond,
             "guard_exit": header_exit_assignments,
             "rendering": "guarded_loop" if guarded else "direct_while",
@@ -1260,7 +1232,7 @@ class _SurfaceBuilder:
             "label": label,
             "block_params": list(block.block_params),
             "preheader": _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors else [],
-            "condition": "true",
+            "condition": _expr_node("true"),
             "prologue": [],
             "guard_exit": [],
             "rendering": "unconditional_loop",
@@ -1351,15 +1323,14 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
             lines.extend(_render_region(child, indent))
         return lines
     if kind == "block":
-        lines = [prefix + line for line in region.get("prelabel", [])]
+        lines = _render_statement_list(region.get("prelabel") or [], indent)
         label = region.get("label")
         stmt_indent = indent
         if label:
             lines.append(prefix + f"{label}:")
             stmt_indent += 1
-        stmt_prefix = "    " * stmt_indent
-        lines.extend(stmt_prefix + stmt for stmt in region.get("statements", []))
-        lines.extend(stmt_prefix + stmt for stmt in (region.get("terminator") or {}).get("rendered_lines", []))
+        lines.extend(_render_statement_list(region.get("body") or [], stmt_indent))
+        lines.extend(_render_statement_list((region.get("terminator") or {}).get("rendered") or [], stmt_indent))
         return lines
     if kind in {"if", "if_else"}:
         lines: list[str] = []
@@ -1369,31 +1340,31 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
             lines.append(prefix + f"{label}:")
             stmt_indent += 1
         sp = "    " * stmt_indent
-        lines.extend(sp + stmt for stmt in region.get("prologue", []))
-        lines.append(sp + f"if ({region.get('condition')}) {{")
+        lines.extend(_render_statement_list(region.get("prologue") or [], stmt_indent))
+        lines.append(sp + f"if ({_render_expr(region.get('condition'))}) {{")
         lines.extend(_render_region(region.get("then"), stmt_indent + 1))
         if kind == "if_else" and region.get("else"):
             lines.append(sp + "} else {")
             lines.extend(_render_region(region.get("else"), stmt_indent + 1))
         lines.append(sp + "}")
-        lines.extend(sp + stmt for stmt in region.get("resume_param_merge", []))
+        lines.extend(_render_statement_list(region.get("resume_param_merge") or [], stmt_indent))
         return lines
     if kind == "while":
-        lines = [prefix + stmt for stmt in region.get("preheader", [])]
+        lines = _render_statement_list(region.get("preheader") or [], indent)
         label = region.get("label")
         loop_indent = indent
         if label:
             lines.append(prefix + f"{label}:")
             loop_indent += 1
         lp = "    " * loop_indent
-        lines.append(lp + f"while ({region.get('condition') or 'true'}) {{")
+        lines.append(lp + f"while ({_render_expr(region.get('condition')) or 'true'}) {{")
         inner = loop_indent + 1
         ip = "    " * inner
-        lines.extend(ip + stmt for stmt in region.get("prologue", []))
+        lines.extend(_render_statement_list(region.get("prologue") or [], inner))
         if region.get("rendering") == "guarded_loop":
-            guard = region.get("guard_condition") or "true"
+            guard = _render_expr(region.get("guard_condition")) or "true"
             lines.append(ip + f"if (!({guard})) {{")
-            lines.extend("    " * (inner + 1) + stmt for stmt in region.get("guard_exit", []))
+            lines.extend(_render_statement_list(region.get("guard_exit") or [], inner + 1))
             lines.append("    " * (inner + 1) + "break")
             lines.append(ip + "}")
         lines.extend(_render_region(region.get("body"), inner))
@@ -1409,7 +1380,7 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
         sp = "    " * switch_indent
         lines.append(sp + "switch_like {")
         for case in region.get("cases") or []:
-            cond = case.get("condition") or "<cond>"
+            cond = _render_expr(case.get("condition")) or "<cond>"
             target = case.get("target") or "<unresolved>"
             lines.append("    " * (switch_indent + 1) + f"when ({cond}) -> {target} {{")
             lines.extend(_render_region(case.get("body"), switch_indent + 2))
@@ -1418,7 +1389,6 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
         lines.append(sp + "}")
         return lines
     return [prefix + f"/* unsupported AST region: {kind} */"]
-
 
 def _render_function_text(name: str, entry_args: list[str], tree: dict[str, Any], include_text: bool) -> str:
     if not include_text:
@@ -1447,10 +1417,10 @@ def build_function_ast_from_payload(function_payload: dict[str, Any], *, include
     entry_args = blocks[0].entry_stack if blocks else []
     builder = _SurfaceBuilder(blocks)
     region_tree, structured_meta = builder.build()
-    ast_root = _lift_region(region_tree) or {"kind": "sequence", "regions": []}
+    ast_root = region_tree or {"kind": "sequence", "regions": []}
     shape_metrics = _collect_ast_shape_metrics(ast_root)
-    semantic_validation = _validate_lifted_ast_semantics(ast_root, shape_metrics)
-    ast_text = _render_function_text(name, list(entry_args), region_tree, include_text)
+    semantic_validation = _validate_ast_semantics(ast_root, shape_metrics)
+    ast_text = _render_function_text(name, list(entry_args), ast_root, include_text)
     trivial_body = _classify_trivial_function_body(ast_root, list(entry_args))
     block_count = len(blocks)
     fallback_block_count = int(structured_meta.get("fallback_block_count", 0))
@@ -1622,10 +1592,10 @@ def build_module_ast(
         "contract": {
             "version": AST_CONTRACT_VERSION,
             "input_hir_contract": HIR_CONTRACT_VERSION,
-            "layers": ["normalized_hir", "structured_regions", "lifted_ast", "ast_summary"],
+            "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_summary"],
             "notes": [
-                "AST v4 builds directly from normalized HIR CFG blocks.",
-                "Labels, edge parameters, and residual gotos are derived before rendering; no late forced-label healing pass is used.",
+                "AST v5 builds statement/expression nodes directly from normalized HIR CFG blocks.",
+                "Text is an output-only renderer concern; branch, loop, alias, and edge-parameter normalization operate on nodes.",
                 "Unsafe shapes remain explicit goto_region instead of being repaired after the fact.",
             ],
         },
@@ -1678,10 +1648,10 @@ def summarize_ast_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any
         "contract": {
             "version": "ast-report-v2",
             "ast_contract": AST_CONTRACT_VERSION,
-            "layers": ["normalized_hir", "structured_regions", "lifted_ast", "ast_corpus_metrics"],
+            "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_corpus_metrics"],
             "notes": [
-                "AST v4 removes late healing passes; residual explicit CFG is a first-class result.",
-                "Dangling jump counters are semantic validation failures, not inputs to a repair loop.",
+                "AST v5 keeps residual explicit CFG as a first-class result, not as an input to a repair loop.",
+                "Dangling jump counters are semantic validation failures, and text rendering is output-only.",
             ],
         },
         "summary": summary,
