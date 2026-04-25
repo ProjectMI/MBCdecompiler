@@ -5,8 +5,8 @@ import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
-from mbl_vm_tools.ast import build_module_ast, render_module_ast_text_from_payload
-from mbl_vm_tools.hir import build_module_hir, summarize_corpus, write_json, write_text
+from mbl_vm_tools.ast import build_module_ast, render_module_ast_text_from_payload, summarize_ast_corpus
+from mbl_vm_tools.hir import build_module_hir, write_json, write_text
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -34,19 +34,21 @@ def _resolve_script_path(script_arg: str) -> Path:
 
 
 
-def _build_module_hir_one(path: str, include_definitions: bool, include_exports: bool, validate: bool) -> dict:
-    return build_module_hir(
+def _build_module_ast_report_one(path: str, include_definitions: bool, include_exports: bool, validate: bool) -> dict:
+    return build_module_ast(
         path,
         include_canonical=False,
+        include_hir=False,
         include_text=False,
+        include_ast=False,
+        include_diagnostics=False,
         include_definitions=include_definitions,
         include_exports=include_exports,
         validate=validate,
     )
 
 
-
-def build_corpus_report(
+def build_ast_corpus_report(
     paths: list[Path],
     workers: int = DEFAULT_WORKERS,
     *,
@@ -55,15 +57,7 @@ def build_corpus_report(
     validate: bool = False,
 ) -> dict:
     if not paths:
-        return {
-            "summary": {
-                "module_count": 0,
-                "function_count": 0,
-                "total_canonical_instructions": 0,
-            },
-            "token_coverage": {},
-            "heaviest_functions": [],
-        }
+        return summarize_ast_corpus([])
 
     worker_count = min(max(1, workers), len(paths))
     module_payloads: list[dict | None] = [None] * len(paths)
@@ -72,22 +66,22 @@ def build_corpus_report(
         failed: list[str] = []
         for idx, path in enumerate(paths):
             try:
-                module_payloads[idx] = _build_module_hir_one(str(path), include_definitions, include_exports, validate)
+                module_payloads[idx] = _build_module_ast_report_one(str(path), include_definitions, include_exports, validate)
             except Exception as exc:  # pragma: no cover - CLI fallback path
                 failed.append(f"{path.name}: {exc}")
             completed = idx + 1
             if completed % 25 == 0 or completed == len(paths):
-                print(f"HIR corpus: {completed}/{len(paths)}")
+                print(f"AST corpus: {completed}/{len(paths)}")
         if failed:
-            print(f"HIR corpus warnings: {len(failed)} module(s) failed")
+            print(f"AST corpus warnings: {len(failed)} module(s) failed")
             for item in failed[:8]:
                 print(f"  - {item}")
         ready_modules = [module for module in module_payloads if module is not None]
-        return summarize_corpus(ready_modules)
+        return summarize_ast_corpus(ready_modules)
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         future_to_index = {
-            executor.submit(_build_module_hir_one, str(path), include_definitions, include_exports, validate): idx
+            executor.submit(_build_module_ast_report_one, str(path), include_definitions, include_exports, validate): idx
             for idx, path in enumerate(paths)
         }
         completed = 0
@@ -102,15 +96,14 @@ def build_corpus_report(
                 failed.append(f"{Path(path_str).name}: {exc}")
             completed += 1
             if completed % 25 == 0 or completed == total:
-                print(f"HIR corpus: {completed}/{total}")
+                print(f"AST corpus: {completed}/{total}")
         if failed:
-            print(f"HIR corpus warnings: {len(failed)} module(s) failed")
+            print(f"AST corpus warnings: {len(failed)} module(s) failed")
             for item in failed[:8]:
                 print(f"  - {item}")
 
     ready_modules = [module for module in module_payloads if module is not None]
-    return summarize_corpus(ready_modules)
-
+    return summarize_ast_corpus(ready_modules)
 
 
 def _default_single_json_out(script_path: Path) -> Path:
@@ -125,19 +118,19 @@ def _default_single_text_out(script_path: Path) -> Path:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build HIR for one MBC script or emit a corpus-wide summary. Optional text output is generated from AST."
+        description="Build one MBC script or emit an AST-oriented corpus report. Optional text output is generated from AST."
     )
     parser.add_argument(
         "script",
         nargs="?",
         help="Optional script path or name. Example: door1.mbc or door1",
     )
-    parser.add_argument("--out", help="Output JSON path. In single-script mode this is the JSON file; in corpus mode this is the report file.")
+    parser.add_argument("--out", help="Output JSON path. In single-script mode this is the HIR JSON file; in corpus mode this is the AST report file.")
     parser.add_argument("--text-out", help="Optional AST text output path for single-script mode. Defaults to hir/<script>.ast.txt")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Max workers for corpus mode (default: {DEFAULT_WORKERS})")
     parser.add_argument("--summary-only", action="store_true", help="In single-script mode omit canonical instructions from the JSON payload.")
     parser.add_argument("--validate", action="store_true", help="Run HIR validation in single-script mode.")
-    parser.add_argument("--validate-corpus", action="store_true", help="Run HIR validation for every analyzed function in corpus mode.")
+    parser.add_argument("--validate-corpus", action="store_true", help="Run pre-AST validation while building the AST corpus report.")
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument("--exports-only", action="store_true", help="Analyze only export records. Default analyzes definitions plus export-only records.")
     mode_group.add_argument("--definitions-only", action="store_true", help="Analyze only definition records.")
@@ -190,7 +183,7 @@ def main() -> None:
         return
 
     paths = sorted(MBC_DIR.glob("*.mbc"))
-    report = build_corpus_report(
+    report = build_ast_corpus_report(
         paths,
         workers=args.workers,
         include_definitions=include_definitions,
@@ -199,7 +192,7 @@ def main() -> None:
     )
     if args.out:
         out_path = write_json(report, args.out)
-        print(f"Wrote HIR corpus report to {out_path}")
+        print(f"Wrote AST corpus report to {out_path}")
     else:
         print(json.dumps(report, ensure_ascii=False, indent=2))
 

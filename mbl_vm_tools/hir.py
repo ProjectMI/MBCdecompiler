@@ -112,7 +112,6 @@ class HIRFunction:
     core_hir_blocks: list[HIRBlock]
     normalized_hir_blocks: list[HIRBlock]
     analysis_hints: dict[str, Any]
-    report: dict[str, Any]
     body_selection: dict[str, Any]
 
     def to_dict(self, include_canonical: bool = True, include_text: bool = True) -> dict[str, Any]:
@@ -132,7 +131,6 @@ class HIRFunction:
                 "hir_blocks": [block.to_dict() for block in self.normalized_hir_blocks],
             },
             "analysis_hints": self.analysis_hints,
-            "report": self.report,
         }
         if include_canonical:
             payload["canonical_instructions"] = [inst.to_dict() for inst in self.canonical_instructions]
@@ -1901,13 +1899,13 @@ def _function_summary(
     cfg: dict[str, Any],
     analysis_hints: dict[str, Any],
     dataflow_metrics: dict[str, int],
-    report: dict[str, Any],
+    diagnostics: dict[str, Any],
 ) -> dict[str, Any]:
     canonical_hist = Counter(inst.semantic_op for inst in canonical)
-    validation = report.get("validation", {})
+    validation = diagnostics.get("validation", {})
     core_validation = validation.get("core_raw", {})
     normalized_validation = validation.get("normalized_final", {})
-    token_coverage = report.get("token_coverage", {})
+    token_coverage = diagnostics.get("token_coverage", {})
     return {
         "canonical_instruction_count": len(canonical),
         "basic_block_count": len(core_blocks),
@@ -2117,13 +2115,13 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
         "analysis_hints": round((t_hints1 - t_hints0) * 1000.0, 3),
     }
     token_coverage = _token_coverage_from_ir(ir_function)
-    report = {
+    diagnostics = {
         "validation": validation,
         "pipeline": pipeline,
         "timings_ms": timings_ms,
         "token_coverage": token_coverage,
     }
-    summary = _function_summary(canonical, core_values, core_hir_blocks, normalized_blocks, canonical_cfg, analysis_hints, dataflow_metrics, report)
+    summary = _function_summary(canonical, core_values, core_hir_blocks, normalized_blocks, canonical_cfg, analysis_hints, dataflow_metrics, diagnostics)
 
     return HIRFunction(
         name=ir_function.name,
@@ -2136,7 +2134,6 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
         core_hir_blocks=core_hir_blocks,
         normalized_hir_blocks=normalized_blocks,
         analysis_hints=analysis_hints,
-        report=report,
         body_selection=ir_function.body_selection,
     )
 
@@ -2219,11 +2216,6 @@ def build_module_hir(
             "summary": fn.summary,
             "body_selection": fn.body_selection,
             "analysis_hints": fn.analysis_hints,
-            "report": {
-                "token_coverage": fn.report.get("token_coverage", {}),
-                "validation": fn.report.get("validation", {}),
-                "pipeline": fn.report.get("pipeline", {}),
-            },
         }
         if summary_only_layout
         else fn.to_dict(include_canonical=include_canonical, include_text=False)
@@ -2240,7 +2232,6 @@ def build_module_hir(
                 "core_hir",
                 "normalized_hir",
                 "analysis_hints",
-                "report",
             ],
             "notes": [
                 "HIR ends at a normalized CFG-like IR and does not try to be the final source-shaped tree",
@@ -2251,6 +2242,7 @@ def build_module_hir(
                 "branch predicates are rendered as cond[opcode](value) to avoid inventing exact VM truth semantics",
                 "normalized_hir applies only semantics-safe cleanup, fallthrough collapse, and merge-parameter renaming",
                 "analysis_hints provides dominators, postdominators, loop candidates, branch regions, and switch candidates for AST",
+                "corpus-level reporting is intentionally owned by ast.py",
                 "final structuring and semantic lifting now belong to ast.py, not hir.py",
             ],
         },
@@ -2274,240 +2266,6 @@ def build_module_hir(
         "summary": _module_summary(functions),
         "functions": functions_payload,
     }
-
-
-def _merge_counter_from_mapping(counter: Counter, payload: dict[str, Any] | None) -> None:
-    if not payload:
-        return
-    for key, value in payload.items():
-        try:
-            counter[str(key)] += int(value)
-        except Exception:
-            continue
-
-
-def summarize_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any]:
-    module_count = len(module_payloads)
-    function_count = 0
-    public_export_count = 0
-    definition_count = 0
-    analyzed_definition_count = 0
-    analyzed_exported_count = 0
-    export_only_count = 0
-    total_instructions = 0
-    unresolved = 0
-    cfg_anomalies = 0
-    macro_lowered = 0
-    placeholders = 0
-    phi_total = 0
-    total_loop_hints = 0
-    total_branch_region_hints = 0
-    total_switch_candidates = 0
-    total_core_validation_errors = 0
-    total_validation_errors = 0
-    total_dataflow_worklist_limit_hits = 0
-
-    token_count = 0
-    known_token_count = 0
-    unknown_token_count = 0
-    token_bytes = 0
-    known_token_bytes = 0
-    unknown_token_bytes = 0
-    opaque_nodes = 0
-    known_low_semantic_ops = 0
-    data_nodes = 0
-    token_kind_hist: Counter[str] = Counter()
-    semantic_hist: Counter[str] = Counter()
-    unknown_opcode_hist: Counter[str] = Counter()
-    opaque_opcode_hist: Counter[str] = Counter()
-    opaque_lowering_rule_hist: Counter[str] = Counter()
-    opaque_raw_kind_hist: Counter[str] = Counter()
-    opaque_terminal_kind_hist: Counter[str] = Counter()
-    known_low_semantic_op_hist: Counter[str] = Counter()
-
-    heaviest_functions: list[dict[str, Any]] = []
-    lowest_token_coverage_functions: list[dict[str, Any]] = []
-    low_semantic_op_functions: list[dict[str, Any]] = []
-    pipeline_deviations: list[dict[str, Any]] = []
-
-    for module in module_payloads:
-        summary = module.get("summary", {})
-        module_function_count = int(summary.get("function_count", summary.get("export_count", 0)))
-        function_count += module_function_count
-        public_export_count += int(module.get("exports_count", 0))
-        definition_count += int(module.get("definition_count", 0))
-        analyzed_definition_count += int(summary.get("definition_function_count", 0))
-        analyzed_exported_count += int(summary.get("exported_function_count", 0))
-        export_only_count += int(summary.get("export_only_function_count", 0))
-        total_instructions += int(summary.get("total_canonical_instructions", 0))
-        unresolved += int(summary.get("total_unresolved_branches", 0))
-        cfg_anomalies += int(summary.get("total_cfg_anomalies", 0))
-        macro_lowered += int(summary.get("total_macro_lowered", 0))
-        placeholders += int(summary.get("total_placeholders", 0))
-        phi_total += int(summary.get("total_phi", 0))
-        total_loop_hints += int(summary.get("total_loop_hints", 0))
-        total_branch_region_hints += int(summary.get("total_branch_region_hints", 0))
-        total_switch_candidates += int(summary.get("total_switch_candidates", 0))
-        total_core_validation_errors += int(summary.get("total_core_validation_errors", 0))
-        total_validation_errors += int(summary.get("total_validation_errors", 0))
-        total_dataflow_worklist_limit_hits += int(summary.get("total_dataflow_worklist_limit_hits", 0))
-
-        for fn in module.get("functions", []):
-            fn_summary = fn.get("summary", {})
-            coverage = (fn.get("report", {}) or {}).get("token_coverage", {}) or {}
-
-            fn_token_count = int(coverage.get("token_count", fn_summary.get("token_count", 0)))
-            fn_known_token_count = int(coverage.get("known_token_count", fn_summary.get("known_token_count", 0)))
-            fn_unknown_token_count = int(coverage.get("unknown_token_count", fn_summary.get("unknown_token_count", 0)))
-            fn_token_bytes = int(coverage.get("token_byte_size", fn_summary.get("token_byte_size", 0)))
-            fn_known_token_bytes = int(coverage.get("known_byte_size", round(fn_summary.get("known_byte_ratio", 1.0) * fn_token_bytes)))
-            fn_unknown_token_bytes = int(coverage.get("unknown_byte_size", fn_token_bytes - fn_known_token_bytes))
-            fn_opaque_nodes = int(coverage.get("opaque_node_count", fn_summary.get("opaque_node_count", 0)))
-            fn_data_nodes = int(coverage.get("data_node_count", fn_summary.get("data_node_count", 0)))
-            fn_low_semantic_ops = int(coverage.get("known_low_semantic_op_count", fn_summary.get("known_low_semantic_op_count", 0)))
-
-            token_count += fn_token_count
-            known_token_count += fn_known_token_count
-            unknown_token_count += fn_unknown_token_count
-            token_bytes += fn_token_bytes
-            known_token_bytes += fn_known_token_bytes
-            unknown_token_bytes += fn_unknown_token_bytes
-            opaque_nodes += fn_opaque_nodes
-            known_low_semantic_ops += fn_low_semantic_ops
-            data_nodes += fn_data_nodes
-
-            _merge_counter_from_mapping(token_kind_hist, coverage.get("token_kind_histogram"))
-            _merge_counter_from_mapping(semantic_hist, coverage.get("semantic_histogram"))
-            _merge_counter_from_mapping(unknown_opcode_hist, coverage.get("unknown_opcode_histogram"))
-            _merge_counter_from_mapping(opaque_opcode_hist, coverage.get("opaque_opcode_histogram"))
-            _merge_counter_from_mapping(opaque_lowering_rule_hist, coverage.get("opaque_lowering_rule_histogram"))
-            _merge_counter_from_mapping(opaque_raw_kind_hist, coverage.get("opaque_raw_kind_histogram"))
-            _merge_counter_from_mapping(opaque_terminal_kind_hist, coverage.get("opaque_terminal_kind_histogram"))
-            _merge_counter_from_mapping(known_low_semantic_op_hist, coverage.get("known_low_semantic_op_histogram"))
-
-            entry = (fn.get("body_selection", {}) or {}).get("entry", {}) or {}
-            function_ref = {
-                "script_name": module.get("script_name"),
-                "function": fn.get("name"),
-                "symbol": entry.get("symbol"),
-                "source_kind": entry.get("source_kind"),
-                "is_exported": bool(entry.get("is_exported")),
-            }
-            heaviest_functions.append(
-                {
-                    **function_ref,
-                    "canonical_instruction_count": int(fn_summary.get("canonical_instruction_count", 0)),
-                    "cfg_anomaly_count": int(fn_summary.get("cfg_anomaly_count", 0)),
-                    "placeholder_count": int(fn_summary.get("placeholder_count", 0)),
-                    "loop_hint_count": int(fn_summary.get("loop_hint_count", 0)),
-                }
-            )
-
-            known_ratio = float(coverage.get("known_token_ratio", fn_summary.get("known_token_ratio", 1.0)))
-            if fn_low_semantic_ops > 0:
-                low_semantic_op_functions.append(
-                    {
-                        **function_ref,
-                        "known_low_semantic_op_count": fn_low_semantic_ops,
-                        "token_count": fn_token_count,
-                        "known_low_semantic_op_ratio": (fn_low_semantic_ops / fn_token_count) if fn_token_count else 0.0,
-                        "known_low_semantic_op_histogram": coverage.get("known_low_semantic_op_histogram", {}),
-                    }
-                )
-
-            if fn_token_count and (fn_unknown_token_count > 0 or known_ratio < 1.0 or fn_opaque_nodes > 0):
-                lowest_token_coverage_functions.append(
-                    {
-                        **function_ref,
-                        "known_token_ratio": known_ratio,
-                        "unknown_token_count": fn_unknown_token_count,
-                        "token_count": fn_token_count,
-                        "opaque_node_count": fn_opaque_nodes,
-                        "known_low_semantic_op_count": fn_low_semantic_ops,
-                        "known_low_semantic_op_histogram": coverage.get("known_low_semantic_op_histogram", {}),
-                        "unknown_opcode_histogram": coverage.get("unknown_opcode_histogram", {}),
-                    }
-                )
-
-            deviation_score = (
-                int(fn_summary.get("cfg_anomaly_count", 0))
-                + int(fn_summary.get("unresolved_branch_count", 0))
-                + int(fn_summary.get("core_validation_error_count", 0))
-                + int(fn_summary.get("validation_error_count", 0))
-                + int(fn_summary.get("dataflow_worklist_iteration_limit_hit", 0))
-            )
-            if deviation_score:
-                pipeline_deviations.append(
-                    {
-                        **function_ref,
-                        "cfg_anomaly_count": int(fn_summary.get("cfg_anomaly_count", 0)),
-                        "unresolved_branch_count": int(fn_summary.get("unresolved_branch_count", 0)),
-                        "core_validation_error_count": int(fn_summary.get("core_validation_error_count", 0)),
-                        "validation_error_count": int(fn_summary.get("validation_error_count", 0)),
-                        "dataflow_worklist_iteration_limit_hit": int(fn_summary.get("dataflow_worklist_iteration_limit_hit", 0)),
-                        "canonical_instruction_count": int(fn_summary.get("canonical_instruction_count", 0)),
-                    }
-                )
-
-    heaviest_functions.sort(key=lambda item: (-item["canonical_instruction_count"], item["placeholder_count"], str(item["script_name"]), str(item["function"])))
-    lowest_token_coverage_functions.sort(key=lambda item: (item["known_token_ratio"], -item["unknown_token_count"], str(item["script_name"]), str(item["function"])))
-    low_semantic_op_functions.sort(key=lambda item: (-item["known_low_semantic_op_count"], -item["known_low_semantic_op_ratio"], str(item["script_name"]), str(item["function"])))
-    pipeline_deviations.sort(key=lambda item: (-(item["cfg_anomaly_count"] + item["unresolved_branch_count"] + item["core_validation_error_count"] + item["validation_error_count"]), str(item["script_name"]), str(item["function"])))
-
-    return {
-        "summary": {
-            "module_count": module_count,
-            "function_count": function_count,
-            "public_export_count": public_export_count,
-            "definition_count": definition_count,
-            "analyzed_definition_count": analyzed_definition_count,
-            "analyzed_exported_count": analyzed_exported_count,
-            "export_only_function_count": export_only_count,
-            "total_canonical_instructions": total_instructions,
-            "avg_canonical_instructions_per_function": (total_instructions / function_count) if function_count else 0.0,
-            "total_cfg_anomalies": cfg_anomalies,
-            "total_unresolved_branches": unresolved,
-            "total_macro_lowered": macro_lowered,
-            "total_placeholders": placeholders,
-            "total_phi": phi_total,
-            "total_loop_hints": total_loop_hints,
-            "total_branch_region_hints": total_branch_region_hints,
-            "total_switch_candidates": total_switch_candidates,
-            "total_core_validation_errors": total_core_validation_errors,
-            "total_validation_errors": total_validation_errors,
-            "total_dataflow_worklist_limit_hits": total_dataflow_worklist_limit_hits,
-        },
-        "token_coverage": {
-            "token_count": token_count,
-            "known_token_count": known_token_count,
-            "unknown_token_count": unknown_token_count,
-            "known_token_ratio": (known_token_count / token_count) if token_count else 1.0,
-            "unknown_token_ratio": (unknown_token_count / token_count) if token_count else 0.0,
-            "token_byte_size": token_bytes,
-            "known_byte_size": known_token_bytes,
-            "unknown_byte_size": unknown_token_bytes,
-            "known_byte_ratio": (known_token_bytes / token_bytes) if token_bytes else 1.0,
-            "unknown_byte_ratio": (unknown_token_bytes / token_bytes) if token_bytes else 0.0,
-            "opaque_node_count": opaque_nodes,
-            "opaque_node_ratio": (opaque_nodes / token_count) if token_count else 0.0,
-            "opaque_opcode_histogram": dict(opaque_opcode_hist.most_common(64)),
-            "opaque_lowering_rule_histogram": dict(opaque_lowering_rule_hist.most_common(64)),
-            "opaque_raw_kind_histogram": dict(opaque_raw_kind_hist.most_common(64)),
-            "opaque_terminal_kind_histogram": dict(opaque_terminal_kind_hist.most_common(64)),
-            "known_low_semantic_op_count": known_low_semantic_ops,
-            "known_low_semantic_op_ratio": (known_low_semantic_ops / token_count) if token_count else 0.0,
-            "known_low_semantic_op_histogram": dict(known_low_semantic_op_hist.most_common(64)),
-            "data_node_count": data_nodes,
-            "token_kind_histogram": dict(token_kind_hist.most_common(64)),
-            "semantic_histogram": dict(semantic_hist.most_common(64)),
-            "unknown_opcode_histogram": dict(unknown_opcode_hist.most_common(64)),
-            "lowest_token_coverage_functions": lowest_token_coverage_functions[:64],
-            "low_semantic_op_functions": low_semantic_op_functions[:64],
-        },
-        "pipeline_deviations": pipeline_deviations[:64],
-        "heaviest_functions": heaviest_functions[:32],
-    }
-
 
 
 def write_json(payload: dict[str, Any], out_path: str | Path) -> Path:
