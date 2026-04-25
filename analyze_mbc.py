@@ -77,7 +77,10 @@ def build_ast_corpus_report(
             for item in failed[:8]:
                 print(f"  - {item}")
         ready_modules = [module for module in module_payloads if module is not None]
-        return summarize_ast_corpus(ready_modules)
+        report = summarize_ast_corpus(ready_modules)
+        report["summary"]["failed_module_count"] = len(failed)
+        report["failed_modules"] = failed
+        return report
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         future_to_index = {
@@ -103,7 +106,10 @@ def build_ast_corpus_report(
                 print(f"  - {item}")
 
     ready_modules = [module for module in module_payloads if module is not None]
-    return summarize_ast_corpus(ready_modules)
+    report = summarize_ast_corpus(ready_modules)
+    report["summary"]["failed_module_count"] = len(failed)
+    report["failed_modules"] = failed
+    return report
 
 
 def _default_single_json_out(script_path: Path) -> Path:

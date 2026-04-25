@@ -1718,27 +1718,58 @@ def _compute_dominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
 def _compute_postdominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
     if not hir_blocks:
         return {}
+
     ids = [block.id for block in hir_blocks]
+    index_by_id = {block_id: index for index, block_id in enumerate(ids)}
     _, _, succs, _ = _block_maps(hir_blocks)
     exits = [block.id for block in hir_blocks if not succs[block.id]]
-    postdom: dict[str, set[str]] = {block.id: set(ids) for block in hir_blocks}
+
+    # A function with no CFG exit has no meaningful post-dominator lattice for
+    # source-level join detection.  Returning only the reflexive fact is the
+    # conservative choice: it disables postdom-based structuring instead of
+    # inventing a bogus join inside an endless/state-machine loop.
+    if not exits:
+        return {block.id: {block.id} for block in hir_blocks}
+
+    all_bits = (1 << len(ids)) - 1
+    bits_by_id = {block_id: 1 << index for index, block_id in enumerate(ids)}
+    post_bits: dict[str, int] = {block.id: all_bits for block in hir_blocks}
     for exit_id in exits:
-        postdom[exit_id] = {exit_id}
-    changed = True
-    while changed:
+        post_bits[exit_id] = bits_by_id[exit_id]
+
+    # Reverse lexical order is much closer to the natural propagation direction
+    # for post-dominators on our normalized HIR.  The integer bitset lattice also
+    # avoids repeatedly intersecting large Python sets on pathological dispatcher
+    # functions.  If convergence still fails within a generous bound, fall back
+    # to self-only facts; that is semantically safe because it can only reduce
+    # structuring, not hide a real control-flow edge.
+    order = list(reversed(hir_blocks))
+    max_iterations = max(16, len(hir_blocks) * 4)
+    for _ in range(max_iterations):
         changed = False
-        for block in hir_blocks:
+        for block in order:
             if block.id in exits:
                 continue
-            succ_sets = [postdom[succ] for succ in succs[block.id] if succ in postdom]
-            new_postdom = {block.id}
-            if succ_sets:
-                new_postdom |= set.intersection(*succ_sets)
-            if new_postdom != postdom[block.id]:
-                postdom[block.id] = new_postdom
+            block_succs = [succ for succ in succs[block.id] if succ in post_bits]
+            if not block_succs:
+                new_bits = bits_by_id[block.id]
+            else:
+                succ_iter = iter(block_succs)
+                first = next(succ_iter)
+                intersection_bits = post_bits[first]
+                for succ in succ_iter:
+                    intersection_bits &= post_bits[succ]
+                new_bits = bits_by_id[block.id] | intersection_bits
+            if new_bits != post_bits[block.id]:
+                post_bits[block.id] = new_bits
                 changed = True
-    return postdom
+        if not changed:
+            return {
+                block_id: {ids[index] for index in range(len(ids)) if bits & (1 << index)}
+                for block_id, bits in post_bits.items()
+            }
 
+    return {block.id: {block.id} for block in hir_blocks}
 
 def _immediate_postdom(block_id: str, postdom: dict[str, set[str]], index_by_id: dict[str, int]) -> Optional[str]:
     candidates = list(postdom.get(block_id, set()) - {block_id})
@@ -2053,7 +2084,7 @@ def _build_hir_analysis_hints(blocks: list[HIRBlock]) -> dict[str, Any]:
     }
 
 
-def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, include_canonical: bool = True, include_text: bool = True, validate: bool = False) -> HIRFunction:
+def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, include_canonical: bool = True, include_text: bool = True, validate: bool = False, include_analysis_hints: bool = True) -> HIRFunction:
     t0 = time.perf_counter()
     ir_function = build_function_ir(mod, entry_or_name)
     hir_nodes = list(ir_function.nodes)
@@ -2096,7 +2127,20 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
     t_norm1 = time.perf_counter()
 
     t_hints0 = time.perf_counter()
-    analysis_hints = _build_hir_analysis_hints(normalized_blocks)
+    if include_analysis_hints:
+        analysis_hints = _build_hir_analysis_hints(normalized_blocks)
+    else:
+        analysis_hints = {
+            "entry_block": normalized_blocks[0].id if normalized_blocks else None,
+            "exit_blocks": [block.id for block in normalized_blocks if not block.successors or block.terminator.get("kind") == "return"],
+            "rpo": [],
+            "dominators": {},
+            "postdominators": {},
+            "loops": [],
+            "branch_regions": [],
+            "switch_candidates": [],
+            "skipped_for_ast_summary": True,
+        }
     if prologue_meta is not None:
         analysis_hints["prologue"] = prologue_meta
     t_hints1 = time.perf_counter()
