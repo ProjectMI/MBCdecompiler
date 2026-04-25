@@ -21,7 +21,7 @@ from mbl_vm_tools.hir import (
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-AST_CONTRACT_VERSION = "ast-v5"
+AST_CONTRACT_VERSION = "ast-v7"
 
 
 @dataclass
@@ -348,7 +348,7 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
                 rendered_terminator_statement_count += 1
                 visit_stmt(stmt)
             return
-        if kind in {"if", "if_else", "while"}:
+        if kind in {"if", "if_else", "while", "do_while"}:
             if params:
                 parameterized_region_count += 1
                 region_param_count += len(params)
@@ -364,6 +364,26 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
             visit_region(region.get("else"), depth + 1)
         elif kind == "while":
             visit_region(region.get("body"), depth + 1)
+        elif kind == "do_while":
+            for stmt in region.get("body") or []:
+                visit_stmt(stmt)
+            for stmt in region.get("loopback") or []:
+                visit_stmt(stmt)
+        elif kind == "threaded_decision_tree":
+            for stmt in region.get("entry_param_merge") or []:
+                visit_stmt(stmt)
+            for node in region.get("nodes") or []:
+                for stmt in node.get("prelabel") or []:
+                    visit_stmt(stmt)
+                for stmt in node.get("body") or []:
+                    visit_stmt(stmt)
+                visit_expr(node.get("condition"))
+                for edge_name in ("true_edge", "false_edge"):
+                    edge = node.get(edge_name) or {}
+                    for stmt in edge.get("statements") or []:
+                        visit_stmt(stmt)
+            for stmt in region.get("exit_param_merge") or []:
+                visit_stmt(stmt)
         elif kind == "switch_like":
             for case in region.get("cases") or []:
                 visit_region(case, depth + 1)
@@ -721,6 +741,7 @@ class _SurfaceBuilder:
         self.unconditional_loops = 0
         self.structured_loopbacks = 0
         self.settled_preds_by_block: dict[str, set[str]] = defaultdict(set)
+        self.handled_param_predecessors_by_block: dict[str, set[str]] = defaultdict(set)
         self.needed_label_ids: set[str] = set()
         self.explicit_label_ids = {
             succ
@@ -761,13 +782,128 @@ class _SurfaceBuilder:
         settled = set(self.settled_preds_by_block.get(block.id, set()))
         if previous_source_id is not None:
             settled.add(previous_source_id)
-        preds = [pred for pred in block.predecessors if pred not in settled]
+        preds = [
+            pred
+            for pred in block.predecessors
+            if pred not in settled and not self._empty_forward_skip(pred, block.id)
+        ]
         if not preds:
             return False
         nonlinear = [pred for pred in preds if self.cfg.index_by_id.get(pred, -10) + 1 != block.index]
         if nonlinear:
             return True
         return len(preds) > 1
+
+    def _incoming_args_equivalent(self, source_id: str, linear_pred_id: str, target_id: str) -> bool:
+        target = self.cfg.by_id.get(target_id)
+        if target is None or not target.block_params:
+            return True
+        return list(target.incoming_args.get(source_id) or []) == list(target.incoming_args.get(linear_pred_id) or [])
+
+    def _empty_fallthrough_tail(self, start_id: Optional[str], target_id: Optional[str]) -> Optional[str]:
+        if start_id is None or target_id is None:
+            return None
+        current_id = start_id
+        previous_id: Optional[str] = None
+        seen: set[str] = set()
+        while current_id not in seen:
+            if current_id == target_id:
+                return previous_id
+            seen.add(current_id)
+            block = self.cfg.by_id.get(current_id)
+            if block is None or block.statements or block.block_params:
+                return None
+            if block.terminator.get("kind") != "fallthrough" or len(block.successors) != 1:
+                return None
+            successor = block.successors[0]
+            if self.cfg.index_by_id.get(successor, -1) <= self.cfg.index_by_id.get(current_id, -1):
+                return None
+            previous_id = current_id
+            current_id = successor
+        return None
+
+    def _empty_fallthrough_reaches(self, start_id: Optional[str], target_id: Optional[str], *, source_id: Optional[str] = None) -> bool:
+        tail_id = self._empty_fallthrough_tail(start_id, target_id)
+        if tail_id is None:
+            return start_id == target_id
+        if source_id is not None and target_id is not None:
+            return self._incoming_args_equivalent(source_id, tail_id, target_id)
+        return True
+
+    def _empty_forward_skip(self, pred_id: str, target_id: str) -> bool:
+        pred_idx = self.cfg.index_by_id.get(pred_id, -1)
+        target_idx = self.cfg.index_by_id.get(target_id, -1)
+        if pred_idx < 0 or target_idx < 0 or pred_idx >= target_idx:
+            return False
+        if target_idx == pred_idx + 1:
+            return True
+        next_id = self.blocks[pred_idx + 1].id if pred_idx + 1 < len(self.blocks) else None
+        tail_id = self._empty_fallthrough_tail(next_id, target_id)
+        if tail_id is None:
+            return False
+        if self._incoming_args_equivalent(pred_id, tail_id, target_id):
+            return True
+        merge = self._branch_param_merge(self.cfg.by_id.get(pred_id), next_id)
+        return bool(merge and merge.get("target_id") == target_id)
+
+    def _branch_empty_convergence(self, block: HIRBlock) -> Optional[str]:
+        if block.terminator.get("kind") != "branch":
+            return None
+        branch_target, fallthrough_target = _edge_targets(block, self.cfg.index_by_id)
+        if branch_target is None or fallthrough_target is None:
+            return None
+        if self._empty_fallthrough_reaches(fallthrough_target, branch_target, source_id=block.id):
+            return branch_target
+        if self._empty_fallthrough_reaches(branch_target, fallthrough_target, source_id=block.id):
+            return fallthrough_target
+        return None
+
+    def _branch_param_merge(self, block: Optional[HIRBlock], next_id: Optional[str]) -> Optional[dict[str, Any]]:
+        if block is None or block.terminator.get("kind") != "branch" or next_id is None:
+            return None
+        branch_target, fallthrough_target = _edge_targets(block, self.cfg.index_by_id)
+        if not branch_target or not fallthrough_target or fallthrough_target != next_id or branch_target == next_id:
+            return None
+        target = self.cfg.by_id.get(branch_target)
+        if target is None:
+            return None
+        fallthrough_tail = self._empty_fallthrough_tail(fallthrough_target, branch_target)
+        if fallthrough_tail is None:
+            return None
+        if not target.block_params:
+            return {"target_id": branch_target, "fallthrough_tail": fallthrough_tail, "nodes": [], "sources": {block.id, fallthrough_tail}}
+        default_args = list(target.incoming_args.get(fallthrough_tail) or [])
+        branch_args = list(target.incoming_args.get(block.id) or [])
+        if len(default_args) != len(target.block_params) or len(branch_args) != len(target.block_params):
+            return None
+        if default_args == branch_args:
+            nodes: list[dict[str, Any]] = []
+        else:
+            condition = block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}"
+            nodes = [
+                _assignment_node(param, f"select({condition}, {branch_arg}, {default_arg})")
+                for param, branch_arg, default_arg in zip(target.block_params, branch_args, default_args)
+                if param != branch_arg or param != default_arg
+            ]
+        return {
+            "target_id": branch_target,
+            "fallthrough_tail": fallthrough_tail,
+            "nodes": nodes,
+            "sources": {block.id, fallthrough_tail},
+        }
+
+    def _mark_param_merge(self, merge: Optional[dict[str, Any]]) -> None:
+        if not merge:
+            return
+        target_id = merge.get("target_id")
+        if not target_id:
+            return
+        sources = set(merge.get("sources") or set())
+        if sources:
+            self.settled_preds_by_block[str(target_id)].update(str(source) for source in sources)
+        tail = merge.get("fallthrough_tail")
+        if tail:
+            self.handled_param_predecessors_by_block[str(target_id)].add(str(tail))
 
     def _transparent_fallthrough_target(self, target_id: Optional[str]) -> Optional[str]:
         seen: set[str] = set()
@@ -785,12 +921,34 @@ class _SurfaceBuilder:
             current = nxt
         return current
 
-    def _jump_nodes(self, source: Optional[HIRBlock], target_id: Optional[str], aliases: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    def _alias_for_source(self, target_id: Optional[str], source: Optional[HIRBlock], aliases: dict[str, Any]) -> Any:
+        if target_id is None:
+            return None
+        alias = aliases.get(target_id)
+        if not isinstance(alias, dict):
+            return alias
+        by_source = alias.get("prelude_by_source") or {}
+        if by_source:
+            source_key = source.id if source is not None else None
+            if source_key not in by_source:
+                return None
+        return alias
+
+    def _jump_nodes(
+        self,
+        source: Optional[HIRBlock],
+        target_id: Optional[str],
+        aliases: dict[str, Any],
+        *,
+        source_specific_alias: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
         if target_id is None:
             return [], 0
         target = self.cfg.by_id.get(target_id)
-        alias = aliases.get(target_id)
+        alias = self._alias_for_source(target_id, source, aliases) if source_specific_alias else aliases.get(target_id)
         if alias is None:
+            if target_id in self.cfg.by_id:
+                self.needed_label_ids.add(target_id)
             return [{"kind": "goto", "target": _target_call(target, source) or target_id}], 1
         if isinstance(alias, dict):
             source_key = source.id if source is not None else None
@@ -816,12 +974,12 @@ class _SurfaceBuilder:
             target_id = block.fallthrough_target or (block.successors[0] if block.successors else None)
             if target_id is None:
                 return [], 0
-            if target_id not in aliases:
+            if self._alias_for_source(target_id, block, aliases) is None:
                 if target_id == next_id:
                     return [], 0
                 if next_id is not None and self._transparent_fallthrough_target(next_id) == target_id:
                     return [], 0
-            return self._jump_nodes(block, target_id, aliases)
+            return self._jump_nodes(block, target_id, aliases, source_specific_alias=True)
         if kind == "branch":
             cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
             branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
@@ -829,7 +987,16 @@ class _SurfaceBuilder:
                 if branch is None or branch == next_id:
                     return [], 0
                 return self._jump_nodes(block, branch, aliases)
-            if branch not in aliases and fallthrough not in aliases:
+            branch_alias = self._alias_for_source(branch, block, aliases)
+            fallthrough_alias = self._alias_for_source(fallthrough, block, aliases)
+            if branch_alias is None and fallthrough_alias is None and self._branch_empty_convergence(block) is not None:
+                return [], 0
+            if fallthrough == next_id and branch_alias is None and fallthrough_alias is None:
+                merge = self._branch_param_merge(block, next_id)
+                if merge is not None:
+                    self._mark_param_merge(merge)
+                    return list(merge.get("nodes") or []), 0
+            if branch_alias is None and fallthrough_alias is None:
                 branch_final = self._transparent_fallthrough_target(branch)
                 fallthrough_final = self._transparent_fallthrough_target(fallthrough)
                 next_final = self._transparent_fallthrough_target(next_id)
@@ -873,7 +1040,8 @@ class _SurfaceBuilder:
         previous_source_id: Optional[str],
     ) -> tuple[dict[str, Any], Optional[str]]:
         label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
-        prelabel = _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors and block.id not in aliases else []
+        handled_param_pred = previous_source_id in self.handled_param_predecessors_by_block.get(block.id, set())
+        prelabel = _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors and block.id not in aliases and not handled_param_pred else []
         statements = [_statement_node(stmt) for stmt in block.statements]
         term_nodes, goto_count = self._terminator_nodes(block, next_id, aliases)
         if len(term_nodes) == 1 and statements and _render_statement(statements[-1]) == _render_statement(term_nodes[0]):
@@ -967,6 +1135,145 @@ class _SurfaceBuilder:
             "body": statements,
             "terminator": {"kind": "fallthrough", "condition": None, "rendered": [], "successors": [], "branch_target": None, "fallthrough_target": None},
         }
+
+    def _decision_edge_node(
+        self,
+        source: HIRBlock,
+        target_id: Optional[str],
+        tree_ids: set[str],
+        aliases: dict[str, Any],
+        next_after_id: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        if target_id is None:
+            return {"kind": "exit", "target": None, "statements": []}
+        if target_id in tree_ids:
+            return {"kind": "internal", "target": target_id, "statements": []}
+        if target_id == next_after_id:
+            return {"kind": "fallthrough_exit", "target": target_id, "statements": []}
+        if self._alias_for_source(target_id, source, aliases) is not None:
+            statements, _ = self._jump_nodes(source, target_id, aliases)
+            return {"kind": "structured_jump", "target": target_id, "statements": statements}
+        return None
+
+    def _same_incoming_args_for_sources(self, target_id: str, sources: set[str]) -> Optional[list[str]]:
+        target = self.cfg.by_id.get(target_id)
+        if target is None or not target.block_params:
+            return []
+        selected: Optional[list[str]] = None
+        for source_id in sources:
+            args = list(target.incoming_args.get(source_id) or [])
+            if len(args) != len(target.block_params):
+                return None
+            if selected is None:
+                selected = args
+            elif selected != args:
+                return None
+        return selected or []
+
+    def _try_threaded_decision_tree(
+        self,
+        idx: int,
+        stop: int,
+        allowed: Optional[set[str]],
+        aliases: dict[str, Any],
+        hidden_labels: set[str],
+        previous_source_id: Optional[str],
+    ) -> Optional[tuple[dict[str, Any], int]]:
+        if idx in self.cfg.switches:
+            return None
+        run: list[HIRBlock] = []
+        i = idx
+        while i < min(stop, len(self.blocks)):
+            block = self.blocks[i]
+            if allowed is not None and block.id not in allowed:
+                break
+            if block.terminator.get("kind") != "branch":
+                break
+            run.append(block)
+            i += 1
+        if len(run) < 4:
+            return None
+        tree_ids = {block.id for block in run}
+        next_after_id = self.blocks[i].id if i < min(stop, len(self.blocks)) else None
+
+        complex_internal_edge = False
+        backward_internal_edge = False
+        for block in run:
+            for succ in self.cfg.succs.get(block.id, []):
+                if succ not in tree_ids:
+                    continue
+                succ_idx = self.cfg.index_by_id.get(succ, 10**9)
+                if succ_idx != block.index + 1:
+                    complex_internal_edge = True
+                if succ_idx <= block.index:
+                    backward_internal_edge = True
+        if not complex_internal_edge:
+            return None
+        if not backward_internal_edge and len(run) < 8:
+            return None
+
+        for offset, block in enumerate(run):
+            for pred_id in self.cfg.preds.get(block.id, []):
+                if pred_id in tree_ids:
+                    continue
+                pred_idx = self.cfg.index_by_id.get(pred_id)
+                allowed_entry = offset == 0 and (pred_id == previous_source_id or (pred_idx is not None and pred_idx + 1 == block.index))
+                if not allowed_entry:
+                    return None
+
+        exit_sources_by_target: dict[str, set[str]] = defaultdict(set)
+        nodes: list[dict[str, Any]] = []
+        for block in run:
+            branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+            true_edge = self._decision_edge_node(block, branch, tree_ids, aliases, next_after_id)
+            false_edge = self._decision_edge_node(block, fallthrough, tree_ids, aliases, next_after_id)
+            if true_edge is None or false_edge is None:
+                return None
+            for target in (branch, fallthrough):
+                if target is not None and target not in tree_ids and target not in aliases:
+                    exit_sources_by_target[target].add(block.id)
+            nodes.append(
+                {
+                    "kind": "decision_node",
+                    "block_id": block.id,
+                    "block_params": list(block.block_params),
+                    "prelabel": _incoming_assignments(block, previous_source_id) if block.id == run[0].id and previous_source_id in block.predecessors else [],
+                    "body": [_statement_node(stmt) for stmt in block.statements],
+                    "condition": _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}"),
+                    "true_edge": true_edge,
+                    "false_edge": false_edge,
+                }
+            )
+
+        exit_param_merge: list[dict[str, Any]] = []
+        for target_id, sources in exit_sources_by_target.items():
+            if target_id != next_after_id:
+                return None
+            args = self._same_incoming_args_for_sources(target_id, sources)
+            if args is None:
+                return None
+            target = self.cfg.by_id.get(target_id)
+            if target is not None and target.block_params:
+                exit_param_merge.extend(
+                    _assignment_node(param, arg)
+                    for param, arg in zip(target.block_params, args)
+                    if param != arg
+                )
+                self.handled_param_predecessors_by_block[target_id].update(sources)
+            self.settled_preds_by_block[target_id].update(sources)
+
+        label = _format_block_label(run[0]) if self._label_needed(run[0], hidden_labels, previous_source_id) else None
+        self.constructs["threaded_decision_tree"] += 1
+        region = {
+            "kind": "threaded_decision_tree",
+            "label": label,
+            "entry_block": run[0].id,
+            "exit_block": next_after_id,
+            "node_count": len(nodes),
+            "nodes": nodes,
+            "exit_param_merge": exit_param_merge,
+        }
+        return region, i
 
     def _try_switch_like(
         self,
@@ -1138,6 +1445,56 @@ class _SurfaceBuilder:
             if isinstance(alias, dict):
                 self.settled_preds_by_block[target_id].update((alias.get("prelude_by_source") or {}).keys())
 
+    def _try_self_loop(
+        self,
+        idx: int,
+        stop: int,
+        allowed: Optional[set[str]],
+        aliases: dict[str, Any],
+        hidden_labels: set[str],
+        previous_source_id: Optional[str],
+    ) -> Optional[tuple[dict[str, Any], int]]:
+        block = self.blocks[idx]
+        loop = self.cfg.loops.get(block.id)
+        if not loop or not loop.get("safe"):
+            return None
+        nodes = set(loop.get("nodes") or set())
+        if nodes != {block.id}:
+            return None
+        idx0, idx1 = loop.get("index_range") or (idx, idx)
+        if idx0 != idx or idx1 != idx or idx + 1 > stop or (allowed is not None and block.id not in allowed):
+            return None
+        if loop.get("body_succ") != block.id or loop.get("exit_succ") is None:
+            return None
+        exit_succ = str(loop.get("exit_succ"))
+        # Keep this rule intentionally conservative. Parameterized self-loops need a
+        # phi-update model; plain self-loops can be lifted to a real do/while node.
+        if block.block_params:
+            return None
+        if _incoming_assignments(block, block.id):
+            return None
+        if _incoming_assignments(self.cfg.by_id.get(exit_succ), block.id):
+            return None
+        cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
+        label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
+        preheader = _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors else []
+        self.constructs["do_while"] += 1
+        self.loop_headers += 1
+        self.structured_loopbacks += _loopback_source_count(loop, self.cfg)
+        region = {
+            "kind": "do_while",
+            "header_block": block.id,
+            "label": label,
+            "block_params": [],
+            "preheader": preheader,
+            "body": [_statement_node(stmt) for stmt in block.statements],
+            "condition": cond,
+            "loopback": [],
+            "continue_target": block.id,
+            "break_target": exit_succ,
+        }
+        return region, idx + 1
+
     def _try_loop(
         self,
         idx: int,
@@ -1268,6 +1625,14 @@ class _SurfaceBuilder:
                 i += 1
                 prev = None
                 continue
+            self_loop = None if block.id in suppressed_loops else self._try_self_loop(i, stop, allowed, aliases, hidden_labels, prev)
+            if self_loop is not None:
+                region, next_i = self_loop
+                if next_i > i:
+                    regions.append(region)
+                    i = next_i
+                    prev = None
+                    continue
             loop = None if block.id in suppressed_loops else self._try_loop(i, stop, allowed, aliases, hidden_labels, prev)
             if loop is not None:
                 region, next_i = loop
@@ -1276,17 +1641,25 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
-            uncond = self._try_unconditional_loop(i, stop, allowed, aliases, hidden_labels, prev, suppressed_loops)
-            if uncond is not None:
-                region, next_i = uncond
+            switch = self._try_switch_like(i, stop, allowed, aliases, hidden_labels, prev)
+            if switch is not None:
+                region, next_i = switch
                 if next_i > i:
                     regions.append(region)
                     i = next_i
                     prev = None
                     continue
-            switch = self._try_switch_like(i, stop, allowed, aliases, hidden_labels, prev)
-            if switch is not None:
-                region, next_i = switch
+            threaded = self._try_threaded_decision_tree(i, stop, allowed, aliases, hidden_labels, prev)
+            if threaded is not None:
+                region, next_i = threaded
+                if next_i > i:
+                    regions.append(region)
+                    i = next_i
+                    prev = None
+                    continue
+            uncond = self._try_unconditional_loop(i, stop, allowed, aliases, hidden_labels, prev, suppressed_loops)
+            if uncond is not None:
+                region, next_i = uncond
                 if next_i > i:
                     regions.append(region)
                     i = next_i
@@ -1349,6 +1722,20 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
         lines.append(sp + "}")
         lines.extend(_render_statement_list(region.get("resume_param_merge") or [], stmt_indent))
         return lines
+    if kind == "do_while":
+        lines = _render_statement_list(region.get("preheader") or [], indent)
+        label = region.get("label")
+        loop_indent = indent
+        if label:
+            lines.append(prefix + f"{label}:")
+            loop_indent += 1
+        lp = "    " * loop_indent
+        lines.append(lp + "do {")
+        inner = loop_indent + 1
+        lines.extend(_render_statement_list(region.get("body") or [], inner))
+        lines.extend(_render_statement_list(region.get("loopback") or [], inner))
+        lines.append(lp + f"}} while ({_render_expr(region.get('condition')) or 'true'})")
+        return lines
     if kind == "while":
         lines = _render_statement_list(region.get("preheader") or [], indent)
         label = region.get("label")
@@ -1369,6 +1756,51 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
             lines.append(ip + "}")
         lines.extend(_render_region(region.get("body"), inner))
         lines.append(lp + "}")
+        return lines
+    if kind == "threaded_decision_tree":
+        lines: list[str] = []
+        label = region.get("label")
+        tree_indent = indent
+        if label:
+            lines.append(prefix + f"{label}:")
+            tree_indent += 1
+        tp = "    " * tree_indent
+        header = f"threaded_decision_tree {region.get('entry_block')}"
+        if region.get("exit_block"):
+            header += f" -> {region.get('exit_block')}"
+        lines.append(tp + header + " {")
+
+        def edge_text(edge: dict[str, Any]) -> str:
+            target = edge.get("target")
+            edge_kind = edge.get("kind")
+            rendered: list[str] = []
+            for stmt in edge.get("statements") or []:
+                rendered.extend(_render_statement_lines(stmt))
+            suffix = ""
+            if rendered:
+                suffix = " { " + "; ".join(rendered) + " }"
+            if edge_kind == "internal":
+                return f"node {target}"
+            if edge_kind == "fallthrough_exit":
+                return f"exit {target}" if target else "exit"
+            if edge_kind == "structured_jump":
+                return f"structured {target}" + suffix
+            return str(target or "exit") + suffix
+
+        for node in region.get("nodes") or []:
+            np = "    " * (tree_indent + 1)
+            lines.append(np + f"node {node.get('block_id')} {{")
+            body_indent = tree_indent + 2
+            for stmt in node.get("prelabel") or []:
+                lines.extend("    " * body_indent + line for line in _render_statement_lines(stmt))
+            for stmt in node.get("body") or []:
+                lines.extend("    " * body_indent + line for line in _render_statement_lines(stmt))
+            cond = _render_expr(node.get("condition")) or "<cond>"
+            lines.append("    " * body_indent + f"if ({cond}) -> {edge_text(node.get('true_edge') or {})}")
+            lines.append("    " * body_indent + f"else -> {edge_text(node.get('false_edge') or {})}")
+            lines.append(np + "}")
+        lines.append(tp + "}")
+        lines.extend(_render_statement_list(region.get("exit_param_merge") or [], tree_indent))
         return lines
     if kind == "switch_like":
         lines: list[str] = []
@@ -1594,7 +2026,7 @@ def build_module_ast(
             "input_hir_contract": HIR_CONTRACT_VERSION,
             "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_summary"],
             "notes": [
-                "AST v5 builds statement/expression nodes directly from normalized HIR CFG blocks.",
+                "AST v7 builds statement/expression nodes directly from normalized HIR CFG blocks and applies source-specific edge aliases and conservative self-loop lifting before rendering.",
                 "Text is an output-only renderer concern; branch, loop, alias, and edge-parameter normalization operate on nodes.",
                 "Unsafe shapes remain explicit goto_region instead of being repaired after the fact.",
             ],
@@ -1650,7 +2082,7 @@ def summarize_ast_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any
             "ast_contract": AST_CONTRACT_VERSION,
             "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_corpus_metrics"],
             "notes": [
-                "AST v5 keeps residual explicit CFG as a first-class result, not as an input to a repair loop.",
+                "AST v6 keeps residual explicit CFG as a first-class result, not as an input to a repair loop.",
                 "Dangling jump counters are semantic validation failures, and text rendering is output-only.",
             ],
         },
