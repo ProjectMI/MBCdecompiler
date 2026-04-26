@@ -21,7 +21,7 @@ from mbl_vm_tools.hir import (
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-AST_CONTRACT_VERSION = "ast-v7"
+AST_CONTRACT_VERSION = "ast-v3"
 
 
 @dataclass
@@ -455,6 +455,32 @@ def _collect_simple_body_statements(region: Any) -> Optional[list[dict[str, Any]
         return None
     return list(region.get("body") or [])
 
+
+
+
+def _region_has_visible_content(region: Any, keep_block_ids: Optional[set[str]] = None) -> bool:
+    keep_block_ids = keep_block_ids or set()
+    if not isinstance(region, dict):
+        return bool(region)
+    kind = region.get("kind")
+    if kind == "sequence":
+        return any(_region_has_visible_content(child, keep_block_ids) for child in region.get("regions") or [])
+    if kind == "goto_region":
+        return any(_region_has_visible_content(child, keep_block_ids) for child in region.get("blocks") or [])
+    if kind == "block":
+        term = region.get("terminator") or {}
+        return bool(
+            region.get("block_id") in keep_block_ids
+            or region.get("label")
+            or region.get("prelabel")
+            or region.get("body")
+            or term.get("rendered")
+        )
+    return True
+
+
+def _drop_empty_regions(regions: list[dict[str, Any]], keep_block_ids: Optional[set[str]] = None) -> list[dict[str, Any]]:
+    return [region for region in regions if _region_has_visible_content(region, keep_block_ids)]
 
 def _classify_trivial_function_body(ast_root: dict[str, Any], entry_args: list[str]) -> dict[str, Any]:
     statements = _collect_simple_body_statements(ast_root)
@@ -1041,7 +1067,13 @@ class _SurfaceBuilder:
     ) -> tuple[dict[str, Any], Optional[str]]:
         label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
         handled_param_pred = previous_source_id in self.handled_param_predecessors_by_block.get(block.id, set())
-        prelabel = _incoming_assignments(block, previous_source_id) if previous_source_id in block.predecessors and block.id not in aliases and not handled_param_pred else []
+        previous_source = self.cfg.by_id.get(previous_source_id) if previous_source_id is not None else None
+        handled_edge_alias = self._alias_for_source(block.id, previous_source, aliases) is not None
+        prelabel = (
+            _incoming_assignments(block, previous_source_id)
+            if previous_source_id in block.predecessors and not handled_edge_alias and not handled_param_pred
+            else []
+        )
         statements = [_statement_node(stmt) for stmt in block.statements]
         term_nodes, goto_count = self._terminator_nodes(block, next_id, aliases)
         if len(term_nodes) == 1 and statements and _render_statement(statements[-1]) == _render_statement(term_nodes[0]):
@@ -1378,10 +1410,10 @@ class _SurfaceBuilder:
         rendered_cond = cond
         branch_direct = branch == join_id
         fall_direct = fallthrough == join_id
-        then_regions = build_arm(then_ids, branch_direct, "then")
-        else_regions = build_arm(else_ids, fall_direct, "else")
+        then_regions = _drop_empty_regions(build_arm(then_ids, branch_direct, "then"), self.explicit_label_ids)
+        else_regions = _drop_empty_regions(build_arm(else_ids, fall_direct, "else"), self.explicit_label_ids)
         if not then_regions and not else_regions:
-            if prologue:
+            if prologue or label:
                 region = {
                     "kind": "block",
                     "block_id": block.id,
@@ -1467,12 +1499,23 @@ class _SurfaceBuilder:
         if loop.get("body_succ") != block.id or loop.get("exit_succ") is None:
             return None
         exit_succ = str(loop.get("exit_succ"))
-        # Keep this rule intentionally conservative. Parameterized self-loops need a
-        # phi-update model; plain self-loops can be lifted to a real do/while node.
-        if block.block_params:
-            return None
+        # Keep this rule intentionally conservative. A parameterized self-loop is
+        # safe only when the loopback passes the header params unchanged and the
+        # single non-loop entry is the linear predecessor that can provide the
+        # preheader assignments.  Anything needing a real phi-update model stays
+        # explicit CFG.
         if _incoming_assignments(block, block.id):
             return None
+        outside_preds = [pred for pred in block.predecessors if pred != block.id]
+        if block.block_params:
+            settled = set(self.settled_preds_by_block.get(block.id, set()))
+            allowed_entries = set(outside_preds)
+            if previous_source_id is not None:
+                allowed_entries.discard(previous_source_id)
+            if allowed_entries and not allowed_entries.issubset(settled):
+                return None
+            if previous_source_id is None and not outside_preds:
+                return None
         if _incoming_assignments(self.cfg.by_id.get(exit_succ), block.id):
             return None
         cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
@@ -2026,7 +2069,7 @@ def build_module_ast(
             "input_hir_contract": HIR_CONTRACT_VERSION,
             "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_summary"],
             "notes": [
-                "AST v7 builds statement/expression nodes directly from normalized HIR CFG blocks and applies source-specific edge aliases and conservative self-loop lifting before rendering.",
+                "AST v3 builds statement/expression nodes directly from normalized HIR CFG blocks and keeps source-specific edge aliases from hiding unrelated linear merge-param assignments.",
                 "Text is an output-only renderer concern; branch, loop, alias, and edge-parameter normalization operate on nodes.",
                 "Unsafe shapes remain explicit goto_region instead of being repaired after the fact.",
             ],
@@ -2082,7 +2125,7 @@ def summarize_ast_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any
             "ast_contract": AST_CONTRACT_VERSION,
             "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_corpus_metrics"],
             "notes": [
-                "AST v6 keeps residual explicit CFG as a first-class result, not as an input to a repair loop.",
+                "AST v8 keeps residual explicit CFG as a first-class result, not as an input to a repair loop.",
                 "Dangling jump counters are semantic validation failures, and text rendering is output-only.",
             ],
         },
