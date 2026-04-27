@@ -646,7 +646,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             continue
 
         if i + 13 <= body_size and data[i:i + 11] == (b"\x7c" * 11) and data[i + 11] == 0x4A:
-            out.append(Token(i, "SIG_PAD11_BR", 13, {"off": data[i + 12]}))
+            out.append(Token(i, "SIG_PAD11_BR", 13, {"op": 0x4A, "off": data[i + 12]}))
             i += 13
             continue
 

@@ -2,7 +2,7 @@
 
 1. Построить стабильный pre-AST/HIR payload для одного скрипта и AST text:
 
-python analyze_mbc.py имя_скрипта.mbc
+analyze_mbc.py имя_скрипта.mbc
 
 По умолчанию анализируются все function entry points из таблицы definitions плюс export-only записи.
 Экспорты, у которых уже есть definition с точным span, не анализируются второй раз — export metadata
@@ -14,15 +14,15 @@ python analyze_mbc.py имя_скрипта.mbc
 
 2. Компактный JSON без листинга canonical/HIR details:
 
-python analyze_mbc.py имя_скрипта.mbc --summary-only --out out.json
+analyze_mbc.py имя_скрипта.mbc --summary-only --out out.json
 
 3. Режим только по definitions:
 
-python analyze_mbc.py имя_скрипта.mbc --definitions-only --summary-only --out definitions.json
+analyze_mbc.py имя_скрипта.mbc --definitions-only --summary-only --out definitions.json
 
 4. Прогон по всему корпусу .mbc теперь строит AST report, а не pre-AST/HIR report:
 
-python analyze_mbc.py --out ast-report.json
+analyze_mbc.py --out ast-report.json
 
 Формат corpus-отчёта: `ast-report-v1`. Основные секции:
 - `summary` — агрегаты по модулям/функциям: structured/fallback block ratios, residual labels/gotos, explicit CFG regions, AST depth/regions/statements/expressions, parameterized blocks, block params, loopbacks.
@@ -32,4 +32,4 @@ python analyze_mbc.py --out ast-report.json
 
 5. Полная валидация корпуса отдельным флагом:
 
-python analyze_mbc.py --validate-corpus --out ast-report.validation.json
+analyze_mbc.py --validate-corpus --out ast-report.validation.json

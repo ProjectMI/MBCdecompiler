@@ -162,20 +162,20 @@ def _make_corpus_resume_state(paths: list[Path], signature: dict[str, Any]) -> d
     }
 
 
+def _reset_corpus_resume_files(state_path: Path, cache_dir: Path) -> None:
+    if state_path.exists():
+        state_path.unlink()
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+
+
 def _prepare_corpus_resume_state(
     paths: list[Path],
     *,
     state_path: Path,
     cache_dir: Path,
     signature: dict[str, Any],
-    reset: bool = False,
 ) -> dict[str, Any]:
-    if reset:
-        if state_path.exists():
-            state_path.unlink()
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-
     script_names = [path.name for path in paths]
     script_name_set = set(script_names)
     raw_state = _read_json_file(state_path)
@@ -186,10 +186,16 @@ def _prepare_corpus_resume_state(
     )
 
     if not state_is_compatible:
-        if (state_path.exists() or cache_dir.exists()) and not reset:
+        if state_path.exists() or cache_dir.exists():
             print(f"AST corpus resume: state/cache reset because options or implementation changed: {state_path}")
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
+        _reset_corpus_resume_files(state_path, cache_dir)
+        state = _make_corpus_resume_state(paths, signature)
+        _atomic_write_json(state, state_path)
+        return state
+
+    if not _ordered_unique_names(list(raw_state.get("pending") or [])):
+        print(f"AST corpus resume: previous corpus report is complete; starting a fresh run: {state_path}")
+        _reset_corpus_resume_files(state_path, cache_dir)
         state = _make_corpus_resume_state(paths, signature)
         _atomic_write_json(state, state_path)
         return state
@@ -357,7 +363,6 @@ def build_ast_corpus_report_resumable(
     include_definitions: bool = True,
     include_exports: bool = True,
     validate: bool = False,
-    reset: bool = False,
     max_modules: int | None = None,
 ) -> dict:
     if not paths:
@@ -373,7 +378,6 @@ def build_ast_corpus_report_resumable(
         state_path=state_path,
         cache_dir=cache_dir,
         signature=signature,
-        reset=reset,
     )
 
     paths_by_name = {path.name: path for path in paths}
@@ -516,7 +520,6 @@ def main() -> None:
     parser.add_argument("--validate", action="store_true", help="Run HIR validation in single-script mode.")
     parser.add_argument("--validate-corpus", action="store_true", help="Run pre-AST validation while building the AST corpus report.")
     parser.add_argument("--corpus-state", help="Persistent corpus pending-list JSON path. Defaults next to --out, or hir/ast-report.pending.json.")
-    parser.add_argument("--reset-corpus-state", action="store_true", help="Discard the saved corpus queue and cached module payloads before running.")
     parser.add_argument("--max-corpus-modules", type=int, help="Process at most N pending corpus modules in this run, then write a partial report.")
     parser.add_argument("--no-corpus-resume", action="store_true", help="Disable the persistent corpus queue and use the old one-shot in-memory mode.")
     mode_group = parser.add_mutually_exclusive_group()
@@ -592,7 +595,6 @@ def main() -> None:
             include_definitions=include_definitions,
             include_exports=include_exports,
             validate=args.validate_corpus,
-            reset=args.reset_corpus_state,
             max_modules=args.max_corpus_modules,
         )
 

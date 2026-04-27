@@ -400,6 +400,11 @@ def _normalize_operands(raw_kind: str, terminal_kind: str, payload: dict[str, An
     elif raw_kind.startswith("SIG_") or terminal_kind.startswith("SIG_"):
         family = raw_kind if raw_kind.startswith("SIG_") else terminal_kind
         operands.update({"family": family[4:], **payload})
+        if family.endswith("_BR") or family.endswith("BR"):
+            if "op" in payload:
+                operands["branch_op"] = _hex_byte(int(payload["op"])) if isinstance(payload["op"], int) else payload["op"]
+            if "off" in payload:
+                operands["offset"] = payload.get("off")
     elif terminal_kind in DATA_KINDS:
         operands.update(payload)
     elif terminal_kind == "OP":
