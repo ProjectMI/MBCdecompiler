@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -11,17 +11,32 @@ from mbl_vm_tools.hir import (
     HIRBlock,
     HIR_CONTRACT_VERSION,
     build_function_hir,
-    _block_maps,
     _coerce_hir_block,
     _match_assignment,
     _normalize_hir_blocks,
-    _ordered_unique,
     _rename_merge_params,
+)
+from mbl_vm_tools.ast_cfg import (
+    _Cfg,
+    _build_cfg,
+    _edge_targets,
+    _external_successors,
+    _fold_constant_branches,
+    _loopback_source_count,
+    _prune_unreachable_blocks,
+)
+from mbl_vm_tools.ast_flow import (
+    alias_for_source as _flow_alias_for_source,
+    classify_cyclic_component as _classify_cyclic_component,
+    classify_linear_cyclic_span as _classify_linear_cyclic_span,
+    classify_transfer as _classify_transfer,
+    merge_scoped_aliases as _merge_scoped_aliases,
+    plan_loop_aliases as _plan_loop_aliases,
 )
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-AST_CONTRACT_VERSION = "ast-v3"
+AST_CONTRACT_VERSION = "ast-v5"
 
 
 @dataclass
@@ -147,8 +162,6 @@ def _statement_node(stmt: Any) -> dict[str, Any]:
         return {"kind": "break", "target": text[6:].strip() or None}
     if text == "continue" or text.startswith("continue "):
         return {"kind": "continue", "target": text[9:].strip() or None}
-    if text == "state_jump" or text.startswith("state_jump "):
-        return {"kind": "state_jump", "target": text[11:].strip() or None}
     if text.startswith("goto "):
         return {"kind": "goto", "target": text[5:].strip()}
     if text.startswith("return"):
@@ -238,9 +251,6 @@ def _render_statement(stmt: Any) -> str:
     if kind == "continue":
         target = stmt.get("target")
         return f"continue {target}" if target else "continue"
-    if kind == "state_jump":
-        target = stmt.get("target")
-        return f"state_jump {target}" if target else "state_jump"
     if kind in {"conditional_jump", "conditional_block"}:
         return f"if ({_render_expr(stmt.get('condition'))}) {{ ... }}"
     return str(stmt.get("source") or kind or "")
@@ -341,7 +351,7 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
             target = _statement_target(stmt)
             if target:
                 goto_targets.add(target)
-        elif kind in {"break", "continue", "state_jump"}:
+        elif kind in {"break", "continue"}:
             target = _statement_target(stmt)
             if target:
                 jump_targets.add(target)
@@ -380,7 +390,7 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
                 rendered_terminator_statement_count += 1
                 visit_stmt(stmt)
             return
-        if kind in {"if", "if_else", "while", "do_while"}:
+        if kind in {"if", "if_else", "while", "do_while", "empty_loop"}:
             if params:
                 parameterized_region_count += 1
                 region_param_count += len(params)
@@ -396,39 +406,26 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
             visit_region(region.get("else"), depth + 1)
         elif kind == "while":
             visit_region(region.get("body"), depth + 1)
-        elif kind == "state_loop":
-            visit_region(region.get("body"), depth + 1)
         elif kind == "do_while":
             for stmt in region.get("body") or []:
                 visit_stmt(stmt)
             for stmt in region.get("loopback") or []:
                 visit_stmt(stmt)
-        elif kind == "threaded_decision_tree":
-            for stmt in region.get("entry_param_merge") or []:
-                visit_stmt(stmt)
+        elif kind == "empty_loop":
+            pass
+        elif kind == "decision_loop":
             for node in region.get("nodes") or []:
                 for stmt in node.get("prelabel") or []:
                     visit_stmt(stmt)
                 for stmt in node.get("body") or []:
                     visit_stmt(stmt)
                 visit_expr(node.get("condition"))
-                for edge_name in ("true_edge", "false_edge"):
+                for stmt in node.get("terminal") or []:
+                    visit_stmt(stmt)
+                for edge_name in ("true_edge", "false_edge", "next_edge"):
                     edge = node.get(edge_name) or {}
                     for stmt in edge.get("statements") or []:
                         visit_stmt(stmt)
-            for stmt in region.get("exit_param_merge") or []:
-                visit_stmt(stmt)
-        elif kind == "switch_like":
-            for case in region.get("cases") or []:
-                edge = case.get("edge") or {}
-                for stmt in edge.get("statements") or []:
-                    visit_stmt(stmt)
-                visit_region(case, depth + 1)
-            edge = region.get("default_edge") or {}
-            for stmt in edge.get("statements") or []:
-                visit_stmt(stmt)
-        elif kind == "case":
-            visit_region(region.get("body"), depth + 1)
         elif kind == "goto_region":
             for child in region.get("blocks") or []:
                 visit_region(child, depth + 1)
@@ -551,37 +548,6 @@ def _drop_empty_regions(regions: list[dict[str, Any]], keep_block_ids: Optional[
     return [region for region in regions if _region_has_visible_content(region, keep_block_ids)]
 
 
-def _strip_region_labels(region: Any, labels: set[str]) -> None:
-    if not labels or not isinstance(region, dict):
-        return
-    label = _base_label(region.get("label"))
-    if label in labels:
-        region["label"] = None
-    kind = region.get("kind")
-    if kind == "sequence":
-        for child in region.get("regions") or []:
-            _strip_region_labels(child, labels)
-    elif kind == "goto_region":
-        for child in region.get("blocks") or []:
-            _strip_region_labels(child, labels)
-    elif kind in {"if", "if_else"}:
-        _strip_region_labels(region.get("then"), labels)
-        _strip_region_labels(region.get("else"), labels)
-    elif kind == "while":
-        _strip_region_labels(region.get("body"), labels)
-    elif kind == "state_loop":
-        _strip_region_labels(region.get("body"), labels)
-    elif kind == "case":
-        _strip_region_labels(region.get("body"), labels)
-    elif kind == "switch_like":
-        for case in region.get("cases") or []:
-            _strip_region_labels(case, labels)
-
-
-def _strip_labels_in_regions(regions: list[dict[str, Any]], labels: set[str]) -> list[dict[str, Any]]:
-    for region in regions:
-        _strip_region_labels(region, labels)
-    return regions
 
 def _classify_trivial_function_body(ast_root: dict[str, Any], entry_args: list[str]) -> dict[str, Any]:
     statements = _collect_simple_body_statements(ast_root)
@@ -642,319 +608,6 @@ def _validate_ast_semantics(ast_root: dict[str, Any], metrics: dict[str, Any]) -
     }
 
 
-@dataclass
-class _Cfg:
-    blocks: list[HIRBlock]
-    by_id: dict[str, HIRBlock]
-    index_by_id: dict[str, int]
-    succs: dict[str, list[str]]
-    preds: dict[str, list[str]]
-    dom: dict[str, set[str]]
-    postdom: dict[str, set[str]]
-    ipdom: dict[str, Optional[str]]
-    loops: dict[str, dict[str, Any]]
-    switches: dict[int, dict[str, Any]]
-
-
-def _compute_dominators(blocks: list[HIRBlock]) -> dict[str, set[str]]:
-    if not blocks:
-        return {}
-    ids = [block.id for block in blocks]
-    _, _, _, preds = _block_maps(blocks)
-    dom = {block.id: set(ids) for block in blocks}
-    dom[blocks[0].id] = {blocks[0].id}
-    for _ in range(max(1, len(blocks) * 3)):
-        changed = False
-        for block in blocks[1:]:
-            pred_sets = [dom[pred] for pred in preds[block.id] if pred in dom]
-            new = {block.id} | (set.intersection(*pred_sets) if pred_sets else set())
-            if new != dom[block.id]:
-                dom[block.id] = new
-                changed = True
-        if not changed:
-            break
-    return dom
-
-
-def _compute_postdominators(blocks: list[HIRBlock]) -> dict[str, set[str]]:
-    if not blocks:
-        return {}
-    ids = [block.id for block in blocks]
-    _, _, succs, _ = _block_maps(blocks)
-    exits = [block.id for block in blocks if not succs[block.id]]
-    if not exits:
-        return {block.id: {block.id} for block in blocks}
-    post = {block.id: set(ids) for block in blocks}
-    for exit_id in exits:
-        post[exit_id] = {exit_id}
-    for _ in range(max(1, len(blocks) * 4)):
-        changed = False
-        for block in reversed(blocks):
-            if block.id in exits:
-                continue
-            block_succs = [succ for succ in succs[block.id] if succ in post]
-            if block_succs:
-                acc = set(post[block_succs[0]])
-                for succ in block_succs[1:]:
-                    acc &= post[succ]
-                new = {block.id} | acc
-            else:
-                new = {block.id}
-            if new != post[block.id]:
-                post[block.id] = new
-                changed = True
-        if not changed:
-            break
-    return post
-
-
-def _immediate_postdom(block_id: str, postdom: dict[str, set[str]], index_by_id: dict[str, int]) -> Optional[str]:
-    candidates = list(postdom.get(block_id, set()) - {block_id})
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: index_by_id.get(item, 10**9))
-    for candidate in candidates:
-        if all(candidate not in postdom.get(other, set()) for other in candidates if other != candidate):
-            return candidate
-    return candidates[0]
-
-
-def _edge_targets(block: HIRBlock, index_by_id: dict[str, int]) -> tuple[Optional[str], Optional[str]]:
-    if block.terminator.get("kind") != "branch":
-        return None, block.fallthrough_target or (block.successors[0] if block.successors else None)
-    branch = block.branch_target
-    fallthrough = block.fallthrough_target
-    if branch is None and block.successors:
-        ordered = sorted(block.successors, key=lambda item: index_by_id.get(item, 10**9))
-        branch = ordered[0]
-        fallthrough = ordered[1] if len(ordered) > 1 else None
-    return branch, fallthrough
-
-
-_COND_CMP_RE = re.compile(r"^cond\[(?P<op>0x[0-9A-Fa-f]+)\]\((?P<payload>.*)\)$")
-
-
-def _constant_branch_value(block: HIRBlock) -> Optional[bool]:
-    if block.terminator.get("kind") != "branch":
-        return None
-    condition = str(block.terminator.get("condition") or block.terminator.get("text") or "").strip()
-    match = _COND_CMP_RE.match(condition)
-    if match is None:
-        return None
-    payload = match.group("payload").strip()
-    if not (payload.startswith("cmp(") and payload.endswith(")")):
-        return None
-    args = _split_top_level(payload[4:-1])
-    if len(args) != 2 or args[0].strip() != args[1].strip():
-        return None
-    op = str(block.terminator.get("branch_op") or match.group("op")).upper()
-    if op == "0X4A":
-        return True
-    return None
-
-
-def _fold_constant_branches(blocks: list[HIRBlock]) -> list[HIRBlock]:
-    if not blocks:
-        return blocks
-    index_by_id = {block.id: block.index for block in blocks}
-    folded: list[HIRBlock] = []
-    changed = False
-    for block in blocks:
-        constant = _constant_branch_value(block)
-        if constant is None:
-            folded.append(block)
-            continue
-        kept_target = block.branch_target if constant else block.fallthrough_target
-        kept_index = index_by_id.get(kept_target, 10**9) if kept_target is not None else 10**9
-        if kept_index <= block.index:
-            folded.append(block)
-            continue
-        term = dict(block.terminator)
-        term.update(
-            {
-                "kind": "fallthrough",
-                "text": None,
-                "condition": None,
-                "folded_branch_condition": block.terminator.get("condition") or block.terminator.get("text"),
-                "folded_branch_value": constant,
-            }
-        )
-        successors = [kept_target] if kept_target else []
-        folded.append(
-            replace(
-                block,
-                terminator=term,
-                branch_target=None,
-                fallthrough_target=kept_target,
-                successors=successors,
-            )
-        )
-        changed = True
-    if not changed:
-        return blocks
-    ids = {block.id for block in folded}
-    preds: dict[str, list[str]] = {block.id: [] for block in folded}
-    for block in folded:
-        for succ in block.successors:
-            if succ in ids:
-                preds[succ].append(block.id)
-    return [replace(block, predecessors=preds.get(block.id, [])) for block in folded]
-
-
-def _prune_unreachable_blocks(blocks: list[HIRBlock]) -> list[HIRBlock]:
-    if not blocks:
-        return blocks
-    by_id = {block.id: block for block in blocks}
-    reachable: set[str] = set()
-    stack = [blocks[0].id]
-    while stack:
-        block_id = stack.pop()
-        if block_id in reachable or block_id not in by_id:
-            continue
-        reachable.add(block_id)
-        stack.extend(succ for succ in by_id[block_id].successors if succ in by_id and succ not in reachable)
-    if len(reachable) == len(blocks):
-        return blocks
-
-    pruned: list[HIRBlock] = []
-    for new_index, block in enumerate(block for block in blocks if block.id in reachable):
-        successors = [succ for succ in block.successors if succ in reachable]
-        incoming_args = {pred: list(args) for pred, args in block.incoming_args.items() if pred in reachable}
-        branch_target = block.branch_target if block.branch_target in reachable else None
-        fallthrough_target = block.fallthrough_target if block.fallthrough_target in reachable else None
-        term = dict(block.terminator)
-        if isinstance(term.get("successors"), list):
-            term["successors"] = [succ for succ in term.get("successors", []) if succ in reachable]
-        if term.get("branch_target") not in reachable:
-            term["branch_target"] = None
-        if term.get("fallthrough_target") not in reachable:
-            term["fallthrough_target"] = None
-        pruned.append(
-            replace(
-                block,
-                index=new_index,
-                incoming_args=incoming_args,
-                branch_target=branch_target,
-                fallthrough_target=fallthrough_target,
-                successors=successors,
-                terminator=term,
-            )
-        )
-
-    ids = {block.id for block in pruned}
-    preds: dict[str, list[str]] = {block.id: [] for block in pruned}
-    for block in pruned:
-        for succ in block.successors:
-            if succ in ids:
-                preds[succ].append(block.id)
-    return [replace(block, predecessors=preds.get(block.id, [])) for block in pruned]
-
-
-def _natural_loops(blocks: list[HIRBlock], dom: dict[str, set[str]]) -> dict[str, dict[str, Any]]:
-    _, index_by_id, succs, preds = _block_maps(blocks)
-    loops: dict[str, dict[str, Any]] = {}
-    for block in blocks:
-        for succ in succs[block.id]:
-            if succ in dom.get(block.id, set()) and index_by_id.get(succ, 10**9) <= block.index:
-                loop = loops.setdefault(succ, {"header": succ, "latches": set(), "nodes": {succ}})
-                loop["latches"].add(block.id)
-                work = [block.id]
-                while work:
-                    node = work.pop()
-                    if node in loop["nodes"]:
-                        continue
-                    loop["nodes"].add(node)
-                    work.extend(pred for pred in preds.get(node, []) if pred not in loop["nodes"])
-    for header_id, loop in loops.items():
-        indices = sorted(index_by_id[node] for node in loop["nodes"] if node in index_by_id)
-        idx0, idx1 = (indices[0], indices[-1]) if indices else (index_by_id[header_id], index_by_id[header_id])
-        loop["index_range"] = (idx0, idx1)
-        contiguous_ids = {blocks[idx].id for idx in range(idx0, idx1 + 1)}
-        nodes = set(loop["nodes"])
-        contiguous = contiguous_ids == nodes
-        header_succs = list(succs.get(header_id, []))
-        body_succs = [succ for succ in header_succs if succ in nodes]
-        exit_succs = [succ for succ in header_succs if succ not in nodes]
-        loop["body_succ"] = body_succs[0] if len(body_succs) == 1 else None
-        loop["exit_succ"] = exit_succs[0] if len(exit_succs) == 1 else None
-        external_entries = [
-            (pred, node)
-            for node in nodes - {header_id}
-            for pred in preds.get(node, [])
-            if pred not in nodes
-        ]
-        loop["contiguous"] = contiguous
-        loop["external_entries"] = external_entries
-        exit_idx = index_by_id.get(loop["exit_succ"], -1) if loop.get("exit_succ") else -1
-        body_idx = index_by_id.get(loop.get("body_succ"), -1) if loop.get("body_succ") else -1
-        loop["safe"] = bool(
-            blocks[index_by_id[header_id]].terminator.get("kind") == "branch"
-            and loop.get("body_succ")
-            and loop.get("exit_succ")
-            and contiguous
-            and body_idx >= idx0
-            and exit_idx > idx1
-        )
-    return loops
-
-
-
-def _collect_switch_like(
-    start_index: int,
-    blocks: list[HIRBlock],
-    index_by_id: dict[str, int],
-    ipdom: dict[str, Optional[str]],
-    preds: dict[str, list[str]],
-) -> Optional[dict[str, Any]]:
-    chain: list[HIRBlock] = []
-    join: Optional[str] = None
-    i = start_index
-    while i < len(blocks):
-        block = blocks[i]
-        if block.terminator.get("kind") != "branch" or block.statements:
-            break
-        branch_target, fallthrough_target = _edge_targets(block, index_by_id)
-        next_textual = blocks[i + 1].id if i + 1 < len(blocks) else None
-        if branch_target is None or fallthrough_target != next_textual:
-            break
-        block_join = ipdom.get(block.id)
-        if block_join is None:
-            break
-        if join is None:
-            join = block_join
-        elif join != block_join:
-            break
-        chain.append(block)
-        i += 1
-        if branch_target == join:
-            break
-    if len(chain) < 3 or join is None:
-        return None
-    chain_ids = {block.id for block in chain}
-    for offset, chain_block in enumerate(chain):
-        for pred_id in preds.get(chain_block.id, []):
-            if pred_id in chain_ids:
-                continue
-            pred_idx = index_by_id.get(pred_id)
-            allowed_textual_entry = offset == 0 and pred_idx is not None and pred_idx + 1 == chain_block.index
-            if not allowed_textual_entry:
-                return None
-    return {"blocks": chain, "join": join, "end_index": i}
-
-def _build_cfg(blocks: list[HIRBlock]) -> _Cfg:
-    by_id, index_by_id, succs, preds = _block_maps(blocks)
-    dom = _compute_dominators(blocks)
-    postdom = _compute_postdominators(blocks)
-    ipdom = {block.id: _immediate_postdom(block.id, postdom, index_by_id) for block in blocks}
-    loops = _natural_loops(blocks, dom)
-    switches = {
-        idx: info
-        for idx in range(len(blocks))
-        if (info := _collect_switch_like(idx, blocks, index_by_id, ipdom, preds)) is not None
-    }
-    return _Cfg(blocks, by_id, index_by_id, succs, preds, dom, postdom, ipdom, loops, switches)
-
-
 def _format_block_label(block: HIRBlock) -> str:
     # Block parameters are SSA/phi plumbing.  Render labels as source-level
     # control-flow anchors only; edge-specific parameter values are materialized
@@ -971,36 +624,6 @@ def _incoming_assignments(target: Optional[HIRBlock], source_id: Optional[str]) 
     return [_assignment_node(param, arg) for param, arg in zip(target.block_params, args) if param != arg]
 
 
-def _target_call(target: Optional[HIRBlock], source: Optional[HIRBlock]) -> Optional[str]:
-    if target is None:
-        return None
-    return target.id
-
-
-def _external_successors(loop: dict[str, Any], cfg: _Cfg) -> list[str]:
-    nodes = set(loop.get("nodes") or set())
-    return _ordered_unique([
-        succ
-        for block_id in sorted(nodes, key=lambda item: cfg.index_by_id.get(item, 10**9))
-        for succ in cfg.succs.get(block_id, [])
-        if succ not in nodes
-    ])
-
-
-def _loopback_source_count(loop: dict[str, Any], cfg: _Cfg) -> int:
-    return sum(len(sources) for sources in _loopback_edges(loop, cfg).values())
-
-
-def _loopback_edges(loop: dict[str, Any], cfg: _Cfg) -> dict[str, set[str]]:
-    nodes = set(loop.get("nodes") or set())
-    edges: dict[str, set[str]] = {}
-    for source_id in nodes:
-        source_idx = cfg.index_by_id.get(source_id, 10**9)
-        for succ in cfg.succs.get(source_id, []):
-            if succ in nodes and cfg.index_by_id.get(succ, 10**9) <= source_idx:
-                edges.setdefault(succ, set()).add(source_id)
-    return edges
-
 
 class _SurfaceBuilder:
     def __init__(self, blocks: list[HIRBlock]):
@@ -1012,7 +635,6 @@ class _SurfaceBuilder:
         self.residual_labels = 0
         self.residual_gotos = 0
         self.loop_headers = 0
-        self.unconditional_loops = 0
         self.structured_loopbacks = 0
         self.settled_preds_by_block: dict[str, set[str]] = defaultdict(set)
         self.handled_param_predecessors_by_block: dict[str, set[str]] = defaultdict(set)
@@ -1034,7 +656,6 @@ class _SurfaceBuilder:
             "residual_label_count": self.residual_labels,
             "residual_goto_count": self.residual_gotos,
             "loop_header_count": self.loop_headers,
-            "unconditional_loop_count": self.unconditional_loops,
             "structured_loopback_count": self.structured_loopbacks,
         }
         return tree, meta
@@ -1250,17 +871,8 @@ class _SurfaceBuilder:
         return current
 
     def _alias_for_source(self, target_id: Optional[str], source: Optional[HIRBlock], aliases: dict[str, Any]) -> Any:
-        if target_id is None:
-            return None
-        alias = aliases.get(target_id)
-        if not isinstance(alias, dict):
-            return alias
-        by_source = alias.get("prelude_by_source") or {}
-        if by_source:
-            source_key = source.id if source is not None else None
-            if source_key not in by_source:
-                return None
-        return alias
+        source_id = source.id if source is not None else None
+        return _flow_alias_for_source(target_id, source_id, aliases)
 
     def _jump_nodes(
         self,
@@ -1270,32 +882,32 @@ class _SurfaceBuilder:
         *,
         source_specific_alias: bool = False,
     ) -> tuple[list[dict[str, Any]], int]:
-        if target_id is None:
+        source_id = source.id if source is not None else None
+        action = _classify_transfer(
+            source_id=source_id,
+            source_index=source.index if source is not None else None,
+            target_id=target_id,
+            target_index=self.cfg.index_by_id.get(target_id) if target_id is not None else None,
+            aliases=aliases,
+            source_specific_alias=source_specific_alias,
+        )
+        if action.kind == "none" or target_id is None:
             return [], 0
+        if action.kind == "alias":
+            alias = action.alias
+            if isinstance(alias, dict):
+                by_source = alias.get("prelude_by_source") or {}
+                prelude = list(by_source.get(source_id) or [])
+                jump = alias.get("jump")
+                return prelude + ([jump] if isinstance(jump, dict) else []), int(isinstance(jump, dict) and jump.get("kind") == "goto")
+            node = _statement_node(alias)
+            return ([node] if node.get("kind") != "empty" else []), int(node.get("kind") == "goto")
+
         target = self.cfg.by_id.get(target_id)
-        raw_alias = aliases.get(target_id)
-        if source_specific_alias or (isinstance(raw_alias, dict) and raw_alias.get("source_specific")):
-            alias = self._alias_for_source(target_id, source, aliases)
-        else:
-            alias = raw_alias
-        if alias is None:
-            source_id = source.id if source is not None else None
-            prelude = _incoming_assignments(target, source_id)
-            if target_id in self.cfg.by_id:
-                self.needed_label_ids.add(target_id)
-            source_idx = source.index if source is not None else None
-            target_idx = self.cfg.index_by_id.get(target_id)
-            if source_idx is not None and target_idx is not None and target_idx > source_idx:
-                return [*prelude, {"kind": "break", "target": _target_call(target, source) or target_id}], 0
-            return [*prelude, {"kind": "goto", "target": _target_call(target, source) or target_id}], 1
-        if isinstance(alias, dict):
-            source_key = source.id if source is not None else None
-            by_source = alias.get("prelude_by_source") or {}
-            prelude = list(by_source.get(source_key) or [])
-            jump = alias.get("jump")
-            return prelude + ([jump] if isinstance(jump, dict) else []), int(isinstance(jump, dict) and jump.get("kind") == "goto")
-        node = _statement_node(alias)
-        return ([node] if node.get("kind") != "empty" else []), int(node.get("kind") == "goto")
+        prelude = _incoming_assignments(target, source_id)
+        if action.needs_label and target_id in self.cfg.by_id:
+            self.needed_label_ids.add(target_id)
+        return [*prelude, {"kind": action.kind, "target": action.target_label or target_id}], int(action.counts_as_goto)
 
     def _terminator_nodes(
         self,
@@ -1576,112 +1188,112 @@ class _SurfaceBuilder:
                 return None
         return selected or []
 
-    def _try_threaded_decision_tree(
+    def _decision_loop_edge_node(
         self,
-        idx: int,
-        stop: int,
-        allowed: Optional[set[str]],
+        source: HIRBlock,
+        target_id: Optional[str],
+        loop_ids: set[str],
+        aliases: dict[str, Any],
+        next_after_id: Optional[str],
+    ) -> dict[str, Any]:
+        if target_id is None:
+            return {"kind": "exit", "target": None, "statements": []}
+        target = self.cfg.by_id.get(target_id)
+        if target_id in loop_ids:
+            return {
+                "kind": "internal",
+                "target": target_id,
+                "statements": _incoming_assignments(target, source.id),
+            }
+        if self._alias_for_source(target_id, source, aliases) is not None:
+            statements, _ = self._jump_nodes(source, target_id, aliases, source_specific_alias=True)
+            return {"kind": "structured_jump", "target": target_id, "statements": statements}
+        statements = _incoming_assignments(target, source.id)
+        if target_id in self.cfg.by_id:
+            self.settled_preds_by_block[target_id].add(source.id)
+            if statements:
+                self.handled_param_predecessors_by_block[target_id].add(source.id)
+        return {
+            "kind": "fallthrough_exit" if target_id == next_after_id else "external_exit",
+            "target": target_id,
+            "statements": statements,
+        }
+
+    def _decision_loop_region(
+        self,
+        *,
+        label_block: HIRBlock,
+        entry_id: str,
+        ordered_ids: list[str],
+        loop_ids: set[str],
+        exit_ids: list[str],
+        classification: str,
         aliases: dict[str, Any],
         hidden_labels: set[str],
         previous_source_id: Optional[str],
-    ) -> Optional[tuple[dict[str, Any], int]]:
-        if idx in self.cfg.switches:
-            return None
-        run: list[HIRBlock] = []
-        i = idx
-        while i < min(stop, len(self.blocks)):
-            block = self.blocks[i]
-            if allowed is not None and block.id not in allowed:
-                break
-            if block.terminator.get("kind") != "branch":
-                break
-            run.append(block)
-            i += 1
-        if len(run) < 4:
-            return None
-        tree_ids = {block.id for block in run}
-        next_after_id = self.blocks[i].id if i < min(stop, len(self.blocks)) else None
-
-        complex_internal_edge = False
-        backward_internal_edge = False
-        for block in run:
-            for succ in self.cfg.succs.get(block.id, []):
-                if succ not in tree_ids:
-                    continue
-                succ_idx = self.cfg.index_by_id.get(succ, 10**9)
-                if succ_idx != block.index + 1:
-                    complex_internal_edge = True
-                if succ_idx <= block.index:
-                    backward_internal_edge = True
-        if not complex_internal_edge:
-            return None
-        if not backward_internal_edge and len(run) < 8:
-            return None
-
-        for offset, block in enumerate(run):
-            for pred_id in self.cfg.preds.get(block.id, []):
-                if pred_id in tree_ids:
-                    continue
-                pred_idx = self.cfg.index_by_id.get(pred_id)
-                allowed_entry = offset == 0 and (pred_id == previous_source_id or (pred_idx is not None and pred_idx + 1 == block.index))
-                if not allowed_entry:
-                    return None
-
-        exit_sources_by_target: dict[str, set[str]] = defaultdict(set)
+        next_after_id: Optional[str],
+        backward_edge_count: int = 0,
+    ) -> dict[str, Any]:
         nodes: list[dict[str, Any]] = []
-        for block in run:
-            branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
-            true_edge = self._decision_edge_node(block, branch, tree_ids, aliases, next_after_id)
-            false_edge = self._decision_edge_node(block, fallthrough, tree_ids, aliases, next_after_id)
-            if true_edge is None or false_edge is None:
-                return None
-            for target in (branch, fallthrough):
-                if target is not None and target not in tree_ids and target not in aliases:
-                    exit_sources_by_target[target].add(block.id)
-            nodes.append(
-                {
-                    "kind": "decision_node",
-                    "block_id": block.id,
-                    "block_params": list(block.block_params),
-                    "prelabel": self._entry_assignments(block, previous_source_id, aliases) if block.id == run[0].id else [],
-                    "body": _statement_nodes(list(block.statements)),
-                    "condition": _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}"),
-                    "true_edge": true_edge,
-                    "false_edge": false_edge,
-                }
-            )
-
-        exit_param_merge: list[dict[str, Any]] = []
-        for target_id, sources in exit_sources_by_target.items():
-            if target_id != next_after_id:
-                return None
-            args = self._same_incoming_args_for_sources(target_id, sources)
-            if args is None:
-                return None
-            target = self.cfg.by_id.get(target_id)
-            if target is not None and target.block_params:
-                exit_param_merge.extend(
-                    _assignment_node(param, arg)
-                    for param, arg in zip(target.block_params, args)
-                    if param != arg
+        for block_id in ordered_ids:
+            node_block = self.cfg.by_id.get(str(block_id))
+            if node_block is None:
+                continue
+            node: dict[str, Any] = {
+                "kind": "decision_loop_node",
+                "block_id": node_block.id,
+                "block_params": list(node_block.block_params),
+                "prelabel": self._entry_assignments(node_block, previous_source_id, aliases) if node_block.id == entry_id else [],
+                "body": _statement_nodes(list(node_block.statements)),
+            }
+            term_kind = node_block.terminator.get("kind")
+            if term_kind == "branch":
+                branch, fallthrough = _edge_targets(node_block, self.cfg.index_by_id)
+                node.update(
+                    {
+                        "terminator_kind": "branch",
+                        "condition": _expr_node(node_block.terminator.get("condition") or node_block.terminator.get("text") or f"cond_{node_block.id}"),
+                        "true_edge": self._decision_loop_edge_node(node_block, branch, loop_ids, aliases, next_after_id),
+                        "false_edge": self._decision_loop_edge_node(node_block, fallthrough, loop_ids, aliases, next_after_id),
+                    }
                 )
-                self.handled_param_predecessors_by_block[target_id].update(sources)
-            self.settled_preds_by_block[target_id].update(sources)
+            elif term_kind == "fallthrough":
+                target_id = node_block.fallthrough_target or (node_block.successors[0] if node_block.successors else None)
+                node.update(
+                    {
+                        "terminator_kind": "fallthrough",
+                        "next_edge": self._decision_loop_edge_node(node_block, target_id, loop_ids, aliases, next_after_id),
+                    }
+                )
+            elif term_kind == "return":
+                node.update({"terminator_kind": "return", "terminal": [_statement_node(node_block.terminator.get("text") or "return")]})
+            elif term_kind == "stop":
+                node.update({"terminator_kind": "stop", "terminal": [{"kind": "stop", "source": str(node_block.terminator.get("text") or "stop").strip()}]})
+            else:
+                target_id = node_block.successors[0] if node_block.successors else None
+                node.update(
+                    {
+                        "terminator_kind": term_kind or "none",
+                        "next_edge": self._decision_loop_edge_node(node_block, target_id, loop_ids, aliases, next_after_id) if target_id else None,
+                    }
+                )
+            nodes.append(node)
 
-        label = _format_block_label(run[0]) if self._label_needed(run[0], hidden_labels, previous_source_id) else None
-        self.constructs["threaded_decision_tree"] += 1
-        region = {
-            "kind": "threaded_decision_tree",
+        label = _format_block_label(label_block) if self._label_needed(label_block, hidden_labels, previous_source_id) else None
+        self.constructs["decision_loop"] += 1
+        self.loop_headers += 1
+        self.structured_loopbacks += backward_edge_count
+        return {
+            "kind": "decision_loop",
             "label": label,
-            "entry_block": run[0].id,
-            "exit_block": next_after_id,
+            "entry_block": entry_id,
+            "exit_blocks": list(exit_ids),
+            "classification": classification,
             "node_count": len(nodes),
             "nodes": nodes,
-            "exit_param_merge": exit_param_merge,
         }
-        return region, i
 
-    def _try_switch_like(
+    def _try_decision_loop(
         self,
         idx: int,
         stop: int,
@@ -1689,54 +1301,51 @@ class _SurfaceBuilder:
         aliases: dict[str, Any],
         hidden_labels: set[str],
         previous_source_id: Optional[str],
+        suppressed_loops: set[str],
     ) -> Optional[tuple[dict[str, Any], int]]:
-        info = self.cfg.switches.get(idx)
-        if info is None:
+        block = self.blocks[idx]
+        if block.id in suppressed_loops:
             return None
-        end_index = int(info.get("end_index", idx))
-        if end_index <= idx or end_index > stop:
+        component = self.cfg.cyclic_components.get(block.id)
+        if component is None:
             return None
-        dispatch_blocks = list(info.get("blocks") or [])
-        if not dispatch_blocks:
+        plan = _classify_cyclic_component(component, self.cfg)
+        if plan is None:
             return None
-        dispatch_ids = {block.id for block in dispatch_blocks}
-        if allowed is not None and not dispatch_ids.issubset(allowed):
+        idx0, idx1 = component.get("index_range") or (idx, idx)
+        loop_ids = set(plan.nodes)
+        if idx0 != idx or idx1 >= stop or (allowed is not None and not loop_ids.issubset(allowed)):
             return None
-        join_id = info.get("join")
-        if join_id is not None:
-            self.settled_preds_by_block[str(join_id)].update(dispatch_ids)
-        label = _format_block_label(dispatch_blocks[0]) if self._label_needed(dispatch_blocks[0], hidden_labels, previous_source_id) else None
-        cases: list[dict[str, Any]] = []
-        join_target = str(join_id) if join_id is not None else None
-        for case_block in dispatch_blocks:
-            case_target, _ = _edge_targets(case_block, self.cfg.index_by_id)
-            edge = self._decision_edge_node(case_block, case_target, dispatch_ids, aliases, join_target)
-            cases.append(
-                {
-                    "kind": "case",
-                    "dispatch_block": case_block.id,
-                    "condition": _expr_node(case_block.terminator.get("condition")),
-                    "target": case_target,
-                    "edge": edge,
-                    "body": {"kind": "sequence", "regions": []},
-                }
+
+        entry_id = plan.entry_id
+        for pred_id, node_id in component.get("external_entries") or []:
+            pred_id = str(pred_id)
+            node_id = str(node_id)
+            settled = set(self.settled_preds_by_block.get(node_id, set()))
+            pred_idx = self.cfg.index_by_id.get(pred_id)
+            allowed_entry = (
+                node_id == entry_id
+                and (pred_id == previous_source_id or pred_id in settled or (pred_idx is not None and pred_idx + 1 == idx))
             )
-        default_target = self.blocks[end_index].id if end_index < len(self.blocks) and end_index <= stop else None
-        default_edge = None
-        if default_target is not None:
-            default_edge = {"kind": "fallthrough_exit", "target": default_target, "statements": []}
-            if default_target in aliases:
-                default_edge = self._decision_edge_node(dispatch_blocks[-1], default_target, dispatch_ids, aliases, join_target)
-        self.constructs["switch_like"] += 1
-        region = {
-            "kind": "switch_like",
-            "label": label,
-            "join_block": join_id,
-            "cases": cases,
-            "default": "dispatch_fallthrough",
-            "default_edge": default_edge,
-        }
-        return region, end_index
+            if not allowed_entry:
+                return None
+
+        next_after_id = self.blocks[idx1 + 1].id if idx1 + 1 < min(stop, len(self.blocks)) else None
+        region = self._decision_loop_region(
+            label_block=block,
+            entry_id=entry_id,
+            ordered_ids=[str(item) for item in (component.get("ordered_nodes") or [])],
+            loop_ids=loop_ids,
+            exit_ids=list(plan.exit_ids),
+            classification=plan.classification,
+            aliases=aliases,
+            hidden_labels=hidden_labels,
+            previous_source_id=previous_source_id,
+            next_after_id=next_after_id,
+            backward_edge_count=len(component.get("backward_edges") or []),
+        )
+        return region, idx1 + 1
+
 
     def _forward_skip_arm_ids(
         self,
@@ -1938,6 +1547,92 @@ class _SurfaceBuilder:
             return region, join_idx
         return None
 
+
+    def _empty_decision_span_ids(
+        self,
+        start_id: str,
+        join_id: str,
+        stop: int,
+        allowed: Optional[set[str]],
+        aliases: dict[str, Any],
+        previous_source_id: Optional[str],
+    ) -> Optional[set[str]]:
+        start_idx = self.cfg.index_by_id.get(start_id)
+        join_idx = self.cfg.index_by_id.get(join_id)
+        if start_idx is None or join_idx is None or join_idx <= start_idx or join_idx > stop:
+            return None
+        ids: set[str] = set()
+        stack = [start_id]
+        while stack:
+            node = stack.pop()
+            if node == join_id:
+                continue
+            node_idx = self.cfg.index_by_id.get(node)
+            if node_idx is None or node_idx < start_idx or node_idx >= join_idx:
+                return None
+            if allowed is not None and node not in allowed:
+                return None
+            if node in aliases and node != start_id:
+                return None
+            if node in ids:
+                continue
+            block = self.cfg.by_id.get(node)
+            if block is None or block.statements:
+                return None
+            if block.terminator.get("kind") not in {"branch", "fallthrough"}:
+                return None
+            succs = list(self.cfg.succs.get(node, []))
+            if not succs:
+                return None
+            ids.add(node)
+            for succ in succs:
+                if succ == join_id:
+                    continue
+                if succ in aliases:
+                    return None
+                stack.append(succ)
+        if not ids:
+            return None
+        for node in ids:
+            settled = set(self.settled_preds_by_block.get(node, set()))
+            for pred in self.cfg.preds.get(node, []):
+                if pred in ids or pred in settled:
+                    continue
+                if node == start_id and pred == previous_source_id:
+                    continue
+                return None
+        join_block = self.cfg.by_id.get(join_id)
+        for source_id in ids:
+            if join_id in self.cfg.succs.get(source_id, []) and _incoming_assignments(join_block, source_id):
+                return None
+        return ids
+
+    def _try_empty_decision_span(
+        self,
+        idx: int,
+        stop: int,
+        allowed: Optional[set[str]],
+        aliases: dict[str, Any],
+        hidden_labels: set[str],
+        previous_source_id: Optional[str],
+    ) -> Optional[tuple[dict[str, Any], int]]:
+        block = self.blocks[idx]
+        if block.statements or block.terminator.get("kind") not in {"branch", "fallthrough"}:
+            return None
+        if self._label_needed(block, hidden_labels, previous_source_id):
+            return None
+        join_id = self.cfg.ipdom.get(block.id)
+        if join_id is None:
+            return None
+        ids = self._empty_decision_span_ids(block.id, join_id, stop, allowed, aliases, previous_source_id)
+        if ids is None:
+            return None
+        join_sources = {source_id for source_id in ids if join_id in self.cfg.succs.get(source_id, [])}
+        if join_sources:
+            self.settled_preds_by_block[str(join_id)].update(join_sources)
+        self.constructs["empty_decision_span"] += 1
+        return {"kind": "sequence", "regions": []}, self.cfg.index_by_id[join_id]
+
     def _try_if(
         self,
         idx: int,
@@ -2062,34 +1757,18 @@ class _SurfaceBuilder:
         return region, join_idx
 
     def _loop_aliases(self, loop: dict[str, Any], exit_ids: Optional[list[str]] = None) -> dict[str, Any]:
-        nodes = set(loop.get("nodes") or set())
-        header_id = str(loop.get("header"))
         aliases: dict[str, Any] = {}
-        for target_id, sources in _loopback_edges(loop, self.cfg).items():
-            target = self.cfg.by_id.get(target_id)
-            jump = {"kind": "continue", "target": None if target_id == header_id else target_id}
-            if target_id != header_id:
-                self.needed_label_ids.add(target_id)
-            aliases[target_id] = {
-                "jump": jump,
-                "prelude_by_source": {source_id: _incoming_assignments(target, source_id) for source_id in sources},
+        for plan in _plan_loop_aliases(loop, self.cfg, exit_ids):
+            target = self.cfg.by_id.get(plan.target_id)
+            if plan.needs_label:
+                self.needed_label_ids.add(plan.target_id)
+            alias: dict[str, Any] = {
+                "jump": {"kind": plan.jump_kind, "target": plan.jump_target},
+                "prelude_by_source": {source_id: _incoming_assignments(target, source_id) for source_id in plan.sources},
             }
-        exits = list(exit_ids) if exit_ids is not None else _external_successors(loop, self.cfg)
-        idx0, idx1 = loop.get("index_range") or (None, None)
-        next_after = self.blocks[idx1 + 1].id if isinstance(idx1, int) and idx1 + 1 < len(self.blocks) else None
-        if next_after in exits:
-            exits.remove(next_after)
-            exits.insert(0, next_after)
-        for pos, exit_id in enumerate(exits):
-            exit_block = self.cfg.by_id.get(exit_id)
-            sources = [source_id for source_id in nodes if exit_id in self.cfg.succs.get(source_id, [])]
-            jump = {"kind": "break", "target": None if pos == 0 else exit_id}
-            if pos != 0:
-                self.needed_label_ids.add(exit_id)
-            aliases[exit_id] = {
-                "jump": jump,
-                "prelude_by_source": {source_id: _incoming_assignments(exit_block, source_id) for source_id in sources},
-            }
+            if plan.source_specific:
+                alias["source_specific"] = True
+            aliases[plan.target_id] = alias
         return aliases
 
     def _settle_alias_predecessors(self, alias_map: dict[str, Any]) -> None:
@@ -2098,152 +1777,7 @@ class _SurfaceBuilder:
                 self.settled_preds_by_block[target_id].update((alias.get("prelude_by_source") or {}).keys())
 
 
-    def _state_loop_candidate(
-        self,
-        idx: int,
-        stop: int,
-        allowed: Optional[set[str]],
-        previous_source_id: Optional[str],
-    ) -> Optional[dict[str, Any]]:
-        limit = min(stop, len(self.blocks))
-        if idx >= limit:
-            return None
-        if allowed is not None and self.blocks[idx].id not in allowed:
-            return None
-
-        end = idx
-        saw_non_linear = False
-        saw_backward = False
-        changed = True
-        while changed:
-            changed = False
-            for pos in range(idx, end + 1):
-                block = self.blocks[pos]
-                if allowed is not None and block.id not in allowed:
-                    return None
-                for succ in self.cfg.succs.get(block.id, []):
-                    succ_idx = self.cfg.index_by_id.get(succ)
-                    if succ_idx is None or succ_idx < idx or succ_idx >= limit:
-                        continue
-                    if allowed is not None and succ not in allowed:
-                        continue
-                    if succ_idx != block.index + 1:
-                        saw_non_linear = True
-                        if succ_idx <= block.index:
-                            saw_backward = True
-                        if succ_idx > end:
-                            end = succ_idx
-                            changed = True
-            for pos in range(end + 1, limit):
-                block = self.blocks[pos]
-                if allowed is not None and block.id not in allowed:
-                    break
-                reaches_current_state = False
-                for succ in self.cfg.succs.get(block.id, []):
-                    succ_idx = self.cfg.index_by_id.get(succ)
-                    if succ_idx is None or succ_idx < idx or succ_idx > end:
-                        continue
-                    if succ_idx != block.index + 1:
-                        reaches_current_state = True
-                        saw_non_linear = True
-                        saw_backward = True
-                        break
-                if reaches_current_state:
-                    end = pos
-                    changed = True
-                    break
-
-        if not saw_non_linear or not saw_backward or end <= idx:
-            return None
-
-        state_blocks = self.blocks[idx : end + 1]
-        state_ids = {block.id for block in state_blocks}
-        if allowed is not None and any(block.id not in allowed for block in state_blocks):
-            return None
-
-        entry_id = self.blocks[idx].id
-        for block in state_blocks:
-            settled = set(self.settled_preds_by_block.get(block.id, set()))
-            for pred in self.cfg.preds.get(block.id, []):
-                if pred in state_ids or pred in settled:
-                    continue
-                if block.id == entry_id and pred == previous_source_id:
-                    continue
-                return None
-
-        next_after_id = self.blocks[end + 1].id if end + 1 < limit else None
-        if next_after_id is None and end + 1 < len(self.blocks) and end + 1 <= stop:
-            # A state region that exits exactly at the current range boundary is
-            # ambiguous: many ordinary forward decision chains live at such
-            # boundaries and should not be promoted to state_loop. Allow the
-            # boundary exit only when a previously structured predecessor enters
-            # a non-entry state block; that is the general multi-entry/internal-label
-            # shape that cannot be represented by a plain forward sequence without
-            # reintroducing a jump.
-            has_settled_side_entry = False
-            for state_block in state_blocks:
-                if state_block.id == entry_id:
-                    continue
-                settled = set(self.settled_preds_by_block.get(state_block.id, set()))
-                for pred in self.cfg.preds.get(state_block.id, []):
-                    if pred not in state_ids and pred in settled:
-                        has_settled_side_entry = True
-                        break
-                if has_settled_side_entry:
-                    break
-            if has_settled_side_entry:
-                next_after_id = self.blocks[end + 1].id
-        exit_sources: set[str] = set()
-        internal_sources_by_target: dict[str, set[str]] = defaultdict(set)
-        for block in state_blocks:
-            for succ in self.cfg.succs.get(block.id, []):
-                succ_idx = self.cfg.index_by_id.get(succ)
-                if succ in state_ids:
-                    if succ_idx is not None and succ_idx != block.index + 1:
-                        internal_sources_by_target[succ].add(block.id)
-                    continue
-                if next_after_id is not None and succ == next_after_id:
-                    exit_sources.add(block.id)
-                    continue
-                return None
-
-        if not internal_sources_by_target:
-            return None
-        return {
-            "end": end,
-            "ids": state_ids,
-            "entry_id": entry_id,
-            "next_after_id": next_after_id,
-            "exit_sources": exit_sources,
-            "internal_sources_by_target": internal_sources_by_target,
-        }
-
-    def _state_loop_aliases(self, candidate: dict[str, Any]) -> dict[str, Any]:
-        aliases: dict[str, Any] = {}
-        ids = set(candidate.get("ids") or set())
-        for target_id, sources in (candidate.get("internal_sources_by_target") or {}).items():
-            target = self.cfg.by_id.get(target_id)
-            self.needed_label_ids.add(str(target_id))
-            aliases[str(target_id)] = {
-                "jump": {"kind": "state_jump", "target": str(target_id)},
-                "prelude_by_source": {source_id: _incoming_assignments(target, source_id) for source_id in sources},
-                "source_specific": True,
-            }
-        next_after_id = candidate.get("next_after_id")
-        exit_sources = set(candidate.get("exit_sources") or set())
-        if next_after_id is not None and exit_sources:
-            exit_block = self.cfg.by_id.get(str(next_after_id))
-            aliases[str(next_after_id)] = {
-                "jump": {"kind": "break", "target": None},
-                "prelude_by_source": {source_id: _incoming_assignments(exit_block, source_id) for source_id in exit_sources},
-                "source_specific": True,
-            }
-            self.settled_preds_by_block[str(next_after_id)].update(exit_sources)
-            self.handled_param_predecessors_by_block[str(next_after_id)].update(exit_sources)
-        self._settle_alias_predecessors(aliases)
-        return aliases
-
-    def _try_state_loop(
+    def _try_linear_decision_loop(
         self,
         idx: int,
         stop: int,
@@ -2251,36 +1785,41 @@ class _SurfaceBuilder:
         aliases: dict[str, Any],
         hidden_labels: set[str],
         previous_source_id: Optional[str],
-        suppressed_loops: set[str],
     ) -> Optional[tuple[dict[str, Any], int]]:
-        candidate = self._state_loop_candidate(idx, stop, allowed, previous_source_id)
-        if candidate is None:
-            return None
-        state_aliases = dict(aliases)
-        state_aliases.update(self._state_loop_aliases(candidate))
-        state_ids = set(candidate.get("ids") or set())
-        entry_block = self.blocks[idx]
-        label = _format_block_label(entry_block) if self._label_needed(entry_block, hidden_labels, previous_source_id) else None
-        body = self._range(
-            idx,
-            int(candidate["end"]) + 1,
-            state_ids,
-            state_aliases,
-            hidden_labels,
-            previous_source_id,
-            suppressed_loops,
-            allow_state_loop=False,
+        plan = _classify_linear_cyclic_span(
+            self.cfg,
+            idx=idx,
+            stop=stop,
+            allowed=allowed,
+            previous_source_id=previous_source_id,
+            settled_preds_by_block=self.settled_preds_by_block,
         )
-        self.constructs["state_loop"] += 1
-        region = {
-            "kind": "state_loop",
-            "label": label,
-            "entry_block": candidate.get("entry_id"),
-            "exit_block": candidate.get("next_after_id"),
-            "state_target_count": len(candidate.get("internal_sources_by_target") or {}),
-            "body": {"kind": "sequence", "regions": body},
-        }
-        return region, int(candidate["end"]) + 1
+        if plan is None:
+            return None
+        loop_ids = set(plan.nodes)
+        end = int(plan.end_index)
+        entry_block = self.blocks[idx]
+        next_after_id = plan.exit_ids[0] if plan.exit_ids else None
+        backward_edge_count = 0
+        for source_id in loop_ids:
+            source_idx = self.cfg.index_by_id.get(source_id, 10**9)
+            for succ in self.cfg.succs.get(source_id, []):
+                if succ in loop_ids and self.cfg.index_by_id.get(succ, 10**9) <= source_idx:
+                    backward_edge_count += 1
+        region = self._decision_loop_region(
+            label_block=entry_block,
+            entry_id=plan.entry_id,
+            ordered_ids=[self.blocks[pos].id for pos in range(idx, end + 1) if self.blocks[pos].id in loop_ids],
+            loop_ids=loop_ids,
+            exit_ids=list(plan.exit_ids),
+            classification=plan.classification,
+            aliases=aliases,
+            hidden_labels=hidden_labels,
+            previous_source_id=previous_source_id,
+            next_after_id=str(next_after_id) if next_after_id is not None else None,
+            backward_edge_count=backward_edge_count,
+        )
+        return region, end + 1
 
     def _try_self_loop(
         self,
@@ -2378,6 +1917,19 @@ class _SurfaceBuilder:
                 "break_targets": [exit_succ],
             }
             return region, idx + 1
+        if not block.statements:
+            self.constructs["empty_loop"] += 1
+            region = {
+                "kind": "empty_loop",
+                "header_block": block.id,
+                "label": label,
+                "block_params": [],
+                "preheader": preheader,
+                "condition": continue_condition,
+                "continue_target": block.id,
+                "break_target": exit_succ,
+            }
+            return region, idx + 1
         self.constructs["do_while"] += 1
         region = {
             "kind": "do_while",
@@ -2453,9 +2005,23 @@ class _SurfaceBuilder:
 
         preheader = self._entry_assignments(header, previous_source_id, aliases)
         label = _format_block_label(header) if self._label_needed(header, hidden_labels, previous_source_id) else None
-        self.constructs["do_while"] += 1
         self.loop_headers += 1
         self.structured_loopbacks += 1
+        if not body.statements:
+            self.constructs["empty_loop"] += 1
+            region = {
+                "kind": "empty_loop",
+                "header_block": header.id,
+                "label": label,
+                "block_params": [],
+                "preheader": preheader,
+                "condition": loop_cond,
+                "continue_target": header.id,
+                "break_target": exit_succ,
+                "rendering": "transparent_header_loop",
+            }
+            return region, body_idx + 1
+        self.constructs["do_while"] += 1
         region = {
             "kind": "do_while",
             "header_block": header.id,
@@ -2495,10 +2061,9 @@ class _SurfaceBuilder:
             return None
         cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
         body_cond = cond if branch == body_succ else _negated_expr(cond) if fallthrough == body_succ else cond
-        loop_aliases = dict(aliases)
         local_aliases = self._loop_aliases(loop)
         self._settle_alias_predecessors(local_aliases)
-        loop_aliases.update(local_aliases)
+        loop_aliases = _merge_scoped_aliases(aliases, local_aliases, nodes)
         body_ids = nodes - {block.id}
         if not body_ids:
             return None
@@ -2529,55 +2094,6 @@ class _SurfaceBuilder:
         }
         return region, idx1 + 1
 
-    def _try_unconditional_loop(
-        self,
-        idx: int,
-        stop: int,
-        allowed: Optional[set[str]],
-        aliases: dict[str, Any],
-        hidden_labels: set[str],
-        previous_source_id: Optional[str],
-        suppressed_loops: set[str],
-    ) -> Optional[tuple[dict[str, Any], int]]:
-        block = self.blocks[idx]
-        loop = self.cfg.loops.get(block.id)
-        if not loop or loop.get("safe") or block.id in suppressed_loops or not loop.get("contiguous"):
-            return None
-        idx0, idx1 = loop.get("index_range") or (idx, idx)
-        nodes = set(loop.get("nodes") or set())
-        if idx0 != idx or idx1 >= stop or (allowed is not None and not nodes.issubset(allowed)):
-            return None
-        exits = [succ for succ in _external_successors(loop, self.cfg) if self.cfg.index_by_id.get(succ, -1) > idx1]
-        if not exits or not _loopback_edges(loop, self.cfg):
-            return None
-        loop_aliases = dict(aliases)
-        local_aliases = self._loop_aliases(loop, exits)
-        self._settle_alias_predecessors(local_aliases)
-        loop_aliases.update(local_aliases)
-        body = self._range(idx, idx1 + 1, nodes, loop_aliases, hidden_labels | {block.id}, None, suppressed_loops | {block.id})
-        self.constructs["while"] += 1
-        self.unconditional_loops += 1
-        self.structured_loopbacks += _loopback_source_count(loop, self.cfg)
-        label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
-        if label:
-            body = _strip_labels_in_regions(body, {_base_label(label) or label})
-        region = {
-            "kind": "while",
-            "header_block": block.id,
-            "label": label,
-            "block_params": list(block.block_params),
-            "preheader": self._entry_assignments(block, previous_source_id, aliases),
-            "condition": _expr_node("true"),
-            "prologue": [],
-            "guard_exit": [],
-            "rendering": "unconditional_loop",
-            "body": {"kind": "sequence", "regions": body},
-            "continue_target": block.id,
-            "break_target": exits[0] if exits else None,
-            "break_targets": exits,
-        }
-        return region, idx1 + 1
-
     def _range(
         self,
         start: int,
@@ -2587,7 +2103,6 @@ class _SurfaceBuilder:
         hidden_labels: set[str],
         previous_source_id: Optional[str],
         suppressed_loops: Optional[set[str]] = None,
-        allow_state_loop: bool = True,
     ) -> list[dict[str, Any]]:
         regions: list[dict[str, Any]] = []
         i = start
@@ -2622,6 +2137,14 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
+            decision_loop = self._try_decision_loop(i, stop, allowed, aliases, hidden_labels, prev, suppressed_loops)
+            if decision_loop is not None:
+                region, next_i = decision_loop
+                if next_i > i:
+                    regions.append(region)
+                    i = next_i
+                    prev = None
+                    continue
             loop = None if block.id in suppressed_loops else self._try_loop(i, stop, allowed, aliases, hidden_labels, prev)
             if loop is not None:
                 region, next_i = loop
@@ -2630,25 +2153,9 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
-            switch = self._try_switch_like(i, stop, allowed, aliases, hidden_labels, prev)
-            if switch is not None:
-                region, next_i = switch
-                if next_i > i:
-                    regions.append(region)
-                    i = next_i
-                    prev = None
-                    continue
-            threaded = self._try_threaded_decision_tree(i, stop, allowed, aliases, hidden_labels, prev)
-            if threaded is not None:
-                region, next_i = threaded
-                if next_i > i:
-                    regions.append(region)
-                    i = next_i
-                    prev = None
-                    continue
-            uncond = self._try_unconditional_loop(i, stop, allowed, aliases, hidden_labels, prev, suppressed_loops)
-            if uncond is not None:
-                region, next_i = uncond
+            empty_decision = self._try_empty_decision_span(i, stop, allowed, aliases, hidden_labels, prev)
+            if empty_decision is not None:
+                region, next_i = empty_decision
                 if next_i > i:
                     regions.append(region)
                     i = next_i
@@ -2674,9 +2181,9 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
-            state_loop = self._try_state_loop(i, stop, allowed, aliases, hidden_labels, prev, suppressed_loops) if allow_state_loop else None
-            if state_loop is not None:
-                region, next_i = state_loop
+            linear_decision_loop = self._try_linear_decision_loop(i, stop, allowed, aliases, hidden_labels, prev)
+            if linear_decision_loop is not None:
+                region, next_i = linear_decision_loop
                 if next_i > i:
                     regions.append(region)
                     i = next_i
@@ -2731,6 +2238,20 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
         lines.append(sp + "}")
         lines.extend(_render_statement_list(region.get("resume_param_merge") or [], stmt_indent))
         return lines
+    if kind == "empty_loop":
+        lines = _render_statement_list(region.get("preheader") or [], indent)
+        label = region.get("label")
+        loop_indent = indent
+        if label:
+            lines.append(prefix + f"{label}:")
+            loop_indent += 1
+        lp = "    " * loop_indent
+        cond = _render_expr(region.get("condition")) or "true"
+        header = f"empty_loop {region.get('header_block')} while ({cond})"
+        if region.get("break_target"):
+            header += f" -> {region.get('break_target')}"
+        lines.append(lp + header)
+        return lines
     if kind == "do_while":
         lines = _render_statement_list(region.get("preheader") or [], indent)
         label = region.get("label")
@@ -2766,7 +2287,7 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
         lines.extend(_render_region(region.get("body"), inner))
         lines.append(lp + "}")
         return lines
-    if kind == "state_loop":
+    if kind == "decision_loop":
         lines: list[str] = []
         label = region.get("label")
         loop_indent = indent
@@ -2774,25 +2295,13 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
             lines.append(prefix + f"{label}:")
             loop_indent += 1
         lp = "    " * loop_indent
-        header = f"state_loop {region.get('entry_block')}"
-        if region.get("exit_block"):
-            header += f" -> {region.get('exit_block')}"
+        exits = [str(item) for item in region.get("exit_blocks") or []]
+        header = f"decision_loop {region.get('entry_block')}"
+        if region.get("classification"):
+            header += f" [{region.get('classification')}]"
+        if exits:
+            header += " -> " + ", ".join(exits)
         lines.append(lp + header + " {")
-        lines.extend(_render_region(region.get("body"), loop_indent + 1))
-        lines.append(lp + "}")
-        return lines
-    if kind == "threaded_decision_tree":
-        lines: list[str] = []
-        label = region.get("label")
-        tree_indent = indent
-        if label:
-            lines.append(prefix + f"{label}:")
-            tree_indent += 1
-        tp = "    " * tree_indent
-        header = f"threaded_decision_tree {region.get('entry_block')}"
-        if region.get("exit_block"):
-            header += f" -> {region.get('exit_block')}"
-        lines.append(tp + header + " {")
 
         def edge_text(edge: dict[str, Any]) -> str:
             target = edge.get("target")
@@ -2804,72 +2313,35 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
             if rendered:
                 suffix = " { " + "; ".join(rendered) + " }"
             if edge_kind == "internal":
-                return f"node {target}"
+                return f"node {target}" + suffix
             if edge_kind == "fallthrough_exit":
-                return f"exit {target}" if target else "exit"
+                return (f"exit {target}" if target else "exit") + suffix
+            if edge_kind == "external_exit":
+                return f"external {target}" + suffix
             if edge_kind == "structured_jump":
                 return f"structured {target}" + suffix
+            if edge_kind == "exit":
+                return "exit" + suffix
             return str(target or "exit") + suffix
 
         for node in region.get("nodes") or []:
-            np = "    " * (tree_indent + 1)
+            np = "    " * (loop_indent + 1)
             lines.append(np + f"node {node.get('block_id')} {{")
-            body_indent = tree_indent + 2
+            body_indent = loop_indent + 2
             for stmt in node.get("prelabel") or []:
                 lines.extend("    " * body_indent + line for line in _render_statement_lines(stmt))
             for stmt in node.get("body") or []:
                 lines.extend("    " * body_indent + line for line in _render_statement_lines(stmt))
-            cond = _render_expr(node.get("condition")) or "<cond>"
-            lines.append("    " * body_indent + f"if ({cond}) -> {edge_text(node.get('true_edge') or {})}")
-            lines.append("    " * body_indent + f"else -> {edge_text(node.get('false_edge') or {})}")
+            if node.get("terminator_kind") == "branch":
+                cond = _render_expr(node.get("condition")) or "<cond>"
+                lines.append("    " * body_indent + f"if ({cond}) -> {edge_text(node.get('true_edge') or {})}")
+                lines.append("    " * body_indent + f"else -> {edge_text(node.get('false_edge') or {})}")
+            elif node.get("next_edge"):
+                lines.append("    " * body_indent + f"next -> {edge_text(node.get('next_edge') or {})}")
+            for stmt in node.get("terminal") or []:
+                lines.extend("    " * body_indent + line for line in _render_statement_lines(stmt))
             lines.append(np + "}")
-        lines.append(tp + "}")
-        lines.extend(_render_statement_list(region.get("exit_param_merge") or [], tree_indent))
-        return lines
-    if kind == "switch_like":
-        lines: list[str] = []
-        label = region.get("label")
-        switch_indent = indent
-        if label:
-            lines.append(prefix + f"{label}:")
-            switch_indent += 1
-        sp = "    " * switch_indent
-        lines.append(sp + "switch_like {")
-
-        def switch_edge_text(edge: dict[str, Any], fallback_target: Any) -> str:
-            target = edge.get("target", fallback_target)
-            edge_kind = edge.get("kind")
-            rendered: list[str] = []
-            for stmt in edge.get("statements") or []:
-                rendered.extend(_render_statement_lines(stmt))
-            suffix = ""
-            if rendered:
-                suffix = " { " + "; ".join(rendered) + " }"
-            if edge_kind == "internal":
-                return f"node {target}"
-            if edge_kind == "fallthrough_exit":
-                return f"exit {target}" if target else "exit"
-            if edge_kind == "structured_jump":
-                return f"structured {target}" + suffix
-            return str(target or "<unresolved>") + suffix
-
-        for case in region.get("cases") or []:
-            cond = _render_expr(case.get("condition")) or "<cond>"
-            target = case.get("target") or "<unresolved>"
-            edge_text = switch_edge_text(case.get("edge") or {}, target)
-            body = case.get("body")
-            if _region_has_visible_content(body):
-                lines.append("    " * (switch_indent + 1) + f"when ({cond}) -> {edge_text} {{")
-                lines.extend(_render_region(body, switch_indent + 2))
-                lines.append("    " * (switch_indent + 1) + "}")
-            else:
-                lines.append("    " * (switch_indent + 1) + f"when ({cond}) -> {edge_text}")
-        default_edge = region.get("default_edge") or {}
-        if default_edge:
-            lines.append("    " * (switch_indent + 1) + f"default -> {switch_edge_text(default_edge, None)}")
-        else:
-            lines.append("    " * (switch_indent + 1) + "default: { /* dispatch fallthrough */ }")
-        lines.append(sp + "}")
+        lines.append(lp + "}")
         return lines
     return [prefix + f"/* unsupported AST region: {kind} */"]
 
@@ -2924,7 +2396,6 @@ def build_function_ast_from_payload(function_payload: dict[str, Any], *, include
         "residual_goto_density": (residual_goto_count / block_count) if block_count else 0.0,
         "residual_label_density": (residual_label_count / block_count) if block_count else 0.0,
         "loop_header_count": structured_meta.get("loop_header_count", 0),
-        "unconditional_loop_count": structured_meta.get("unconditional_loop_count", 0),
         "structured_loopback_count": structured_meta.get("structured_loopback_count", 0),
         "source_shape_score": max(0.0, 1.0 - fallback_block_ratio - (0.25 * ((residual_goto_count / block_count) if block_count else 0.0))),
         **shape_metrics,
@@ -3013,7 +2484,6 @@ def _empty_module_summary(function_summaries: list[dict[str, Any]]) -> dict[str,
         "total_residual_labels": sum(summary.get("residual_label_count", 0) for summary in function_summaries),
         "total_residual_gotos": sum(summary.get("residual_goto_count", 0) for summary in function_summaries),
         "total_loop_headers": sum(summary.get("loop_header_count", 0) for summary in function_summaries),
-        "total_unconditional_loops": sum(summary.get("unconditional_loop_count", 0) for summary in function_summaries),
         "total_structured_loopbacks": sum(summary.get("structured_loopback_count", 0) for summary in function_summaries),
         "avg_source_shape_score": (sum(summary.get("source_shape_score", 1.0) for summary in function_summaries) / len(function_summaries)) if function_summaries else 1.0,
         "max_ast_depth": max((summary.get("ast_max_depth", 0) for summary in function_summaries), default=0),
@@ -3095,9 +2565,9 @@ def build_module_ast(
             "input_hir_contract": HIR_CONTRACT_VERSION,
             "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_summary"],
             "notes": [
-                "AST v3 builds statement/expression nodes directly from normalized HIR CFG blocks and keeps source-specific edge aliases from hiding unrelated linear merge-param assignments.",
+                "AST builds statement/expression nodes directly from normalized HIR CFG blocks and keeps source-specific edge aliases from hiding unrelated linear merge-param assignments.",
                 "Text is an output-only renderer concern; branch, loop, alias, and edge-parameter normalization operate on nodes.",
-                "Unsafe shapes remain explicit goto_region instead of being repaired after the fact.",
+                "Complex cyclic CFG regions are represented as decision_loop data instead of renderer-side targeted jumps.",
             ],
         },
         "path": str(path),
