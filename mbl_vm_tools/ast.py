@@ -1283,6 +1283,10 @@ class _SurfaceBuilder:
             prelude = _incoming_assignments(target, source_id)
             if target_id in self.cfg.by_id:
                 self.needed_label_ids.add(target_id)
+            source_idx = source.index if source is not None else None
+            target_idx = self.cfg.index_by_id.get(target_id)
+            if source_idx is not None and target_idx is not None and target_idx > source_idx:
+                return [*prelude, {"kind": "break", "target": _target_call(target, source) or target_id}], 0
             return [*prelude, {"kind": "goto", "target": _target_call(target, source) or target_id}], 1
         if isinstance(alias, dict):
             source_key = source.id if source is not None else None
@@ -1772,7 +1776,10 @@ class _SurfaceBuilder:
                 if succ_idx is not None and start_idx <= succ_idx < join_idx:
                     stack.append(succ)
                     continue
-                if succ_idx is not None and join_idx <= succ_idx < stop:
+                # Non-local forward exits are valid arm bypasses. They are not
+                # part of the local skip body and are materialized later as
+                # source-specific targeted breaks.
+                if succ_idx is not None and join_idx <= succ_idx:
                     continue
                 if self._alias_for_source(succ, block, aliases) is not None:
                     continue
@@ -1796,7 +1803,7 @@ class _SurfaceBuilder:
                 if self._alias_for_source(succ, block, aliases) is not None:
                     continue
                 succ_idx = self.cfg.index_by_id.get(succ)
-                if succ_idx is not None and join_idx <= succ_idx < stop:
+                if succ_idx is not None and join_idx <= succ_idx:
                     bypass_targets.add(succ)
                     continue
                 return None
@@ -1853,8 +1860,33 @@ class _SurfaceBuilder:
             join_alias = self._edge_alias_to_join(join_id, join_sources)
             self.settled_preds_by_block[str(join_id)].update(join_sources)
 
+            # A bypass is a forward edge out of this local skip arm, not an
+            # unstructured goto. Keep it source-specific so unrelated edges to the
+            # same later label are not accidentally swallowed.
+            bypass_aliases: dict[str, Any] = {}
+            for bypass_target in bypass_targets:
+                bypass_sources = {
+                    source_id
+                    for source_id in body_ids
+                    if bypass_target in self.cfg.succs.get(source_id, [])
+                }
+                if not bypass_sources:
+                    continue
+                target_block = self.cfg.by_id.get(bypass_target)
+                self.needed_label_ids.add(bypass_target)
+                bypass_aliases[bypass_target] = {
+                    "source_specific": True,
+                    "jump": {"kind": "break", "target": bypass_target},
+                    "prelude_by_source": {
+                        source_id: _incoming_assignments(target_block, source_id)
+                        for source_id in bypass_sources
+                    },
+                }
+            self._settle_alias_predecessors(bypass_aliases)
+
             arm_aliases = dict(aliases)
             arm_aliases[str(join_id)] = join_alias
+            arm_aliases.update(bypass_aliases)
             body_regions = self._range(
                 body_idx,
                 join_idx,
@@ -2140,6 +2172,27 @@ class _SurfaceBuilder:
                 return None
 
         next_after_id = self.blocks[end + 1].id if end + 1 < limit else None
+        if next_after_id is None and end + 1 < len(self.blocks) and end + 1 <= stop:
+            # A state region that exits exactly at the current range boundary is
+            # ambiguous: many ordinary forward decision chains live at such
+            # boundaries and should not be promoted to state_loop. Allow the
+            # boundary exit only when a previously structured predecessor enters
+            # a non-entry state block; that is the general multi-entry/internal-label
+            # shape that cannot be represented by a plain forward sequence without
+            # reintroducing a jump.
+            has_settled_side_entry = False
+            for state_block in state_blocks:
+                if state_block.id == entry_id:
+                    continue
+                settled = set(self.settled_preds_by_block.get(state_block.id, set()))
+                for pred in self.cfg.preds.get(state_block.id, []):
+                    if pred not in state_ids and pred in settled:
+                        has_settled_side_entry = True
+                        break
+                if has_settled_side_entry:
+                    break
+            if has_settled_side_entry:
+                next_after_id = self.blocks[end + 1].id
         exit_sources: set[str] = set()
         internal_sources_by_target: dict[str, set[str]] = defaultdict(set)
         for block in state_blocks:
@@ -2252,12 +2305,11 @@ class _SurfaceBuilder:
             return None
         exit_succ = str(loop.get("exit_succ"))
         # Keep this rule intentionally conservative. A parameterized self-loop is
-        # safe only when the loopback passes the header params unchanged and the
-        # single non-loop entry is the linear predecessor that can provide the
-        # preheader assignments.  Anything needing a real phi-update model stays
-        # explicit CFG.
-        if _incoming_assignments(block, block.id):
-            return None
+        # safe only when the loopback passes the header params unchanged and all
+        # non-loop entries are already represented by the linear predecessor,
+        # settled structured predecessors, or by the function-entry stack.
+        # Anything needing a real phi-update model stays explicit CFG.
+        loopback_assignments = _incoming_assignments(block, block.id)
         outside_preds = [pred for pred in block.predecessors if pred != block.id]
         if block.block_params:
             settled = set(self.settled_preds_by_block.get(block.id, set()))
@@ -2266,16 +2318,67 @@ class _SurfaceBuilder:
                 allowed_entries.discard(previous_source_id)
             if allowed_entries and not allowed_entries.issubset(settled):
                 return None
-            if previous_source_id is None and not outside_preds:
+            if previous_source_id is None and not outside_preds and block.index != 0:
                 return None
-        if _incoming_assignments(self.cfg.by_id.get(exit_succ), block.id):
-            return None
+        exit_assignments = _incoming_assignments(self.cfg.by_id.get(exit_succ), block.id)
         cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
+        branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+        if branch == block.id:
+            continue_condition = cond
+        elif fallthrough == block.id:
+            continue_condition = _negated_expr(cond)
+        else:
+            return None
         label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
         preheader = self._entry_assignments(block, previous_source_id, aliases)
-        self.constructs["do_while"] += 1
+        self.settled_preds_by_block[exit_succ].add(block.id)
+        if exit_assignments:
+            self.handled_param_predecessors_by_block[exit_succ].add(block.id)
         self.loop_headers += 1
         self.structured_loopbacks += _loopback_source_count(loop, self.cfg)
+        if loopback_assignments or exit_assignments:
+            body_nodes = _statement_nodes(list(block.statements))
+            body_nodes.append(_conditional_node(_negated_expr(continue_condition), [*exit_assignments, {"kind": "break", "target": None}]))
+            body_nodes.extend(loopback_assignments)
+            self.constructs["while"] += 1
+            region = {
+                "kind": "while",
+                "header_block": block.id,
+                "label": label,
+                "block_params": list(block.block_params),
+                "preheader": preheader,
+                "condition": _expr_node("true"),
+                "prologue": [],
+                "guard_condition": continue_condition,
+                "guard_exit": exit_assignments,
+                "rendering": "parameterized_self_loop",
+                "body": {
+                    "kind": "sequence",
+                    "regions": [
+                        {
+                            "kind": "block",
+                            "block_id": block.id,
+                            "label": None,
+                            "block_params": [],
+                            "prelabel": [],
+                            "body": [node for node in body_nodes if node is not None],
+                            "terminator": {
+                                "kind": "fallthrough",
+                                "condition": None,
+                                "rendered": [],
+                                "successors": [],
+                                "branch_target": None,
+                                "fallthrough_target": None,
+                            },
+                        }
+                    ],
+                },
+                "continue_target": block.id,
+                "break_target": exit_succ,
+                "break_targets": [exit_succ],
+            }
+            return region, idx + 1
+        self.constructs["do_while"] += 1
         region = {
             "kind": "do_while",
             "header_block": block.id,
@@ -2283,12 +2386,90 @@ class _SurfaceBuilder:
             "block_params": [],
             "preheader": preheader,
             "body": _statement_nodes(list(block.statements)),
-            "condition": cond,
+            "condition": continue_condition,
             "loopback": [],
             "continue_target": block.id,
             "break_target": exit_succ,
         }
         return region, idx + 1
+
+    def _try_transparent_header_loop(
+        self,
+        idx: int,
+        stop: int,
+        allowed: Optional[set[str]],
+        aliases: dict[str, Any],
+        hidden_labels: set[str],
+        previous_source_id: Optional[str],
+    ) -> Optional[tuple[dict[str, Any], int]]:
+        # Some bytecode emits an empty fallthrough block only as a loopback label:
+        #     header: goto body
+        #     body:   if (...) goto header
+        # Treat that label as the do-while header when it has no params or side
+        # effects, and when the body has no independent entry that would require
+        # preserving its own label.
+        header = self.blocks[idx]
+        if header.statements or header.block_params or header.terminator.get("kind") != "fallthrough":
+            return None
+        body_id = header.fallthrough_target or (header.successors[0] if header.successors else None)
+        body_idx = self.cfg.index_by_id.get(body_id)
+        if body_id is None or body_idx != idx + 1 or body_idx >= stop:
+            return None
+        if allowed is not None and (header.id not in allowed or body_id not in allowed):
+            return None
+        body = self.cfg.by_id.get(body_id)
+        if body is None or body.block_params or body.terminator.get("kind") != "branch":
+            return None
+        if header.id in aliases or body_id in aliases:
+            return None
+        branch, fallthrough = _edge_targets(body, self.cfg.index_by_id)
+        cond = _expr_node(body.terminator.get("condition") or body.terminator.get("text") or f"cond_{body.id}")
+        if branch == header.id and fallthrough is not None:
+            loop_cond = cond
+            exit_succ = fallthrough
+        elif fallthrough == header.id and branch is not None:
+            loop_cond = _negated_expr(cond)
+            exit_succ = branch
+        else:
+            return None
+        exit_idx = self.cfg.index_by_id.get(exit_succ)
+        if exit_idx is None or exit_idx <= body_idx or exit_idx > stop:
+            return None
+        if _incoming_assignments(header, body.id):
+            return None
+        if _incoming_assignments(self.cfg.by_id.get(exit_succ), body.id):
+            return None
+
+        header_entry_preds = {pred for pred in header.predecessors if pred != body.id}
+        body_entry_preds = {pred for pred in body.predecessors if pred != header.id}
+        if previous_source_id is not None:
+            header_entry_preds.discard(previous_source_id)
+            body_entry_preds.discard(previous_source_id)
+        settled_header = set(self.settled_preds_by_block.get(header.id, set()))
+        if header_entry_preds - settled_header:
+            return None
+        if body_entry_preds:
+            return None
+
+        preheader = self._entry_assignments(header, previous_source_id, aliases)
+        label = _format_block_label(header) if self._label_needed(header, hidden_labels, previous_source_id) else None
+        self.constructs["do_while"] += 1
+        self.loop_headers += 1
+        self.structured_loopbacks += 1
+        region = {
+            "kind": "do_while",
+            "header_block": header.id,
+            "label": label,
+            "block_params": [],
+            "preheader": preheader,
+            "body": _statement_nodes(list(body.statements)),
+            "condition": loop_cond,
+            "loopback": [],
+            "continue_target": header.id,
+            "break_target": exit_succ,
+            "rendering": "transparent_header_loop",
+        }
+        return region, body_idx + 1
 
     def _try_loop(
         self,
@@ -2431,6 +2612,16 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
+            transparent_loop = None if block.id in suppressed_loops else self._try_transparent_header_loop(
+                i, stop, allowed, aliases, hidden_labels, prev
+            )
+            if transparent_loop is not None:
+                region, next_i = transparent_loop
+                if next_i > i:
+                    regions.append(region)
+                    i = next_i
+                    prev = None
+                    continue
             loop = None if block.id in suppressed_loops else self._try_loop(i, stop, allowed, aliases, hidden_labels, prev)
             if loop is not None:
                 region, next_i = loop
@@ -2463,17 +2654,21 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
-            forward_skip = self._try_forward_skip_if(i, stop, allowed, aliases, hidden_labels, prev)
-            if forward_skip is not None:
-                region, next_i = forward_skip
+            branch = self._try_if(i, stop, allowed, aliases, hidden_labels, prev)
+            if branch is not None:
+                region, next_i = branch
                 if next_i > i:
                     regions.append(region)
                     i = next_i
                     prev = None
                     continue
-            branch = self._try_if(i, stop, allowed, aliases, hidden_labels, prev)
-            if branch is not None:
-                region, next_i = branch
+            # Prefer the stricter postdominator-shaped if/if-else rule before the
+            # forward-skip rule.  Forward-skip is intentionally permissive and can
+            # otherwise steal a normal diamond whose skipped arm ends in an
+            # already-folded constant jump, leaving a residual goto to the join.
+            forward_skip = self._try_forward_skip_if(i, stop, allowed, aliases, hidden_labels, prev)
+            if forward_skip is not None:
+                region, next_i = forward_skip
                 if next_i > i:
                     regions.append(region)
                     i = next_i
