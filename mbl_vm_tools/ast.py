@@ -22,7 +22,6 @@ from mbl_vm_tools.ast_cfg import (
     _edge_targets,
     _external_successors,
     _fold_constant_branches,
-    _loopback_source_count,
     _prune_unreachable_blocks,
 )
 from mbl_vm_tools.ast_flow import (
@@ -300,65 +299,42 @@ def _statement_target(stmt: dict[str, Any]) -> Optional[str]:
     return _base_label(str(target))
 
 
-def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
-    region_hist: Counter[str] = Counter()
-    statement_hist: Counter[str] = Counter()
-    expression_hist: Counter[str] = Counter()
+def _collect_ast_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
     rendered_labels: set[str] = set()
-    goto_targets: set[str] = set()
     jump_targets: set[str] = set()
     max_depth = 0
     parameterized_region_count = region_param_count = 0
     parameterized_block_count = block_param_count = 0
-    targeted_continue_count = targeted_break_count = 0
-    rendered_terminator_statement_count = 0
     unknown_branch_predicate_count = 0
     unresolved_call_rel_count = 0
-    predicate_opcode_hist: Counter[str] = Counter()
-    unresolved_call_rel_hist: Counter[str] = Counter()
 
     def visit_expr(expr: Any) -> None:
         nonlocal unknown_branch_predicate_count, unresolved_call_rel_count
         if not isinstance(expr, dict):
             return
         kind = str(expr.get("kind") or "unknown")
-        expression_hist[kind] += 1
         if kind == "predicate":
             source = str(expr.get("source") or "")
             match = re.match(r"^cond\[(?P<op>[^\]]+)\]\(", source)
-            if match is not None:
-                op = match.group("op")
-                predicate_opcode_hist[op] += 1
-                if op.lower() == "0x??":
-                    unknown_branch_predicate_count += 1
+            if match is not None and match.group("op").lower() == "0x??":
+                unknown_branch_predicate_count += 1
         elif kind == "call_expr":
             callee = str(expr.get("callee") or "")
             if callee.startswith("call_rel_"):
                 unresolved_call_rel_count += 1
-                unresolved_call_rel_hist[callee] += 1
         for arg in expr.get("args") or []:
             visit_expr(arg)
         for key in ("condition", "value", "target", "expr", "base"):
             visit_expr(expr.get(key))
 
     def visit_stmt(stmt: Any) -> None:
-        nonlocal targeted_continue_count, targeted_break_count
         if not isinstance(stmt, dict):
             return
         kind = str(stmt.get("kind") or "unknown")
-        statement_hist[kind] += 1
-        if kind == "goto":
-            target = _statement_target(stmt)
-            if target:
-                goto_targets.add(target)
-        elif kind in {"break", "continue"}:
+        if kind in {"goto", "break", "continue"}:
             target = _statement_target(stmt)
             if target:
                 jump_targets.add(target)
-                if kind == "break":
-                    targeted_break_count += 1
-                elif kind == "continue":
-                    targeted_continue_count += 1
         for key in ("expr", "condition", "value", "target"):
             visit_expr(stmt.get(key))
         visit_stmt(stmt.get("jump"))
@@ -367,11 +343,10 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
 
     def visit_region(region: Any, depth: int = 1) -> None:
         nonlocal max_depth, parameterized_region_count, region_param_count
-        nonlocal parameterized_block_count, block_param_count, rendered_terminator_statement_count
+        nonlocal parameterized_block_count, block_param_count
         if not isinstance(region, dict):
             return
         kind = str(region.get("kind") or "unknown")
-        region_hist[kind] += 1
         max_depth = max(max_depth, depth)
         label = _base_label(region.get("label"))
         if label:
@@ -387,7 +362,6 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
                 visit_stmt(stmt)
             term = region.get("terminator") or {}
             for stmt in term.get("rendered") or []:
-                rendered_terminator_statement_count += 1
                 visit_stmt(stmt)
             return
         if kind in {"if", "if_else", "while", "do_while", "empty_loop"}:
@@ -431,39 +405,17 @@ def _collect_ast_shape_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
                 visit_region(child, depth + 1)
 
     visit_region(ast_root)
-    dangling_gotos = sorted(target for target in goto_targets if target not in rendered_labels)
     dangling_jumps = sorted(target for target in jump_targets if target not in rendered_labels)
     return {
-        "ast_region_count": sum(region_hist.values()),
-        "ast_statement_count": sum(statement_hist.values()),
-        "ast_expression_count": sum(expression_hist.values()),
         "ast_max_depth": max_depth,
-        "ast_region_kind_histogram": dict(region_hist),
-        "ast_statement_kind_histogram": dict(statement_hist),
-        "ast_expression_kind_histogram": dict(expression_hist),
-        "explicit_cfg_region_count": region_hist.get("goto_region", 0),
         "ast_parameterized_region_count": parameterized_region_count,
         "ast_region_param_count": region_param_count,
         "ast_parameterized_block_count": parameterized_block_count,
         "ast_block_param_count": block_param_count,
-        "ast_targeted_continue_count": targeted_continue_count,
-        "ast_targeted_break_count": targeted_break_count,
-        "ast_rendered_terminator_statement_count": rendered_terminator_statement_count,
-        "ast_rendered_label_count": len(rendered_labels),
-        "ast_goto_target_count": len(goto_targets),
-        "ast_dangling_goto_count": len(dangling_gotos),
-        "ast_jump_target_count": len(jump_targets),
-        "ast_dangling_jump_count": len(dangling_jumps),
-        "ast_dangling_jump_targets": dangling_gotos + dangling_jumps,
+        "ast_dangling_jump_targets": dangling_jumps,
         "ast_unknown_branch_predicate_count": unknown_branch_predicate_count,
-        "ast_predicate_opcode_histogram": dict(predicate_opcode_hist),
         "ast_unresolved_call_rel_count": unresolved_call_rel_count,
-        "ast_unresolved_call_rel_histogram": dict(unresolved_call_rel_hist.most_common(32)),
     }
-
-
-def _statement_text(stmt: dict[str, Any]) -> str:
-    return _render_statement(stmt).strip()
 
 
 def _is_nonsemantic_data_statement(stmt: dict[str, Any]) -> bool:
@@ -481,7 +433,7 @@ def _is_nonsemantic_data_statement(stmt: dict[str, Any]) -> bool:
     if '"family": "PAD' in normalized:
         return True
     # Plain byte-runs with no semantic role are tokenizer padding/dump leakage,
-    # not source-level statements.  Keep this deliberately narrow: byte+len
+    # not source-level statements. Keep this deliberately narrow: byte+len
     # records carry no VM effect, while named ASCII/DWBLOB families remain
     # visible if the frontend later decides to model them semantically.
     if '"byte":' in normalized and '"len":' in normalized and '"family":' not in normalized:
@@ -489,38 +441,9 @@ def _is_nonsemantic_data_statement(stmt: dict[str, Any]) -> bool:
     return False
 
 
-def _is_data_nop_statement(stmt: dict[str, Any]) -> bool:
-    return _is_nonsemantic_data_statement(stmt)
-
-
 def _statement_nodes(statements: list[Any]) -> list[dict[str, Any]]:
     nodes = [_statement_node(stmt) for stmt in statements]
     return [node for node in nodes if not _is_nonsemantic_data_statement(node)]
-
-
-def _collect_simple_body_statements(region: Any) -> Optional[list[dict[str, Any]]]:
-    if not isinstance(region, dict):
-        return None
-    if region.get("kind") == "sequence":
-        out: list[dict[str, Any]] = []
-        for child in region.get("regions") or []:
-            items = _collect_simple_body_statements(child)
-            if items is None:
-                return None
-            out.extend(items)
-        return out
-    if region.get("kind") != "block":
-        return None
-    if region.get("label") or region.get("block_params") or region.get("prelabel"):
-        return None
-    term = region.get("terminator") or {}
-    if term.get("rendered"):
-        return None
-    if term.get("kind") not in {None, "return", "fallthrough"}:
-        return None
-    return list(region.get("body") or [])
-
-
 
 
 def _region_has_visible_content(region: Any, keep_block_ids: Optional[set[str]] = None) -> bool:
@@ -546,28 +469,6 @@ def _region_has_visible_content(region: Any, keep_block_ids: Optional[set[str]] 
 
 def _drop_empty_regions(regions: list[dict[str, Any]], keep_block_ids: Optional[set[str]] = None) -> list[dict[str, Any]]:
     return [region for region in regions if _region_has_visible_content(region, keep_block_ids)]
-
-
-
-def _classify_trivial_function_body(ast_root: dict[str, Any], entry_args: list[str]) -> dict[str, Any]:
-    statements = _collect_simple_body_statements(ast_root)
-    if statements is None:
-        return {"kind": "nontrivial", "is_trivial": False, "reason": "structured_or_explicit_control", "semantic_statement_count": None, "ignored_noop_statement_count": 0}
-    ignored = sum(1 for stmt in statements if _is_data_nop_statement(stmt))
-    significant = [stmt for stmt in statements if not _is_data_nop_statement(stmt)]
-    base = {"is_trivial": False, "semantic_statement_count": len(significant), "ignored_noop_statement_count": ignored, "raw_statement_count": len(statements)}
-    if not significant:
-        return {**base, "kind": "empty", "is_trivial": True, "reason": "no_semantic_statements"}
-    if len(significant) == 1 and significant[0].get("kind") == "return":
-        value = significant[0].get("value")
-        value_text = _render_expr(value) if value is not None else ""
-        if isinstance(value, dict) and value.get("kind") == "literal" and value.get("literal_type") == "int" and value.get("value") == 0:
-            return {**base, "kind": "return_zero", "is_trivial": True, "reason": "single_zero_return_after_noops", "return_value_text": value_text}
-        if isinstance(value, dict) and value.get("kind") == "symbol" and value.get("name") in entry_args:
-            arg = str(value.get("name"))
-            return {**base, "kind": "return_argument", "is_trivial": True, "reason": "single_entry_argument_return_after_noops", "return_value_text": value_text, "return_argument": arg, "return_argument_index": entry_args.index(arg)}
-        return {**base, "kind": "return_only_other", "reason": "single_non_requested_return", "return_value_text": value_text}
-    return {**base, "kind": "nontrivial", "reason": "semantic_statements_before_or_after_return", "sample_statements": [_statement_text(stmt) for stmt in significant[:4]]}
 
 
 def _validate_ast_semantics(ast_root: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
@@ -630,12 +531,6 @@ class _SurfaceBuilder:
         self.blocks = _prune_unreachable_blocks(_fold_constant_branches(blocks))
         self.cfg = _build_cfg(self.blocks)
         self.constructs: Counter[str] = Counter()
-        self.fallback_regions = 0
-        self.fallback_blocks = 0
-        self.residual_labels = 0
-        self.residual_gotos = 0
-        self.loop_headers = 0
-        self.structured_loopbacks = 0
         self.settled_preds_by_block: dict[str, set[str]] = defaultdict(set)
         self.handled_param_predecessors_by_block: dict[str, set[str]] = defaultdict(set)
         self.needed_label_ids: set[str] = set()
@@ -649,15 +544,7 @@ class _SurfaceBuilder:
 
     def build(self) -> tuple[dict[str, Any], dict[str, Any]]:
         tree = {"kind": "sequence", "regions": self._range(0, len(self.blocks), None, {}, set(), None, set())}
-        meta = {
-            "constructs": dict(self.constructs),
-            "fallback_region_count": self.fallback_regions,
-            "fallback_block_count": self.fallback_blocks,
-            "residual_label_count": self.residual_labels,
-            "residual_goto_count": self.residual_gotos,
-            "loop_header_count": self.loop_headers,
-            "structured_loopback_count": self.structured_loopbacks,
-        }
+        meta = {"constructs": dict(self.constructs)}
         return tree, meta
 
     def _next_allowed_id(self, idx: int, stop: int, allowed: Optional[set[str]]) -> Optional[str]:
@@ -1000,9 +887,6 @@ class _SurfaceBuilder:
             if term_nodes[0].get("kind") == "goto" and goto_count:
                 goto_count = 0
             term_nodes = []
-        label_count = 1 if label and block.id not in self.needed_label_ids else 0
-        self.residual_labels += label_count
-        self.residual_gotos += goto_count
         region = {
             "kind": "block",
             "block_id": block.id,
@@ -1019,14 +903,8 @@ class _SurfaceBuilder:
                 "fallthrough_target": block.fallthrough_target,
             },
         }
-        # A visible label is only an anchor; it does not by itself mean the block
-        # had to fall back to explicit CFG. Keep labels in residual_label_count,
-        # but reserve goto_region/fallback accounting for blocks that still render
-        # an unstructured transfer.
         if goto_count:
-            self.fallback_regions += 1
-            self.fallback_blocks += 1
-            region = {"kind": "goto_region", "label_count": label_count, "goto_count": goto_count, "blocks": [region]}
+            region = {"kind": "goto_region", "goto_count": goto_count, "blocks": [region]}
         return region, block.id
 
     def _edge_alias_to_join(self, join_id: str, source_ids: set[str]) -> dict[str, Any]:
@@ -1281,8 +1159,6 @@ class _SurfaceBuilder:
 
         label = _format_block_label(label_block) if self._label_needed(label_block, hidden_labels, previous_source_id) else None
         self.constructs["decision_loop"] += 1
-        self.loop_headers += 1
-        self.structured_loopbacks += backward_edge_count
         return {
             "kind": "decision_loop",
             "label": label,
@@ -1873,8 +1749,6 @@ class _SurfaceBuilder:
         self.settled_preds_by_block[exit_succ].add(block.id)
         if exit_assignments:
             self.handled_param_predecessors_by_block[exit_succ].add(block.id)
-        self.loop_headers += 1
-        self.structured_loopbacks += _loopback_source_count(loop, self.cfg)
         if loopback_assignments or exit_assignments:
             body_nodes = _statement_nodes(list(block.statements))
             body_nodes.append(_conditional_node(_negated_expr(continue_condition), [*exit_assignments, {"kind": "break", "target": None}]))
@@ -2005,8 +1879,6 @@ class _SurfaceBuilder:
 
         preheader = self._entry_assignments(header, previous_source_id, aliases)
         label = _format_block_label(header) if self._label_needed(header, hidden_labels, previous_source_id) else None
-        self.loop_headers += 1
-        self.structured_loopbacks += 1
         if not body.statements:
             self.constructs["empty_loop"] += 1
             region = {
@@ -2073,8 +1945,6 @@ class _SurfaceBuilder:
         header_exit_assignments = _incoming_assignments(self.cfg.by_id.get(exit_succ), block.id)
         guarded = bool(block.statements or header_exit_assignments)
         self.constructs["while"] += 1
-        self.loop_headers += 1
-        self.structured_loopbacks += _loopback_source_count(loop, self.cfg)
         label = _format_block_label(block) if self._label_needed(block, hidden_labels, previous_source_id) else None
         region = {
             "kind": "while",
@@ -2373,48 +2243,26 @@ def build_function_ast_from_payload(function_payload: dict[str, Any], *, include
     builder = _SurfaceBuilder(blocks)
     region_tree, structured_meta = builder.build()
     ast_root = region_tree or {"kind": "sequence", "regions": []}
-    shape_metrics = _collect_ast_shape_metrics(ast_root)
-    semantic_validation = _validate_ast_semantics(ast_root, shape_metrics)
+    ast_metrics = _collect_ast_metrics(ast_root)
+    semantic_validation = _validate_ast_semantics(ast_root, ast_metrics)
     ast_text = _render_function_text(name, list(entry_args), ast_root, include_text)
-    trivial_body = _classify_trivial_function_body(ast_root, list(entry_args))
-    block_count = len(blocks)
-    fallback_block_count = int(structured_meta.get("fallback_block_count", 0))
-    residual_goto_count = int(structured_meta.get("residual_goto_count", 0))
-    residual_label_count = int(structured_meta.get("residual_label_count", 0))
-    structured_block_count = max(0, block_count - fallback_block_count)
-    fallback_block_ratio = (fallback_block_count / block_count) if block_count else 0.0
     summary = {
-        "normalized_basic_block_count": block_count,
-        "structured_block_count": structured_block_count,
-        "structured_block_ratio": (structured_block_count / block_count) if block_count else 1.0,
-        "fallback_block_ratio": fallback_block_ratio,
+        "normalized_basic_block_count": len(blocks),
+        "max_ast_depth": int(ast_metrics.get("ast_max_depth", 0)),
         "region_kind_histogram": structured_meta.get("constructs", {}),
-        "fallback_region_count": structured_meta.get("fallback_region_count", 0),
-        "fallback_block_count": fallback_block_count,
-        "residual_label_count": residual_label_count,
-        "residual_goto_count": residual_goto_count,
-        "residual_goto_density": (residual_goto_count / block_count) if block_count else 0.0,
-        "residual_label_density": (residual_label_count / block_count) if block_count else 0.0,
-        "loop_header_count": structured_meta.get("loop_header_count", 0),
-        "structured_loopback_count": structured_meta.get("structured_loopback_count", 0),
-        "source_shape_score": max(0.0, 1.0 - fallback_block_ratio - (0.25 * ((residual_goto_count / block_count) if block_count else 0.0))),
-        **shape_metrics,
-        "semantic_body_kind": trivial_body.get("kind"),
-        "semantic_trivial_body": bool(trivial_body.get("is_trivial")),
-        "semantic_statement_count": trivial_body.get("semantic_statement_count"),
-        "ignored_noop_statement_count": trivial_body.get("ignored_noop_statement_count", 0),
+        "ast_parameterized_region_count": int(ast_metrics.get("ast_parameterized_region_count", 0)),
+        "ast_region_param_count": int(ast_metrics.get("ast_region_param_count", 0)),
+        "ast_parameterized_block_count": int(ast_metrics.get("ast_parameterized_block_count", 0)),
+        "ast_block_param_count": int(ast_metrics.get("ast_block_param_count", 0)),
         "ast_semantic_error_count": int(semantic_validation.get("error_count", 0)),
         "ast_semantic_error_kind_histogram": semantic_validation.get("kind_histogram", {}),
         "ast_semantic_warning_count": int(semantic_validation.get("warning_count", 0)),
-        "ast_unknown_branch_predicate_count": int(shape_metrics.get("ast_unknown_branch_predicate_count", 0)),
-        "ast_unresolved_call_rel_count": int(shape_metrics.get("ast_unresolved_call_rel_count", 0)),
         "ast_semantic_warning_kind_histogram": semantic_validation.get("warning_kind_histogram", {}),
-        "ast_forced_label_count": 0,
+        "ast_unresolved_call_rel_count": int(ast_metrics.get("ast_unresolved_call_rel_count", 0)),
     }
     diagnostics = {
-        "structuring": {**structured_meta, "forced_label_count": 0, "forced_labels": []},
-        "ast_shape": shape_metrics,
-        "semantic_body": trivial_body,
+        "structuring": structured_meta,
+        "ast_metrics": ast_metrics,
         "semantic_validation": semantic_validation,
         "timings_ms": {"total": round((time.perf_counter() - t0) * 1000.0, 3)},
     }
@@ -2457,67 +2305,28 @@ def _merge_counter(counter: Counter[str], payload: dict[str, Any] | None) -> Non
 
 
 def _empty_module_summary(function_summaries: list[dict[str, Any]]) -> dict[str, Any]:
-    semantic_body_hist = Counter(str(summary.get("semantic_body_kind") or "unknown") for summary in function_summaries)
     region_hist: Counter[str] = Counter()
-    ast_region_hist: Counter[str] = Counter()
-    statement_hist: Counter[str] = Counter()
-    expression_hist: Counter[str] = Counter()
     semantic_error_hist: Counter[str] = Counter()
     semantic_warning_hist: Counter[str] = Counter()
-    predicate_opcode_hist: Counter[str] = Counter()
-    unresolved_call_rel_hist: Counter[str] = Counter()
     for summary in function_summaries:
         _merge_counter(region_hist, summary.get("region_kind_histogram", {}))
-        _merge_counter(ast_region_hist, summary.get("ast_region_kind_histogram", {}))
-        _merge_counter(statement_hist, summary.get("ast_statement_kind_histogram", {}))
-        _merge_counter(expression_hist, summary.get("ast_expression_kind_histogram", {}))
         _merge_counter(semantic_error_hist, summary.get("ast_semantic_error_kind_histogram", {}))
         _merge_counter(semantic_warning_hist, summary.get("ast_semantic_warning_kind_histogram", {}))
-        _merge_counter(predicate_opcode_hist, summary.get("ast_predicate_opcode_histogram", {}))
-        _merge_counter(unresolved_call_rel_hist, summary.get("ast_unresolved_call_rel_histogram", {}))
     return {
         "function_count": len(function_summaries),
         "total_normalized_basic_blocks": sum(summary.get("normalized_basic_block_count", 0) for summary in function_summaries),
-        "total_structured_blocks": sum(summary.get("structured_block_count", 0) for summary in function_summaries),
-        "total_fallback_regions": sum(summary.get("fallback_region_count", 0) for summary in function_summaries),
-        "total_fallback_blocks": sum(summary.get("fallback_block_count", 0) for summary in function_summaries),
-        "total_residual_labels": sum(summary.get("residual_label_count", 0) for summary in function_summaries),
-        "total_residual_gotos": sum(summary.get("residual_goto_count", 0) for summary in function_summaries),
-        "total_loop_headers": sum(summary.get("loop_header_count", 0) for summary in function_summaries),
-        "total_structured_loopbacks": sum(summary.get("structured_loopback_count", 0) for summary in function_summaries),
-        "avg_source_shape_score": (sum(summary.get("source_shape_score", 1.0) for summary in function_summaries) / len(function_summaries)) if function_summaries else 1.0,
-        "max_ast_depth": max((summary.get("ast_max_depth", 0) for summary in function_summaries), default=0),
-        "total_ast_regions": sum(summary.get("ast_region_count", 0) for summary in function_summaries),
-        "total_ast_statements": sum(summary.get("ast_statement_count", 0) for summary in function_summaries),
-        "total_ast_expressions": sum(summary.get("ast_expression_count", 0) for summary in function_summaries),
-        "total_explicit_cfg_regions": sum(summary.get("explicit_cfg_region_count", 0) for summary in function_summaries),
+        "max_ast_depth": max((summary.get("max_ast_depth", 0) for summary in function_summaries), default=0),
         "total_ast_parameterized_regions": sum(summary.get("ast_parameterized_region_count", 0) for summary in function_summaries),
         "total_ast_region_params": sum(summary.get("ast_region_param_count", 0) for summary in function_summaries),
         "total_ast_parameterized_blocks": sum(summary.get("ast_parameterized_block_count", 0) for summary in function_summaries),
         "total_ast_block_params": sum(summary.get("ast_block_param_count", 0) for summary in function_summaries),
-        "total_ast_targeted_continues": sum(summary.get("ast_targeted_continue_count", 0) for summary in function_summaries),
-        "total_ast_targeted_breaks": sum(summary.get("ast_targeted_break_count", 0) for summary in function_summaries),
-        "total_ast_rendered_terminator_statements": sum(summary.get("ast_rendered_terminator_statement_count", 0) for summary in function_summaries),
-        "total_ast_rendered_labels": sum(summary.get("ast_rendered_label_count", 0) for summary in function_summaries),
-        "total_ast_goto_targets": sum(summary.get("ast_goto_target_count", 0) for summary in function_summaries),
-        "total_ast_dangling_gotos": sum(summary.get("ast_dangling_goto_count", 0) for summary in function_summaries),
-        "total_ast_jump_targets": sum(summary.get("ast_jump_target_count", 0) for summary in function_summaries),
-        "total_ast_dangling_jumps": sum(summary.get("ast_dangling_jump_count", 0) for summary in function_summaries),
         "total_ast_semantic_errors": sum(summary.get("ast_semantic_error_count", 0) for summary in function_summaries),
         "total_ast_semantic_warnings": sum(summary.get("ast_semantic_warning_count", 0) for summary in function_summaries),
-        "total_ast_unknown_branch_predicates": sum(summary.get("ast_unknown_branch_predicate_count", 0) for summary in function_summaries),
         "total_ast_unresolved_call_rels": sum(summary.get("ast_unresolved_call_rel_count", 0) for summary in function_summaries),
-        "semantic_body_kind_histogram": dict(semantic_body_hist),
+        "region_kind_histogram": dict(region_hist),
         "ast_semantic_error_kind_histogram": dict(semantic_error_hist),
         "ast_semantic_warning_kind_histogram": dict(semantic_warning_hist),
-        "ast_predicate_opcode_histogram": dict(predicate_opcode_hist),
-        "ast_unresolved_call_rel_histogram": dict(unresolved_call_rel_hist.most_common(32)),
-        "region_kind_histogram": dict(region_hist),
-        "ast_region_kind_histogram": dict(ast_region_hist),
-        "ast_statement_kind_histogram": dict(statement_hist),
-        "ast_expression_kind_histogram": dict(expression_hist),
     }
-
 
 def build_module_ast(
     path: str | Path,
@@ -2594,109 +2403,55 @@ def summarize_ast_corpus(module_payloads: list[dict[str, Any]]) -> dict[str, Any
     summary = _empty_module_summary(summaries)
     summary["module_count"] = len(module_payloads)
     summary["failed_module_count"] = 0
-    summary["fully_structured_function_count"] = sum(1 for item in summaries if int(item.get("fallback_block_count", 0)) == 0 and int(item.get("residual_goto_count", 0)) == 0)
-    summary["fallback_function_count"] = sum(1 for item in summaries if int(item.get("fallback_block_count", 0)) or int(item.get("residual_goto_count", 0)))
-    total_blocks = int(summary.get("total_normalized_basic_blocks", 0))
-    summary["structured_block_ratio"] = (summary.get("total_structured_blocks", 0) / total_blocks) if total_blocks else 1.0
-    summary["fallback_block_ratio"] = (summary.get("total_fallback_blocks", 0) / total_blocks) if total_blocks else 0.0
-    summary["residual_goto_density_per_1k_blocks"] = (1000.0 * summary.get("total_residual_gotos", 0) / total_blocks) if total_blocks else 0.0
 
-    worst: list[dict[str, Any]] = []
-    dangling: list[dict[str, Any]] = []
-    unknown_predicate: list[dict[str, Any]] = []
+    semantic_errors: list[dict[str, Any]] = []
     unresolved_calls: list[dict[str, Any]] = []
     for module in module_payloads:
         for fn in module.get("functions", []):
+            fn_summary = fn.get("summary", {})
             ref = _entry_ref(module, fn)
-            item = {**ref, **{k: fn.get("summary", {}).get(k) for k in (
-                "normalized_basic_block_count", "fallback_block_count", "residual_goto_count", "ast_dangling_goto_count", "ast_dangling_jump_count", "ast_semantic_error_count", "ast_semantic_warning_count", "ast_unknown_branch_predicate_count", "ast_unresolved_call_rel_count", "source_shape_score"
-            )}}
-            if item.get("fallback_block_count") or item.get("residual_goto_count"):
-                worst.append(item)
-            if item.get("ast_dangling_goto_count") or item.get("ast_dangling_jump_count") or item.get("ast_semantic_error_count"):
-                dangling.append(item)
-            if item.get("ast_unknown_branch_predicate_count"):
-                unknown_predicate.append(item)
+            item = {
+                **ref,
+                "normalized_basic_block_count": fn_summary.get("normalized_basic_block_count"),
+                "ast_semantic_error_count": fn_summary.get("ast_semantic_error_count"),
+                "ast_semantic_warning_count": fn_summary.get("ast_semantic_warning_count"),
+                "ast_unresolved_call_rel_count": fn_summary.get("ast_unresolved_call_rel_count"),
+            }
+            if item.get("ast_semantic_error_count"):
+                semantic_errors.append(item)
             if item.get("ast_unresolved_call_rel_count"):
                 unresolved_calls.append(item)
-    worst.sort(key=lambda item: (-int(item.get("fallback_block_count") or 0), -int(item.get("residual_goto_count") or 0), str(item.get("script_name")), str(item.get("function"))))
-    dangling.sort(key=lambda item: (-int(item.get("ast_semantic_error_count") or 0), -int(item.get("ast_dangling_goto_count") or 0), str(item.get("script_name")), str(item.get("function"))))
-    unknown_predicate.sort(key=lambda item: (-int(item.get("ast_unknown_branch_predicate_count") or 0), str(item.get("script_name")), str(item.get("function"))))
+
+    semantic_errors.sort(key=lambda item: (-int(item.get("ast_semantic_error_count") or 0), str(item.get("script_name")), str(item.get("function"))))
     unresolved_calls.sort(key=lambda item: (-int(item.get("ast_unresolved_call_rel_count") or 0), str(item.get("script_name")), str(item.get("function"))))
     return {
         "contract": {
-            "version": "ast-report-v2",
+            "version": "ast-report-v3",
             "ast_contract": AST_CONTRACT_VERSION,
-            "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_corpus_metrics"],
+            "layers": ["normalized_hir", "node_ast_builder", "ast_renderer", "ast_summary"],
             "notes": [
-                "AST v8 keeps residual explicit CFG as a first-class result, not as an input to a repair loop.",
-                "Dangling jump counters are semantic validation failures, and text rendering is output-only.",
+                "Report counters are limited to AST normalization, block-param materialization, and semantic validation signals.",
+                "Renderer labels, fallback/residual-goto accounting, and raw statement/expression histograms are intentionally not report metrics.",
             ],
         },
         "summary": summary,
-        "ast_metrics": {
-            "region_kind_histogram": summary.get("region_kind_histogram", {}),
-            "ast_region_kind_histogram": summary.get("ast_region_kind_histogram", {}),
-            "ast_statement_kind_histogram": summary.get("ast_statement_kind_histogram", {}),
-            "ast_expression_kind_histogram": summary.get("ast_expression_kind_histogram", {}),
-            "semantic_body_kind_histogram": summary.get("semantic_body_kind_histogram", {}),
-            "ast_semantic_error_kind_histogram": summary.get("ast_semantic_error_kind_histogram", {}),
-            "ast_semantic_warning_kind_histogram": summary.get("ast_semantic_warning_kind_histogram", {}),
-            "ast_predicate_opcode_histogram": summary.get("ast_predicate_opcode_histogram", {}),
-            "ast_unresolved_call_rel_histogram": summary.get("ast_unresolved_call_rel_histogram", {}),
-            "control_flow_counters": {
-                "loop_headers": summary.get("total_loop_headers", 0),
-                "structured_loopbacks": summary.get("total_structured_loopbacks", 0),
-                "explicit_cfg_regions": summary.get("total_explicit_cfg_regions", 0),
-                "rendered_labels": summary.get("total_ast_rendered_labels", 0),
-                "goto_targets": summary.get("total_ast_goto_targets", 0),
-                "dangling_gotos": summary.get("total_ast_dangling_gotos", 0),
-                "jump_targets": summary.get("total_ast_jump_targets", 0),
-                "dangling_jumps": summary.get("total_ast_dangling_jumps", 0),
-                "semantic_errors": summary.get("total_ast_semantic_errors", 0),
-                "semantic_warnings": summary.get("total_ast_semantic_warnings", 0),
-                "unknown_branch_predicates": summary.get("total_ast_unknown_branch_predicates", 0),
-                "unresolved_call_rels": summary.get("total_ast_unresolved_call_rels", 0),
-            },
-        },
         "rankings": {
-            "worst_fallback_functions": worst[:64],
-            "most_residual_goto_functions": sorted(worst, key=lambda item: -int(item.get("residual_goto_count") or 0))[:64],
-            "most_dangling_goto_functions": dangling[:64],
-            "most_dangling_jump_functions": dangling[:64],
-            "most_semantic_error_functions": dangling[:64],
-            "most_unknown_branch_predicate_functions": unknown_predicate[:64],
+            "most_semantic_error_functions": semantic_errors[:64],
             "most_unresolved_call_rel_functions": unresolved_calls[:64],
-            "module_structuring_watchlist": [
-                {
-                    "script_name": module.get("script_name"),
-                    "fallback_block_count": module.get("summary", {}).get("total_fallback_blocks", 0),
-                    "residual_goto_count": module.get("summary", {}).get("total_residual_gotos", 0),
-                    "ast_semantic_error_count": module.get("summary", {}).get("total_ast_semantic_errors", 0),
-                    "ast_semantic_warning_count": module.get("summary", {}).get("total_ast_semantic_warnings", 0),
-                    "ast_unknown_branch_predicate_count": module.get("summary", {}).get("total_ast_unknown_branch_predicates", 0),
-                    "ast_unresolved_call_rel_count": module.get("summary", {}).get("total_ast_unresolved_call_rels", 0),
-                }
-                for module in sorted(module_payloads, key=lambda m: -int(m.get("summary", {}).get("total_fallback_blocks", 0)))[:64]
-            ],
         },
         "modules": [
             {
                 "script_name": module.get("script_name"),
                 "function_count": module.get("summary", {}).get("function_count", 0),
                 "normalized_basic_block_count": module.get("summary", {}).get("total_normalized_basic_blocks", 0),
-                "fallback_block_count": module.get("summary", {}).get("total_fallback_blocks", 0),
-                "residual_goto_count": module.get("summary", {}).get("total_residual_gotos", 0),
                 "ast_semantic_error_count": module.get("summary", {}).get("total_ast_semantic_errors", 0),
                 "ast_semantic_warning_count": module.get("summary", {}).get("total_ast_semantic_warnings", 0),
-                "ast_unknown_branch_predicate_count": module.get("summary", {}).get("total_ast_unknown_branch_predicates", 0),
                 "ast_unresolved_call_rel_count": module.get("summary", {}).get("total_ast_unresolved_call_rels", 0),
                 "region_kind_histogram": module.get("summary", {}).get("region_kind_histogram", {}),
             }
             for module in sorted(module_payloads, key=lambda item: str(item.get("script_name")))
         ],
     }
-
 
 def render_function_ast_text_from_payload(function_payload: dict[str, Any]) -> str:
     return str(function_payload.get("ast_text") or "").rstrip()
