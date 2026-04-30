@@ -79,7 +79,7 @@ class ASTFunction:
         return payload
 
 
-_EXPR_CALL_RE = re.compile(r"^(?P<target>[A-Za-z_][A-Za-z0-9_]*)\((?P<args>.*)\)$")
+_EXPR_CALL_RE = re.compile(r"^(?P<target>call_rel_-?\d+|[A-Za-z_][A-Za-z0-9_]*)\((?P<args>.*)\)$")
 _MEMBER_RE = re.compile(r"^(?P<base>[A-Za-z_][A-Za-z0-9_]*)\.(?P<field>[A-Za-z_][A-Za-z0-9_]*)$")
 _INT_RE = re.compile(r"^-?\d+$")
 _FLOAT_RE = re.compile(r"^-?(?:\d+\.\d*|\d*\.\d+)$")

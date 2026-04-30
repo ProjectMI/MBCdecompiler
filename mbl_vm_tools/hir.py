@@ -12,7 +12,7 @@ from mbl_vm_tools.IR import IRFunction, IRNode, build_function_ir
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-HIR_CONTRACT_VERSION = "hir-v11"
+HIR_CONTRACT_VERSION = "hir-v13"
 
 
 def _coerce_hir_block(payload: dict[str, Any]) -> "HIRBlock":
@@ -218,6 +218,16 @@ def _format_call_target(inst: CanonicalInstruction) -> str:
     return "call"
 
 
+def _format_code_ref_target(inst: CanonicalInstruction) -> str:
+    encoded = inst.control.get("encoded_target_offset")
+    if encoded is not None:
+        return f"code_ref_{encoded}"
+    rel = inst.operands.get("rel")
+    if rel is not None:
+        return f"code_ref_{rel}"
+    return "code_ref"
+
+
 def _format_record_constructor(inst: CanonicalInstruction) -> str:
     parts: list[str] = []
     for key in sorted(inst.operands.keys()):
@@ -273,6 +283,8 @@ def _canonical_expr(inst: CanonicalInstruction, args: list[str]) -> str:
         return _format_record_constructor(inst)
     if inst.semantic_op == "aggregate":
         return _format_aggregate(inst)
+    if inst.semantic_op == "code_ref":
+        return _format_code_ref_target(inst)
     if inst.semantic_op in {"call", "syscall", "opaque_call"}:
         return f"{_format_call_target(inst)}({', '.join(args)})"
     if inst.semantic_op == "cmp":
@@ -293,6 +305,8 @@ def _infer_stack_io(inst: CanonicalInstruction) -> tuple[int, int]:
         forced_in = int(operands.get("stack_inputs_required") or 0)
         forced_out = int(operands.get("stack_outputs", 0) or 0)
         return forced_in, forced_out
+    if op == "code_ref":
+        return 0, 0
     if op in {"const", "load", "read_field", "make_record", "aggregate", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op", "vm_op"}:
         if op in {"call", "syscall", "opaque_call"}:
             return int(operands.get("argc", 0) or 0), 1
@@ -569,7 +583,7 @@ def _signature_to_steps(node: IRNode) -> list[tuple[str, str, dict[str, Any]]]:
         return [("return", "return", {"family": family})]
     if node.semantic_op == "branch":
         return [("branch", "branch", dict(operands))]
-    if node.semantic_op in {"call", "syscall", "opaque_call", "const", "load", "read_field", "make_record", "aggregate", "store", "write_field", "cmp", "vm_op"}:
+    if node.semantic_op in {"call", "syscall", "opaque_call", "const", "load", "read_field", "make_record", "aggregate", "code_ref", "store", "write_field", "cmp", "vm_op"}:
         return [(node.semantic_op, node.semantic_op, dict(operands))]
     if node.semantic_op.startswith("opaque_"):
         return [(node.semantic_op, node.semantic_op, dict(operands))]
@@ -656,19 +670,84 @@ def _build_instruction_control(instructions: list[CanonicalInstruction], nodes: 
                     "fallthrough": True,
                 }
             )
+        elif inst.semantic_op == "code_ref" and inst.operands.get("rel") is not None:
+            encoded_target_offset = origin.control.get("encoded_target_offset")
+            if encoded_target_offset is None:
+                encoded_target_offset = inst.operands.get("rel")
+            nearest_instruction_offset = origin.control.get("nearest_instruction_offset")
+            if nearest_instruction_offset is None:
+                nearest_instruction_offset = origin.control.get("resolved_target_offset")
+            control.update(
+                {
+                    "kind": "code_ref",
+                    "encoded_target_offset": encoded_target_offset,
+                    "target_addressing_mode": origin.control.get("target_addressing_mode"),
+                    "resolved_local_target_offset": origin.control.get("resolved_local_target_offset"),
+                    "nearest_instruction_offset": nearest_instruction_offset,
+                    "nearest_instruction_delta": origin.control.get("nearest_instruction_delta"),
+                    # Backward-compatible diagnostic aliases.  This is not a CFG
+                    # branch/call target and must not be used as a control edge.
+                    "resolved_target_offset": nearest_instruction_offset,
+                    "resolved_target_instruction_index": offset_to_first_inst.get(nearest_instruction_offset),
+                    "resolved_target_confidence": origin.control.get("resolved_target_confidence"),
+                    "fallthrough": True,
+                }
+            )
         inst.control = control
 
 
-def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _compute_canonical_blocks(
+    instructions: list[CanonicalInstruction],
+    *,
+    declared_local_end: int | None = None,
+    min_code_ref_confidence: float = 0.75,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not instructions:
         cfg = {
             "entry_block": None,
             "blocks": [],
             "edges": [],
             "anomalies": [],
-            "stats": {"block_count": 0, "edge_count": 0, "unreachable_blocks": 0, "unresolved_targets": 0},
+            "stats": {
+                "block_count": 0,
+                "edge_count": 0,
+                "unreachable_blocks": 0,
+                "unresolved_targets": 0,
+                "code_ref_cfg_edges": 0,
+                "fallthrough_cuts": 0,
+            },
         }
         return [], cfg
+
+    def _code_ref_target_index(inst: CanonicalInstruction) -> int | None:
+        if inst.semantic_op != "code_ref":
+            return None
+        target_index = inst.control.get("resolved_target_instruction_index")
+        if not isinstance(target_index, int):
+            return None
+        confidence = inst.control.get("resolved_target_confidence")
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        if confidence_value < min_code_ref_confidence:
+            return None
+        if target_index < 0 or target_index >= len(instructions):
+            return None
+        return target_index
+
+    def _crosses_extension_boundary(src_block: dict[str, Any], dst_block: dict[str, Any] | None) -> bool:
+        if declared_local_end is None or dst_block is None:
+            return False
+        # The selected span may be extended past the definition table's declared
+        # end.  A byte-layout neighbour across that old boundary is not an
+        # implicit runtime successor; only explicit branch/code_ref edges may
+        # reach the detached fragment.
+        return (
+            src_block["start_offset"] < declared_local_end
+            and src_block["end_offset"] >= declared_local_end
+            and dst_block["start_offset"] >= declared_local_end
+        )
 
     leaders: set[int] = {0}
     for idx, inst in enumerate(instructions):
@@ -676,11 +755,26 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
         if ctrl.get("is_terminator"):
             target_index = ctrl.get("target_instruction_index")
             if target_index is not None:
-                leaders.add(target_index)
+                leaders.add(int(target_index))
             if ctrl.get("fallthrough") and idx + 1 < len(instructions):
                 leaders.add(idx + 1)
+        code_ref_target_index = _code_ref_target_index(inst)
+        if code_ref_target_index is not None:
+            leaders.add(code_ref_target_index)
+            # Keep the marker isolated from following payload/code so the edge is
+            # represented in CFG before dataflow and before surface cleanup.
+            if idx + 1 < len(instructions):
+                leaders.add(idx + 1)
 
-    sorted_leaders = sorted(leaders)
+    if declared_local_end is not None:
+        for idx, inst in enumerate(instructions):
+            if inst.offset >= declared_local_end or (inst.offset < declared_local_end <= inst.offset + inst.size):
+                leaders.add(idx)
+                if inst.offset < declared_local_end <= inst.offset + inst.size and idx + 1 < len(instructions):
+                    leaders.add(idx + 1)
+                break
+
+    sorted_leaders = sorted(item for item in leaders if 0 <= item < len(instructions))
     blocks: list[dict[str, Any]] = []
     inst_to_block: dict[int, str] = {}
     for block_idx, start_idx in enumerate(sorted_leaders):
@@ -707,13 +801,31 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
     block_index = {block["id"]: idx for idx, block in enumerate(blocks)}
     edges: list[dict[str, Any]] = []
     anomalies: list[dict[str, Any]] = []
+    edge_keys: set[tuple[str, Optional[str], str, Optional[int], Optional[int]]] = set()
 
-    def add_edge(src: str, dst: Optional[str], kind: str, target_offset: Optional[int] = None) -> None:
+    def add_edge(
+        src: str,
+        dst: Optional[str],
+        kind: str,
+        target_offset: Optional[int] = None,
+        *,
+        instruction_index: int | None = None,
+        connect: bool = True,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        key = (src, dst, kind, target_offset, instruction_index)
+        if key in edge_keys:
+            return
+        edge_keys.add(key)
         edge = {"src": src, "dst": dst, "kind": kind}
         if target_offset is not None:
             edge["target_offset"] = target_offset
+        if instruction_index is not None:
+            edge["instruction_index"] = instruction_index
+        if extra:
+            edge.update(extra)
         edges.append(edge)
-        if dst is None:
+        if dst is None or not connect:
             return
         src_block = blocks[block_index[src]]
         if dst not in src_block["successors"]:
@@ -722,10 +834,33 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
         if src not in dst_block["predecessors"]:
             dst_block["predecessors"].append(src)
 
+    def add_fallthrough_edge(src_block: dict[str, Any], dst_block: dict[str, Any] | None) -> None:
+        if dst_block is None:
+            src_block["flags"].append("open_exit")
+            return
+        if _crosses_extension_boundary(src_block, dst_block):
+            src_block["flags"].append("extension_boundary_fallthrough_cut")
+            if src_block["start_offset"] < declared_local_end < src_block["end_offset"]:
+                src_block["flags"].append("span_boundary_crossing_instruction")
+            dst_block["flags"].append("detached_code_ref_fragment")
+            add_edge(
+                src_block["id"],
+                dst_block["id"],
+                "fallthrough_cut",
+                None,
+                connect=False,
+                extra={
+                    "barrier_offset": declared_local_end,
+                    "reason": "implicit_fallthrough_crosses_code_ref_extension_boundary",
+                },
+            )
+            return
+        add_edge(src_block["id"], dst_block["id"], "fallthrough")
+
     for idx, block in enumerate(blocks):
         terminator = instructions[block["terminator_index"]]
         ctrl = terminator.control
-        next_block_id = blocks[idx + 1]["id"] if idx + 1 < len(blocks) else None
+        next_block = blocks[idx + 1] if idx + 1 < len(blocks) else None
 
         if ctrl.get("kind") == "return":
             block["flags"].append("returns")
@@ -733,7 +868,7 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
 
         if ctrl.get("kind") == "branch":
             target_inst = ctrl.get("target_instruction_index")
-            target_block = inst_to_block.get(target_inst) if target_inst is not None else None
+            target_block = inst_to_block.get(int(target_inst)) if isinstance(target_inst, int) else None
             if target_block is not None:
                 add_edge(block["id"], target_block, "branch", ctrl.get("target_offset"))
             else:
@@ -748,16 +883,44 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
                 )
                 block["flags"].append("unresolved_branch_target")
                 add_edge(block["id"], None, "branch_unresolved", ctrl.get("target_offset"))
-            if next_block_id is not None and ctrl.get("fallthrough"):
-                add_edge(block["id"], next_block_id, "fallthrough")
-            elif next_block_id is None:
+            if ctrl.get("fallthrough"):
+                add_fallthrough_edge(block, next_block)
+            elif next_block is None:
                 block["flags"].append("open_exit")
             continue
 
-        if next_block_id is not None:
-            add_edge(block["id"], next_block_id, "fallthrough")
-        else:
-            block["flags"].append("open_exit")
+        add_fallthrough_edge(block, next_block)
+
+    # CODE_REF63 is an internal code-address encoding.  It is not a stack value
+    # or call, but its resolved target must be part of the HIR CFG so AST sees
+    # a normal normalized graph instead of a side-channel hint.
+    for inst in instructions:
+        target_inst = _code_ref_target_index(inst)
+        if target_inst is None:
+            continue
+        src_block = inst_to_block.get(inst.index)
+        target_block = inst_to_block.get(target_inst)
+        if src_block is None or target_block is None or src_block == target_block:
+            continue
+        target_offset = inst.control.get("nearest_instruction_offset")
+        source = blocks[block_index[src_block]]
+        target = blocks[block_index[target_block]]
+        source["flags"].append("has_code_ref_edge")
+        target["flags"].append("code_ref_target")
+        if declared_local_end is not None and target["start_offset"] >= declared_local_end:
+            target["flags"].append("detached_code_ref_fragment")
+        add_edge(
+            src_block,
+            target_block,
+            "code_ref",
+            int(target_offset) if isinstance(target_offset, int) else None,
+            instruction_index=inst.index,
+            extra={
+                "encoded_target_offset": inst.control.get("encoded_target_offset"),
+                "target_addressing_mode": inst.control.get("target_addressing_mode"),
+                "confidence": inst.control.get("resolved_target_confidence"),
+            },
+        )
 
     reachable: set[str] = set()
     if blocks:
@@ -774,6 +937,9 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
     for block in blocks:
         if block["id"] not in reachable:
             block["flags"].append("unreachable")
+            if declared_local_end is not None and block["start_offset"] >= declared_local_end:
+                block["flags"].append("detached_unreachable_fragment")
+                continue
             anomalies.append({"kind": "unreachable_block", "block_id": block["id"]})
 
     cfg = {
@@ -786,6 +952,8 @@ def _compute_canonical_blocks(instructions: list[CanonicalInstruction]) -> tuple
             "edge_count": len(edges),
             "unreachable_blocks": sum(1 for block in blocks if "unreachable" in block["flags"]),
             "unresolved_targets": sum(1 for item in anomalies if item["kind"] == "unresolved_branch_target"),
+            "code_ref_cfg_edges": sum(1 for edge in edges if edge.get("kind") == "code_ref"),
+            "fallthrough_cuts": sum(1 for edge in edges if edge.get("kind") == "fallthrough_cut"),
         },
     }
     return blocks, cfg
@@ -1069,7 +1237,7 @@ def build_hir_blocks(
                         placeholder_count += 1
             expr = _canonical_expr(inst, args)
 
-            if inst.semantic_op in {"const", "load", "read_field", "make_record", "aggregate", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op", "vm_op"}:
+            if inst.semantic_op in {"const", "load", "read_field", "make_record", "aggregate", "code_ref", "call", "syscall", "opaque_call", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate", "opaque_op", "vm_op"}:
                 if outputs:
                     out_name = outputs[0]
                     value_map[out_name] = DataflowValue(name=out_name, producer_instruction=inst.index, expr=expr)
@@ -1420,6 +1588,11 @@ def _sanitize_hir_blocks(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
     )
 
 
+def _has_code_ref_cfg_role(block: HIRBlock) -> bool:
+    flags = set(block.flags)
+    return bool(flags & {"has_code_ref_edge", "code_ref_target", "detached_code_ref_fragment", "extension_boundary_fallthrough_cut"})
+
+
 def _collect_hir_defs(blocks: list[HIRBlock]) -> set[str]:
     defs: set[str] = set()
     if blocks:
@@ -1567,6 +1740,8 @@ def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock
         succ = by_id.get(succ_id)
         if succ is None or succ.id == block.id:
             continue
+        if _has_code_ref_cfg_role(block) or _has_code_ref_cfg_role(succ):
+            continue
 
         forwarded_incoming = {pred: list(args) for pred, args in succ.incoming_args.items() if pred != block.id}
         forwarded_tail = list(succ.incoming_args.get(block.id, []))
@@ -1612,6 +1787,8 @@ def _rewrite_linear_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBloc
         succ_id = block.successors[0]
         succ = by_id.get(succ_id)
         if succ is None or succ.id == block.id:
+            continue
+        if _has_code_ref_cfg_role(block) or _has_code_ref_cfg_role(succ):
             continue
         if succ.predecessors != [block.id]:
             continue
@@ -1944,6 +2121,11 @@ def _function_summary(
         "value_count": len(core_values),
         "macro_lowered_count": sum(1 for inst in canonical if inst.macro_kind),
         "call_count": canonical_hist.get("call", 0) + canonical_hist.get("syscall", 0) + canonical_hist.get("opaque_call", 0),
+        "code_ref_count": canonical_hist.get("code_ref", 0),
+        "code_ref_gap_target_count": sum(1 for item in analysis_hints.get("code_refs", []) if item.get("target_region") == "post_definition_gap"),
+        "code_ref_cfg_edge_count": int(cfg.get("stats", {}).get("code_ref_cfg_edges", 0)),
+        "code_ref_soft_edge_count": len(analysis_hints.get("code_ref_edges", [])),
+        "span_boundary_cut_count": int(cfg.get("stats", {}).get("fallthrough_cuts", 0)),
         "branch_count": canonical_hist.get("branch", 0),
         "return_count": canonical_hist.get("return", 0),
         "cfg_anomaly_count": len(cfg.get("anomalies", [])),
@@ -1985,8 +2167,104 @@ def _looks_like_aggregate_prologue(nodes: list[IRNode]) -> bool:
     if len(nodes) == 1:
         return True
     next_node = nodes[1]
-    return next_node.semantic_op in {"const", "load", "read_field", "call", "syscall", "opaque_call", "branch", "return", "cmp", "make_record", "vm_op"}
+    return next_node.semantic_op in {"const", "load", "read_field", "code_ref", "call", "syscall", "opaque_call", "branch", "return", "cmp", "make_record", "vm_op"}
 
+
+
+def _code_ref_target_region(function_start: int | None, declared_end: int | None, selected_end: int | None, absolute_target: int | None) -> str | None:
+    if function_start is None or selected_end is None or absolute_target is None:
+        return None
+    if absolute_target < function_start:
+        return "before_function_start"
+    if absolute_target >= selected_end:
+        return "after_selected_span"
+    if declared_end is not None and absolute_target >= declared_end:
+        return "post_definition_gap"
+    return "declared_span"
+
+
+def _collect_code_ref_hints(
+    canonical: list[CanonicalInstruction],
+    blocks: list[HIRBlock] | None = None,
+    *,
+    function_start: int | None = None,
+    declared_end: int | None = None,
+    selected_end: int | None = None,
+) -> list[dict[str, Any]]:
+    instruction_to_block: dict[int, str] = {}
+    if blocks:
+        for block in blocks:
+            for inst_index in block.instruction_indices:
+                instruction_to_block[int(inst_index)] = block.id
+
+    refs: list[dict[str, Any]] = []
+    for inst in canonical:
+        if inst.semantic_op != "code_ref":
+            continue
+        encoded = inst.control.get("encoded_target_offset")
+        nearest_local = inst.control.get("nearest_instruction_offset")
+        absolute_target = None
+        absolute_nearest = None
+        if isinstance(encoded, int) and function_start is not None:
+            # Absolute only when the addressing mode is absolute-local.  Relative
+            # forms are resolved through nearest_local below.
+            if inst.control.get("target_addressing_mode") == "absolute_local":
+                absolute_target = function_start + encoded
+        if isinstance(nearest_local, int) and function_start is not None:
+            absolute_nearest = function_start + nearest_local
+            if absolute_target is None:
+                absolute_target = absolute_nearest
+        target_inst_index = inst.control.get("resolved_target_instruction_index")
+        refs.append(
+            {
+                "instruction_index": inst.index,
+                "block": instruction_to_block.get(inst.index),
+                "offset": inst.offset,
+                "absolute_offset": (function_start + inst.offset) if function_start is not None else None,
+                "size": inst.size,
+                "raw_kind": inst.raw_kind,
+                "prefix_chain": list(inst.operands.get("prefix_chain") or []),
+                "encoded_target_offset": encoded,
+                "target_addressing_mode": inst.control.get("target_addressing_mode"),
+                "resolved_local_target_offset": inst.control.get("resolved_local_target_offset"),
+                "nearest_instruction_offset": nearest_local,
+                "nearest_instruction_delta": inst.control.get("nearest_instruction_delta"),
+                "absolute_target_offset": absolute_target,
+                "absolute_nearest_instruction_offset": absolute_nearest,
+                "target_region": _code_ref_target_region(function_start, declared_end, selected_end, absolute_target),
+                "target_instruction_index": target_inst_index,
+                "target_block": instruction_to_block.get(int(target_inst_index)) if isinstance(target_inst_index, int) else None,
+                "nearest_instruction_confidence": inst.control.get("resolved_target_confidence"),
+            }
+        )
+    return refs
+
+
+def _collect_code_ref_edges(refs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    edges: list[dict[str, Any]] = []
+    for ref in refs:
+        target_index = ref.get("target_instruction_index")
+        if target_index is None:
+            continue
+        edges.append(
+            {
+                "edge_kind": "code_ref_soft",
+                "hard_cfg_edge": False,
+                "source_instruction_index": ref.get("instruction_index"),
+                "source_block": ref.get("block"),
+                "source_offset": ref.get("offset"),
+                "source_absolute_offset": ref.get("absolute_offset"),
+                "target_instruction_index": target_index,
+                "target_block": ref.get("target_block"),
+                "target_offset": ref.get("nearest_instruction_offset"),
+                "target_absolute_offset": ref.get("absolute_nearest_instruction_offset"),
+                "encoded_target_offset": ref.get("encoded_target_offset"),
+                "target_addressing_mode": ref.get("target_addressing_mode"),
+                "target_region": ref.get("target_region"),
+                "confidence": ref.get("nearest_instruction_confidence"),
+            }
+        )
+    return edges
 
 
 def _build_hir_analysis_hints(blocks: list[HIRBlock]) -> dict[str, Any]:
@@ -2104,7 +2382,18 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
     t_lower0 = time.perf_counter()
     canonical, _ = lower_ir_nodes(hir_nodes)
     _build_instruction_control(canonical, hir_nodes)
-    canonical_blocks, canonical_cfg = _compute_canonical_blocks(canonical)
+
+    span_payload_for_cfg = dict(ir_function.span or {})
+    body_selection_for_cfg = dict(ir_function.body_selection or {})
+    declared_span_for_cfg = (body_selection_for_cfg.get("span_extension") or {}).get("declared_span") or body_selection_for_cfg.get("exact_span")
+    declared_local_end: int | None = None
+    if isinstance(declared_span_for_cfg, dict):
+        function_start_for_cfg = span_payload_for_cfg.get("start")
+        declared_end_for_cfg = declared_span_for_cfg.get("end")
+        if isinstance(function_start_for_cfg, int) and isinstance(declared_end_for_cfg, int):
+            declared_local_end = max(0, declared_end_for_cfg - function_start_for_cfg)
+
+    canonical_blocks, canonical_cfg = _compute_canonical_blocks(canonical, declared_local_end=declared_local_end)
     t_lower1 = time.perf_counter()
 
     t_core0 = time.perf_counter()
@@ -2141,6 +2430,27 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
             "switch_candidates": [],
             "skipped_for_ast_summary": True,
         }
+    span_payload = dict(ir_function.span or {})
+    function_start = span_payload.get("start")
+    selected_end = span_payload.get("end")
+    body_selection = dict(ir_function.body_selection or {})
+    declared_span_payload = (body_selection.get("span_extension") or {}).get("declared_span") or body_selection.get("exact_span")
+    declared_end = None
+    if isinstance(declared_span_payload, dict):
+        declared_end = declared_span_payload.get("end")
+
+    code_ref_hints = _collect_code_ref_hints(
+        canonical,
+        normalized_blocks,
+        function_start=function_start if isinstance(function_start, int) else None,
+        declared_end=declared_end if isinstance(declared_end, int) else None,
+        selected_end=selected_end if isinstance(selected_end, int) else None,
+    )
+    if code_ref_hints:
+        analysis_hints["code_refs"] = code_ref_hints
+        code_ref_edges = _collect_code_ref_edges(code_ref_hints)
+        if code_ref_edges:
+            analysis_hints["code_ref_edges"] = code_ref_edges
     if prologue_meta is not None:
         analysis_hints["prologue"] = prologue_meta
     t_hints1 = time.perf_counter()
@@ -2212,6 +2522,11 @@ def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
         "avg_canonical_instructions_per_function": (total_canonical / function_count) if function_count else 0.0,
         "avg_canonical_instructions_per_export": (total_canonical / function_count) if function_count else 0.0,
         "total_values": sum(fn.summary["value_count"] for fn in functions),
+        "total_code_ref_count": sum(fn.summary.get("code_ref_count", 0) for fn in functions),
+        "total_code_ref_gap_targets": sum(fn.summary.get("code_ref_gap_target_count", 0) for fn in functions),
+        "total_code_ref_cfg_edges": sum(fn.summary.get("code_ref_cfg_edge_count", 0) for fn in functions),
+        "total_code_ref_soft_edges": sum(fn.summary.get("code_ref_soft_edge_count", 0) for fn in functions),
+        "total_span_boundary_cuts": sum(fn.summary.get("span_boundary_cut_count", 0) for fn in functions),
         "total_cfg_anomalies": sum(fn.summary["cfg_anomaly_count"] for fn in functions),
         "total_unresolved_branches": sum(fn.summary["unresolved_branch_count"] for fn in functions),
         "total_macro_lowered": sum(fn.summary["macro_lowered_count"] for fn in functions),
@@ -2286,6 +2601,7 @@ def build_module_hir(
                 "branch predicates are rendered as cond[opcode](value) to avoid inventing exact VM truth semantics",
                 "normalized_hir applies only semantics-safe cleanup, fallthrough collapse, and merge-parameter renaming",
                 "analysis_hints provides dominators, postdominators, loop candidates, branch regions, and switch candidates for AST",
+                "CODE_REF63 is lifted as non-stack code-reference CFG normalization, never as call/value stack semantics",
                 "corpus-level reporting is intentionally owned by ast.py",
                 "final structuring and semantic lifting now belong to ast.py, not hir.py",
             ],

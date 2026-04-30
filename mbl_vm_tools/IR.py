@@ -22,25 +22,27 @@ SEMANTIC_PRECEDENCE = {
     "make_record": 9,
     "aggregate": 10,
     "const": 11,
-    "data": 12,
-    "opaque_const": 13,
-    "opaque_load": 14,
-    "opaque_store": 15,
-    "opaque_call": 16,
-    "opaque_branch": 17,
-    "opaque_cmp": 18,
-    "opaque_record": 19,
-    "opaque_aggregate": 20,
-    "opaque_data": 21,
-    "vm_op": 22,
-    "opaque_op": 23,
-    "unknown": 24,
+    "code_ref": 12,
+    "data": 13,
+    "opaque_const": 14,
+    "opaque_load": 15,
+    "opaque_store": 16,
+    "opaque_call": 17,
+    "opaque_branch": 18,
+    "opaque_cmp": 19,
+    "opaque_record": 20,
+    "opaque_aggregate": 21,
+    "opaque_data": 22,
+    "vm_op": 23,
+    "opaque_op": 24,
+    "unknown": 25,
 }
 
 CONST_KINDS = {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "F32", "OPU16"}
 REF_KINDS = {"REF", "REF16"}
 RECORD_KINDS = {"REC41", "REC61", "REC62"}
-CALL_KINDS = {"CALL66", "CALL63A", "CALL63B"}
+CALL_KINDS = {"CALL66", "CALL63A"}
+CODE_REF_KINDS = {"CODE_REF63"}
 BRANCH_KINDS = {"BR"}
 RETURN_KINDS = {"PAIR72_23", "SIG_RETURN_TAIL", "END"}
 DATA_KINDS = {"PAD", "ASCII", "DWBLOB", "NOP", "MARK"}
@@ -142,6 +144,7 @@ class ExportBodySelection:
     exact_span: dict[str, int] | None
     candidates: list[dict[str, Any]]
     entry: dict[str, Any] | None = None
+    span_extension: dict[str, Any] | None = None
     raw: bytes = field(repr=False, default=b"")
     tokens: list[Token] = field(repr=False, default_factory=list)
     nodes: list[IRNode] = field(repr=False, default_factory=list)
@@ -159,6 +162,8 @@ class ExportBodySelection:
         }
         if self.entry is not None:
             payload["entry"] = self.entry
+        if self.span_extension is not None:
+            payload["span_extension"] = self.span_extension
         return payload
 
 
@@ -238,6 +243,8 @@ def _category_for_kind(raw_kind: str, terminal_kind: str) -> str:
         return "record"
     if terminal_kind in CALL_KINDS:
         return "call"
+    if terminal_kind in CODE_REF_KINDS:
+        return "code_ref"
     if terminal_kind in BRANCH_KINDS:
         return "branch"
     if terminal_kind in RETURN_KINDS:
@@ -282,8 +289,9 @@ def _opcode_for_token(raw_kind: str, terminal_kind: str, category: str) -> str:
         return {
             "CALL66": "call.native",
             "CALL63A": "call.rel_argv",
-            "CALL63B": "call.rel",
         }.get(terminal_kind, "call")
+    if category == "code_ref":
+        return "code.ref"
     if category == "branch":
         return "branch"
     if category == "return":
@@ -367,9 +375,10 @@ def _normalize_operands(raw_kind: str, terminal_kind: str, payload: dict[str, An
         call_kind = {
             "CALL66": "native",
             "CALL63A": "relative_with_arity",
-            "CALL63B": "relative",
         }[terminal_kind]
         operands.update({"call_kind": call_kind, **payload})
+    elif terminal_kind in CODE_REF_KINDS:
+        operands.update({"code_ref_kind": "function_local_label", **payload})
     elif terminal_kind == "BR":
         operands.update(
             {
@@ -430,8 +439,10 @@ def _lower_prefixed_basic(terminal_kind: str, prefix_chain: list[str]) -> tuple[
         return "make_record", ["make_record"], _clamp(0.96 - depth_penalty, 0.60, 0.96), "basic.record"
     if terminal_kind == "CALL66":
         return "syscall", ["syscall"], _clamp(0.98 - depth_penalty, 0.60, 0.98), "basic.call66"
-    if terminal_kind in {"CALL63A", "CALL63B"}:
+    if terminal_kind == "CALL63A":
         return "call", ["call"], _clamp(0.98 - depth_penalty, 0.60, 0.98), "basic.call63"
+    if terminal_kind == "CODE_REF63":
+        return "code_ref", ["code_ref"], _clamp(0.98 - depth_penalty, 0.60, 0.98), "basic.code_ref63"
     if terminal_kind == "BR":
         comps = ["branch"] if not prefix_chain else ["cmp", "branch"]
         return "branch", comps, _clamp(0.96 - depth_penalty, 0.50, 0.96), "basic.branch"
@@ -496,6 +507,9 @@ def _lower_signature_family(
     elif "CALL63" in family_name:
         components.append("call")
         confidence = max(confidence, 0.70)
+    elif "CODE_REF63" in family_name or "CODE_REF" in family_name:
+        components.append("code_ref")
+        confidence = max(confidence, 0.70)
     if "BR" in family_name or "offset" in operands or "off" in operands:
         components.extend(["cmp", "branch"])
         confidence = max(confidence, 0.64)
@@ -522,7 +536,7 @@ def _lower_signature_family(
         return "opaque_op", ["opaque_op"], 0.25, f"signature-fallback:{family}"
 
     primary = _choose_primary_semantic(components)
-    if primary in {"const", "load", "call", "syscall", "branch", "cmp", "make_record", "aggregate", "read_field", "write_field", "store", "data", "return"}:
+    if primary in {"const", "load", "code_ref", "call", "syscall", "branch", "cmp", "make_record", "aggregate", "read_field", "write_field", "store", "data", "return"}:
         return primary, _unique_preserve(components), _clamp(confidence, 0.30, 0.90), f"signature-heuristic:{family}"
     return primary, _unique_preserve(components), _clamp(confidence, 0.20, 0.75), f"signature-opaque:{family}"
 
@@ -565,6 +579,94 @@ BRANCH_SIGNED_PREFERENCES: dict[str, list[tuple[str, int]]] = {
     "PFX_F1_72_BR": [("start", 2), ("start", 1), ("start", 0), ("end", 2)],
     "PFX_F1_3D_BR": [("start", 2), ("start", 1), ("start", 0), ("end", 2)],
 }
+
+def _nearest_code_ref_boundary(target: int, valid_offsets: set[int], formula_prefix: str, base_confidence: float) -> dict[str, Any] | None:
+    if target in valid_offsets:
+        return {
+            "resolved": True,
+            "nearest_instruction_offset": target,
+            "nearest_instruction_delta": 0,
+            "formula": f"{formula_prefix}+0",
+            "confidence": base_confidence,
+        }
+
+    # CODE_REF63 often names a byte-level VM sub-position that is folded into a
+    # wider tokenizer node.  Keep the encoded payload intact, but expose the
+    # nearest instruction-start as an inspection aid and a soft lifting target.
+    for distance in range(1, 9):
+        for delta in (distance, -distance):
+            candidate = target + delta
+            if candidate in valid_offsets:
+                return {
+                    "resolved": True,
+                    "nearest_instruction_offset": candidate,
+                    "nearest_instruction_delta": delta,
+                    "formula": f"{formula_prefix}{delta:+d}",
+                    "confidence": max(0.42, base_confidence - 0.04 * distance),
+                }
+    return None
+
+
+def _resolve_code_ref_target(
+    encoded_offset: int,
+    valid_offsets: set[int],
+    *,
+    node_offset: int | None = None,
+    node_size: int = 0,
+) -> dict[str, Any]:
+    """Resolve a 0x63 code-reference payload without turning it into a call.
+
+    The common CODE_REF63 form is an absolute function-local code offset.  Stage
+    three found hidden post-definition fragments where negative payloads behave
+    like signed local references from the current token.  We therefore preserve
+    the raw encoded value and try several addressing modes, in a conservative
+    order: absolute-local first, then signed relative-from-end/start.  The result
+    is still a soft code reference, not a hard CFG edge.
+    """
+    encoded = int(encoded_offset)
+    attempts: list[tuple[str, int, float]] = []
+    if encoded >= 0:
+        attempts.append(("absolute_local", encoded, 0.96))
+    if node_offset is not None:
+        # Negative refs cannot be absolute-local targets, but they can point
+        # backwards to earlier local code.  Try end first because branch-like VM
+        # encodings usually count after the full opcode payload.
+        if encoded < 0:
+            attempts.append(("signed_from_end", int(node_offset) + int(node_size) + encoded, 0.88))
+            attempts.append(("signed_from_start", int(node_offset) + encoded, 0.82))
+        else:
+            # Only a fallback for currently unresolved positive payloads.
+            attempts.append(("signed_from_end", int(node_offset) + int(node_size) + encoded, 0.46))
+            attempts.append(("signed_from_start", int(node_offset) + encoded, 0.42))
+
+    seen: set[tuple[str, int]] = set()
+    for mode, target, confidence in attempts:
+        key = (mode, target)
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved = _nearest_code_ref_boundary(target, valid_offsets, mode, confidence)
+        if resolved is None:
+            continue
+        return {
+            "resolved": True,
+            "encoded_target_offset": encoded,
+            "addressing_mode": mode,
+            "resolved_local_target_offset": resolved.get("nearest_instruction_offset"),
+            **resolved,
+        }
+
+    return {
+        "resolved": False,
+        "encoded_target_offset": encoded,
+        "addressing_mode": None,
+        "resolved_local_target_offset": None,
+        "nearest_instruction_offset": None,
+        "nearest_instruction_delta": None,
+        "formula": None,
+        "confidence": 0.0,
+    }
+
 
 def _resolve_branch_target(
     displacement: int,
@@ -693,6 +795,27 @@ def _build_control(node: IRNode, valid_offsets: set[int]) -> dict[str, Any]:
         )
         return control
 
+    if node.semantic_op == "code_ref" and "rel" in node.operands:
+        ref_info = _resolve_code_ref_target(int(node.operands["rel"]), valid_offsets, node_offset=node.offset, node_size=node.size)
+        control.update(
+            {
+                "kind": "code_ref",
+                "is_terminator": False,
+                "fallthrough": True,
+                "encoded_target_offset": ref_info.get("encoded_target_offset"),
+                "target_addressing_mode": ref_info.get("addressing_mode"),
+                "resolved_local_target_offset": ref_info.get("resolved_local_target_offset"),
+                "nearest_instruction_offset": ref_info.get("nearest_instruction_offset"),
+                "nearest_instruction_delta": ref_info.get("nearest_instruction_delta"),
+                # Backward-compatible diagnostic aliases.  These are not CFG
+                # branch targets and must not be used to create control-flow edges.
+                "resolved_target_offset": ref_info.get("nearest_instruction_offset"),
+                "resolved_target_formula": ref_info.get("formula"),
+                "resolved_target_confidence": ref_info.get("confidence"),
+            }
+        )
+        return control
+
     return control
 
 
@@ -812,6 +935,101 @@ def _slice_code_span_with_lookahead(mod: MBCModule, span: tuple[int, int], looka
     return mod._slice_code_span(start, tail_end), max(0, end - start)
 
 
+def _next_definition_boundary_for_span(mod: MBCModule, span: tuple[int, int]) -> int:
+    start, end = span
+    code_limit = mod.get_real_code_size()
+    later_starts = [rec.a for rec in mod.definitions if rec.a > start]
+    if later_starts:
+        return max(end, min(code_limit, min(later_starts)))
+    return code_limit
+
+
+def _code_ref_gap_extension_for_span(
+    mod: MBCModule,
+    declared_span: tuple[int, int] | None,
+    nodes: list[IRNode],
+) -> tuple[tuple[int, int] | None, dict[str, Any] | None]:
+    if declared_span is None:
+        return None, None
+
+    start, declared_end = declared_span
+    boundary = _next_definition_boundary_for_span(mod, declared_span)
+    if boundary <= declared_end:
+        return None, None
+
+    gap_refs: list[dict[str, Any]] = []
+    seen: set[tuple[int, int, int]] = set()
+    for node in nodes:
+        if node.semantic_op != "code_ref" or "rel" not in node.operands:
+            continue
+        try:
+            encoded = int(node.operands["rel"])
+        except (TypeError, ValueError):
+            continue
+        # Positive CODE_REF63 payloads are predominantly absolute-local code
+        # offsets.  If such an offset points into the post-definition gap, the
+        # declared span has truncated a reachable local fragment.
+        if encoded < 0:
+            continue
+        target_abs = start + encoded
+        if not (declared_end <= target_abs < boundary):
+            continue
+        key = (node.offset, encoded, target_abs)
+        if key in seen:
+            continue
+        seen.add(key)
+        gap_refs.append(
+            {
+                "source_instruction_index": node.index,
+                "source_offset": node.offset,
+                "source_absolute_offset": start + node.offset,
+                "source_raw_kind": node.raw_kind,
+                "prefix_chain": list(node.prefix_chain),
+                "encoded_target_offset": encoded,
+                "target_absolute_offset": target_abs,
+                "target_gap_offset": target_abs - declared_end,
+            }
+        )
+
+    if not gap_refs:
+        return None, None
+
+    extended_span = (start, boundary)
+    extension = {
+        "kind": "code_ref_gap_extension",
+        "reason": "code_ref_target_in_post_definition_gap",
+        "declared_span": _span_dict(declared_span),
+        "extended_span": _span_dict(extended_span),
+        "extension_boundary": boundary,
+        "extension_bytes": max(0, boundary - declared_end),
+        "target_count": len(gap_refs),
+        "targets": gap_refs[:64],
+    }
+    if len(gap_refs) > 64:
+        extension["truncated_target_count"] = len(gap_refs) - 64
+    return extended_span, extension
+
+
+def _reslice_for_code_ref_gap_extension(
+    mod: MBCModule,
+    mode: str,
+    declared_span: tuple[int, int] | None,
+    nodes: list[IRNode],
+) -> tuple[dict[str, Any] | None, list[Token], list[IRNode], bytes, dict[str, Any] | None]:
+    extended_span, extension = _code_ref_gap_extension_for_span(mod, declared_span, nodes)
+    if extended_span is None or extension is None:
+        return None, [], [], b"", None
+
+    raw, limit = _slice_code_span_with_lookahead(mod, extended_span)
+    if not raw:
+        return None, [], [], b"", None
+    stats, tokens, extended_nodes, effective_raw = _summarize_body_candidate(mode, extended_span, raw, body_limit=limit)
+    extension["post_extension_token_count"] = stats.get("token_count")
+    extension["post_extension_node_count"] = stats.get("node_count")
+    extension["post_extension_unknown_ratio"] = stats.get("unknown_ratio")
+    return stats, tokens, extended_nodes, effective_raw, extension
+
+
 def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySelection:
     exact_span, exact_reason = mod.get_function_exact_code_span_with_reason(entry)
     exact_raw = b""
@@ -824,6 +1042,21 @@ def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySe
     if exact_span is not None and exact_raw:
         exact_stats, exact_tokens, exact_nodes, exact_raw = _summarize_body_candidate("definition_exact", exact_span, exact_raw, body_limit=exact_limit)
 
+    span_extension: dict[str, Any] | None = None
+    if exact_stats is not None:
+        extended_stats, extended_tokens, extended_nodes, extended_raw, extension = _reslice_for_code_ref_gap_extension(
+            mod,
+            "definition_code_ref_extended",
+            exact_span,
+            exact_nodes,
+        )
+        if extended_stats is not None and extension is not None:
+            exact_stats = extended_stats
+            exact_tokens = extended_tokens
+            exact_nodes = extended_nodes
+            exact_raw = extended_raw
+            span_extension = extension
+
     if exact_stats is None:
         return ExportBodySelection(
             name=entry.name,
@@ -835,6 +1068,7 @@ def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySe
             exact_span=_span_dict(exact_span),
             candidates=[],
             entry=_entry_payload(entry),
+            span_extension=span_extension,
             raw=b"",
             tokens=[],
             nodes=[],
@@ -842,14 +1076,15 @@ def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySe
 
     return ExportBodySelection(
         name=entry.name,
-        slice_mode="definition_exact",
+        slice_mode="definition_code_ref_extended" if span_extension is not None else "definition_exact",
         used_fallback=False,
-        reason="definition_exact",
+        reason="code_ref_target_in_post_definition_gap" if span_extension is not None else "definition_exact",
         span=exact_stats["span"],
         public_span=exact_stats["span"],
         exact_span=_span_dict(exact_span),
         candidates=[exact_stats],
         entry=_entry_payload(entry),
+        span_extension=span_extension,
         raw=exact_raw,
         tokens=exact_tokens,
         nodes=exact_nodes,
@@ -873,17 +1108,33 @@ def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | 
     if exact_span is not None and exact_raw:
         exact_stats, exact_tokens, exact_nodes, exact_raw = _summarize_body_candidate("definition_exact", exact_span, exact_raw, body_limit=exact_limit)
 
+    span_extension: dict[str, Any] | None = None
+    if exact_stats is not None:
+        extended_stats, extended_tokens, extended_nodes, extended_raw, extension = _reslice_for_code_ref_gap_extension(
+            mod,
+            "definition_code_ref_extended",
+            exact_span,
+            exact_nodes,
+        )
+        if extended_stats is not None and extension is not None:
+            exact_stats = extended_stats
+            exact_tokens = extended_tokens
+            exact_nodes = extended_nodes
+            exact_raw = extended_raw
+            span_extension = extension
+
     if _exact_body_is_stable(exact_stats):
         return ExportBodySelection(
             name=entry.name if entry is not None else export_name,
-            slice_mode="definition_exact",
+            slice_mode="definition_code_ref_extended" if span_extension is not None else "definition_exact",
             used_fallback=False,
-            reason="definition_exact_fast_path",
+            reason="code_ref_target_in_post_definition_gap" if span_extension is not None else "definition_exact_fast_path",
             span=exact_stats["span"],
             public_span=_span_dict(public_span),
             exact_span=_span_dict(exact_span),
             candidates=[exact_stats],
             entry=_entry_payload(entry),
+            span_extension=span_extension,
             raw=exact_raw,
             tokens=exact_tokens,
             nodes=exact_nodes,
@@ -938,14 +1189,15 @@ def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | 
     if public_stats is None or exact_raw == public_raw:
         return ExportBodySelection(
             name=entry.name if entry is not None else export_name,
-            slice_mode="definition_exact",
+            slice_mode="definition_code_ref_extended" if span_extension is not None else "definition_exact",
             used_fallback=False,
-            reason="definition_exact",
+            reason="code_ref_target_in_post_definition_gap" if span_extension is not None else "definition_exact",
             span=exact_stats["span"],
             public_span=_span_dict(public_span),
             exact_span=_span_dict(exact_span),
             candidates=candidate_stats,
             entry=_entry_payload(entry),
+            span_extension=span_extension,
             raw=exact_raw,
             tokens=exact_tokens,
             nodes=exact_nodes,
@@ -976,14 +1228,15 @@ def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | 
 
     return ExportBodySelection(
         name=entry.name if entry is not None else export_name,
-        slice_mode="definition_exact",
+        slice_mode="definition_code_ref_extended" if span_extension is not None else "definition_exact",
         used_fallback=False,
-        reason="definition_exact_preferred",
+        reason="code_ref_target_in_post_definition_gap" if span_extension is not None else "definition_exact_preferred",
         span=exact_stats["span"],
         public_span=_span_dict(public_span),
         exact_span=_span_dict(exact_span),
         candidates=candidate_stats,
         entry=_entry_payload(entry),
+        span_extension=span_extension,
         raw=exact_raw,
         tokens=exact_tokens,
         nodes=exact_nodes,

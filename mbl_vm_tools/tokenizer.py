@@ -42,7 +42,7 @@ class Token:
 
 
 SINGLE_BYTE_OPS = {
-    0x00, 0x21, 0x23, 0x27, 0x28, 0x2B, 0x2E, 0x30, 0x31, 0x32, 0x3A, 0x48, 0x63, 0x72, 0x7C,
+    0x00, 0x21, 0x23, 0x27, 0x28, 0x2B, 0x2E, 0x30, 0x31, 0x32, 0x3A, 0x48, 0x63, 0x72, 0x74, 0x7C,
     0x3D, 0x2A, 0x2D, 0x2F, 0x25,
     0xF0, 0xF1, 0xF3, 0xE1, 0xE8, 0xEC, 0xED, 0xEF, 0x5E, 0xEB, 0x3C, 0x3E, 0x26,
 }
@@ -234,7 +234,7 @@ def _match_atomic_semantic(data: bytes, start: int, limit: int) -> tuple[str, in
     if op == 0x2C and start + 7 <= limit and data[start + 2] == 0x63:
         return "CALL63A", 7, {"argc": data[start + 1], "rel": s32(data, start + 3)}
     if op == 0x63 and start + 5 <= limit:
-        return "CALL63B", 5, {"rel": s32(data, start + 1)}
+        return "CODE_REF63", 5, {"rel": s32(data, start + 1)}
     if op == 0x29 and start + 3 <= limit and data[start + 1] == 0x10:
         return "IMM", 3, {"value": data[start + 2]}
     if op == 0x28 and start + 4 <= limit and data[start + 1] == 0x10:
@@ -255,12 +255,12 @@ _PREFIX_ALLOWED_ATOMIC = {
     0x2B: {"REF", "IMM", "IMM16", "IMM32", "F32", "CALL66", "CALL63A", "REC61"},
     0x2D: {"REF", "IMM", "IMM16", "CALL66", "CALL63A", "REC61", "F32", "OPU16"},
     0x2F: {"REF", "IMM", "IMM16", "CALL66", "F32", "OPU16"},
-    0x30: {"REF", "REF16", "REC41", "REC61", "REC62", "CALL66", "CALL63A", "CALL63B", "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16", "SIG_U32_U8_CALL66_TAIL", "SIG_GETCASTLENUM_HEAD"},
+    0x30: {"REF", "REF16", "REC41", "REC61", "REC62", "CALL66", "CALL63A", "CODE_REF63", "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16", "SIG_U32_U8_CALL66_TAIL", "SIG_GETCASTLENUM_HEAD"},
     0x32: {"REF", "REC41", "CALL66", "CALL63A", "IMM"},
     0xF1: {"REF", "CALL66", "CALL63A", "IMM", "IMM16", "IMM32", "F32"},
-    0x3D: {"REF", "REF16", "REC41", "REC61", "REC62", "CALL66", "CALL63A", "CALL63B", "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16"},
+    0x3D: {"REF", "REF16", "REC41", "REC61", "REC62", "CALL66", "CALL63A", "CODE_REF63", "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16"},
     0x5E: {"REF", "IMM", "IMM16", "BR", "CALL66", "CALL63A"},
-    0x72: {"BR", "CALL63B", "OPU16"},
+    0x72: {"BR", "CODE_REF63", "OPU16"},
     0xF3: {"REF", "BR", "IMM"},
     0xF6: {"CALL66", "BR", "REC61"},
     0xF7: {"BR", "CALL66"},
@@ -335,7 +335,7 @@ _TAIL_REPAIR_DIRECT_START_OPS = {0x30, 0x63}
 _TAIL_REPAIR_PREFIX_START_OPS = set(_PREFIX_ALLOWED_ATOMIC) | set(_PREFIX_ALLOWED_NESTED)
 _TAIL_REPAIR_TERMINALS = {
     "REF", "REF16", "REC41", "REC61", "REC62",
-    "CALL66", "CALL63A", "CALL63B",
+    "CALL66", "CALL63A", "CODE_REF63",
     "IMM", "IMM16", "IMM24Z", "IMM24S", "IMM24U", "IMM32", "F32", "BR", "OPU16",
     "SIG_U32_U8_CALL66_TAIL", "SIG_GETCASTLENUM_HEAD",
 }
@@ -1239,7 +1239,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 8
             continue
 
-        # call / transfer families
+        # call / code-reference families
         if op == 0x2C and i + 4 <= body_size and data[i + 2] == 0x66:
             out.append(Token(i, "CALL66", 4, {"argc": data[i + 1], "opid": data[i + 3]}))
             i += 4
@@ -1251,7 +1251,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             continue
 
         if op == 0x63 and i + 5 <= body_size:
-            out.append(Token(i, "CALL63B", 5, {"rel": s32(data, i + 1)}))
+            out.append(Token(i, "CODE_REF63", 5, {"rel": s32(data, i + 1)}))
             i += 5
             continue
 
