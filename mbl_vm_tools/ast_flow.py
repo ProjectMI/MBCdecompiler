@@ -60,10 +60,6 @@ def classify_cyclic_component(component: dict[str, Any], cfg: AstCFG) -> Optiona
     is_guarded_safe_natural_loop = bool(is_natural_loop and natural_loop.get("safe") and (has_header_side_effects or has_header_exit_params))
     force_cyclic_region = is_unsafe_natural_loop or is_multi_exit_natural_loop or is_guarded_safe_natural_loop
 
-    # A single-entry natural loop whose only backward target is its own header is
-    # still a normal loop candidate when it has a single safe header/exit shape.
-    # Unsafe, multi-exit, or header-guarded natural loops stay as data-level cyclic
-    # regions instead of being lowered to while(true) plus internal break/continue aliases.
     if not force_cyclic_region:
         if backward_targets and backward_targets <= {entry_id} and len(nonlinear_edges) <= len(branch_nodes) + 1:
             return None
@@ -174,10 +170,6 @@ def classify_linear_cyclic_span(
 
     next_after_id = cfg.blocks[end + 1].id if end + 1 < limit else None
     if next_after_id is None and end + 1 < len(cfg.blocks) and end + 1 <= stop:
-        # A span ending exactly at the current range boundary is ambiguous.  It
-        # is promoted only when an already-structured predecessor enters a
-        # non-entry block, which is the general multi-entry/internal-label shape
-        # that a plain sequence cannot represent without reintroducing a jump.
         has_settled_side_entry = False
         for span_block in span_blocks:
             if span_block.id == entry_id:

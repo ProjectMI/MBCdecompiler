@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 import math
 import struct
 from typing import Any
@@ -56,7 +56,6 @@ GENERIC_ZERO_IMM24_OPS = {0x03, 0x06, 0x08, 0x0C, 0x10, 0x14, 0x18, 0x28, 0x38, 
 # treat them as opaque generic OP nodes.
 END_OPS = {0x23}
 NOP_OPS = {0x7C, 0x48}
-MARKER_OPS = SINGLE_BYTE_OPS - END_OPS - NOP_OPS
 PREFIX_SENSITIVE_IMM24U_OPS = {0x3C, 0x3E, 0xED, 0xF0}
 
 
@@ -201,14 +200,8 @@ def _match_atomic_semantic(data: bytes, start: int, limit: int) -> tuple[str, in
         return "F32", 6, {"op": 0x39, "mode": 0x20, "bits": bits, "value": value if math.isfinite(value) else None}
     if start + 6 <= limit and op == 0x39 and data[start + 1] == 0x10:
         return "IMM32", 6, {"op": 0x39, "mode": 0x10, "value": u32(data, start + 2)}
-    # Prefix-sensitive imm24 forms: these bytes can be prefixes before
-    # branches, so direct tokenization only accepts the unambiguous immediate
-    # shape here. Nested prefix matching can still use the same atomic form.
     if op in PREFIX_SENSITIVE_IMM24U_OPS and start + 4 <= limit:
         next_op = data[start + 1]
-        # These opcodes double as prefix heads.  Do not greedily eat a nested
-        # branch/prefix chain as a plain imm24.  Direct imm24 is only accepted
-        # when the following byte cannot start a legal nested form.
         if next_op not in (0x4A, 0x4B, 0x4C, 0x4D) and next_op not in _PREFIX_ALLOWED_NESTED.get(op, set()):
             return "IMM24U", 4, {"op": op, "imm": u24(data, start + 1)}
     if op in SIGNED_IMM24_OPS and start + 4 <= limit:
@@ -400,10 +393,6 @@ def _tail_repair_match(data: bytes, start: int, body_limit: int, stream_limit: i
     return best
 
 def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
-    # `limit` is the logical body boundary.  The byte buffer may contain a
-    # small lookahead tail so an instruction that starts inside the body but
-    # crosses the table span can still be completed.  No token is started at or
-    # beyond `body_size`.
     body_size = len(data) if limit is None else min(len(data), limit)
     size = len(data)
     out: list[Token] = []
@@ -457,32 +446,24 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 14
             continue
 
-        # aggregate families: 23 4f N, 74 4f N
-        # children=(tag + ref32)
-        # close is usually 31 30, but stable wrapper families also use the
-        # paired trailer 72 23. Treating only 72 as the terminator leaves a
-        # spurious trailing 23 and systematically under-scores compact wrappers.
         if i + 2 < body_size and data[i + 1] == 0x4F and op in (0x23, 0x74):
             raw_arity = data[i + 2]
             matched_agg = False
             for arity in _aggregate_arity_candidates(raw_arity):
                 body = 3 + 5 * arity
                 end = i + body
-                # normal two-byte close
                 if end + 2 <= body_size and data[end] == 0x31 and data[end + 1] == 0x30:
                     out.append(Token(i, "AGG", body + 2, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 3, arity), "term2": 0x3130}))
                     i += body + 2
                     matched_agg = True
                     break
 
-                # alternate paired close used by compact wrapper exports
                 if end + 2 <= body_size and data[end] == 0x72 and data[end + 1] == 0x23:
                     out.append(Token(i, "AGG", body + 2, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 3, arity), "term2": 0x7223}))
                     i += body + 2
                     matched_agg = True
                     break
 
-                # fallback single-byte close (covers legacy / partial stubs)
                 if end + 1 <= body_size and data[end] in (0x72, 0x30):
                     out.append(Token(i, "AGG", body + 1, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, i + 3, arity), "term": data[end]}))
                     i += body + 1
@@ -491,9 +472,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             if matched_agg:
                 continue
 
-        # bare aggregate micro-pattern: 4f N <tag ref32>*
-        # observed in many short wrapper exports where the leading selector op is absent
-        # or has already been consumed by the previous export boundary.
         if op == 0x4F and i + 2 < body_size:
             raw_arity = data[i + 1]
             matched_agg0 = False
@@ -557,9 +535,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 10
             continue
 
-        # exact recurring export heads recovered from the corpus. These are not learned
-        # templates: they are deterministic byte signatures that recur across adb-stable
-        # module families and deserve first-class micro-semantics.
         if i + 23 <= body_size and data[i:i + 4] == b"\x10\x01\xf1\x3d" and all(b == 0x7C for b in data[i + 4:i + 23]):
             out.append(Token(i, "SIG_PADDED_CHECKPUT", 23, {"pad_len": 19}))
             i += 23
@@ -595,8 +570,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 14
             continue
 
-        # adb-backed recurring wrapper heads that appear verbatim across large module families.
-        # These are intentionally exact / narrow to avoid overfitting random byte runs.
         if i + 13 <= body_size and data[i + 3:i + 10] == b"\x2c\x01\x66\x24\x5b\x01\x00" and data[i + 10] == 0x6C and data[i + 11] == 0x01:
             out.append(Token(i, "SIG_CALL66_REFPAIR_HEAD", 13, {
                 "imm24": u24(data, i),
@@ -660,7 +633,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
         if matched_pad_sig:
             continue
 
-        # recurring wrapper head: short 0x7c pad run bridging directly into 30+REF.
         for pad_len in (5, 8, 9, 13):
             if i + pad_len + 7 <= body_size and data[i:i + pad_len] == (b"\x7c" * pad_len) and data[i + pad_len] == 0x30 and data[i + pad_len + 1] in (0x69, 0x65, 0x6C):
                 out.append(Token(i, "SIG_PADRUN_OPREF", pad_len + 7, {"pad_len": pad_len, "ref_op": data[i + pad_len + 1], "mode": data[i + pad_len + 2], "ref": u32(data, i + pad_len + 3)}))
@@ -831,11 +803,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 13
             continue
 
-
-        # Rare high-prefix ref family observed in definition bodies:
-        #   F0 E8 3D 30 <REF>
-        # Without this explicit guard, F0+E8 is greedily misread as an
-        # unsigned-imm24 prefix and leaves the REF payload as unknown bytes.
         if i + 10 <= body_size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2:i + 4] == b"\x3d\x30" and data[i + 4] in (0x69, 0x65, 0x6C):
             out.append(Token(i, "PFX_F0_E8_3D_30_REF", 10, {
                 "prefix_op": 0xF0,
@@ -992,10 +959,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 10
             continue
 
-        # Guard against a false fusion seen in the createInfoPicture family:
-        #   OPU16 + REC41 can look like <u32><0x41...> if we only check byte +4.
-        # Prefer the cleaner structural split when the leading dword is actually
-        # a short-u16 op followed immediately by REC41.
         if i + 11 <= body_size and data[i + 4] == 0x41 and not (data[i] in SHORT_U16_OPS and data[i + 3] == 0x41):
             out.append(Token(i, "SIG_CONST_U32_REC41", 11, {
                 "value": u32(data, i),
@@ -1112,10 +1075,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 6
             continue
 
-        # duplicated signature block removed; handled above
-
-
-
         if i + 6 <= body_size and data[i] == 0x3C and data[i + 1] == 0xE8 and data[i + 2] == 0xEB and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D):
             out.append(Token(i, "PFX_3C_E8_EB_BR", 6, {
                 "prefix_op": 0x3C,
@@ -1178,7 +1137,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += blob_size
             continue
 
-        # compact immediate families inferred from repeated low-coverage wrapper motifs
         if op in SIGNED_IMM24_OPS and i + 4 <= body_size:
             out.append(Token(i, "IMM24S", 4, {"op": op, "imm": s24(data, i + 1)}))
             i += 4
@@ -1189,9 +1147,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 4
             continue
 
-        # generic compact op + zero-imm24 form. This shows up repeatedly in still-moderate
-        # long bodies such as InitObj/GetParam, usually as small structural arguments between
-        # recognized refs/calls. Keep it conservative: only accept the exact zero-imm shape.
         if op in GENERIC_ZERO_IMM24_OPS and i + 4 <= body_size and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 0:
             out.append(Token(i, "IMM24Z", 4, {"op": op, "imm": 0}))
             i += 4
@@ -1202,7 +1157,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 2
             continue
 
-        # long / short ref families
         if op in (0x69, 0x65, 0x6C) and i + 6 <= body_size:
             out.append(Token(i, "REF", 6, {"op": op, "mode": data[i + 1], "ref": u32(data, i + 2)}))
             i += 6
@@ -1213,7 +1167,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 4
             continue
 
-        # structured literals
         if op == 0x41 and i + 7 <= body_size:
             out.append(Token(i, "REC41", 7, {"ref": u32(data, i + 1), "imm": struct.unpack_from("<H", data, i + 5)[0]}))
             i += 7
@@ -1239,7 +1192,6 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 8
             continue
 
-        # call / code-reference families
         if op == 0x2C and i + 4 <= body_size and data[i + 2] == 0x66:
             out.append(Token(i, "CALL66", 4, {"argc": data[i + 1], "opid": data[i + 3]}))
             i += 4
@@ -1255,13 +1207,11 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 5
             continue
 
-        # short imm / branch
         if op == 0x29 and i + 3 <= body_size and data[i + 1] == 0x10:
             out.append(Token(i, "IMM", 3, {"value": data[i + 2]}))
             i += 3
             continue
 
-        # related compact u16 literal form observed in several short wrappers
         if op == 0x28 and i + 4 <= body_size and data[i + 1] == 0x10:
             out.append(Token(i, "IMM16", 4, {"op": op, "value": struct.unpack_from('<H', data, i + 2)[0]}))
             i += 4
@@ -1277,17 +1227,11 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 3
             continue
 
-        # common compact imm32 family observed in many service-style exports:
-        #   30 <imm32-le>
-        # A fully-open 30+u32 rule causes regressions because plain 0x30 also occurs
-        # as a real single-byte op. A safe expansion is to accept 16-bit immediates
-        # encoded as 30 xx yy 00 00 in addition to the old 8-bit-only form.
         if op == 0x30 and i + 5 <= body_size and data[i + 3] == 0 and data[i + 4] == 0:
             out.append(Token(i, "IMM32", 5, {"op": op, "imm": u32(data, i + 1)}))
             i += 5
             continue
 
-        # pad / filler blocks (often '||||' or '\xff\xff\xff\xff')
         if op in (0x7C, 0xFF):
             j = i
             while j < body_size and data[j] == op:
@@ -1298,12 +1242,10 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
                 i = j
                 continue
 
-        # ASCII-ish data blocks (format strings, HTML-ish snippets, CSV-like rows, etc.)
         if _is_printable_ascii(op):
             j = _ascii_run(data, i, body_size)
             run = data[i:j]
             if _looks_like_text(run):
-                # Keep payload small; we only need hints for debugging.
                 preview = run[:120].decode("latin1", "replace")
                 out.append(Token(i, "ASCII", len(run), {"preview": preview}))
                 i = j

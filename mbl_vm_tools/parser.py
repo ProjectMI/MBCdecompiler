@@ -44,7 +44,6 @@ def _looks_like_filler_name(name: str) -> bool:
     most_common = max(name.count(ch) for ch in set(name))
     if len(name) >= 24 and (most_common / len(name)) > 0.85:
         return True
-    # Short low-entropy garbage like "нЮнЮ", "Ю", "Ќ" should never be treated as symbol names.
     if len(name) <= 8 and len(set(name)) <= 2 and all(ord(ch) > 127 for ch in name):
         return True
     return False
@@ -243,7 +242,6 @@ def _looks_like_globals(records: list[TableRecord]) -> bool:
 def _looks_like_exports(records: list[TableRecord]) -> bool:
     if len(records) < 1:
         return False
-    # Allow a mostly-normal export stream to contain embedded import-like mini-blocks.
     starts = [r.a for r in records]
     cvals = [r.c for r in records]
     normal = [r for r in records if r.b != 0xFFFFFFFF]
@@ -714,9 +712,6 @@ class MBCModule:
             )
             self._export_function_entries.append(export_entry)
 
-            # Default mode is de-duplicated: if a function has a definition,
-            # the definition entry already gives the exact body and carries the
-            # export marker.  Only export-only records are appended here.
             if record.name not in definition_symbols:
                 default_name = unique_name
                 if default_name in self._function_entry_by_name or any(e.name == default_name for e in self._function_entries):
@@ -796,8 +791,7 @@ class MBCModule:
         entry = self._function_entry_by_name.get(name)
         if entry is not None:
             return entry
-        # Backward-compatible convenience: a unique definition can be requested
-        # by its raw symbol even if the exported view was used before.
+
         records = self._definition_records_by_name.get(name)
         if records and len(records) == 1:
             for candidate in self._definition_function_entries:

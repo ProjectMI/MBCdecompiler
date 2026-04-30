@@ -478,8 +478,6 @@ def _signature_to_steps(node: IRNode) -> list[tuple[str, str, dict[str, Any]]]:
                     "family": family,
                     "branch_op": operands.get("branch_op"),
                     "offset": operands.get("offset"),
-                    # This tail reuses the immediately preceding loaded value and
-                    # compares it against the embedded literal before branching.
                     "stack_inputs_required": 2,
                 },
             )
@@ -685,8 +683,6 @@ def _build_instruction_control(instructions: list[CanonicalInstruction], nodes: 
                     "resolved_local_target_offset": origin.control.get("resolved_local_target_offset"),
                     "nearest_instruction_offset": nearest_instruction_offset,
                     "nearest_instruction_delta": origin.control.get("nearest_instruction_delta"),
-                    # Backward-compatible diagnostic aliases.  This is not a CFG
-                    # branch/call target and must not be used as a control edge.
                     "resolved_target_offset": nearest_instruction_offset,
                     "resolved_target_instruction_index": offset_to_first_inst.get(nearest_instruction_offset),
                     "resolved_target_confidence": origin.control.get("resolved_target_confidence"),
@@ -739,10 +735,6 @@ def _compute_canonical_blocks(
     def _crosses_extension_boundary(src_block: dict[str, Any], dst_block: dict[str, Any] | None) -> bool:
         if declared_local_end is None or dst_block is None:
             return False
-        # The selected span may be extended past the definition table's declared
-        # end.  A byte-layout neighbour across that old boundary is not an
-        # implicit runtime successor; only explicit branch/code_ref edges may
-        # reach the detached fragment.
         return (
             src_block["start_offset"] < declared_local_end
             and src_block["end_offset"] >= declared_local_end
@@ -761,8 +753,6 @@ def _compute_canonical_blocks(
         code_ref_target_index = _code_ref_target_index(inst)
         if code_ref_target_index is not None:
             leaders.add(code_ref_target_index)
-            # Keep the marker isolated from following payload/code so the edge is
-            # represented in CFG before dataflow and before surface cleanup.
             if idx + 1 < len(instructions):
                 leaders.add(idx + 1)
 
@@ -891,9 +881,6 @@ def _compute_canonical_blocks(
 
         add_fallthrough_edge(block, next_block)
 
-    # CODE_REF63 is an internal code-address encoding.  It is not a stack value
-    # or call, but its resolved target must be part of the HIR CFG so AST sees
-    # a normal normalized graph instead of a side-channel hint.
     for inst in instructions:
         target_inst = _code_ref_target_index(inst)
         if target_inst is None:
@@ -969,9 +956,6 @@ def _compute_stack_plans(blocks: list[dict[str, Any]], instructions: list[Canoni
     entry_depth: dict[str, int] = {block["id"]: 0 for block in blocks}
     exit_depth: dict[str, int] = {block["id"]: 0 for block in blocks}
 
-    # Use a forward-edge requirement pass. Back-edges are intentionally ignored here;
-    # otherwise any mis-modeled positive stack effect inside a loop explodes into
-    # fake function arguments and phi towers.
     for _ in range(max(4, len(blocks) * 4)):
         changed = False
         for block in reversed(blocks):
@@ -1074,10 +1058,6 @@ def _compose_entry_stack(
         phi_name = f"phi_{block_id}_{pos}"
         unique = _ordered_unique([value for value in values if value != phi_name] or values)
 
-        # Treat real merge points as stable SSA boundaries even when the current
-        # iteration temporarily sees the same value from every predecessor.  In
-        # loop-heavy bytecode the old "collapse single unique source" rule could
-        # oscillate between a predecessor phi and a concrete temp forever.
         if len(unique) == 1 and len(effective_incoming) <= 1:
             entry.append(unique[0])
         else:
@@ -1114,9 +1094,6 @@ def build_hir_blocks(
     exit_stacks: dict[str, list[str]] = {}
     work = deque([entry_block_id] if entry_block_id else [])
     work_iterations = 0
-    # Keep the solver bounded so malformed bytecode cannot hang corpus runs.
-    # Merge blocks are stabilized in _compose_entry_stack; the limit is now a
-    # safety net rather than a normal termination path.
     worklist_iteration_limit = max(128, len(blocks) * 64 + len(instructions) * 8)
     worklist_iteration_limit_hit = False
 
@@ -1359,22 +1336,6 @@ def _substitute_blocks(hir_blocks: list[HIRBlock], mapping: dict[str, str], *, r
         return list(hir_blocks)
     return [_substitute_block_values(block, mapping, replace_block_params=replace_block_params) for block in hir_blocks]
 
-
-def _find_assignment_expr(hir_blocks: list[HIRBlock], name: str) -> Optional[str]:
-    prefix = f"{name} = "
-    for block in hir_blocks:
-        for stmt in block.statements:
-            if stmt.startswith(prefix):
-                return stmt[len(prefix):]
-    return None
-
-
-def _drop_assignment_statement(block: HIRBlock, name: str) -> HIRBlock:
-    prefix = f"{name} = "
-    kept = [stmt for stmt in block.statements if not stmt.startswith(prefix)]
-    if len(kept) == len(block.statements):
-        return block
-    return _clone_block(block, statements=kept)
 
 
 def _substitute_text_map(text: Optional[str], mapping: dict[str, str]) -> Optional[str]:
@@ -1700,26 +1661,6 @@ def validate_hir_blocks(blocks: list[HIRBlock], values: list[DataflowValue], sta
     }
 
 
-def _compose_forwarded_incoming_args(block: HIRBlock, succ: HIRBlock) -> Optional[dict[str, list[str]]]:
-    forwarded_args = list(succ.incoming_args.get(block.id, []))
-    param_names = list(block.block_params)
-    incoming = {pred: list(args) for pred, args in succ.incoming_args.items() if pred != block.id}
-    for pred_id in block.predecessors:
-        if pred_id == succ.id or pred_id in incoming:
-            return None
-        pred_args = list(block.incoming_args.get(pred_id, []))
-        if param_names and len(pred_args) != len(param_names):
-            return None
-        composed: list[str] = []
-        for arg in forwarded_args:
-            rewritten = arg
-            for idx, param_name in enumerate(param_names):
-                replacement = pred_args[idx] if idx < len(pred_args) else param_name
-                rewritten = _replace_var(rewritten, param_name, replacement) or rewritten
-            composed.append(rewritten)
-        incoming[pred_id] = composed
-    return incoming
-
 
 def _rewrite_empty_fallthrough(blocks: list[HIRBlock]) -> Optional[list[HIRBlock]]:
     by_id = {block.id: block for block in blocks}
@@ -1901,10 +1842,6 @@ def _compute_postdominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
     _, _, succs, _ = _block_maps(hir_blocks)
     exits = [block.id for block in hir_blocks if not succs[block.id]]
 
-    # A function with no CFG exit has no meaningful post-dominator lattice for
-    # source-level join detection.  Returning only the reflexive fact is the
-    # conservative choice: it disables postdom-based structuring instead of
-    # inventing a bogus join inside an endless/state-machine loop.
     if not exits:
         return {block.id: {block.id} for block in hir_blocks}
 
@@ -1914,12 +1851,6 @@ def _compute_postdominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
     for exit_id in exits:
         post_bits[exit_id] = bits_by_id[exit_id]
 
-    # Reverse lexical order is much closer to the natural propagation direction
-    # for post-dominators on our normalized HIR.  The integer bitset lattice also
-    # avoids repeatedly intersecting large Python sets on pathological dispatcher
-    # functions.  If convergence still fails within a generous bound, fall back
-    # to self-only facts; that is semantically safe because it can only reduce
-    # structuring, not hide a real control-flow edge.
     order = list(reversed(hir_blocks))
     max_iterations = max(16, len(hir_blocks) * 4)
     for _ in range(max_iterations):
@@ -2206,8 +2137,6 @@ def _collect_code_ref_hints(
         absolute_target = None
         absolute_nearest = None
         if isinstance(encoded, int) and function_start is not None:
-            # Absolute only when the addressing mode is absolute-local.  Relative
-            # forms are resolved through nearest_local below.
             if inst.control.get("target_addressing_mode") == "absolute_local":
                 absolute_target = function_start + encoded
         if isinstance(nearest_local, int) and function_start is not None:
@@ -2512,8 +2441,6 @@ def _module_summary(functions: list[HIRFunction]) -> dict[str, Any]:
     return {
         "function_count": function_count,
         "entry_count": function_count,
-        # Backward-compatible field name.  New callers should prefer
-        # function_count/public_export_count where the distinction matters.
         "export_count": exported_function_count,
         "definition_function_count": definition_function_count,
         "exported_function_count": exported_function_count,

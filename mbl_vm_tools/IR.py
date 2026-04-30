@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import statistics
 from dataclasses import asdict, dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 from mbl_vm_tools.tokenizer import Token, tokenize_stream
@@ -590,9 +590,6 @@ def _nearest_code_ref_boundary(target: int, valid_offsets: set[int], formula_pre
             "confidence": base_confidence,
         }
 
-    # CODE_REF63 often names a byte-level VM sub-position that is folded into a
-    # wider tokenizer node.  Keep the encoded payload intact, but expose the
-    # nearest instruction-start as an inspection aid and a soft lifting target.
     for distance in range(1, 9):
         for delta in (distance, -distance):
             candidate = target + delta
@@ -628,14 +625,10 @@ def _resolve_code_ref_target(
     if encoded >= 0:
         attempts.append(("absolute_local", encoded, 0.96))
     if node_offset is not None:
-        # Negative refs cannot be absolute-local targets, but they can point
-        # backwards to earlier local code.  Try end first because branch-like VM
-        # encodings usually count after the full opcode payload.
         if encoded < 0:
             attempts.append(("signed_from_end", int(node_offset) + int(node_size) + encoded, 0.88))
             attempts.append(("signed_from_start", int(node_offset) + encoded, 0.82))
         else:
-            # Only a fallback for currently unresolved positive payloads.
             attempts.append(("signed_from_end", int(node_offset) + int(node_size) + encoded, 0.46))
             attempts.append(("signed_from_start", int(node_offset) + encoded, 0.42))
 
@@ -721,7 +714,25 @@ def _resolve_branch_target(
     best_formula, best_target = matched[0]
     immediate_fallthrough = node_offset + node_size
     degenerate_targets = {immediate_fallthrough, node_offset}
-    if best_target in degenerate_targets and len(matched) > 1:
+    selected_forward_relative_over_backward_absolute = False
+
+    if best_formula.startswith("absolute+") and best_target < node_offset and len(matched) > 1:
+        forward_relative = [
+            (formula, target)
+            for formula, target in matched
+            if target > node_offset
+            and (
+                formula.startswith("start+")
+                or formula.startswith("end+")
+                or formula.startswith("signed_start+")
+                or formula.startswith("signed_end+")
+            )
+        ]
+        if forward_relative:
+            best_formula, best_target = forward_relative[0]
+            selected_forward_relative_over_backward_absolute = True
+
+    if (not selected_forward_relative_over_backward_absolute) and best_target in degenerate_targets and len(matched) > 1:
         relative_preference = [
             (formula, target)
             for formula, target in matched
@@ -807,8 +818,6 @@ def _build_control(node: IRNode, valid_offsets: set[int]) -> dict[str, Any]:
                 "resolved_local_target_offset": ref_info.get("resolved_local_target_offset"),
                 "nearest_instruction_offset": ref_info.get("nearest_instruction_offset"),
                 "nearest_instruction_delta": ref_info.get("nearest_instruction_delta"),
-                # Backward-compatible diagnostic aliases.  These are not CFG
-                # branch targets and must not be used to create control-flow edges.
                 "resolved_target_offset": ref_info.get("nearest_instruction_offset"),
                 "resolved_target_formula": ref_info.get("formula"),
                 "resolved_target_confidence": ref_info.get("confidence"),
@@ -966,9 +975,6 @@ def _code_ref_gap_extension_for_span(
             encoded = int(node.operands["rel"])
         except (TypeError, ValueError):
             continue
-        # Positive CODE_REF63 payloads are predominantly absolute-local code
-        # offsets.  If such an offset points into the post-definition gap, the
-        # declared span has truncated a reachable local fragment.
         if encoded < 0:
             continue
         target_abs = start + encoded
@@ -1093,10 +1099,6 @@ def select_definition_body(mod: MBCModule, entry: FunctionEntry) -> ExportBodySe
 
 def select_export_body(mod: MBCModule, export_name: str, entry: FunctionEntry | None = None) -> ExportBodySelection:
     public_span = mod.get_export_public_code_span(export_name)
-
-    # Fast path: exact definitions are usually the best slice and avoid the old
-    # public+exact double tokenization for every export.  Public slicing is now
-    # only evaluated when exact slicing is missing or suspicious.
     exact_span, exact_reason = mod.get_export_exact_code_span_with_reason(export_name)
     exact_raw = b""
     exact_limit: int | None = None

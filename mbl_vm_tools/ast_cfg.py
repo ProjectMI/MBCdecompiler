@@ -427,18 +427,3 @@ def loopback_edges(loop: dict[str, Any], cfg: AstCFG) -> dict[str, set[str]]:
     return edges
 
 
-def loopback_source_count(loop: dict[str, Any], cfg: AstCFG) -> int:
-    return sum(len(sources) for sources in loopback_edges(loop, cfg).values())
-
-
-# Compatibility aliases for the current AST builder while the public boundary is
-# being tightened around ast_cfg.py.
-_Cfg = AstCFG
-_build_cfg = build_cfg
-_edge_targets = edge_targets
-_external_successors = external_successors
-_fold_constant_branches = fold_constant_branches
-_loopback_edges = loopback_edges
-_loopback_source_count = loopback_source_count
-_cyclic_components = cyclic_components
-_prune_unreachable_blocks = prune_unreachable_blocks

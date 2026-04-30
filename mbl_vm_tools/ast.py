@@ -17,12 +17,11 @@ from mbl_vm_tools.hir import (
     _rename_merge_params,
 )
 from mbl_vm_tools.ast_cfg import (
-    _Cfg,
-    _build_cfg,
-    _edge_targets,
-    _external_successors,
-    _fold_constant_branches,
-    _prune_unreachable_blocks,
+    build_cfg,
+    edge_targets,
+    external_successors,
+    fold_constant_branches,
+    prune_unreachable_blocks,
 )
 from mbl_vm_tools.ast_flow import (
     alias_for_source as _flow_alias_for_source,
@@ -389,6 +388,9 @@ def _collect_ast_metrics(ast_root: dict[str, Any]) -> dict[str, Any]:
             pass
         elif kind == "decision_loop":
             for node in region.get("nodes") or []:
+                node_label = _base_label(node.get("block_id"))
+                if node_label:
+                    rendered_labels.add(node_label)
                 for stmt in node.get("prelabel") or []:
                     visit_stmt(stmt)
                 for stmt in node.get("body") or []:
@@ -432,10 +434,6 @@ def _is_nonsemantic_data_statement(stmt: dict[str, Any]) -> bool:
         return True
     if '"family": "PAD' in normalized:
         return True
-    # Plain byte-runs with no semantic role are tokenizer padding/dump leakage,
-    # not source-level statements. Keep this deliberately narrow: byte+len
-    # records carry no VM effect, while named ASCII/DWBLOB families remain
-    # visible if the frontend later decides to model them semantically.
     if '"byte":' in normalized and '"len":' in normalized and '"family":' not in normalized:
         return True
     return False
@@ -510,9 +508,6 @@ def _validate_ast_semantics(ast_root: dict[str, Any], metrics: dict[str, Any]) -
 
 
 def _format_block_label(block: HIRBlock) -> str:
-    # Block parameters are SSA/phi plumbing.  Render labels as source-level
-    # control-flow anchors only; edge-specific parameter values are materialized
-    # as assignments before the transfer.
     return block.id
 
 
@@ -528,8 +523,8 @@ def _incoming_assignments(target: Optional[HIRBlock], source_id: Optional[str]) 
 
 class _SurfaceBuilder:
     def __init__(self, blocks: list[HIRBlock]):
-        self.blocks = _prune_unreachable_blocks(_fold_constant_branches(blocks))
-        self.cfg = _build_cfg(self.blocks)
+        self.blocks = prune_unreachable_blocks(fold_constant_branches(blocks))
+        self.cfg = build_cfg(self.blocks)
         self.constructs: Counter[str] = Counter()
         self.settled_preds_by_block: dict[str, set[str]] = defaultdict(set)
         self.handled_param_predecessors_by_block: dict[str, set[str]] = defaultdict(set)
@@ -685,7 +680,7 @@ class _SurfaceBuilder:
     def _branch_empty_convergence(self, block: HIRBlock) -> Optional[str]:
         if block.terminator.get("kind") != "branch":
             return None
-        branch_target, fallthrough_target = _edge_targets(block, self.cfg.index_by_id)
+        branch_target, fallthrough_target = edge_targets(block, self.cfg.index_by_id)
         if branch_target is None or fallthrough_target is None:
             return None
         if self._empty_fallthrough_reaches(fallthrough_target, branch_target, source_id=block.id):
@@ -697,7 +692,7 @@ class _SurfaceBuilder:
     def _branch_param_merge(self, block: Optional[HIRBlock], next_id: Optional[str]) -> Optional[dict[str, Any]]:
         if block is None or block.terminator.get("kind") != "branch" or next_id is None:
             return None
-        branch_target, fallthrough_target = _edge_targets(block, self.cfg.index_by_id)
+        branch_target, fallthrough_target = edge_targets(block, self.cfg.index_by_id)
         if not branch_target or not fallthrough_target or fallthrough_target != next_id or branch_target == next_id:
             return None
         target = self.cfg.by_id.get(branch_target)
@@ -819,7 +814,7 @@ class _SurfaceBuilder:
             return self._jump_nodes(block, target_id, aliases, source_specific_alias=True)
         if kind == "branch":
             cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
-            branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+            branch, fallthrough = edge_targets(block, self.cfg.index_by_id)
             if branch == fallthrough:
                 if branch is None or branch == next_id:
                     return [], 0
@@ -1126,7 +1121,7 @@ class _SurfaceBuilder:
             }
             term_kind = node_block.terminator.get("kind")
             if term_kind == "branch":
-                branch, fallthrough = _edge_targets(node_block, self.cfg.index_by_id)
+                branch, fallthrough = edge_targets(node_block, self.cfg.index_by_id)
                 node.update(
                     {
                         "terminator_kind": "branch",
@@ -1261,9 +1256,6 @@ class _SurfaceBuilder:
                 if succ_idx is not None and start_idx <= succ_idx < join_idx:
                     stack.append(succ)
                     continue
-                # Non-local forward exits are valid arm bypasses. They are not
-                # part of the local skip body and are materialized later as
-                # source-specific targeted breaks.
                 if succ_idx is not None and join_idx <= succ_idx:
                     continue
                 if self._alias_for_source(succ, block, aliases) is not None:
@@ -1306,7 +1298,7 @@ class _SurfaceBuilder:
         block = self.blocks[idx]
         if block.terminator.get("kind") != "branch":
             return None
-        branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+        branch, fallthrough = edge_targets(block, self.cfg.index_by_id)
         if branch is None or fallthrough is None or branch == fallthrough:
             return None
         cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
@@ -1345,9 +1337,6 @@ class _SurfaceBuilder:
             join_alias = self._edge_alias_to_join(join_id, join_sources)
             self.settled_preds_by_block[str(join_id)].update(join_sources)
 
-            # A bypass is a forward edge out of this local skip arm, not an
-            # unstructured goto. Keep it source-specific so unrelated edges to the
-            # same later label are not accidentally swallowed.
             bypass_aliases: dict[str, Any] = {}
             for bypass_target in bypass_targets:
                 bypass_sources = {
@@ -1527,7 +1516,7 @@ class _SurfaceBuilder:
         join_idx = self.cfg.index_by_id[join_id]
         if join_idx <= idx or join_idx > stop:
             return None
-        branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+        branch, fallthrough = edge_targets(block, self.cfg.index_by_id)
         if branch is None or fallthrough is None:
             return None
         branch_ids = self._arm_ids(branch, join_id, stop, allowed, aliases)
@@ -1719,11 +1708,6 @@ class _SurfaceBuilder:
         if loop.get("body_succ") != block.id or loop.get("exit_succ") is None:
             return None
         exit_succ = str(loop.get("exit_succ"))
-        # Keep this rule intentionally conservative. A parameterized self-loop is
-        # safe only when the loopback passes the header params unchanged and all
-        # non-loop entries are already represented by the linear predecessor,
-        # settled structured predecessors, or by the function-entry stack.
-        # Anything needing a real phi-update model stays explicit CFG.
         loopback_assignments = _incoming_assignments(block, block.id)
         outside_preds = [pred for pred in block.predecessors if pred != block.id]
         if block.block_params:
@@ -1737,7 +1721,7 @@ class _SurfaceBuilder:
                 return None
         exit_assignments = _incoming_assignments(self.cfg.by_id.get(exit_succ), block.id)
         cond = _expr_node(block.terminator.get("condition") or block.terminator.get("text") or f"cond_{block.id}")
-        branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+        branch, fallthrough = edge_targets(block, self.cfg.index_by_id)
         if branch == block.id:
             continue_condition = cond
         elif fallthrough == block.id:
@@ -1828,12 +1812,6 @@ class _SurfaceBuilder:
         hidden_labels: set[str],
         previous_source_id: Optional[str],
     ) -> Optional[tuple[dict[str, Any], int]]:
-        # Some bytecode emits an empty fallthrough block only as a loopback label:
-        #     header: goto body
-        #     body:   if (...) goto header
-        # Treat that label as the do-while header when it has no params or side
-        # effects, and when the body has no independent entry that would require
-        # preserving its own label.
         header = self.blocks[idx]
         if header.statements or header.block_params or header.terminator.get("kind") != "fallthrough":
             return None
@@ -1848,7 +1826,7 @@ class _SurfaceBuilder:
             return None
         if header.id in aliases or body_id in aliases:
             return None
-        branch, fallthrough = _edge_targets(body, self.cfg.index_by_id)
+        branch, fallthrough = edge_targets(body, self.cfg.index_by_id)
         cond = _expr_node(body.terminator.get("condition") or body.terminator.get("text") or f"cond_{body.id}")
         if branch == header.id and fallthrough is not None:
             loop_cond = cond
@@ -1926,7 +1904,7 @@ class _SurfaceBuilder:
         nodes = set(loop.get("nodes") or set())
         if idx0 != idx or idx1 >= stop or (allowed is not None and not nodes.issubset(allowed)):
             return None
-        branch, fallthrough = _edge_targets(block, self.cfg.index_by_id)
+        branch, fallthrough = edge_targets(block, self.cfg.index_by_id)
         body_succ = loop.get("body_succ")
         exit_succ = loop.get("exit_succ")
         if body_succ not in self.cfg.index_by_id or exit_succ is None:
@@ -1960,7 +1938,7 @@ class _SurfaceBuilder:
             "body": {"kind": "sequence", "regions": body},
             "continue_target": block.id,
             "break_target": exit_succ,
-            "break_targets": _external_successors(loop, self.cfg),
+            "break_targets": external_successors(loop, self.cfg),
         }
         return region, idx1 + 1
 
@@ -2039,10 +2017,6 @@ class _SurfaceBuilder:
                     i = next_i
                     prev = None
                     continue
-            # Prefer the stricter postdominator-shaped if/if-else rule before the
-            # forward-skip rule.  Forward-skip is intentionally permissive and can
-            # otherwise steal a normal diamond whose skipped arm ends in an
-            # already-folded constant jump, leaving a residual goto to the join.
             forward_skip = self._try_forward_skip_if(i, stop, allowed, aliases, hidden_labels, prev)
             if forward_skip is not None:
                 region, next_i = forward_skip
