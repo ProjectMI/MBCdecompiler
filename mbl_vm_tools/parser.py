@@ -103,7 +103,7 @@ class FunctionEntry:
     Stable analysis entry point built from definitions and exports.
 
     Definitions carry exact code spans; exports carry public API order.  The
-    IR/HIR pipeline consumes this de-duplicated view so default corpus runs can
+    VM IR pipeline consumes this de-duplicated view so default corpus runs can
     cover local definitions without doing the same exported definition twice.
     """
 
