@@ -135,6 +135,35 @@ class FunctionEntry:
         }
 
 
+@dataclass(frozen=True)
+class DefinitionSidecar:
+    """A non-callable definition-table record attached to a neighboring runtime entry.
+
+    Some MBC definition tables contain tiny records whose byte span is not a
+    normal VM function body.  They carry table/runtime semantics and should not
+    be treated as callable functions or as AGG/AGG0 ABI declarations.
+    """
+
+    record_index: int
+    owner_index: int
+    kind: str
+    reason: str
+    record: TableRecord
+    owner_record: TableRecord
+    raw_hex: str
+
+    def to_dict(self) -> dict:
+        return {
+            "record_index": self.record_index,
+            "owner_index": self.owner_index,
+            "kind": self.kind,
+            "reason": self.reason,
+            "record": self.record.to_dict(),
+            "owner_record": self.owner_record.to_dict(),
+            "raw_hex": self.raw_hex,
+        }
+
+
 @dataclass
 class ADBInfo:
     present: bool
@@ -649,17 +678,73 @@ class MBCModule:
             if len(records) == 1
         }
 
+        self.definition_sidecars: list[DefinitionSidecar] = self._detect_definition_sidecars()
+        self._definition_sidecar_indices: set[int] = {sidecar.record_index for sidecar in self.definition_sidecars}
+        self._definition_sidecars_by_owner_addr: dict[int, list[DefinitionSidecar]] = defaultdict(list)
+        self._definition_sidecars_by_owner_name: dict[str, list[DefinitionSidecar]] = defaultdict(list)
+        for sidecar in self.definition_sidecars:
+            self._definition_sidecars_by_owner_addr[int(sidecar.owner_record.a)].append(sidecar)
+            self._definition_sidecars_by_owner_name[sidecar.owner_record.name].append(sidecar)
+
         self._definition_function_entries: list[FunctionEntry] = []
         self._export_function_entries: list[FunctionEntry] = []
         self._function_entries: list[FunctionEntry] = []
         self._function_entry_by_name: dict[str, FunctionEntry] = {}
         self._build_function_entries()
 
+    def _detect_definition_sidecars(self) -> list[DefinitionSidecar]:
+        """Detect definition-table records that are metadata sidecars, not functions.
+
+        Hotfix for the CalcParam/Recalc layout seen in the corpus: a 0x201
+        record with body ``4a 02 00 23`` sits immediately before a real
+        callable record.  Treat the short record as table/runtime metadata
+        attached to the next definition instead of decoding it as a normal
+        callable function.  The predicate intentionally requires the whole
+        byte-shape; larger 0x201 definitions remain ordinary functions.
+        """
+
+        out: list[DefinitionSidecar] = []
+        records = self.definitions
+        for idx, record in enumerate(records[:-1]):
+            owner = records[idx + 1]
+            if record.c != 0x201:
+                continue
+            if record.b + 1 != owner.a:
+                continue
+            raw = self._slice_code_span(record.a, record.b + 1)
+            if raw != b"\x4a\x02\x00\x23":
+                continue
+            if record.name in self._export_records_by_name:
+                continue
+            out.append(
+                DefinitionSidecar(
+                    record_index=idx,
+                    owner_index=idx + 1,
+                    kind="runtime_parameter_stub",
+                    reason="0x201 CalcParam-like definition-table sidecar with tiny BR/END body attached to following callable",
+                    record=record,
+                    owner_record=owner,
+                    raw_hex=raw.hex(" "),
+                )
+            )
+        return out
+
+    def is_definition_sidecar_index(self, definition_index: int) -> bool:
+        return int(definition_index) in self._definition_sidecar_indices
+
+    def get_definition_sidecars_for_address(self, address: int) -> list[DefinitionSidecar]:
+        return list(self._definition_sidecars_by_owner_addr.get(int(address), []))
+
+    def get_definition_sidecars_for_symbol(self, symbol: str) -> list[DefinitionSidecar]:
+        return list(self._definition_sidecars_by_owner_name.get(symbol, []))
+
     def _build_function_entries(self) -> None:
         definition_occurrences: Counter[str] = Counter()
         export_occurrences: Counter[str] = Counter()
 
         for definition_index, record in enumerate(self.definitions):
+            if self.is_definition_sidecar_index(definition_index):
+                continue
             definition_occurrences[record.name] += 1
             duplicate_definition_symbol = len(self._definition_records_by_name.get(record.name, [])) > 1
             export_refs = self._export_records_by_name.get(record.name, [])
@@ -913,6 +998,7 @@ class MBCModule:
             "globals": [r.to_dict() for r in self.globals],
             "exports": [r.to_dict() for r in self.exports],
             "function_entries": [entry.to_dict() for entry in self._function_entries],
+            "definition_sidecars": [sidecar.to_dict() for sidecar in self.definition_sidecars],
             "embedded_import_like_exports": [r.to_dict() for r in self.embedded_import_like_exports],
             "definition_name_collisions": {
                 name: [record.to_dict() for record in records]

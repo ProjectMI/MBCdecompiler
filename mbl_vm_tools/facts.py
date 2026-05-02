@@ -63,12 +63,19 @@ class VMFactsReport:
         }
 
 
+def _target_has_definition_sidecar(target: dict[str, Any]) -> bool:
+    record = target.get("target_record") or {}
+    sidecars = record.get("definition_sidecars") or []
+    return bool(sidecars)
+
+
 def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
     definitions: dict[str, CallableFact] = {}
     observed: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
     call_counts: Counter[tuple[str, str]] = Counter()
     call_sites: list[CallSiteFact] = []
     abi_mismatches: list[dict[str, Any]] = []
+    sidecar_relaxed_abi_calls = 0
 
     for fn in module_ir.functions:
         definitions[fn.name] = CallableFact(
@@ -106,14 +113,17 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
                 target_def = definitions.get(target_name)
                 abi_arity = target_def.abi_arity if target_def else None
                 if abi_arity is not None and abi_arity != encoded_argc:
-                    abi_mismatches.append({
-                        "caller": fn.name,
-                        "offset": fact.offset,
-                        "target": target_name,
-                        "encoded_argc": encoded_argc,
-                        "target_abi_arity": abi_arity,
-                        "reason": "CALL_SCRIPT encoded argc differs from target AGG/AGG0 ABI arity",
-                    })
+                    if _target_has_definition_sidecar(target):
+                        sidecar_relaxed_abi_calls += 1
+                    else:
+                        abi_mismatches.append({
+                            "caller": fn.name,
+                            "offset": fact.offset,
+                            "target": target_name,
+                            "encoded_argc": encoded_argc,
+                            "target_abi_arity": abi_arity,
+                            "reason": "CALL_SCRIPT encoded argc differs from target AGG/AGG0 ABI arity",
+                        })
 
     callables: list[CallableFact] = []
     seen: set[tuple[str, str]] = set()
@@ -166,7 +176,8 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
         "definition_abi_mismatch_count": len(abi_mismatches),
         "external_callable_count": sum(1 for c in callables if c.kind == "external"),
         "mixed_external_argc_count": len(mixed_external_argc),
-        "policy": "Facts report compares explicit VM call argc against explicit AGG/AGG0 ABI only; it never infers ABI from stack depth.",
+        "definition_sidecar_relaxed_abi_call_count": sidecar_relaxed_abi_calls,
+        "policy": "Facts report compares explicit VM call argc against explicit AGG/AGG0 ABI only; parser-confirmed definition-table sidecars are reported as runtime metadata rather than hard ABI mismatches.",
     }
     return VMFactsReport(
         contract=FACTS_CONTRACT_VERSION,

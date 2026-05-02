@@ -171,6 +171,21 @@ def _record_payload(record: TableRecord) -> dict[str, Any]:
     return record.to_dict()
 
 
+def _record_payload_with_sidecars(mod: MBCModule, record: TableRecord) -> dict[str, Any]:
+    payload = record.to_dict()
+    getter = getattr(mod, "get_definition_sidecars_for_address", None)
+    if getter is not None:
+        sidecars = getter(int(record.a))
+        if sidecars:
+            payload["definition_sidecars"] = [sidecar.to_dict() for sidecar in sidecars]
+    return payload
+
+
+def _is_definition_sidecar_index(mod: MBCModule, definition_index: int) -> bool:
+    checker = getattr(mod, "is_definition_sidecar_index", None)
+    return bool(checker is not None and checker(int(definition_index)))
+
+
 def build_callable_index(mod: MBCModule) -> dict[int, list[dict[str, Any]]]:
     """Build the VM callable address index.
 
@@ -182,13 +197,15 @@ def build_callable_index(mod: MBCModule) -> dict[int, list[dict[str, Any]]]:
 
     out: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for idx, rec in enumerate(mod.definitions):
+        if _is_definition_sidecar_index(mod, idx):
+            continue
         out[int(rec.a)].append({
             "kind": "definition",
             "name": rec.name,
             "symbol": rec.name,
             "table": "definitions",
             "index": idx,
-            "record": _record_payload(rec),
+            "record": _record_payload_with_sidecars(mod, rec),
         })
     for idx, rec in enumerate(mod.globals):
         out[int(rec.a)].append({
@@ -476,6 +493,7 @@ def build_function_ir(
             "CALL63A arity is the encoded argc byte only.",
             "Externs are call targets, not synthetic local definitions.",
             "Control graph distinguishes proven branch edges from aligned branch candidates.",
+            "Definition-table sidecars are preserved as metadata and are not indexed as callable functions.",
         ],
     }
     return VMFunctionIR(
@@ -514,6 +532,7 @@ def build_module_ir(
         "module": str(mod.path),
         "function_count": len(functions),
         "callable_address_count": len(callable_index),
+        "definition_sidecar_count": len(getattr(mod, "definition_sidecars", [])),
         "contract": VMIR_CONTRACT_VERSION,
     })
     return VMModuleIR(str(mod.path), summary, _index_to_json(callable_index), functions)
