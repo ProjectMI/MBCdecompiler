@@ -307,6 +307,13 @@ def _match_prefixed_semantic(data: bytes, start: int, limit: int, depth: int = 0
     if op == 0x72 and start + 2 <= limit and data[start + 1] == 0x23:
         return "PAIR72_23", 2, {"bytes": "72 23"}
 
+    # ``3d`` is an assignment/write operator.  When it is immediately followed
+    # by a plain function tail, the two bytes are separate tokens: assignment,
+    # then return.  Treating this as PFX_3D_PAIR72_23 hides the write and makes
+    # the return consume an unrelated leftover stack value.
+    if op == 0x3D and start + 3 <= limit and data[start + 1:start + 3] == b"\x72\x23":
+        return None
+
     if op in _PREFIX_ALLOWED_ATOMIC:
         nested = _match_atomic_semantic(data, start + 1, limit)
         if nested is not None:
@@ -346,6 +353,46 @@ def _terminal_kind_from_payload(kind: str, payload: dict[str, Any]) -> str:
         terminal_kind = str(terminal_payload["nested_kind"])
         terminal_payload = terminal_payload["nested"]
     return terminal_kind
+
+
+def _is_strong_token_boundary_byte(op: int) -> bool:
+    return (
+        op in SINGLE_BYTE_OPS
+        or op in SHORT_U16_OPS
+        or op in SIGNED_IMM24_OPS
+        or op in UNSIGNED_IMM24_OPS
+        or op in GENERIC_ZERO_IMM24_OPS
+        or op in {0x29, 0x28, 0x39, 0x41, 0x61, 0x62, 0x63, 0x64, 0x65, 0x69, 0x6C, 0x2C, 0x4A, 0x4B, 0x4C, 0x4D}
+    )
+
+
+def _prefer_short_atomic_boundary(data: bytes, start: int, limit: int, atomic: tuple[str, int, dict[str, Any]]) -> bool:
+    """
+    Prefer a known VM word over broad "u32 + suffix" macro matches when the
+    byte immediately after that word is a plausible token boundary.
+
+    Raw 32-bit constants are untagged in this bytecode, so broad macros are
+    still needed.  They must not steal bytes from real opcodes, though; that is
+    the root cause behind fake constants such as 0xF1011029 and 0x3D001029.
+    """
+    kind, size, _payload = atomic
+    if size <= 0 or start + size >= limit:
+        return False
+    if kind not in {"IMM", "IMM16", "OPU16", "BR", "CALL66", "CALL63A", "REF16", "F32"}:
+        return False
+    return _is_strong_token_boundary_byte(data[start + size])
+
+
+def _starts_with_structural_token_boundary(data: bytes, start: int, limit: int) -> bool:
+    atomic = _match_atomic_semantic(data, start, limit)
+    if atomic is not None and _prefer_short_atomic_boundary(data, start, limit, atomic):
+        return True
+    prefixed = _match_prefixed_semantic(data, start, limit)
+    if prefixed is not None:
+        _kind, size, _payload = prefixed
+        if size > 0 and start + size < limit and _is_strong_token_boundary_byte(data[start + size]):
+            return True
+    return False
 
 
 def _tail_repair_match(data: bytes, start: int, body_limit: int, stream_limit: int) -> tuple[str, int, dict[str, Any]] | None:
@@ -408,6 +455,8 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             out.append(Token(i, kind, repair_size, payload))
             i += repair_size
             continue
+
+        raw_u32_macro_blocked = _starts_with_structural_token_boundary(data, i, body_size)
 
         if i + 32 <= body_size and data[i:i + 4] == b"\x4f\x00\x31\x30" and data[i + 4] in (0x69, 0x6C) and data[i + 10] == 0x6C and data[i + 11] == 0x01 and data[i + 16:i + 20] == b"\x04\x00\x00\x00" and data[i + 20:i + 23] == b"\x3d\x30\x32" and data[i + 23] in (0x69, 0x6C) and data[i + 29] == 0x5E and data[i + 30:i + 32] == b"\x72\x23":
             out.append(Token(i, "SIG_GETWEAR_WRAPPER", 32, {
@@ -587,20 +636,33 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 10
             continue
 
-        if i + 9 <= body_size and data[i] == 0x01 and data[i + 5] == 0x00 and data[i + 6] == 0x01 and data[i + 7] == 0x00 and data[i + 8] == 0x00:
+        if not raw_u32_macro_blocked and i + 9 <= body_size and data[i] == 0x01 and data[i + 5] == 0x00 and data[i + 6] == 0x01 and data[i + 7] == 0x00 and data[i + 8] == 0x00:
             out.append(Token(i, "SIG_CONST_U32_TRAILER", 9, {
                 "value": u32(data, i + 1),
             }))
             i += 9
             continue
 
-        if i + 13 <= body_size and data[i + 4] == 0x64 and data[i + 5] == 0x30 and data[i + 6] == 0x00 and data[i + 7] == 0x00 and data[i + 8:i + 12] == b"\x0c\x00\x00\x00" and data[i + 12] in (0x26, 0x64):
-            out.append(Token(i, "SIG_SLOT_CONST", 13, {
+        # 4-byte literal + REF16-like field marker + 4-byte byte-count.
+        # This is a typed address-window descriptor, not three independent
+        # constants.  The common ref=0 spelling is the historic .slot_const
+        # field; ref=12 and friends are the same descriptor form for other
+        # embedded coordinate/vector fields.
+        #
+        # Older builds consumed the following opcode as a "trailer", which
+        # desynchronised the stream and turned compact REF16 offsets into bogus
+        # slots or constants.  The signature is exactly 12 bytes; the next byte
+        # belongs to the next token.
+        if i + 12 <= body_size and data[i + 4] == 0x64 and data[i + 5] == 0x30 and data[i + 8:i + 12] == b"\x0c\x00\x00\x00":
+            field_ref = struct.unpack_from("<H", data, i + 6)[0]
+            out.append(Token(i, "SIG_SLOT_CONST", 12, {
                 "value": u32(data, i),
                 "slot_mode": data[i + 5],
-                "trailer": data[i + 12],
+                "field_ref": field_ref,
+                "field_name": "slot_const" if field_ref == 0 else f"slot_{field_ref}",
+                "byte_count": 12,
             }))
-            i += 13
+            i += 12
             continue
 
         if i + 29 <= body_size and data[i:i + 29] == b"\x84\xea\x07\x00\x29\x10\x07\x2a\x5b\x04\x00\x29\x10\x06\x5b\x04\x00\x69\x10\x74\xea\x07\x00\x26\x29\x10\x04\x2c\x03":
@@ -730,7 +792,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 5
             continue
 
-        if i + 11 <= body_size and data[i + 4] == 0x3D and data[i + 5] in (0x69, 0x65, 0x6C):
+        if not raw_u32_macro_blocked and i + 11 <= body_size and data[i + 4] == 0x3D and data[i + 5] in (0x69, 0x65, 0x6C):
             out.append(Token(i, "SIG_CONST_U32_PFX_3D_REF", 11, {
                 "value": u32(data, i),
                 "ref_op": data[i + 5],
@@ -740,7 +802,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 11
             continue
 
-        if i + 8 <= body_size and data[i + 4] == 0x28 and data[i + 5] == 0x10:
+        if not raw_u32_macro_blocked and i + 8 <= body_size and data[i + 4] == 0x28 and data[i + 5] == 0x10:
             out.append(Token(i, "SIG_CONST_U32_IMM16", 8, {
                 "value": u32(data, i),
                 "imm16": struct.unpack_from('<H', data, i + 6)[0],
@@ -847,7 +909,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             or (i + 5 <= body_size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2] in (0x4A, 0x4B, 0x4C, 0x4D))
             or (i + 6 <= body_size and data[i] == 0xF0 and data[i + 1] == 0xE8 and data[i + 2] in (0x3D, 0xEB) and data[i + 3] in (0x4A, 0x4B, 0x4C, 0x4D))
         )
-        if direct_atomic is not None and direct_atomic[1] >= 4 and not custom_e8_family:
+        if direct_atomic is not None and (direct_atomic[1] >= 4 or _prefer_short_atomic_boundary(data, i, body_size, direct_atomic)) and not custom_e8_family:
             kind, tok_size, payload = direct_atomic
             out.append(Token(i, kind, tok_size, payload))
             i += tok_size
@@ -860,7 +922,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += tok_size
             continue
 
-        if i + 12 <= body_size and data[i + 4] == 0x3D and data[i + 5] == 0x30 and data[i + 6] in (0x69, 0x65, 0x6C):
+        if not raw_u32_macro_blocked and i + 12 <= body_size and data[i + 4] == 0x3D and data[i + 5] == 0x30 and data[i + 6] in (0x69, 0x65, 0x6C):
             out.append(Token(i, "SIG_CONST_U32_PFX_3D_30_REF", 12, {
                 "value": u32(data, i),
                 "ref_op": data[i + 6],
@@ -870,7 +932,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 12
             continue
 
-        if i + 11 <= body_size and data[i + 4] == 0x5E and data[i + 5] in (0x69, 0x65, 0x6C):
+        if not raw_u32_macro_blocked and i + 11 <= body_size and data[i + 4] == 0x5E and data[i + 5] in (0x69, 0x65, 0x6C):
             out.append(Token(i, "SIG_CONST_U32_PFX_5E_REF", 11, {
                 "value": u32(data, i),
                 "ref_op": data[i + 5],
@@ -880,14 +942,14 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 11
             continue
 
-        if i + 7 <= body_size and data[i + 4] == 0x3D and data[i + 5:i + 7] == b"r#":
+        if not raw_u32_macro_blocked and i + 7 <= body_size and data[i + 4] == 0x3D and data[i + 5:i + 7] == b"r#":
             out.append(Token(i, "SIG_CONST_U32_PFX_3D_PAIR72_23", 7, {
                 "value": u32(data, i),
             }))
             i += 7
             continue
 
-        if i + 8 <= body_size and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 0 and data[i + 4] == 0x64 and data[i + 5] == 0x10:
+        if not raw_u32_macro_blocked and i + 8 <= body_size and data[i + 1] == 0 and data[i + 2] == 0 and data[i + 3] == 0 and data[i + 4] == 0x64 and data[i + 5] == 0x10:
             out.append(Token(i, "SIG_CONST_U32_REF16", 8, {
                 "value": u32(data, i),
                 "ref": struct.unpack_from('<H', data, i + 6)[0],
@@ -895,7 +957,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 8
             continue
 
-        if i + 7 <= body_size and data[i + 4] == 0x29 and data[i + 5] == 0x10:
+        if not raw_u32_macro_blocked and i + 7 <= body_size and data[i + 4] == 0x29 and data[i + 5] == 0x10:
             out.append(Token(i, "SIG_CONST_U32_IMM", 7, {
                 "value": u32(data, i),
                 "imm": data[i + 6],
@@ -903,7 +965,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 7
             continue
 
-        if i + 8 <= body_size and data[i + 4] == 0x2C and data[i + 6] == 0x66:
+        if not raw_u32_macro_blocked and i + 8 <= body_size and data[i + 4] == 0x2C and data[i + 6] == 0x66:
             out.append(Token(i, "SIG_CONST_U32_CALL66", 8, {
                 "value": u32(data, i),
                 "argc": data[i + 5],
@@ -912,7 +974,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 8
             continue
 
-        if i + 11 <= body_size and data[i + 4] == 0x2C and data[i + 6] == 0x63:
+        if not raw_u32_macro_blocked and i + 11 <= body_size and data[i + 4] == 0x2C and data[i + 6] == 0x63:
             out.append(Token(i, "SIG_CONST_U32_CALL63A", 11, {
                 "value": u32(data, i),
                 "argc": data[i + 5],
@@ -921,7 +983,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 11
             continue
 
-        if i + 8 <= body_size and data[i + 4] == 0x5E and data[i + 5] == 0x29 and data[i + 6] == 0x10:
+        if not raw_u32_macro_blocked and i + 8 <= body_size and data[i + 4] == 0x5E and data[i + 5] == 0x29 and data[i + 6] == 0x10:
             out.append(Token(i, "SIG_CONST_U32_5E_IMM", 8, {
                 "value": u32(data, i),
                 "prefix_op": 0x5E,
@@ -930,7 +992,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 8
             continue
 
-        if i + 9 <= body_size and data[i + 4] == 0x26 and data[i + 5] == 0x2C and data[i + 7] == 0x66:
+        if not raw_u32_macro_blocked and i + 9 <= body_size and data[i + 4] == 0x26 and data[i + 5] == 0x2C and data[i + 7] == 0x66:
             out.append(Token(i, "SIG_CONST_U32_26_CALL66", 9, {
                 "value": u32(data, i),
                 "argc": data[i + 6],
@@ -939,7 +1001,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 9
             continue
 
-        if i + 11 <= body_size and data[i + 4] == 0x26 and data[i + 5] in (0x69, 0x65, 0x6C):
+        if not raw_u32_macro_blocked and i + 11 <= body_size and data[i + 4] == 0x26 and data[i + 5] in (0x69, 0x65, 0x6C):
             out.append(Token(i, "SIG_CONST_U32_26_REF", 11, {
                 "value": u32(data, i),
                 "ref_op": data[i + 5],
@@ -949,7 +1011,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 11
             continue
 
-        if i + 10 <= body_size and data[i + 4] in (0x69, 0x65, 0x6C):
+        if not raw_u32_macro_blocked and i + 10 <= body_size and data[i + 4] in (0x69, 0x65, 0x6C):
             out.append(Token(i, "SIG_CONST_U32_REF", 10, {
                 "value": u32(data, i),
                 "ref_op": data[i + 4],
@@ -959,7 +1021,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 10
             continue
 
-        if i + 11 <= body_size and data[i + 4] == 0x41 and not (data[i] in SHORT_U16_OPS and data[i + 3] == 0x41):
+        if not raw_u32_macro_blocked and i + 11 <= body_size and data[i + 4] == 0x41 and not (data[i] in SHORT_U16_OPS and data[i + 3] == 0x41):
             out.append(Token(i, "SIG_CONST_U32_REC41", 11, {
                 "value": u32(data, i),
                 "ref": u32(data, i + 5),
@@ -968,7 +1030,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 11
             continue
 
-        if i + 5 <= body_size and data[i + 4] == 0x72:
+        if not raw_u32_macro_blocked and i + 5 <= body_size and data[i + 4] == 0x72:
             nested = _match_prefixed_semantic(data, i + 4, body_size)
             if nested is not None and (nested[0].startswith("PFX_72_") or nested[0] == "PAIR72_23"):
                 nested_kind, nested_size, nested_payload = nested
@@ -1121,7 +1183,7 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
             i += 4
             continue
 
-        if i + 12 <= body_size and data[i + 4] == 0x62 and data[i + 5] == 0x10:
+        if not raw_u32_macro_blocked and i + 12 <= body_size and data[i + 4] == 0x62 and data[i + 5] == 0x10:
             out.append(Token(i, "SIG_CONST_U32_REC62", 12, {
                 "value": u32(data, i),
                 "mode": 0x10,
@@ -1250,6 +1312,11 @@ def tokenize_stream(data: bytes, limit: int | None = None) -> list[Token]:
                 out.append(Token(i, "ASCII", len(run), {"preview": preview}))
                 i = j
                 continue
+
+        if op == 0x3D:
+            out.append(Token(i, "ASSIGN", 1, {"op": op, "role": "assignment"}))
+            i += 1
+            continue
 
         if op in SINGLE_BYTE_OPS:
             kind, payload = _single_byte_structural_token(op)

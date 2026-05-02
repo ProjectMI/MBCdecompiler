@@ -12,7 +12,7 @@ from mbl_vm_tools.IR import IRFunction, IRNode, build_function_ir
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-HIR_CONTRACT_VERSION = "hir-v13"
+HIR_CONTRACT_VERSION = "hir-v15"
 
 
 def _coerce_hir_block(payload: dict[str, Any]) -> "HIRBlock":
@@ -144,6 +144,23 @@ class _StackPlanBlock:
     output_used: dict[int, bool]
 
 
+IMPLICIT_ENTRY_ARG_LIMIT = 8
+IMPLICIT_PROLOGUE_TAIL_ARG_LIMIT = 1
+
+
+def _implicit_entry_stack(block_id: str, depth: int) -> list[str]:
+    """Name entry live-ins for functions without an aggregate signature.
+
+    Small no-prologue wrappers in this corpus often are genuine stack-ABI
+    helpers, so keep their compact argN surface.  Large inferred depths are
+    produced by stack-balancing over control-flow joins and must not become a
+    source-level function header.
+    """
+    if depth <= IMPLICIT_ENTRY_ARG_LIMIT:
+        return [f"arg{i}" for i in range(depth)]
+    return [f"in_{block_id}_{i}" for i in range(depth)]
+
+
 def _ordered_unique(items: list[str]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -160,6 +177,35 @@ def _is_placeholder_value(name: str) -> bool:
 
 _TEMP_LIKE_RE = re.compile(r"\b(?:t\d+|phi_[A-Za-z0-9_]+|m_[A-Za-z0-9_]+|arg\d+|in_[A-Za-z0-9_]+|undef_[A-Za-z0-9_]+)\b")
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+_SLOT_EXPR_RE = re.compile(r"^slot_(?P<ref>\d+)@(?P<mode>0x[0-9A-Fa-f]+)(?:\..+)?$")
+_INT_EXPR_RE = re.compile(r"^-?\d+$")
+
+
+def _slot_expr_mode(text: str) -> str | None:
+    match = _SLOT_EXPR_RE.match(str(text).strip())
+    return match.group("mode").lower() if match is not None else None
+
+
+def _is_context_slot_expr(text: str) -> bool:
+    return _slot_expr_mode(text) == "0x30"
+
+
+def _is_scalar_slot_expr(text: str) -> bool:
+    return _slot_expr_mode(text) in {"0x00", "0x01", "0x10", "0x11"}
+
+
+def _is_integer_expr(text: str) -> bool:
+    return _INT_EXPR_RE.match(str(text).strip()) is not None
+
+
+def _is_numeric_expr(text: str) -> bool:
+    return re.match(r"^-?\d+(?:\.\d+)?$", str(text).strip()) is not None
+
+
+
+def _is_address_expr(text: str) -> bool:
+    stripped = str(text).strip()
+    return stripped.startswith(("slot_", "arg", "m_bb", "t")) or ".slot" in stripped
 
 
 def _replace_vars(text: Optional[str], mapping: dict[str, str]) -> Optional[str]:
@@ -199,6 +245,41 @@ def _format_literal(value: Any) -> str:
     return str(value)
 
 
+def _record_mode_literal(mode: Any) -> str | None:
+    if mode is None:
+        return None
+    if isinstance(mode, str):
+        if mode.startswith("0x"):
+            return mode
+        try:
+            return f"0x{int(mode):02X}"
+        except Exception:
+            return mode
+    try:
+        return f"0x{int(mode):02X}"
+    except Exception:
+        return str(mode)
+
+
+def _is_integer_const_terminal(inst: CanonicalInstruction) -> bool:
+    return inst.terminal_kind in {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "OPU16", "REF16"}
+
+
+def _embedded_terminal_expr(inst: CanonicalInstruction) -> str | None:
+    if inst.terminal_kind in {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "OPU16", "F32"}:
+        value = inst.operands.get("value")
+        if value is None:
+            value = inst.operands.get("imm")
+        return _format_literal(value) if value is not None else None
+    if inst.terminal_kind == "REF16" and inst.operands.get("encoding") == "ref16_offset":
+        return _format_literal(inst.operands.get("value"))
+    if inst.terminal_kind in {"REF", "REF16"}:
+        return _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+    if inst.terminal_kind in {"REC41", "REC61", "REC62"}:
+        return _format_record_constructor(inst)
+    return None
+
+
 def _format_call_target(inst: CanonicalInstruction) -> str:
     operands = inst.operands
     if inst.semantic_op == "syscall":
@@ -229,26 +310,42 @@ def _format_code_ref_target(inst: CanonicalInstruction) -> str:
 
 
 def _format_record_constructor(inst: CanonicalInstruction) -> str:
+    record_kind = inst.operands.get("record_kind")
+    family = inst.operands.get("family") or inst.operands.get("macro_family")
+    family_text = str(family or "")
+    suffix = ""
+    if isinstance(record_kind, str) and record_kind:
+        suffix = record_kind.lower()
+    elif family_text.endswith("REC41"):
+        suffix = "rec41"
+    elif family_text.endswith("REC62"):
+        suffix = "rec62"
+    elif family_text.endswith("REC61"):
+        suffix = "rec61"
+    else:
+        suffix = inst.terminal_kind.lower()
+
+    # REC61 is consistently used as a typed memory window descriptor:
+    #   mode/u16/a/b/c => base slot, element size, byte span, signed count.
+    # Rendering it as a constructor pollutes dataflow with meaningless rec61(...)
+    # temporaries.  The useful surface value is the addressable base.
+    if suffix == "rec61" and inst.operands.get("a") is not None:
+        return _slot_name(inst.operands.get("a"), _record_mode_literal(inst.operands.get("mode")))
+
+    # REC41 is a compact data/blob descriptor.  It commonly flows into native
+    # calls as an immediate buffer/string argument.
+    if suffix == "rec41" and inst.operands.get("ref") is not None:
+        imm = inst.operands.get("imm")
+        if imm is not None:
+            return f"data_{inst.operands.get('ref')}[{imm}]"
+        return f"data_{inst.operands.get('ref')}"
+
     parts: list[str] = []
     for key in sorted(inst.operands.keys()):
         if key in {"family", "macro_family", "prefix_chain", "record_kind", "stack_inputs_required"}:
             continue
         parts.append(f"{key}={inst.operands[key]}")
     joined = ", ".join(parts)
-    record_kind = inst.operands.get("record_kind")
-    if isinstance(record_kind, str) and record_kind:
-        suffix = record_kind.lower()
-    else:
-        family = inst.operands.get("family") or inst.operands.get("macro_family")
-        family_text = str(family or "")
-        if family_text.endswith("REC41"):
-            suffix = "rec41"
-        elif family_text.endswith("REC62"):
-            suffix = "rec62"
-        elif family_text.endswith("REC61"):
-            suffix = "rec61"
-        else:
-            suffix = inst.terminal_kind.lower()
     return f"{suffix}({joined})"
 
 
@@ -277,7 +374,7 @@ def _canonical_expr(inst: CanonicalInstruction, args: list[str]) -> str:
         return _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
     if inst.semantic_op == "read_field":
         base = args[-1] if args else _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
-        field_name = inst.operands.get("family") or inst.operands.get("field") or "field"
+        field_name = inst.operands.get("field_name") or inst.operands.get("field") or inst.operands.get("family") or "field"
         return f"{base}.{str(field_name).lower()}"
     if inst.semantic_op == "make_record":
         return _format_record_constructor(inst)
@@ -298,6 +395,189 @@ def _canonical_expr(inst: CanonicalInstruction, args: list[str]) -> str:
     return f"{inst.semantic_op}({', '.join(args)})"
 
 
+
+def _assignment_yield_expr(inst: CanonicalInstruction, args: list[str]) -> str:
+    if inst.terminal_kind == "CODE_REF63" and args:
+        # PFX_3D_CODE_REF closes an assignment/test window.  The code-ref is a
+        # control-layout hint; the stack value carried forward is the assigned
+        # value/test operand, not a synthetic slot<?>.
+        return args[-1]
+    return _embedded_terminal_expr(inst) or _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+
+def _resolve_assignment_shape_args(args: list[str], value_map: dict[str, DataflowValue]) -> list[str]:
+    """Inline cheap producer expressions before choosing assignment shape.
+
+    Assignment-window classification needs to see that ``t1`` is really
+    ``slot_4.slot_const`` and ``t2`` is really ``0``.  The later surface cleanup
+    can inline the text, but by then the formatter may already have chosen a
+    scalar store instead of an indexed descriptor store.  Keep this deliberately
+    conservative: calls/syscalls and long expressions stay as temps.
+    """
+    def resolve(name: str, active: set[str]) -> str:
+        if name in active:
+            return name
+        value = value_map.get(name)
+        if value is None:
+            return name
+        expr = str(value.expr)
+        if not expr or len(expr) > 96 or "(" in expr or name in expr:
+            return name
+        active.add(name)
+        for ref in _ordered_unique(_iter_temp_like_refs(expr)):
+            replacement = resolve(ref, active)
+            if replacement != ref:
+                candidate = _replace_var(expr, ref, replacement)
+                if candidate is not None and len(candidate) <= 96 and "(" not in candidate:
+                    expr = candidate
+        active.remove(name)
+        if len(expr) > 96 or "(" in expr:
+            return name
+        return expr
+
+    return [resolve(str(arg), set()) for arg in args]
+
+
+def _format_assignment_statement(inst: CanonicalInstruction, args: list[str]) -> str:
+    if inst.operands.get("assignment_op"):
+        # A bare 0x3D with a single stack value is a call-result sink/barrier,
+        # not an anonymous write.  Keeping it as ``slot<?> = value`` leaks a
+        # fake destination into surface ASTs (showred/syscall_73).
+        if inst.raw_kind == "ASSIGN" and inst.terminal_kind == "ASSIGN" and len(args) == 1:
+            return ""
+
+        if inst.terminal_kind == "CODE_REF63":
+            # Code-ref assignment prefixes are branch/test closures.  Their
+            # carried value is handled by _assignment_yield_expr; emitting a
+            # statement here creates fake numeric l-values such as ``0 = slot``.
+            return ""
+
+        if inst.raw_kind == "ASSIGN" and inst.terminal_kind == "ASSIGN":
+            if (
+                len(args) >= 6
+                and _is_context_slot_expr(args[0])
+                and _is_integer_expr(args[1])
+                and _is_scalar_slot_expr(args[2])
+                and _is_context_slot_expr(args[3])
+                and _is_integer_expr(args[4])
+                and _is_scalar_slot_expr(args[5])
+            ):
+                lhs_context = args[0] if str(args[1]).strip() == "0" else f"{args[0]}[{args[1]}]"
+                rhs_context = args[3] if str(args[4]).strip() == "0" else f"{args[3]}[{args[4]}]"
+                return f"{lhs_context}.{args[2]} = {rhs_context}.{args[5]}"
+            if len(args) >= 4 and _is_context_slot_expr(args[0]) and _is_integer_expr(args[2]):
+                return f"{args[0]}[{args[2]}] = {args[3]}"
+            if (
+                len(args) >= 4
+                and _is_address_expr(args[0])
+                and _is_integer_expr(args[1])
+                and not _is_numeric_expr(args[2])
+                and _is_integer_expr(args[3])
+            ):
+                return f"{args[0]}[{args[1]}] = {args[2]}[{args[3]}]"
+            if len(args) >= 3 and _is_context_slot_expr(args[0]) and _is_integer_expr(args[1]):
+                return f"{args[0]}[{args[1]}] = {args[2]}"
+
+        if "embedded_assignment_value" in inst.operands:
+            target = _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+            return f"{target} = {inst.operands.get('embedded_assignment_value')}"
+
+        # `3D 30 IMM n` is not a write to slot<?>.  It closes the current
+        # address window and leaves the embedded immediate as the next index.
+        # The dynamic stack window before it is: previous_index, base_descriptor, value.
+        if inst.terminal_kind in {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "OPU16"}:
+            if len(args) >= 4 and _is_context_slot_expr(args[0]) and _is_integer_expr(args[1]) and _is_scalar_slot_expr(args[2]):
+                context = args[0] if str(args[1]).strip() == "0" else f"{args[0]}[{args[1]}]"
+                value = _embedded_terminal_expr(inst) or args[3]
+                return f"{context}.{args[2]} = {value}"
+            if len(args) >= 3:
+                if _is_address_expr(args[0]) and _is_numeric_expr(args[1]):
+                    return f"{args[0]}[{args[1]}] = {args[2]}"
+                return f"{args[1]}[{args[0]}] = {args[2]}"
+            if len(args) == 2:
+                if _is_address_expr(args[0]) and not _is_numeric_expr(args[0]):
+                    return f"{args[0]} = {args[1]}"
+                # Without an addressable target the embedded IMM is a carried
+                # value/index for the next VM operation, not an l-value.
+                return ""
+            if len(args) == 1:
+                return ""
+
+        if len(args) >= 5:
+            # Some native-call result stores carry metadata/stride before the
+            # scalar value: target, duplicate/base metadata, index, stride, value.
+            # Rendering the stride as ``stride[value]`` is pure surface noise.
+            if _is_numeric_expr(args[3]) and not _is_numeric_expr(args[4]):
+                return f"{args[0]}[{args[2]}] = {args[4]}"
+            # Five-word assignment windows carry target base, addressing metadata,
+            # target offset, source base and source offset.  The metadata word is
+            # not a destination index.
+            return f"{args[0]}[{args[2]}] = {args[3]}[{args[4]}]"
+        if len(args) >= 4:
+            # Pattern: object context + selector + scalar-field slot + value.
+            # This appears in ResetParams/SetHealth and is not an indexed copy
+            # from scalar_slot[value]; it is a write to the scalar field inside
+            # the context object.
+            if _is_context_slot_expr(args[0]) and _is_integer_expr(args[1]) and _is_scalar_slot_expr(args[2]):
+                context = args[0] if str(args[1]).strip() == "0" else f"{args[0]}[{args[1]}]"
+                return f"{context}.{args[2]} = {args[3]}"
+            # Shape: target, index, scalar metadata/stride, value.
+            if _is_address_expr(args[0]) and not _is_numeric_expr(args[1]) and _is_numeric_expr(args[2]):
+                return f"{args[0]}[{args[1]}] = {args[3]}"
+            # Shape: target, metadata, offset, value.
+            if _is_address_expr(args[0]) and _is_numeric_expr(args[1]) and _is_numeric_expr(args[2]):
+                return f"{args[0]}[{args[2]}] = {args[3]}"
+            return f"{args[0]}[{args[1]}] = {args[2]}[{args[3]}]"
+        if len(args) == 3:
+            terminal_target = _slot_name(inst.operands.get("ref"), inst.operands.get("mode")) if inst.operands.get("ref") is not None else None
+            if terminal_target and _is_numeric_expr(args[0]) and _is_numeric_expr(args[1]):
+                return f"{terminal_target} = {args[2]}"
+            # Three-word stores split into two different shapes:
+            #   target_descriptor, offset, value      -> target[offset] = value
+            #   scalar_target, source_descriptor, off -> target = source[off]
+            # The latter is common in chained scalar initialisers that copy from
+            # slot_4.slot_const[N].
+            if _is_context_slot_expr(args[1]) and _is_integer_expr(args[2]):
+                field_offset = int(str(args[2]).strip())
+                return f"{args[0]} = {args[1]}.slot_{field_offset}@0x10"
+            if _is_address_expr(args[1]) and _is_numeric_expr(args[2]) and not _is_numeric_expr(args[1]):
+                return f"{args[0]} = {args[1]}[{args[2]}]"
+            # Chained assignment prefixes may leave the next literal/index on
+            # the stack before the base descriptor.  Do not invert base/index.
+            if _is_integer_expr(args[0]) and (args[1].startswith("slot_") or "." in args[1]):
+                return f"{args[1]}[{args[0]}] = {args[2]}"
+            return f"{args[0]}[{args[1]}] = {args[2]}"
+        if len(args) == 2:
+            terminal_target = _embedded_terminal_expr(inst) or (
+                _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+                if inst.operands.get("ref") is not None
+                else None
+            )
+            if terminal_target and terminal_target != "slot<?>" and _is_integer_expr(args[0]):
+                return f"{terminal_target}[{args[0]}] = {args[1]}"
+            if (
+                terminal_target
+                and terminal_target != "slot<?>"
+                and _is_context_slot_expr(terminal_target)
+                and _is_scalar_slot_expr(args[0])
+            ):
+                return f"{terminal_target}.{args[0]} = {args[1]}"
+            if terminal_target and terminal_target != "slot<?>":
+                return f"{terminal_target} = {args[1]}"
+            return f"{args[0]} = {args[1]}"
+        if len(args) == 1:
+            target = _embedded_terminal_expr(inst) or _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+            return f"{target} = {args[0]}"
+        target = _embedded_terminal_expr(inst) or _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+        return f"{target} = <?>"
+
+    target = args[0] if len(args) >= 1 else _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
+    value = args[1] if len(args) >= 2 else "<?>"
+    if inst.semantic_op == "write_field":
+        field_name = inst.operands.get("family") or inst.operands.get("field") or "field"
+        return f"{target}.{str(field_name).lower()} = {value}"
+    return f"{target} = {value}"
+
+
 def _infer_stack_io(inst: CanonicalInstruction) -> tuple[int, int]:
     op = inst.semantic_op
     operands = inst.operands
@@ -316,6 +596,15 @@ def _infer_stack_io(inst: CanonicalInstruction) -> tuple[int, int]:
             return 1, 1
         return 0, 1
     if op in {"store", "write_field", "opaque_store"}:
+        if operands.get("assignment_op"):
+            # Assignment prefixes are stack-width sensitive: a scalar write uses
+            # target/index/value, while a vector/address copy uses
+            # target/index/source/index.  Compact const+assignment signatures
+            # carry their value inside the token, so they do not consume a
+            # dynamic stack window.  Some prefixed assignment forms also leave
+            # their encoded target on the VM stack so chained field writes can
+            # omit the base ref in the following bytecode words.
+            return 0, 1 if operands.get("assignment_yields_target") else 0
         return 2, 0
     if op == "branch":
         prefix_chain = operands.get("prefix_chain") or []
@@ -324,6 +613,8 @@ def _infer_stack_io(inst: CanonicalInstruction) -> tuple[int, int]:
             return 2, 0
         return 1, 0
     if op == "return":
+        if operands.get("optional_value"):
+            return 0, 0
         return 1, 0
     return 0, 0
 
@@ -343,7 +634,10 @@ def _effect_lists(inst: CanonicalInstruction) -> tuple[list[str], list[str], lis
     if op == "syscall":
         effects.extend(["call", "native_call"])
     if op == "make_record":
-        effects.append("alloc")
+        # Record tokens are address/data descriptors, not standalone allocation
+        # side effects.  If nobody consumes the descriptor, printing it as a
+        # statement is misleading noise.
+        pass
     if op == "aggregate":
         effects.append("aggregate")
     if op == "branch":
@@ -656,6 +950,7 @@ def _build_instruction_control(instructions: list[CanonicalInstruction], nodes: 
                     "target_instruction_index": offset_to_first_inst.get(target_offset),
                     "branch_op": inst.operands.get("branch_op") or origin.operands.get("branch_op"),
                     "resolved": target_offset in offset_to_first_inst,
+                    "direct_branch": False,
                 }
             )
         elif inst.semantic_op in {"call", "syscall"} and inst.operands.get("rel") is not None:
@@ -741,14 +1036,56 @@ def _compute_canonical_blocks(
             and dst_block["start_offset"] >= declared_local_end
         )
 
+    def _local_window_start_for_branch_target(target_index: int | None) -> int | None:
+        if target_index is None or target_index <= 0 or target_index >= len(instructions):
+            return None
+        target = instructions[target_index]
+        if not (target.semantic_op in {"store", "write_field", "opaque_store"} and target.operands.get("assignment_op")):
+            return None
+        cursor = target_index - 1
+        while cursor >= 0 and not instructions[cursor].control.get("is_terminator"):
+            cursor -= 1
+        window_start = cursor + 1
+        if window_start >= target_index:
+            return None
+        window = list(range(window_start, target_index + 1))
+        local_count = _assignment_local_input_count(window, len(window) - 1, instructions)
+        if local_count is None or local_count <= 0:
+            return None
+        return window_start
+
+    def _fallthrough_window_closure_skip_index(branch_index: int, target_index: int | None) -> int | None:
+        """Return the instruction after a branch-target stack-window closure.
+
+        Conditional bytecode often points a branch at the terminal token of a
+        assignment stack window (for example ``3D 30 REF``) while the operands
+        for that token are staged only by the immediate linear fallthrough window before it.
+        A non-linear edge into the terminal cannot provide those operands; if we
+        connect it there, HIR fabricates wide stack phis and unresolved
+        ``in_bb`` placeholders.
+
+        The terminal remains reachable from its linear predecessor.  Branch
+        edges are redirected to the instruction after the terminal.
+        """
+        if target_index is None or target_index + 1 >= len(instructions):
+            return None
+        local_start = _local_window_start_for_branch_target(target_index)
+        if local_start is None:
+            return None
+        return target_index + 1
+
     leaders: set[int] = {0}
     for idx, inst in enumerate(instructions):
         ctrl = inst.control
         if ctrl.get("is_terminator"):
             target_index = ctrl.get("target_instruction_index")
             if target_index is not None:
-                leaders.add(int(target_index))
-            if ctrl.get("fallthrough") and idx + 1 < len(instructions):
+                target_index_int = int(target_index)
+                leaders.add(target_index_int)
+                skip_index = _fallthrough_window_closure_skip_index(idx, target_index_int)
+                if skip_index is not None:
+                    leaders.add(skip_index)
+            if idx + 1 < len(instructions):
                 leaders.add(idx + 1)
         code_ref_target_index = _code_ref_target_index(inst)
         if code_ref_target_index is not None:
@@ -858,9 +1195,20 @@ def _compute_canonical_blocks(
 
         if ctrl.get("kind") == "branch":
             target_inst = ctrl.get("target_instruction_index")
-            target_block = inst_to_block.get(int(target_inst)) if isinstance(target_inst, int) else None
+            edge_target_inst = target_inst
+            skip_index = _fallthrough_window_closure_skip_index(terminator.index, int(target_inst)) if isinstance(target_inst, int) else None
+            if skip_index is not None:
+                edge_target_inst = skip_index
+                block["flags"].append("branch_skips_fallthrough_assignment_window")
+            target_block = inst_to_block.get(int(edge_target_inst)) if isinstance(edge_target_inst, int) else None
             if target_block is not None:
-                add_edge(block["id"], target_block, "branch", ctrl.get("target_offset"))
+                add_edge(
+                    block["id"],
+                    target_block,
+                    "branch" if skip_index is None else "branch_skip_window_closure",
+                    ctrl.get("target_offset"),
+                    extra={"skipped_target_instruction_index": target_inst} if skip_index is not None else None,
+                )
             else:
                 anomalies.append(
                     {
@@ -949,7 +1297,634 @@ def _compute_canonical_blocks(
 # --- dataflow -------------------------------------------------------------
 
 
+_STACK_WINDOW_BARRIERS = {"store", "write_field", "opaque_store", "branch", "return", "data"}
+
+
+def _previous_value_can_feed_optional_return(block_indices: list[int], pos: int, instructions: list[CanonicalInstruction]) -> bool:
+    if pos <= 0:
+        return False
+    prev = instructions[block_indices[pos - 1]]
+    if prev.stack_outputs <= 0:
+        return False
+    if prev.semantic_op in _STACK_WINDOW_BARRIERS:
+        return False
+    if prev.control.get("is_terminator"):
+        return False
+    return True
+
+
+def _is_offset_literal_instruction(inst: CanonicalInstruction) -> bool:
+    if inst.semantic_op != "const":
+        return False
+    if inst.operands.get("offset_literal"):
+        return True
+    return inst.operands.get("encoding") == "ref16_offset"
+
+
+def _is_descriptor_base_instruction(inst: CanonicalInstruction) -> bool:
+    # A field read followed by an offset literal is one logical native-call
+    # descriptor, but it occupies two VM stack words.  Treat only materialised
+    # descriptor reads this way; plain loads followed by an IMM 0 are ordinary
+    # call arguments in functions such as GetXYZ/syscall_77.
+    return inst.semantic_op == "read_field"
+
+
+def _expanded_call_stack_input_count(block_indices: list[int], pos: int, instructions: list[CanonicalInstruction]) -> int:
+    inst = instructions[block_indices[pos]]
+    if inst.semantic_op not in {"call", "syscall", "opaque_call"}:
+        return inst.stack_inputs_required
+    try:
+        argc = int(inst.operands.get("argc", 0) or 0)
+    except (TypeError, ValueError):
+        return inst.stack_inputs_required
+    if argc <= 0 or pos <= 0:
+        return inst.stack_inputs_required
+
+    physical = 0
+    logical = 0
+    saw_descriptor_pair = False
+    cursor = pos - 1
+    # Native CALL66 encodes the number of logical arguments.  Some bytecode
+    # descriptors (base.slot_const + offset) remain split as two stack words
+    # until the call, so the dataflow pass must count the physical words as
+    # well.  Keep the window deliberately small to avoid swallowing unrelated
+    # setup code across barriers.
+    while cursor >= 0 and logical < argc and physical < argc + 12:
+        cur = instructions[block_indices[cursor]]
+        if cur.control.get("is_terminator") or cur.semantic_op in _STACK_WINDOW_BARRIERS:
+            break
+        if _is_offset_literal_instruction(cur) and cursor - 1 >= 0:
+            prev = instructions[block_indices[cursor - 1]]
+            if (not prev.control.get("is_terminator")) and _is_descriptor_base_instruction(prev):
+                physical += 2
+                logical += 1
+                saw_descriptor_pair = True
+                cursor -= 2
+                continue
+        physical += 1
+        logical += 1
+        cursor -= 1
+
+    if saw_descriptor_pair and physical > inst.stack_inputs_required:
+        return physical
+    return inst.stack_inputs_required
+
+
+def _is_assignment_window_barrier(inst: CanonicalInstruction) -> bool:
+    if inst.control.get("is_terminator"):
+        return True
+    if inst.semantic_op in {"call", "syscall", "opaque_call", "branch", "return", "data"}:
+        return True
+    return False
+
+
+def _is_descriptor_offset_pair(block_indices: list[int], base_pos: int, offset_pos: int, instructions: list[CanonicalInstruction]) -> bool:
+    if base_pos < 0 or offset_pos < 0:
+        return False
+    base = instructions[block_indices[base_pos]]
+    offset = instructions[block_indices[offset_pos]]
+    if _is_assignment_window_barrier(base) or _is_assignment_window_barrier(offset):
+        return False
+    if not _is_offset_literal_instruction(offset):
+        return False
+    # Field reads are the canonical descriptor base.  Plain loads may be the
+    # source side of a vector copy (arg[off]).  A previous assignment prefix may
+    # also yield the same destination descriptor for chained writes such as
+    # `dst[0] = src[0]; dst[4] = src[4]`; treating that yielded descriptor as a
+    # barrier collapses the later writes into `field = offset`.
+    if base.semantic_op in {"read_field", "load"}:
+        return True
+    if base.semantic_op in {"store", "write_field", "opaque_store"} and base.operands.get("assignment_op") and base.stack_outputs > 0:
+        return True
+    return False
+
+
+def _assignment_local_input_count(block_indices: list[int], pos: int, instructions: list[CanonicalInstruction]) -> int | None:
+    # Prefer local bytecode shapes over whole-block depth.  The latter is useful
+    # as a fallback, but it happily absorbs branch selector constants and other
+    # setup words, producing expressions such as `2379[slot_const] = 0[arg0]`.
+    if pos <= 0:
+        return None
+
+    def at(rel: int) -> CanonicalInstruction:
+        return instructions[block_indices[pos + rel]]
+
+    # Bare ASSIGN can close a chained address window.  This must run before the
+    # generic barrier/context rules because a structural MARK may sit directly
+    # before the ASSIGN token, and wider context-field copies otherwise degrade
+    # to numeric l-values such as ``0 = slot``.
+    inst0 = at(0)
+    if inst0.raw_kind == "ASSIGN" and inst0.terminal_kind == "ASSIGN":
+        sig_positions: list[int] = []
+        cursor = pos - 1
+        while cursor >= 0:
+            prev_sig = instructions[block_indices[cursor]]
+            if prev_sig.control.get("is_terminator"):
+                break
+            if prev_sig.semantic_op != "data":
+                sig_positions.append(cursor)
+            cursor -= 1
+
+        def sig(rel: int) -> CanonicalInstruction:
+            return instructions[block_indices[sig_positions[rel]]]
+
+        if len(sig_positions) >= 6:
+            lhs_context = sig(5)
+            lhs_selector = sig(4)
+            lhs_field = sig(3)
+            rhs_context = sig(2)
+            rhs_selector = sig(1)
+            rhs_field = sig(0)
+            if (
+                lhs_context.semantic_op == "load"
+                and lhs_selector.semantic_op == "const"
+                and lhs_field.semantic_op == "load"
+                and rhs_context.semantic_op == "load"
+                and rhs_selector.semantic_op == "const"
+                and rhs_field.semantic_op == "load"
+            ):
+                return 6
+
+        if len(sig_positions) >= 4:
+            target = sig(3)
+            metadata = sig(2)
+            offset = sig(1)
+            value = sig(0)
+            if (
+                target.semantic_op in {"store", "write_field", "opaque_store"}
+                and target.operands.get("assignment_op")
+                and target.stack_outputs > 0
+                and metadata.semantic_op == "const"
+                and _is_offset_literal_instruction(offset)
+                and not _is_assignment_window_barrier(value)
+            ):
+                return 4
+
+        if len(sig_positions) >= 3:
+            target = sig(2)
+            offset = sig(1)
+            value = sig(0)
+            if (
+                target.semantic_op in {"store", "write_field", "opaque_store"}
+                and target.operands.get("assignment_op")
+                and target.stack_outputs > 0
+                and _is_offset_literal_instruction(offset)
+                and not _is_assignment_window_barrier(value)
+            ):
+                return 3
+
+    prev = instructions[block_indices[pos - 1]]
+    if _is_assignment_window_barrier(prev):
+        return None
+
+    def descriptor_base_inst(inst: CanonicalInstruction) -> bool:
+        if inst.semantic_op in {"read_field", "load"}:
+            return True
+        return inst.semantic_op in {"store", "write_field", "opaque_store"} and inst.operands.get("assignment_op") and inst.stack_outputs > 0
+
+    # Metadata-qualified target descriptor + source descriptor, e.g. GetXYZ:
+    #   dst, meta, dst_off, src_base, src.slot_const, src_off, 3D 30 next_ref
+    # The metadata word is not an array index; it belongs to the l-value window.
+    if pos >= 6:
+        target_base = at(-6)
+        metadata = at(-5)
+        target_offset = at(-4)
+        source_owner = at(-3)
+        source_desc = at(-2)
+        source_offset = at(-1)
+        if (
+            descriptor_base_inst(target_base)
+            and metadata.semantic_op == "const"
+            and _is_offset_literal_instruction(target_offset)
+            and source_owner.semantic_op == "load"
+            and source_desc.semantic_op == "read_field"
+            and _is_offset_literal_instruction(source_offset)
+        ):
+            return 5
+
+    # target_descriptor + source_descriptor, e.g.
+    #   dst.slot_const, 0, src, 0, 3D 30 REF
+    if pos >= 4 and _is_descriptor_offset_pair(block_indices, pos - 4, pos - 3, instructions) and _is_descriptor_offset_pair(block_indices, pos - 2, pos - 1, instructions):
+        return 4
+
+    # Encoded destination + source descriptor, e.g. Getxyz:
+    #   dst, dst_off, src_base, src.slot_const, src_off, 3D 30 dst
+    # The source base is consumed by the read_field instruction and therefore
+    # is not a live stack word, but the local instruction window is five tokens
+    # wide.  Counting only the last three words loses the destination object and
+    # turns the assignment into `0[slot_const] = 0`.
+    if pos >= 5:
+        target_base = at(-5)
+        source_owner = at(-3)
+        source_desc = at(-2)
+        if (
+            _is_descriptor_offset_pair(block_indices, pos - 5, pos - 4, instructions)
+            and source_owner.semantic_op == "load"
+            and source_desc.semantic_op == "read_field"
+            and _is_descriptor_offset_pair(block_indices, pos - 2, pos - 1, instructions)
+            and not _is_assignment_window_barrier(target_base)
+        ):
+            return 4
+
+    # Bare ASSIGN can close a chained address window.  Ignore structural data
+    # markers between the last value and the ASSIGN token; they are not stack
+    # words.
+    inst0 = at(0)
+    if inst0.raw_kind == "ASSIGN" and inst0.terminal_kind == "ASSIGN":
+        sig_positions: list[int] = []
+        cursor = pos - 1
+        while cursor >= 0:
+            prev = instructions[block_indices[cursor]]
+            if prev.control.get("is_terminator"):
+                break
+            if prev.semantic_op != "data":
+                sig_positions.append(cursor)
+            cursor -= 1
+
+        def sig(rel: int) -> CanonicalInstruction:
+            return instructions[block_indices[sig_positions[rel]]]
+
+        if len(sig_positions) >= 6:
+            lhs_context = sig(5)
+            lhs_selector = sig(4)
+            lhs_field = sig(3)
+            rhs_context = sig(2)
+            rhs_selector = sig(1)
+            rhs_field = sig(0)
+            if (
+                lhs_context.semantic_op == "load"
+                and lhs_selector.semantic_op == "const"
+                and lhs_field.semantic_op == "load"
+                and rhs_context.semantic_op == "load"
+                and rhs_selector.semantic_op == "const"
+                and rhs_field.semantic_op == "load"
+            ):
+                return 6
+
+        if len(sig_positions) >= 4:
+            target = sig(3)
+            metadata = sig(2)
+            offset = sig(1)
+            value = sig(0)
+            if (
+                target.semantic_op in {"store", "write_field", "opaque_store"}
+                and target.operands.get("assignment_op")
+                and target.stack_outputs > 0
+                and metadata.semantic_op == "const"
+                and _is_offset_literal_instruction(offset)
+                and not _is_assignment_window_barrier(value)
+            ):
+                return 4
+
+        if len(sig_positions) >= 3:
+            target = sig(2)
+            offset = sig(1)
+            value = sig(0)
+            if (
+                target.semantic_op in {"store", "write_field", "opaque_store"}
+                and target.operands.get("assignment_op")
+                and target.stack_outputs > 0
+                and _is_offset_literal_instruction(offset)
+                and not _is_assignment_window_barrier(value)
+            ):
+                return 3
+
+    # REC61 table/vector initialisers are chained by the embedded IMM in the
+    # previous assignment: index, record_descriptor, value, 3D 30 next_index.
+    # Counting only descriptor+value turns them into repeated ``slot = 0``
+    # statements and drops the element offset.
+    if pos >= 3:
+        inst = at(0)
+        index = at(-3)
+        record_desc = at(-2)
+        value = at(-1)
+        if (
+            inst.operands.get("assignment_op")
+            and inst.terminal_kind in {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "OPU16"}
+            and record_desc.semantic_op == "make_record"
+            and value.semantic_op == "const"
+            and (
+                index.semantic_op == "const"
+                or (index.semantic_op in {"store", "write_field", "opaque_store"} and index.operands.get("assignment_op") and index.stack_outputs > 0)
+            )
+        ):
+            return 3
+
+    # Context scalar assignment, e.g. ResetParams/SetHealth:
+    #   object_context, selector, scalar_slot, scalar_value, 3D 30 object
+    # This is a four-word l-value window, not a two-word `tmp = tmp` assignment.
+    if pos >= 4:
+        context = at(-4)
+        selector = at(-3)
+        field = at(-2)
+        value = at(-1)
+        if (
+            context.semantic_op == "load"
+            and selector.semantic_op == "const"
+            and field.semantic_op == "load"
+            and not _is_assignment_window_barrier(value)
+        ):
+            return 4
+
+    # Indexed scalar assignment, e.g. Params:
+    #   target, index_object, value, 26 3D 30 32 target
+    if pos >= 3:
+        target = at(-3)
+        index = at(-2)
+        value = at(-1)
+        if (
+            target.semantic_op == "load"
+            and index.semantic_op == "load"
+            and not _is_assignment_window_barrier(value)
+        ):
+            return 3
+
+    # target_descriptor + scalar value, e.g. Teleport coordinate writes.
+    if pos >= 3 and _is_descriptor_offset_pair(block_indices, pos - 3, pos - 2, instructions):
+        val = instructions[block_indices[pos - 1]]
+        if not _is_assignment_window_barrier(val):
+            return 3
+
+    # Simple scalar assignment.  Keep this only as a bounded local rule; the
+    # caller's fallback can still infer wider windows when no local shape exists.
+    if pos >= 2:
+        prev2 = instructions[block_indices[pos - 2]]
+        if not _is_assignment_window_barrier(prev2):
+            return 2
+    return None
+
+def _assignment_stack_input_count(block_indices: list[int], pos: int, instructions: list[CanonicalInstruction]) -> int:
+    local_count = _assignment_local_input_count(block_indices, pos, instructions)
+    if local_count is not None:
+        return local_count
+
+    start = pos
+    for cursor in range(pos - 1, -1, -1):
+        prev = instructions[block_indices[cursor]]
+        if prev.control.get("is_terminator"):
+            break
+        if prev.semantic_op in {"call", "syscall", "opaque_call"} and cursor != pos - 1:
+            # Calls often leave no meaningful stack value for a later address
+            # write; do not let a native call result leak into a following
+            # multi-word assignment window unless the assignment immediately
+            # consumes the call result.
+            break
+        if prev.semantic_op in {"store", "write_field", "opaque_store"}:
+            if prev.operands.get("assignment_op") and prev.stack_outputs > 0:
+                start = cursor
+            break
+        if prev.semantic_op in _STACK_WINDOW_BARRIERS:
+            break
+        start = cursor
+
+    depth = 0
+    for cursor in range(start, pos):
+        prev = instructions[block_indices[cursor]]
+        if prev.semantic_op in {"store", "write_field", "opaque_store"} and prev.operands.get("assignment_op") and prev.stack_outputs > 0:
+            depth = max(0, prev.stack_outputs)
+            continue
+        if prev.semantic_op in _STACK_WINDOW_BARRIERS:
+            depth = 0
+            continue
+        required = prev.stack_inputs_required
+        depth = max(0, depth - required) + max(0, prev.stack_outputs)
+        depth = min(depth, 8)
+
+    if depth > 0:
+        return depth
+    return 2
+
+def _prefixed_stack_call_input_count(block_indices: list[int], pos: int, instructions: list[CanonicalInstruction]) -> int:
+    """Infer physical arguments for 0x3D-prefixed terminal CALL* tokens.
+
+    These tokens close the current stack-call window.  They are not assignment
+    closures and therefore must not render as ``slot<?> = ...``.  Their encoded
+    argc is often zero even though the VM has already staged the actual call
+    arguments on the stack immediately before the token.
+    """
+    inst = instructions[block_indices[pos]]
+    encoded_argc = int(inst.operands.get("argc", 0) or 0)
+
+    local_count = _assignment_local_input_count(block_indices, pos, instructions)
+    if local_count is not None:
+        return max(encoded_argc, local_count)
+
+    start = pos
+    for cursor in range(pos - 1, -1, -1):
+        prev = instructions[block_indices[cursor]]
+        if prev.control.get("is_terminator"):
+            break
+        if prev.semantic_op in {"call", "syscall", "opaque_call"} and cursor != pos - 1:
+            break
+        if prev.semantic_op in {"store", "write_field", "opaque_store"}:
+            if prev.operands.get("assignment_op") and prev.stack_outputs > 0:
+                start = cursor
+            break
+        if prev.semantic_op in _STACK_WINDOW_BARRIERS:
+            break
+        start = cursor
+
+    depth = 0
+    for cursor in range(start, pos):
+        prev = instructions[block_indices[cursor]]
+        if prev.semantic_op in {"store", "write_field", "opaque_store"} and prev.operands.get("assignment_op") and prev.stack_outputs > 0:
+            depth = max(0, prev.stack_outputs)
+            continue
+        if prev.semantic_op in _STACK_WINDOW_BARRIERS:
+            depth = 0
+            continue
+        required = _expanded_call_stack_input_count(block_indices, cursor, instructions) if prev.semantic_op in {"call", "syscall", "opaque_call"} else prev.stack_inputs_required
+        depth = max(0, depth - required) + max(0, prev.stack_outputs)
+        depth = min(depth, 8)
+
+    if depth > 0:
+        return max(encoded_argc, depth)
+    # If the prefixed call starts a basic block, its argument window may have
+    # been staged by predecessor blocks.  A zero-width fallback silently drops
+    # that cross-edge stack contract and later prunes real entry arguments.
+    return encoded_argc if encoded_argc > 0 else 2
+
+
+
+def _predecessor_value_can_feed_optional_return(
+    block: dict[str, Any],
+    instructions: list[CanonicalInstruction],
+    block_by_id: Optional[dict[str, dict[str, Any]]] = None,
+) -> bool:
+    if block_by_id is None:
+        return False
+    predecessors = block.get("predecessors") or []
+    if len(predecessors) != 1:
+        return False
+    pred = block_by_id.get(predecessors[0])
+    if not pred:
+        return False
+    pred_indices = pred.get("instruction_indices") or []
+    if not pred_indices:
+        return False
+    prev = instructions[pred_indices[-1]]
+    if prev.stack_outputs <= 0:
+        return False
+    if prev.semantic_op in _STACK_WINDOW_BARRIERS:
+        return False
+    if prev.control.get("is_terminator"):
+        return False
+    return True
+
+
+
+def _is_cross_edge_local_operand_join(
+    block: dict[str, Any],
+    pos: int,
+    inst: CanonicalInstruction,
+    block_by_id: Optional[dict[str, dict[str, Any]]] = None,
+) -> bool:
+    """Return True for local operand windows split by a branch target.
+
+    These bytecode shapes are common in short-circuit condition and call chains:
+    a branch target lands on the consumer token while the consumer's operands are
+    staged only by the immediate linear fallthrough predecessor.  Treating those
+    operands as a uniform block entry stack forces every non-fallthrough
+    predecessor to synthesize padding values, which then explodes into
+    ``in_bb*_N`` merge parameters.  Only branch/call consumers are handled here;
+    field reads and assignment terminals still need their carried stack operand
+    because they can encode real path-dependent l-values.
+    """
+    if pos != 0 or block_by_id is None or inst.stack_inputs_required <= 0:
+        return False
+    if inst.semantic_op not in {"branch", "call", "syscall", "opaque_call"}:
+        return False
+    preds = [pred for pred in (block.get("predecessors") or []) if pred in block_by_id]
+    if len(preds) < 2:
+        return False
+    block_index = int(block.get("index", -1))
+    has_linear_fallthrough_pred = any(int(block_by_id[pred].get("index", -999999)) == block_index - 1 for pred in preds)
+    has_non_linear_pred = any(int(block_by_id[pred].get("index", -999999)) != block_index - 1 for pred in preds)
+    return has_linear_fallthrough_pred and has_non_linear_pred
+
+
+def _local_branch_operand_exprs(
+    instructions: list[CanonicalInstruction],
+    inst_index: int,
+    required: int,
+) -> list[str]:
+    """Recover branch operands from the immediately preceding linear window.
+
+    This is deliberately local and side-effect conservative.  It scans back to
+    the previous terminator and evaluates the tiny stack window that directly
+    precedes a branch-target branch.  It does not create HIR temporaries; it
+    returns expressions suitable for the branch condition text.
+    """
+    if required <= 0 or inst_index <= 0:
+        return []
+    start = inst_index
+    cursor = inst_index - 1
+    while cursor >= 0:
+        prev = instructions[cursor]
+        if prev.control.get("is_terminator"):
+            break
+        if prev.semantic_op in {"call", "syscall", "opaque_call"} and cursor != inst_index - 1:
+            # Calls can be part of a condition window, but do not scan through an
+            # older call boundary when the immediate tail already contains enough
+            # values.  This keeps the recovery bounded.
+            pass
+        start = cursor
+        cursor -= 1
+    if start >= inst_index:
+        return []
+
+    stack: list[str] = []
+    local_indices = list(range(start, inst_index))
+    for local_pos, real_index in enumerate(local_indices):
+        cur = instructions[real_index]
+        if cur.control.get("is_terminator"):
+            stack.clear()
+            continue
+        if cur.semantic_op in {"store", "write_field", "opaque_store"} and cur.operands.get("assignment_op"):
+            needed = _assignment_stack_input_count(local_indices, local_pos, instructions)
+        elif cur.semantic_op in {"call", "syscall", "opaque_call"}:
+            needed = _expanded_call_stack_input_count(local_indices, local_pos, instructions)
+        else:
+            needed = cur.stack_inputs_required
+        available = min(needed, len(stack))
+        args = stack[-available:] if available else []
+        if available:
+            del stack[-available:]
+        if len(args) < needed:
+            # The local window is incomplete; do not invent placeholders.
+            args = []
+        if cur.semantic_op in {"store", "write_field", "opaque_store"} and cur.operands.get("assignment_op"):
+            expr = _assignment_yield_expr(cur, args)
+        else:
+            expr = _canonical_expr(cur, args)
+        if cur.stack_outputs > 0:
+            stack.append(expr)
+    if len(stack) < required:
+        return []
+    return stack[-required:]
+
+
+def _cross_block_assignment_input_count(
+    block: dict[str, Any],
+    pos: int,
+    instructions: list[CanonicalInstruction],
+    block_by_id: Optional[dict[str, dict[str, Any]]] = None,
+) -> int | None:
+    if pos != 0 or block_by_id is None:
+        return None
+    block_indices = block["instruction_indices"]
+    if not block_indices:
+        return None
+    inst = instructions[block_indices[pos]]
+    if not (inst.semantic_op in {"store", "write_field", "opaque_store"} and inst.operands.get("assignment_op")):
+        return None
+    preds = [pred for pred in (block.get("predecessors") or []) if pred in block_by_id]
+    if len(preds) != 1:
+        return None
+    pred = block_by_id[preds[0]]
+    if int(pred.get("index", -999999)) != int(block.get("index", -1)) - 1:
+        return None
+    pred_indices = list(pred.get("instruction_indices") or [])
+    if not pred_indices:
+        return None
+    pred_term = instructions[pred_indices[-1]]
+    if pred_term.control.get("is_terminator"):
+        return None
+    combined = pred_indices + [block_indices[pos]]
+    return _assignment_local_input_count(combined, len(combined) - 1, instructions)
+
+def _effective_stack_inputs(
+    block: dict[str, Any],
+    pos: int,
+    instructions: list[CanonicalInstruction],
+    block_by_id: Optional[dict[str, dict[str, Any]]] = None,
+) -> int:
+    block_indices = block["instruction_indices"]
+    inst = instructions[block_indices[pos]]
+    if _is_cross_edge_local_operand_join(block, pos, inst, block_by_id):
+        return 0
+    cross_block_assignment_count = _cross_block_assignment_input_count(block, pos, instructions, block_by_id)
+    if cross_block_assignment_count is not None:
+        return cross_block_assignment_count
+    if inst.semantic_op == "return" and inst.operands.get("optional_value"):
+        if _previous_value_can_feed_optional_return(block_indices, pos, instructions):
+            return 1
+        if pos == 0 and _predecessor_value_can_feed_optional_return(block, instructions, block_by_id):
+            return 1
+        return 0
+    if inst.semantic_op in {"store", "write_field", "opaque_store"} and inst.operands.get("assignment_op"):
+        if "embedded_assignment_value" in inst.operands:
+            return 0
+        return _assignment_stack_input_count(block_indices, pos, instructions)
+    if inst.semantic_op in {"call", "syscall", "opaque_call"}:
+        if inst.operands.get("prefixed_stack_call"):
+            return _prefixed_stack_call_input_count(block_indices, pos, instructions)
+        return _expanded_call_stack_input_count(block_indices, pos, instructions)
+    return inst.stack_inputs_required
+
+
 def _compute_stack_plans(blocks: list[dict[str, Any]], instructions: list[CanonicalInstruction]) -> dict[str, _StackPlanBlock]:
+    block_by_id = {block["id"]: block for block in blocks}
     if not blocks:
         return {}
     block_index = {block["id"]: block["index"] for block in blocks}
@@ -963,10 +1938,13 @@ def _compute_stack_plans(blocks: list[dict[str, Any]], instructions: list[Canoni
             succ_depths = [entry_depth[succ] for succ in forward_succs if succ in entry_depth]
             new_exit = max(succ_depths) if succ_depths else 0
             needed = new_exit
-            for inst_index in reversed(block["instruction_indices"]):
+            block_indices = block["instruction_indices"]
+            for pos in range(len(block_indices) - 1, -1, -1):
+                inst_index = block_indices[pos]
                 inst = instructions[inst_index]
+                required_inputs = _effective_stack_inputs(block, pos, instructions, block_by_id)
                 uses_output = inst.stack_outputs > 0 and needed > 0
-                needed = needed - (1 if uses_output else 0) + inst.stack_inputs_required
+                needed = needed - (1 if uses_output else 0) + required_inputs
             if new_exit != exit_depth[block["id"]] or needed != entry_depth[block["id"]]:
                 exit_depth[block["id"]] = new_exit
                 entry_depth[block["id"]] = needed
@@ -978,11 +1956,14 @@ def _compute_stack_plans(blocks: list[dict[str, Any]], instructions: list[Canoni
     for block in blocks:
         needed = exit_depth[block["id"]]
         output_used: dict[int, bool] = {}
-        for inst_index in reversed(block["instruction_indices"]):
+        block_indices = block["instruction_indices"]
+        for pos in range(len(block_indices) - 1, -1, -1):
+            inst_index = block_indices[pos]
             inst = instructions[inst_index]
+            required_inputs = _effective_stack_inputs(block, pos, instructions, block_by_id)
             uses_output = inst.stack_outputs > 0 and needed > 0
             output_used[inst_index] = uses_output
-            needed = needed - (1 if uses_output else 0) + inst.stack_inputs_required
+            needed = needed - (1 if uses_output else 0) + required_inputs
         plans[block["id"]] = _StackPlanBlock(entry_depth=entry_depth[block["id"]], exit_depth=exit_depth[block["id"]], output_used=output_used)
     return plans
 
@@ -1001,13 +1982,15 @@ def _pop_args(stack: list[str], required: int, block_id: str, inst_index: int) -
     return prefix + taken
 
 
-def _simulate_block_stack(block: dict[str, Any], instructions: list[CanonicalInstruction], plan: _StackPlanBlock, entry_stack: list[str]) -> tuple[list[str], dict[int, list[str]], dict[int, list[str]]]:
+def _simulate_block_stack(block: dict[str, Any], instructions: list[CanonicalInstruction], plan: _StackPlanBlock, entry_stack: list[str], block_by_id: Optional[dict[str, dict[str, Any]]] = None) -> tuple[list[str], dict[int, list[str]], dict[int, list[str]]]:
     stack = list(entry_stack)
     arg_map: dict[int, list[str]] = {}
     out_map: dict[int, list[str]] = {}
-    for inst_index in block["instruction_indices"]:
+    block_indices = block["instruction_indices"]
+    for pos, inst_index in enumerate(block_indices):
         inst = instructions[inst_index]
-        args = _pop_args(stack, inst.stack_inputs_required, block["id"], inst.index)
+        required_inputs = _effective_stack_inputs(block, pos, instructions, block_by_id)
+        args = _pop_args(stack, required_inputs, block["id"], inst.index)
         arg_map[inst_index] = list(args)
         outputs: list[str] = []
         if inst.stack_outputs > 0 and plan.output_used.get(inst_index, False):
@@ -1039,7 +2022,7 @@ def _compose_entry_stack(
         effective_incoming = {"__entry__": list(entry_seed[-depth:]) if depth else [], **effective_incoming}
 
     if is_entry and not effective_incoming:
-        return [f"arg{i}" for i in range(depth)], {}
+        return _implicit_entry_stack(block_id, depth), {}
     if not effective_incoming:
         return [f"in_{block_id}_{i}" for i in range(depth)], {}
 
@@ -1052,7 +2035,15 @@ def _compose_entry_stack(
             if pos < len(stack):
                 values.append(stack[pos])
             elif is_entry and pred_id == "__entry__":
-                values.append(f"arg{pos}")
+                # A declared aggregate prologue is the source-level function
+                # signature.  A small tail beyond that prologue can still be a
+                # real stack-ABI argument (for example GetXYZ has two declared
+                # slots plus one compact live argument).  Large inferred tails
+                # are control-flow stack-balancing artefacts, not source args.
+                if entry_seed and depth <= len(entry_seed) + IMPLICIT_PROLOGUE_TAIL_ARG_LIMIT:
+                    values.append(f"arg{pos}")
+                else:
+                    values.append(f"in_{block_id}_{pos}")
             else:
                 values.append(f"in_{block_id}_{pos}")
         phi_name = f"phi_{block_id}_{pos}"
@@ -1102,7 +2093,7 @@ def build_hir_blocks(
         if entry_seed:
             entry_stacks[entry_block_id] = list(entry_seed[-entry_plan.entry_depth:]) if entry_plan.entry_depth else []
         else:
-            entry_stacks[entry_block_id] = [f"arg{i}" for i in range(entry_plan.entry_depth)]
+            entry_stacks[entry_block_id] = _implicit_entry_stack(entry_block_id, entry_plan.entry_depth)
 
     while work:
         work_iterations += 1
@@ -1128,7 +2119,7 @@ def build_hir_blocks(
                     work.append(pred)
         phi_defs[block_id] = current_phi
 
-        exit_stack, _, _ = _simulate_block_stack(block, instructions, plan, entry_stacks[block_id])
+        exit_stack, _, _ = _simulate_block_stack(block, instructions, plan, entry_stacks[block_id], by_id)
         if exit_stacks.get(block_id) == exit_stack:
             pass
         else:
@@ -1168,7 +2159,7 @@ def build_hir_blocks(
             False,
             entry_seed=None,
         )
-        exit_stacks[block_id], _, _ = _simulate_block_stack(block, instructions, plan, entry_stacks[block_id])
+        exit_stacks[block_id], _, _ = _simulate_block_stack(block, instructions, plan, entry_stacks[block_id], by_id)
 
     temp_uses: Counter[str] = Counter()
     value_map: dict[str, DataflowValue] = {}
@@ -1179,7 +2170,7 @@ def build_hir_blocks(
         block_id = block["id"]
         plan = plans[block_id]
         entry_stack = entry_stacks.get(block_id, [])
-        exit_stack, arg_map, out_map = _simulate_block_stack(block, instructions, plan, entry_stack)
+        exit_stack, arg_map, out_map = _simulate_block_stack(block, instructions, plan, entry_stack, by_id)
 
         phi_bindings: list[str] = []
         for name, sources in sorted(phi_defs.get(block_id, {}).items()):
@@ -1201,9 +2192,11 @@ def build_hir_blocks(
         statements: list[str] = []
         terminator: dict[str, Any] = {"kind": "fallthrough", "text": None, "condition": None}
 
-        for inst_index in block["instruction_indices"]:
+        for pos, inst_index in enumerate(block["instruction_indices"]):
             inst = instructions[inst_index]
             args = list(arg_map.get(inst_index, []))
+            if not args and _is_cross_edge_local_operand_join(block, pos, inst, by_id):
+                args = _local_branch_operand_exprs(instructions, inst.index, inst.stack_inputs_required)
             outputs = list(out_map.get(inst_index, []))
             inst.inputs = args
             inst.outputs = outputs
@@ -1224,13 +2217,14 @@ def build_hir_blocks(
                 continue
 
             if inst.semantic_op in {"store", "write_field", "opaque_store"}:
-                target = args[0] if len(args) >= 1 else _slot_name(inst.operands.get("ref"), inst.operands.get("mode"))
-                value = args[1] if len(args) >= 2 else "<?>"
-                if inst.semantic_op == "write_field":
-                    field_name = inst.operands.get("family") or inst.operands.get("field") or "field"
-                    statements.append(f"{target}.{str(field_name).lower()} = {value}")
-                else:
-                    statements.append(f"{target} = {value}")
+                format_args = _resolve_assignment_shape_args(args, value_map)
+                if outputs:
+                    out_name = outputs[0]
+                    target_expr = _assignment_yield_expr(inst, format_args)
+                    value_map[out_name] = DataflowValue(name=out_name, producer_instruction=inst.index, expr=target_expr)
+                assignment_stmt = _format_assignment_statement(inst, format_args)
+                if assignment_stmt.strip():
+                    statements.append(assignment_stmt)
                 continue
 
             if inst.semantic_op == "return":
@@ -1245,10 +2239,22 @@ def build_hir_blocks(
                 break
 
             if inst.semantic_op == "branch":
-                if len(args) >= 2:
-                    cond_value = f"cmp({', '.join(args)})"
-                elif args:
-                    cond_value = args[-1]
+                if inst.control.get("direct_branch") or not inst.control.get("fallthrough", True):
+                    terminator = {
+                        "kind": "jump",
+                        "text": "goto",
+                        "condition": None,
+                        "branch_op": inst.control.get("branch_op") or inst.operands.get("branch_op") or "0x??",
+                        "instruction_index": inst.index,
+                    }
+                    break
+                branch_args = list(args)
+                if not branch_args and _is_cross_edge_local_operand_join(block, pos, inst, by_id):
+                    branch_args = _local_branch_operand_exprs(instructions, inst.index, inst.stack_inputs_required)
+                if len(branch_args) >= 2:
+                    cond_value = f"cmp({', '.join(branch_args)})"
+                elif branch_args:
+                    cond_value = branch_args[-1]
                 else:
                     cond_value = f"cond_{block_id}"
                 branch_op = inst.control.get("branch_op") or inst.operands.get("branch_op") or "0x??"
@@ -1338,6 +2344,114 @@ def _substitute_blocks(hir_blocks: list[HIRBlock], mapping: dict[str, str], *, r
 
 
 
+_RECORD_INDEX_ASSIGNMENT_RE = re.compile(r"(?P<idx>-?\d+(?:\.\d+)?)\[(?P<rec>rec(?:41|61|62)\([^\]]+?\))\](?P<tail>\s*=)")
+_INVERTED_SLOT_ASSIGNMENT_RE = re.compile(
+    r"^(?P<idx>-?\d+(?:\.\d+)?)\[(?P<base>slot_\d+@0x[0-9A-Fa-f]+(?:\.[A-Za-z0-9_]+)?)\](?P<tail>\s*=\s*.+)$"
+)
+_CONTEXT_SCALAR_ASSIGNMENT_RE = re.compile(
+    r"^(?P<context>slot_\d+@0x30)\[(?P<selector>[^\]]+)\]\s*=\s*(?P<field>slot_\d+@0x(?:00|01|10|11))\[(?P<value>.+)\]$"
+)
+_SCALAR_METADATA_RHS_RE = re.compile(
+    r"^(?P<lhs>.+?=\s*)-?\d+(?:\.\d+)?\[(?P<value>[^\]]+)\]\s*$"
+)
+_SELF_INDEX_ASSIGNMENT_RE = re.compile(
+    r"^(?P<base>slot_\d+@0x[0-9A-Fa-f]+(?:\.[A-Za-z0-9_]+)?)\[(?P=base)\]\s*=\s*(?P<value>.+)$"
+)
+
+_SLOT_SURFACE_EXPR = r"slot_\d+@0x[0-9A-Fa-f]+(?:\.[A-Za-z0-9_@]+)?"
+_SLOT_SLOT_LHS_RE = re.compile(
+    rf"^(?P<base>{_SLOT_SURFACE_EXPR})\[(?P<index>{_SLOT_SURFACE_EXPR})\]\s*=\s*(?P<value>.+)$"
+)
+_SLOT_SLOT_INDEX_RE = re.compile(
+    rf"(?P<base>{_SLOT_SURFACE_EXPR})\[(?P<index>{_SLOT_SURFACE_EXPR})\]"
+)
+
+
+def _slot_surface_mode(text: str) -> str | None:
+    return _slot_expr_mode(str(text).split("[", 1)[0])
+
+
+def _format_slot_slot_index_expr(base: str, index: str) -> str:
+    """Render unresolved slot-indexed windows without claiming array semantics.
+
+    A remaining ``slot[slot]`` surface form is usually not a proven source-level
+    array access: both operands are VM slots and one of them is often metadata,
+    a context object, or a dynamic address carrier.  Keep the dataflow edge, but
+    make the unresolved indexed-address nature explicit so downstream audits do
+    not treat it as a concrete slot-slot array operation.
+    """
+    base = base.strip()
+    index = index.strip()
+    base_mode = _slot_surface_mode(base)
+    index_mode = _slot_surface_mode(index)
+    if base_mode == "0x30" and index_mode in {"0x00", "0x01", "0x10", "0x11", "0x20"}:
+        return f"{base}.{index}"
+    if index_mode == "0x30" and base_mode in {"0x00", "0x01", "0x10", "0x11", "0x20"}:
+        return f"{index}.{base}"
+    return f"indexed({base}, {index})"
+
+
+def _rewrite_slot_slot_indices(text: str) -> str:
+    # LHS needs special treatment: ``indexed(a,b) = v`` is not a stable AST
+    # statement form, while ``a = indexed_store(a,b,v)`` keeps the update edge
+    # and avoids a fake concrete array l-value.
+    stripped = text.strip()
+    lhs = _SLOT_SLOT_LHS_RE.match(stripped)
+    if lhs is not None:
+        base = lhs.group("base")
+        index = lhs.group("index")
+        value = _rewrite_slot_slot_indices(lhs.group("value").strip())
+        resolved_lhs = _format_slot_slot_index_expr(base, index)
+        if resolved_lhs.startswith("indexed("):
+            return f"{base} = indexed_store({base}, {index}, {value})"
+        return f"{resolved_lhs} = {value}"
+    return _SLOT_SLOT_INDEX_RE.sub(lambda m: _format_slot_slot_index_expr(m.group("base"), m.group("index")), text)
+
+
+def _normalize_surface_statement(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    normalized = _RECORD_INDEX_ASSIGNMENT_RE.sub(lambda m: f"{m.group('rec')}[{m.group('idx')}]{m.group('tail')}", text)
+    inverted = _INVERTED_SLOT_ASSIGNMENT_RE.match(normalized.strip())
+    if inverted is not None:
+        normalized = f"{inverted.group('base')}[{inverted.group('idx')}]{inverted.group('tail')}"
+    context_scalar = _CONTEXT_SCALAR_ASSIGNMENT_RE.match(normalized.strip())
+    if context_scalar is not None:
+        normalized = (
+            f"{context_scalar.group('context')}[{context_scalar.group('selector').strip()}]."
+            f"{context_scalar.group('field')} = {context_scalar.group('value').strip()}"
+        )
+    scalar_metadata_rhs = _SCALAR_METADATA_RHS_RE.match(normalized.strip())
+    if scalar_metadata_rhs is not None:
+        # ``stride[value]`` / ``selector[value]`` on the RHS is a rendering
+        # artefact left after temp inlining of assignment metadata.  The numeric
+        # base is not a real array/object expression, so preserve only the value.
+        normalized = f"{scalar_metadata_rhs.group('lhs')}{scalar_metadata_rhs.group('value').strip()}"
+    self_index = _SELF_INDEX_ASSIGNMENT_RE.match(normalized.strip())
+    if self_index is not None:
+        # Chained assignment prefixes can carry the same destination descriptor
+        # both as previous-yield and as explicit terminal ref.  ``dst[dst]`` is
+        # not a real address; collapse the duplicate descriptor.
+        normalized = f"{self_index.group('base')} = {self_index.group('value').strip()}"
+    normalized = _rewrite_slot_slot_indices(normalized)
+    return normalized
+
+
+def _normalize_surface_blocks(blocks: list[HIRBlock]) -> list[HIRBlock]:
+    normalized: list[HIRBlock] = []
+    for block in blocks:
+        terminator = dict(block.terminator)
+        terminator["text"] = _normalize_surface_statement(terminator.get("text"))
+        terminator["condition"] = _normalize_surface_statement(terminator.get("condition"))
+        normalized.append(_clone_block(
+            block,
+            statements=[_normalize_surface_statement(stmt) or stmt for stmt in block.statements],
+            phi_bindings=[_normalize_surface_statement(stmt) or stmt for stmt in block.phi_bindings],
+            terminator=terminator,
+        ))
+    return normalized
+
+
 def _substitute_text_map(text: Optional[str], mapping: dict[str, str]) -> Optional[str]:
     if text is None or not mapping:
         return text
@@ -1418,7 +2532,7 @@ def _cleanup_surface_hir(
         if current_expr is None or current_expr == value.name or value.name in current_expr:
             return False
         semantic = producer_semantic.get(value.name)
-        if semantic not in {"const", "load", "read_field", "make_record", "aggregate", "cmp", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate"}:
+        if semantic not in {"const", "load", "read_field", "make_record", "aggregate", "cmp", "store", "write_field", "opaque_const", "opaque_load", "opaque_record", "opaque_aggregate"}:
             return False
         if len(current_expr) > 96:
             return False
@@ -1426,11 +2540,11 @@ def _cleanup_surface_hir(
 
     blocks = list(hir_blocks)
     expr_by_name, _ = _collect_surface_assignments(blocks)
-    inline_candidates = {
-        value.name: expr_by_name[value.name]
-        for value in sorted(values, key=lambda item: (item.producer_instruction < 0, item.producer_instruction, item.name))
-        if value.name in expr_by_name and is_inlinable(value, expr_by_name[value.name])
-    }
+    inline_candidates: dict[str, str] = {}
+    for value in sorted(values, key=lambda item: (item.producer_instruction < 0, item.producer_instruction, item.name)):
+        candidate_expr = expr_by_name.get(value.name, value.expr)
+        if is_inlinable(value, candidate_expr):
+            inline_candidates[value.name] = candidate_expr
     expanded_cache: dict[str, str] = {}
     inline_map = {
         name: expanded
@@ -1438,7 +2552,7 @@ def _cleanup_surface_hir(
         if (expanded := _expand_inline_expr(name, inline_candidates, cache=expanded_cache)) is not None
     }
     if not inline_map:
-        return blocks, values, {"inlined_value_count": 0, "removed_assignment_count": 0}
+        return _normalize_surface_blocks(blocks), values, {"inlined_value_count": 0, "removed_assignment_count": 0}
 
     inlined_count = 0
     removed_assignments = 0
@@ -1451,7 +2565,8 @@ def _cleanup_surface_hir(
             if matched is not None and matched[0] in inline_map:
                 dropped += 1
                 continue
-            statements.append(_substitute_text_map(stmt, inline_map) or stmt)
+            substituted_stmt = _substitute_text_map(stmt, inline_map) or stmt
+            statements.append(_normalize_surface_statement(substituted_stmt) or substituted_stmt)
         if dropped:
             removed_assignments += dropped
         incoming_args = {
@@ -1459,8 +2574,8 @@ def _cleanup_surface_hir(
             for pred, args in block.incoming_args.items()
         }
         terminator = dict(block.terminator)
-        terminator["text"] = _substitute_text_map(terminator.get("text"), inline_map)
-        terminator["condition"] = _substitute_text_map(terminator.get("condition"), inline_map)
+        terminator["text"] = _normalize_surface_statement(_substitute_text_map(terminator.get("text"), inline_map))
+        terminator["condition"] = _normalize_surface_statement(_substitute_text_map(terminator.get("condition"), inline_map))
         cleaned.append(
             _clone_block(
                 block,
@@ -1809,6 +2924,332 @@ def _rename_merge_params(hir_blocks: list[HIRBlock]) -> list[HIRBlock]:
         return hir_blocks
     return _substitute_blocks(hir_blocks, mapping, replace_block_params=True)
 
+
+
+def _iter_real_surface_refs(blocks: list[HIRBlock]) -> set[str]:
+    """Collect temp-like refs consumed by real HIR surface code.
+
+    Merge parameters/incoming arguments are only a transport contract.  They
+    must not seed liveness by themselves, otherwise stale physical stack lanes
+    are kept alive and later surface as fake ``in_bb*_N`` values.
+    """
+    refs: set[str] = set()
+
+    def scan(text: Optional[str], *, strip_lhs: bool = False) -> None:
+        if not text:
+            return
+        source = text
+        if strip_lhs:
+            matched = _match_assignment(text)
+            if matched is not None:
+                source = matched[1]
+        refs.update(_iter_temp_like_refs(source))
+
+    for block in blocks:
+        for stmt in block.statements:
+            scan(stmt, strip_lhs=True)
+        scan(block.terminator.get("text"), strip_lhs=False)
+        scan(block.terminator.get("condition"), strip_lhs=False)
+    return refs
+
+
+
+def _surface_refs_for_entry_arg_promotion(hir_blocks: list[HIRBlock]) -> set[str]:
+    refs: set[str] = set()
+
+    def scan(text: Optional[str]) -> None:
+        refs.update(_iter_temp_like_refs(text))
+
+    for block in hir_blocks:
+        for stmt in block.statements:
+            scan(stmt)
+        scan(block.terminator.get("text"))
+        scan(block.terminator.get("condition"))
+        for binding in block.phi_bindings:
+            scan(binding)
+        for param in block.block_params:
+            scan(param)
+        for args in block.incoming_args.values():
+            for arg in args:
+                scan(arg)
+    return refs
+
+
+def _promote_live_entry_placeholders(
+    hir_blocks: list[HIRBlock],
+    prologue_meta: Optional[dict[str, Any]],
+) -> tuple[list[HIRBlock], dict[str, int], Optional[dict[str, Any]]]:
+    """Turn surviving entry live-ins into real ABI formals.
+
+    Raw stack-depth inference is too noisy to define a function signature: stale
+    VM stack lanes can survive through direct branches and CFG joins.  After the
+    control fixes and merge-lane liveness pruning, however, any remaining
+    ``in_<entry>_<n>`` that is referenced by statements/conditions/incoming live
+    lanes is an unresolved entry ABI word, not a block-local temporary.  Promote
+    only those liveness-proven entry placeholders to arg<n>; leave no ``in_bb``
+    surface names behind and avoid recreating the old phantom header from raw
+    entry depth.
+    """
+    if not hir_blocks:
+        return [], {"promoted_entry_livein_arg_count": 0}, prologue_meta
+
+    entry_id = hir_blocks[0].id
+    refs = _surface_refs_for_entry_arg_promotion(hir_blocks)
+    prefix = f"in_{entry_id}_"
+    positions: list[int] = []
+    for ref in refs:
+        if not ref.startswith(prefix):
+            continue
+        tail = ref[len(prefix):]
+        if tail.isdigit():
+            positions.append(int(tail))
+    positions = sorted(set(positions))
+    if not positions:
+        return list(hir_blocks), {"promoted_entry_livein_arg_count": 0}, prologue_meta
+
+    mapping = {f"in_{entry_id}_{pos}": f"arg{pos}" for pos in positions}
+    promoted_blocks = _substitute_blocks(hir_blocks, mapping, replace_block_params=True)
+
+    meta = dict(prologue_meta or {})
+    params = [dict(param) for param in list(meta.get("params") or []) if isinstance(param, dict)]
+    used_names = {str(param.get("name")) for param in params if param.get("name") is not None}
+    for pos in positions:
+        name = f"arg{pos}"
+        if name in used_names:
+            continue
+        params.append({
+            "name": name,
+            "slot": None,
+            "ref": None,
+            "tag": None,
+            "source": "liveness_proven_entry_livein",
+            "position": pos,
+        })
+        used_names.add(name)
+    params.sort(key=lambda item: int(str(item.get("name", "arg999999"))[3:]) if str(item.get("name", "")).startswith("arg") and str(item.get("name", ""))[3:].isdigit() else 10**9)
+    effective_arity = max(len(params), max(positions) + 1)
+    if not meta:
+        meta = {"kind": "inferred_stack_signature", "raw_kind": None, "arity": effective_arity, "children": []}
+    else:
+        meta.setdefault("declared_arity", meta.get("arity"))
+    meta["params"] = params
+    meta["promoted_entry_liveins"] = positions
+    meta["effective_arity"] = effective_arity
+    if meta.get("kind") == "inferred_stack_signature":
+        meta["arity"] = effective_arity
+    return promoted_blocks, {"promoted_entry_livein_arg_count": len(positions)}, meta
+
+
+def _insert_entry_preheader_for_loop_liveins(
+    hir_blocks: list[HIRBlock],
+    prologue_meta: Optional[dict[str, Any]],
+) -> tuple[list[HIRBlock], dict[str, int]]:
+    """Materialize initial values for a cyclic entry block.
+
+    When a backward branch targets the physical first block, the stack solver
+    correctly turns that block into a merge header.  Its first-iteration values
+    come from the function entry stack, while later iterations come from the
+    backedge.  Without an explicit synthetic entry predecessor, the surface AST
+    sees only the backedge and prints unbound ``m_bb0_*`` loop parameters.
+    """
+    if not hir_blocks or not prologue_meta:
+        return list(hir_blocks), {"inserted_entry_preheader_count": 0}
+    promoted = list((prologue_meta or {}).get("promoted_entry_liveins") or [])
+    if not promoted:
+        return list(hir_blocks), {"inserted_entry_preheader_count": 0}
+    entry = hir_blocks[0]
+    if not entry.block_params or not entry.predecessors:
+        return list(hir_blocks), {"inserted_entry_preheader_count": 0}
+
+    available_args = {str(param.get("name")) for param in list((prologue_meta or {}).get("params") or []) if isinstance(param, dict)}
+    init_by_param: dict[str, str] = {}
+    phi_re = re.compile(r"^phi\((?P<body>.*)\)$")
+    for binding in entry.phi_bindings:
+        matched = _match_assignment(binding)
+        if matched is None:
+            continue
+        lhs, rhs = matched
+        if lhs not in entry.block_params:
+            continue
+        phi = phi_re.match(rhs.strip())
+        if phi is None:
+            continue
+        candidates = [item.strip() for item in phi.group("body").split(",") if item.strip()]
+        for candidate in candidates:
+            if re.fullmatch(r"arg\d+", candidate) and candidate in available_args:
+                init_by_param[lhs] = candidate
+                break
+
+    init_args: list[str] = []
+    for pos, param in enumerate(entry.block_params):
+        value = init_by_param.get(param)
+        if value is None:
+            suffix = param.rsplit("_", 1)[-1]
+            value = f"arg{suffix}" if suffix.isdigit() else f"arg{pos}"
+        if value not in available_args:
+            return list(hir_blocks), {"inserted_entry_preheader_count": 0}
+        init_args.append(value)
+    if len(init_args) != len(entry.block_params):
+        return list(hir_blocks), {"inserted_entry_preheader_count": 0}
+
+    ids = {block.id for block in hir_blocks}
+    pre_id = "bb_entry"
+    counter = 0
+    while pre_id in ids:
+        counter += 1
+        pre_id = f"bb_entry{counter}"
+
+    preheader = HIRBlock(
+        id=pre_id,
+        index=0,
+        start_offset=entry.start_offset,
+        end_offset=entry.start_offset,
+        instruction_indices=[],
+        entry_stack=list(init_args),
+        exit_stack=list(entry.block_params),
+        phi_bindings=[],
+        block_params=[],
+        incoming_args={},
+        statements=[f"{param} = {value}" for param, value in zip(entry.block_params, init_args)],
+        terminator={"kind": "fallthrough", "text": None, "condition": None},
+        branch_target=None,
+        fallthrough_target=entry.id,
+        successors=[entry.id],
+        predecessors=[],
+        flags=["synthetic_entry_preheader"],
+    )
+
+    cloned: list[HIRBlock] = [preheader]
+    for idx, block in enumerate(hir_blocks):
+        preds = list(block.predecessors)
+        incoming = {pred: list(args) for pred, args in block.incoming_args.items()}
+        if idx == 0:
+            if pre_id not in preds:
+                preds.insert(0, pre_id)
+            incoming[pre_id] = list(block.block_params)
+        cloned.append(_clone_block(block, index=idx + 1, predecessors=preds, incoming_args=incoming))
+    return cloned, {"inserted_entry_preheader_count": 1}
+
+
+def _drop_detached_unreachable_blocks(hir_blocks: list[HIRBlock]) -> tuple[list[HIRBlock], dict[str, int]]:
+    """Remove detached unreachable fragments from exported normalized HIR.
+
+    The bytecode slicer may retain code-ref tails that are outside the reachable
+    function body.  They are useful as parser diagnostics, but they should not be
+    part of the normalized surface contract: their stack requirements can only be
+    satisfied by synthetic ``in_bb`` placeholders, and AST generation already
+    prunes them.  Drop only blocks explicitly marked as detached unreachable
+    fragments, then sanitize remaining CFG links.
+    """
+    drop_ids = {
+        block.id
+        for block in hir_blocks
+        if "detached_unreachable_fragment" in block.flags and "unreachable" in block.flags
+    }
+    if not drop_ids:
+        return list(hir_blocks), {"dropped_detached_unreachable_block_count": 0}
+    kept = [block for block in hir_blocks if block.id not in drop_ids]
+    valid = {block.id for block in kept}
+    cleaned: list[HIRBlock] = []
+    for block in kept:
+        successors = [succ for succ in block.successors if succ in valid]
+        predecessors = [pred for pred in block.predecessors if pred in valid]
+        incoming_args = {pred: list(args) for pred, args in block.incoming_args.items() if pred in valid}
+        branch_target = block.branch_target if block.branch_target in valid else None
+        fallthrough_target = block.fallthrough_target if block.fallthrough_target in valid else None
+        cleaned.append(_clone_block(
+            block,
+            successors=successors,
+            predecessors=predecessors,
+            incoming_args=incoming_args,
+            branch_target=branch_target,
+            fallthrough_target=fallthrough_target,
+        ))
+    return _reindex_hir_blocks(cleaned), {"dropped_detached_unreachable_block_count": len(drop_ids)}
+
+
+def _prune_dead_merge_lanes(hir_blocks: list[HIRBlock]) -> tuple[list[HIRBlock], dict[str, int]]:
+    """Drop CFG merge lanes that never reach a real statement/condition.
+
+    The bytecode VM stack is physical.  A join can therefore inherit stale
+    lower-stack words that are not part of the source-level dataflow.  Keeping
+    the entire physical stack as block parameters creates long chains of
+    ``m_bb`` forwarding assignments and unresolved ``in_bb`` live-ins.
+
+    This pass performs backward liveness over merge lanes: start from refs used
+    by actual statements/terminators, then mark incoming args for live
+    block-param lanes.  Lanes outside that closure are removed from
+    block_params/incoming_args instead of being renamed or hidden.
+    """
+    if not hir_blocks:
+        return [], {"pruned_merge_lane_count": 0, "pruned_incoming_arg_count": 0}
+
+    blocks = list(hir_blocks)
+    live_refs = _iter_real_surface_refs(blocks)
+    max_iterations = max(4, len(blocks) * 4)
+    for _ in range(max_iterations):
+        before = len(live_refs)
+        for block in blocks:
+            if not block.block_params:
+                continue
+            for pos, param in enumerate(block.block_params):
+                if param not in live_refs:
+                    continue
+                for args in block.incoming_args.values():
+                    if pos < len(args):
+                        live_refs.update(_iter_temp_like_refs(args[pos]))
+        if len(live_refs) == before:
+            break
+
+    pruned_lanes = 0
+    pruned_args = 0
+    cleaned: list[HIRBlock] = []
+    for block in blocks:
+        keep_positions = [idx for idx, param in enumerate(block.block_params) if param in live_refs]
+        if block.block_params and len(keep_positions) != len(block.block_params):
+            pruned_lanes += len(block.block_params) - len(keep_positions)
+        kept_params = [block.block_params[idx] for idx in keep_positions]
+        kept_param_set = set(kept_params)
+
+        incoming_args: dict[str, list[str]] = {}
+        for pred, args in block.incoming_args.items():
+            kept_args = [args[idx] for idx in keep_positions if idx < len(args)]
+            pruned_args += max(0, len(args) - len(kept_args))
+            incoming_args[pred] = kept_args
+
+        def keep_stack_item(item: str) -> bool:
+            if not isinstance(item, str):
+                return True
+            if item in kept_param_set:
+                return True
+            if item in block.block_params and item not in kept_param_set:
+                return False
+            if item.startswith(("in_", "undef_")) and item not in live_refs:
+                return False
+            if item.startswith("m_") and item not in live_refs:
+                return False
+            return True
+
+        phi_bindings: list[str] = []
+        for binding in block.phi_bindings:
+            matched = _match_assignment(binding)
+            if matched is not None and matched[0] not in kept_param_set and matched[0] not in live_refs:
+                continue
+            phi_bindings.append(binding)
+
+        cleaned.append(_clone_block(
+            block,
+            entry_stack=[item for item in block.entry_stack if keep_stack_item(item)],
+            exit_stack=[item for item in block.exit_stack if keep_stack_item(item)],
+            phi_bindings=phi_bindings,
+            block_params=kept_params,
+            incoming_args=incoming_args,
+        ))
+
+    return cleaned, {
+        "pruned_merge_lane_count": pruned_lanes,
+        "pruned_incoming_arg_count": pruned_args,
+    }
 
 
 def _compute_dominators(hir_blocks: list[HIRBlock]) -> dict[str, set[str]]:
@@ -2299,13 +3740,30 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
     entry_seed: list[str] | None = None
     if _looks_like_aggregate_prologue(hir_nodes):
         first = hir_nodes[0]
+        children = list(first.operands.get("children") or [])
+
+        def child_slot(child: dict[str, Any]) -> str | None:
+            ref = child.get("ref")
+            if ref is None:
+                return None
+            tag = child.get("tag")
+            mode = f"0x{int(tag):02X}" if isinstance(tag, int) else None
+            return _slot_name(ref, mode)
+
+        params = []
+        for idx, child in enumerate(children):
+            slot = child_slot(child)
+            if slot is None:
+                continue
+            params.append({"name": f"arg{idx}", "slot": slot, "ref": child.get("ref"), "tag": child.get("tag")})
         prologue_meta = {
             "kind": "aggregate_signature",
             "raw_kind": first.raw_kind,
             "arity": first.operands.get("arity"),
-            "children": list(first.operands.get("children") or []),
+            "children": children,
+            "params": params,
         }
-        entry_seed = [_slot_name(child.get("ref")) for child in first.operands.get("children") or [] if child.get("ref") is not None] or None
+        entry_seed = [param["slot"] for param in params]
         hir_nodes = hir_nodes[1:]
 
     t_lower0 = time.perf_counter()
@@ -2340,6 +3798,10 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
     if run_validation:
         validation["normalized_cleaned"] = validate_hir_blocks(normalized_cleaned_blocks, core_values, "normalized_cleaned")
     normalized_blocks = _rename_merge_params(_normalize_hir_blocks(normalized_cleaned_blocks))
+    normalized_blocks, prune_debug = _prune_dead_merge_lanes(normalized_blocks)
+    normalized_blocks, entry_livein_debug, prologue_meta = _promote_live_entry_placeholders(normalized_blocks, prologue_meta)
+    normalized_blocks, entry_preheader_debug = _insert_entry_preheader_for_loop_liveins(normalized_blocks, prologue_meta)
+    normalized_blocks, detached_debug = _drop_detached_unreachable_blocks(normalized_blocks)
     if run_validation:
         validation["normalized_final"] = validate_hir_blocks(normalized_blocks, core_values, "normalized_final")
     t_norm1 = time.perf_counter()
@@ -2389,6 +3851,10 @@ def build_function_hir(mod: MBCModule, entry_or_name: FunctionEntry | str, inclu
         "normalized_block_count": len(normalized_blocks),
         **dataflow_metrics,
         **cleanup_debug,
+        **prune_debug,
+        **entry_livein_debug,
+        **entry_preheader_debug,
+        **detached_debug,
     }
     timings_ms = {
         "total": round((time.perf_counter() - t0) * 1000.0, 3),

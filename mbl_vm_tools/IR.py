@@ -48,6 +48,7 @@ RETURN_KINDS = {"PAIR72_23", "SIG_RETURN_TAIL", "END"}
 DATA_KINDS = {"PAD", "ASCII", "DWBLOB", "NOP", "MARK"}
 AGGREGATE_KINDS = {"AGG", "AGG0"}
 RAW_OP_KINDS = {"OP"}
+ASSIGN_KINDS = {"ASSIGN"}
 UNKNOWN_KINDS = {"UNK"}
 SIGNATURE_RULES: dict[str, tuple[str, list[str], float]] = {
     "SIG_GETWEAR_WRAPPER": ("read_field", ["aggregate", "load", "read_field"], 0.62),
@@ -77,14 +78,14 @@ SIGNATURE_RULES: dict[str, tuple[str, list[str], float]] = {
     "SIG_GETCASTLENUM_HEAD": ("load", ["load"], 0.68),
     "SIG_CONST_0100": ("const", ["const"], 1.00),
     "SIG_CONST_U32_REC62": ("make_record", ["const", "make_record"], 0.90),
-    "SIG_CONST_U32_PFX_3D_REF": ("load", ["const", "load"], 0.90),
+    "SIG_CONST_U32_PFX_3D_REF": ("store", ["const", "store"], 0.90),
     "SIG_CONST_U32_IMM16": ("const", ["const"], 0.96),
     "SIG_CONST_U32_REF": ("load", ["const", "load"], 0.94),
     "SIG_TELEP_CREATEINFOPICTURE_TAIL": ("syscall", ["const", "make_record", "load", "syscall"], 0.76),
     "SIG_PLAYER_GETLEADER_TAIL": ("const", ["const", "const"], 0.56),
     "SIG_PLAYER_LOSTITEM2_TAIL": ("return", ["const", "load", "const", "syscall", "return"], 0.64),
     "SIG_MAIN_PARSECOMMAND_TAIL": ("branch", ["const", "const", "cmp", "branch"], 0.58),
-    "SIG_CONST_U32_PFX_3D_30_REF": ("load", ["const", "load"], 0.88),
+    "SIG_CONST_U32_PFX_3D_30_REF": ("store", ["const", "store"], 0.88),
     "SIG_CONST_U32_PFX_5E_REF": ("load", ["const", "load"], 0.88),
     "SIG_CONST_U32_PFX_3D_PAIR72_23": ("return", ["const", "return"], 0.80),
     "SIG_CONST_U32_REF16": ("load", ["const", "load"], 0.93),
@@ -249,6 +250,8 @@ def _category_for_kind(raw_kind: str, terminal_kind: str) -> str:
         return "branch"
     if terminal_kind in RETURN_KINDS:
         return "return"
+    if terminal_kind in ASSIGN_KINDS:
+        return "store"
     if terminal_kind in DATA_KINDS:
         return "data"
     if terminal_kind in RAW_OP_KINDS:
@@ -296,6 +299,8 @@ def _opcode_for_token(raw_kind: str, terminal_kind: str, category: str) -> str:
         return "branch"
     if category == "return":
         return "return"
+    if category == "store":
+        return "store.assign"
     if category == "data":
         return {
             "PAD": "data.pad",
@@ -405,10 +410,22 @@ def _normalize_operands(raw_kind: str, terminal_kind: str, payload: dict[str, An
             }
         )
     elif terminal_kind == "PAIR72_23":
-        operands.update({"tail": payload.get("bytes", "72 23")})
+        operands.update({"tail": payload.get("bytes", "72 23"), "optional_value": True})
+    elif terminal_kind == "END":
+        operands.update({"op": payload.get("op", 0x23), "role": payload.get("role", "function_end"), "optional_value": True})
+    elif terminal_kind in ASSIGN_KINDS:
+        operands.update({"op": _hex_byte(int(payload.get("op", 0x3D))), "assignment_op": True})
     elif raw_kind.startswith("SIG_") or terminal_kind.startswith("SIG_"):
         family = raw_kind if raw_kind.startswith("SIG_") else terminal_kind
         operands.update({"family": family[4:], **payload})
+        if family in {"SIG_CONST_U32_PFX_3D_REF", "SIG_CONST_U32_PFX_3D_30_REF"}:
+            operands["assignment_op"] = True
+            operands["assignment_yields_target"] = True
+            operands["embedded_assignment_value"] = payload.get("value")
+            if "ref_mode" in payload:
+                operands["mode"] = _hex_byte(int(payload["ref_mode"])) if isinstance(payload["ref_mode"], int) else payload["ref_mode"]
+            if "ref_op" in payload:
+                operands["source_op"] = _hex_byte(int(payload["ref_op"])) if isinstance(payload["ref_op"], int) else payload["ref_op"]
         if family.endswith("_BR") or family.endswith("BR"):
             if "op" in payload:
                 operands["branch_op"] = _hex_byte(int(payload["op"])) if isinstance(payload["op"], int) else payload["op"]
@@ -424,11 +441,29 @@ def _normalize_operands(raw_kind: str, terminal_kind: str, payload: dict[str, An
     else:
         operands.update(payload)
 
+    if "0x3D" in prefixes and terminal_kind not in {"BR", "PAIR72_23", "SIG_RETURN_TAIL"}:
+        if terminal_kind in CALL_KINDS:
+            operands["prefixed_stack_call"] = True
+        else:
+            operands["assignment_op"] = True
+            operands["assignment_yields_target"] = True
+
     return _json_safe(operands)
 
 
 def _lower_prefixed_basic(terminal_kind: str, prefix_chain: list[str]) -> tuple[str, list[str], float, str]:
     depth_penalty = 0.03 * len(prefix_chain)
+    if terminal_kind in ASSIGN_KINDS:
+        return "store", ["store"], 0.94, "basic.assign"
+    if "0x3D" in prefix_chain and terminal_kind in {"CALL66", "CALL63A"}:
+        # 0x3D-prefixed terminal calls are stack-call closures, not writes to
+        # an anonymous slot.  HIR determines the physical argument window from
+        # the already-built stack immediately before the call.
+        if terminal_kind == "CALL66":
+            return "syscall", ["syscall"], _clamp(0.94 - depth_penalty, 0.60, 0.94), "prefix.stack_call66"
+        return "call", ["call"], _clamp(0.94 - depth_penalty, 0.60, 0.94), "prefix.stack_call63"
+    if "0x3D" in prefix_chain and terminal_kind not in {"BR", "PAIR72_23", "SIG_RETURN_TAIL"}:
+        return "store", ["store"], _clamp(0.92 - depth_penalty, 0.55, 0.92), "prefix.assign"
     if terminal_kind in {"IMM", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "F32"}:
         return "const", ["const"], _clamp(1.0 - depth_penalty, 0.55, 1.0), "basic.const"
     if terminal_kind == "OPU16":
@@ -830,16 +865,32 @@ def _build_control(node: IRNode, valid_offsets: set[int]) -> dict[str, Any]:
 
 def normalize_token(token: Token, index: int) -> IRNode:
     terminal_kind, terminal_payload, prefix_chain = _unwrap_prefixed_token(token.kind, token.payload)
-    category = _category_for_kind(token.kind, terminal_kind)
-    opcode = _opcode_for_token(token.kind, terminal_kind, category)
-    operands = _normalize_operands(token.kind, terminal_kind, terminal_payload, prefix_chain)
-    semantic_op, semantic_components, confidence, lowering_rule = _lower_semantics(
-        raw_kind=token.kind,
-        terminal_kind=terminal_kind,
-        payload=token.payload,
-        operands=operands,
-        prefix_chain=prefix_chain,
+    ref16_offset_literal = (
+        terminal_kind == "REF16"
+        and isinstance(terminal_payload, dict)
+        and terminal_payload.get("mode") == 0x20
+        and "0x3D" not in prefix_chain
     )
+    category = "const" if ref16_offset_literal else _category_for_kind(token.kind, terminal_kind)
+    opcode = "const.ref16_offset" if ref16_offset_literal else _opcode_for_token(token.kind, terminal_kind, category)
+    operands = _normalize_operands(token.kind, terminal_kind, terminal_payload, prefix_chain)
+    if ref16_offset_literal:
+        operands = {
+            "value": terminal_payload.get("ref"),
+            "width": 16,
+            "signed": False,
+            "encoding": "ref16_offset",
+            "source_op": _hex_byte(int(terminal_payload.get("op", 0x64))),
+        }
+        semantic_op, semantic_components, confidence, lowering_rule = "const", ["const"], 0.98, "ref16.offset_literal"
+    else:
+        semantic_op, semantic_components, confidence, lowering_rule = _lower_semantics(
+            raw_kind=token.kind,
+            terminal_kind=terminal_kind,
+            payload=token.payload,
+            operands=operands,
+            prefix_chain=prefix_chain,
+        )
     return IRNode(
         index=index,
         offset=token.offset,

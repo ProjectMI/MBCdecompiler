@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,7 +34,7 @@ from mbl_vm_tools.ast_flow import (
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
 
 
-AST_CONTRACT_VERSION = "ast-v5"
+AST_CONTRACT_VERSION = "ast-v6"
 
 
 @dataclass
@@ -2189,12 +2189,144 @@ def _render_region(region: Optional[dict[str, Any]], indent: int = 0) -> list[st
         return lines
     return [prefix + f"/* unsupported AST region: {kind} */"]
 
+def _function_signature_aliases(function_payload: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+    hints = dict(function_payload.get("analysis_hints") or {})
+    prologue = dict(hints.get("prologue") or {})
+    params = list(prologue.get("params") or [])
+    if not params:
+        children = list(prologue.get("children") or [])
+        for idx, child in enumerate(children):
+            if not isinstance(child, dict) or child.get("ref") is None:
+                continue
+            tag = child.get("tag")
+            mode = f"0x{int(tag):02X}" if isinstance(tag, int) else None
+            slot = f"slot_{child.get('ref')}@{mode}" if mode else f"slot_{child.get('ref')}"
+            params.append({"name": f"arg{idx}", "slot": slot, "ref": child.get("ref"), "tag": tag})
+
+    entry_args: list[str] = []
+    aliases: dict[str, str] = {}
+    for idx, param in enumerate(params):
+        if not isinstance(param, dict):
+            continue
+        name = str(param.get("name") or f"arg{idx}")
+        slot = param.get("slot")
+        ref = param.get("ref")
+        tag = param.get("tag")
+        if name not in entry_args:
+            entry_args.append(name)
+        if isinstance(slot, str) and slot:
+            aliases[slot] = name
+        if ref is not None:
+            if isinstance(tag, int):
+                aliases[f"slot_{ref}@0x{tag:02X}"] = name
+            aliases[f"slot_{ref}"] = name
+    # Apply longer spellings first, otherwise slot_123 can eat the prefix of
+    # slot_123@0x31 before the mode-specific alias is applied.
+    ordered_aliases = dict(sorted(aliases.items(), key=lambda item: -len(item[0])))
+    return entry_args, ordered_aliases
+
+
+def _replace_aliases_in_text(text: Optional[str], aliases: dict[str, str]) -> Optional[str]:
+    if text is None or not aliases:
+        return text
+    out = text
+    for old, new in aliases.items():
+        pattern = rf"(?<![A-Za-z0-9_]){re.escape(old)}(?![A-Za-z0-9_])"
+        out = re.sub(pattern, new, out)
+    return out
+
+
+def _alias_hir_blocks(blocks: list[HIRBlock], aliases: dict[str, str]) -> list[HIRBlock]:
+    if not aliases:
+        return list(blocks)
+    out: list[HIRBlock] = []
+    for block in blocks:
+        terminator = dict(block.terminator)
+        terminator["text"] = _replace_aliases_in_text(terminator.get("text"), aliases)
+        terminator["condition"] = _replace_aliases_in_text(terminator.get("condition"), aliases)
+        incoming_args = {
+            pred: [_replace_aliases_in_text(arg, aliases) or arg for arg in args]
+            for pred, args in block.incoming_args.items()
+        }
+        out.append(replace(
+            block,
+            entry_stack=[_replace_aliases_in_text(item, aliases) or item for item in block.entry_stack],
+            exit_stack=[_replace_aliases_in_text(item, aliases) or item for item in block.exit_stack],
+            phi_bindings=[_replace_aliases_in_text(item, aliases) or item for item in block.phi_bindings],
+            block_params=[_replace_aliases_in_text(item, aliases) or item for item in block.block_params],
+            incoming_args=incoming_args,
+            statements=[_replace_aliases_in_text(stmt, aliases) or stmt for stmt in block.statements],
+            terminator=terminator,
+        ))
+    return out
+
+
 def _render_function_text(name: str, entry_args: list[str], tree: dict[str, Any], include_text: bool) -> str:
     if not include_text:
         return ""
     header = f"function {name}({', '.join(entry_args)}) {{" if entry_args else f"function {name}() {{"
     body = _render_region(tree, 1)
     return "\n".join([header, *body, "}"]).rstrip()
+
+
+def _prune_unused_trailing_entry_args(entry_args: list[str], tree: dict[str, Any]) -> list[str]:
+    # AGG/prologue signatures are bytecode stack contracts, not always source
+    # formals. Keep every argument up to the last one that is actually used in
+    # the structured body, but drop trailing phantom args so setters such as
+    # SetHealth do not claim four inputs while only consuming one.
+    if not entry_args:
+        return []
+    body_text = "\n".join(_render_region(tree, 1))
+    pruned = list(entry_args)
+    while pruned:
+        name = pruned[-1]
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", body_text):
+            break
+        pruned.pop()
+    return pruned
+
+
+_ARG_REF_RE = re.compile(r"(?<![A-Za-z0-9_])arg\d+(?![A-Za-z0-9_])")
+
+
+def _replace_arg_refs_in_tree(node: Any, mapping: dict[str, str]) -> Any:
+    if not mapping:
+        return node
+    if isinstance(node, str):
+        return _replace_aliases_in_text(node, mapping) or node
+    if isinstance(node, list):
+        return [_replace_arg_refs_in_tree(item, mapping) for item in node]
+    if isinstance(node, dict):
+        return {key: _replace_arg_refs_in_tree(value, mapping) for key, value in node.items()}
+    return node
+
+
+def _compact_entry_args_and_tree(entry_args: list[str], tree: dict[str, Any]) -> tuple[list[str], dict[str, Any], dict[str, str]]:
+    """Drop and renumber surface-only phantom formals after structuring."""
+    body_text = "\n".join(_render_region(tree, 1))
+    used = set(_ARG_REF_RE.findall(body_text))
+    if not used:
+        return [], tree, {}
+
+    ordered: list[str] = []
+    for name in entry_args:
+        if name in used and name not in ordered:
+            ordered.append(name)
+
+    known = set(ordered)
+    extras = sorted(
+        (name for name in used if name not in known),
+        key=lambda item: int(item[3:]) if item[3:].isdigit() else 10**9,
+    )
+    ordered.extend(extras)
+
+    mapping = {
+        old: f"arg{idx}"
+        for idx, old in enumerate(ordered)
+        if old != f"arg{idx}"
+    }
+    compacted_tree = _replace_arg_refs_in_tree(tree, mapping) if mapping else tree
+    return [f"arg{idx}" for idx in range(len(ordered))], compacted_tree, mapping
 
 
 def _coerce_function_hir(function_payload: dict[str, Any]) -> tuple[list[HIRBlock], str, dict[str, int], dict[str, Any], str, dict[str, Any], str]:
@@ -2213,10 +2345,27 @@ def _coerce_function_hir(function_payload: dict[str, Any]) -> tuple[list[HIRBloc
 def build_function_ast_from_payload(function_payload: dict[str, Any], *, include_hir: bool = False, include_text: bool = True) -> ASTFunction:
     t0 = time.perf_counter()
     blocks, name, span, body_selection, slice_mode, hir_summary, input_contract = _coerce_function_hir(function_payload)
-    entry_args = blocks[0].entry_stack if blocks else []
+    prologue_args, slot_aliases = _function_signature_aliases(function_payload)
+    if slot_aliases:
+        blocks = _alias_hir_blocks(blocks, slot_aliases)
+    if prologue_args:
+        entry_args = list(prologue_args)
+        if blocks:
+            # AGG0 gives named formal slots, but the stack solver may still
+            # discover extra live entry words needed by the first basic block
+            # (for example an implicit VM operand consumed after a branch
+            # merge).  Keep them in the signature instead of letting argN
+            # appear in the body from nowhere.
+            for arg in blocks[0].entry_stack:
+                if isinstance(arg, str) and arg not in entry_args and re.fullmatch(r"arg\d+", arg):
+                    entry_args.append(arg)
+    else:
+        entry_args = blocks[0].entry_stack if blocks else []
     builder = _SurfaceBuilder(blocks)
     region_tree, structured_meta = builder.build()
     ast_root = region_tree or {"kind": "sequence", "regions": []}
+    entry_args, ast_root, arg_compaction = _compact_entry_args_and_tree(list(entry_args), ast_root)
+    entry_args = _prune_unused_trailing_entry_args(list(entry_args), ast_root)
     ast_metrics = _collect_ast_metrics(ast_root)
     semantic_validation = _validate_ast_semantics(ast_root, ast_metrics)
     ast_text = _render_function_text(name, list(entry_args), ast_root, include_text)
@@ -2238,6 +2387,7 @@ def build_function_ast_from_payload(function_payload: dict[str, Any], *, include
         "structuring": structured_meta,
         "ast_metrics": ast_metrics,
         "semantic_validation": semantic_validation,
+        "arg_compaction": arg_compaction,
         "timings_ms": {"total": round((time.perf_counter() - t0) * 1000.0, 3)},
     }
     return ASTFunction(
