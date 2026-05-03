@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .parser import FunctionEntry, MBCModule, TableRecord
-from .vm_spec import VMWord, decode_words, stack_contract, word_role
+from .vm_spec import VMWord, branch_target_offset, decode_words, stack_contract, word_role
 from .control import build_control_graph
+from .semantic import classify_branch
 
 
-IR_CONTRACT_VERSION = "vm-ir-v4"
+IR_CONTRACT_VERSION = "vm-ir-v6"
 VMIR_CONTRACT_VERSION = IR_CONTRACT_VERSION
 CALL_REL_BIAS = -4
 
@@ -171,21 +172,6 @@ def _record_payload(record: TableRecord) -> dict[str, Any]:
     return record.to_dict()
 
 
-def _record_payload_with_sidecars(mod: MBCModule, record: TableRecord) -> dict[str, Any]:
-    payload = record.to_dict()
-    getter = getattr(mod, "get_definition_sidecars_for_address", None)
-    if getter is not None:
-        sidecars = getter(int(record.a))
-        if sidecars:
-            payload["definition_sidecars"] = [sidecar.to_dict() for sidecar in sidecars]
-    return payload
-
-
-def _is_definition_sidecar_index(mod: MBCModule, definition_index: int) -> bool:
-    checker = getattr(mod, "is_definition_sidecar_index", None)
-    return bool(checker is not None and checker(int(definition_index)))
-
-
 def build_callable_index(mod: MBCModule) -> dict[int, list[dict[str, Any]]]:
     """Build the VM callable address index.
 
@@ -197,15 +183,13 @@ def build_callable_index(mod: MBCModule) -> dict[int, list[dict[str, Any]]]:
 
     out: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for idx, rec in enumerate(mod.definitions):
-        if _is_definition_sidecar_index(mod, idx):
-            continue
         out[int(rec.a)].append({
             "kind": "definition",
             "name": rec.name,
             "symbol": rec.name,
             "table": "definitions",
             "index": idx,
-            "record": _record_payload_with_sidecars(mod, rec),
+            "record": _record_payload(rec),
         })
     for idx, rec in enumerate(mod.globals):
         out[int(rec.a)].append({
@@ -492,8 +476,8 @@ def build_function_ir(
             "No stack balancing result is promoted to source arity.",
             "CALL63A arity is the encoded argc byte only.",
             "Externs are call targets, not synthetic local definitions.",
-            "Control graph uses terminal-op operand-base branch targets and byte/sub-entry blocks; it does not snap targets to word starts.",
-            "Definition-table sidecars are preserved as metadata and are not indexed as callable functions.",
+            "Control graph uses terminal-op operand-base branch targets and byte/sub-entry blocks; op 0x4A is a jump edge, while op 0x4B/0x4C/0x4D keep taken/fallthrough conditional edges.",
+            "Parser v2 treats every definition-table record as an authoritative table entry; no parser-level sidecar suppression is applied.",
         ],
     }
     return VMFunctionIR(
@@ -532,7 +516,8 @@ def build_module_ir(
         "module": str(mod.path),
         "function_count": len(functions),
         "callable_address_count": len(callable_index),
-        "definition_sidecar_count": len(getattr(mod, "definition_sidecars", [])),
+        "parser_contract": getattr(mod, "parser_contract", None),
+        "parser_layout_policy": getattr(mod, "layout_diagnostics", {}).get("policy"),
         "contract": VMIR_CONTRACT_VERSION,
     })
     return VMModuleIR(str(mod.path), summary, _index_to_json(callable_index), functions)
@@ -550,6 +535,8 @@ def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
     max_words = 0
     stack_underflows = 0
     branch_status_hist: Counter[str] = Counter()
+    branch_semantic_hist: Counter[str] = Counter()
+    edge_kind_hist: Counter[str] = Counter()
     proven_edges = 0
     candidate_edges = 0
     for fn in funcs:
@@ -558,6 +545,8 @@ def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
         stack_underflows += int(fn.diagnostics.get("stack", {}).get("underflow_count", 0) or 0)
         cfg_summary = fn.cfg.get("summary", {}) if isinstance(fn.cfg, dict) else {}
         branch_status_hist.update(cfg_summary.get("branch_status_histogram", {}))
+        branch_semantic_hist.update(cfg_summary.get("branch_semantic_kind_histogram", {}))
+        edge_kind_hist.update(cfg_summary.get("edge_kind_histogram", {}))
         proven_edges += int(cfg_summary.get("proven_edge_count", 0) or 0)
         candidate_edges += int(cfg_summary.get("candidate_edge_count", 0) or 0)
         for word in fn.words:
@@ -585,6 +574,8 @@ def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
         "resolved_external_script_call_count": external_calls,
         "unresolved_script_call_count": unresolved_calls,
         "control_branch_status_histogram": dict(sorted(branch_status_hist.items())),
+        "control_branch_semantic_kind_histogram": dict(sorted(branch_semantic_hist.items())),
+        "control_edge_kind_histogram": dict(sorted(edge_kind_hist.items())),
         "proven_control_edge_count": proven_edges,
         "candidate_control_edge_count": candidate_edges,
         "word_kind_histogram": dict(sorted(kind_hist.items())),
@@ -608,7 +599,9 @@ def render_function_text(fn: VMFunctionIR) -> str:
         elif word.terminal_kind == "CALL_NATIVE":
             detail = f" argc={word.operands.get('argc')} -> syscall_{word.operands.get('opid')}"
         elif word.terminal_kind == "BR":
-            detail = f" off={word.operands.get('off')}"
+            sem = classify_branch(word)
+            op = int(word.operands.get("op", -1) or -1)
+            detail = f" op=0x{op:02X} off={word.operands.get('off')} target={branch_target_offset(word)} {sem.branch_kind}"
         elif word.terminal_kind in {"AGG", "AGG0"}:
             detail = f" arity={word.operands.get('arity')}"
         elif "value" in word.operands:

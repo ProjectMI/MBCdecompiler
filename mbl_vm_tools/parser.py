@@ -14,6 +14,9 @@ MAGIC_HEADER = b"MBL script v4.0\x00"
 FIXED_CODE_BASE = 0x20
 MAX_INTER_RECORD_ZERO_RUN = 16
 SYMBOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,63}$")
+PARSER_CONTRACT_VERSION = "mbc-parser-v2"
+TABLE_ANCHOR_SYNC_WINDOW = 32
+
 
 
 def u32(data: bytes, offset: int) -> int:
@@ -135,35 +138,6 @@ class FunctionEntry:
         }
 
 
-@dataclass(frozen=True)
-class DefinitionSidecar:
-    """A non-callable definition-table record attached to a neighboring runtime entry.
-
-    Some MBC definition tables contain tiny records whose byte span is not a
-    normal VM function body.  They carry table/runtime semantics and should not
-    be treated as callable functions or as AGG/AGG0 ABI declarations.
-    """
-
-    record_index: int
-    owner_index: int
-    kind: str
-    reason: str
-    record: TableRecord
-    owner_record: TableRecord
-    raw_hex: str
-
-    def to_dict(self) -> dict:
-        return {
-            "record_index": self.record_index,
-            "owner_index": self.owner_index,
-            "kind": self.kind,
-            "reason": self.reason,
-            "record": self.record.to_dict(),
-            "owner_record": self.owner_record.to_dict(),
-            "raw_hex": self.raw_hex,
-        }
-
-
 @dataclass
 class ADBInfo:
     present: bool
@@ -244,302 +218,263 @@ def parse_table_with_padding(data: bytes, start: int, globals_mode: bool = False
     return records, pos
 
 
-def _looks_like_definition(records: list[TableRecord]) -> bool:
-    if len(records) < 1:
-        return False
-    good = 0
-    for rec in records:
-        if rec.a <= rec.b and rec.c in KNOWN_FLAGS:
-            good += 1
-    return good >= max(1, int(len(records) * 0.55))
 
+def _is_definition_record(rec: TableRecord, code_size: int) -> bool:
+    """Authoritative definition-table record predicate.
 
-def _looks_like_globals(records: list[TableRecord]) -> bool:
-    if len(records) < 1:
-        return False
-    good = 0
-    prev = None
-    for r in records:
-        if r.b == 0xFFFFFFFF and r.c == 0:
-            good += 1
-            if prev is not None and r.a - prev == 5:
-                good += 1
-            prev = r.a
-    return good >= max(2, int(len(records) * 1.1))
+    Definition records address a closed byte range inside the code segment and
+    carry one of the observed VM definition flags.  This is a hard table-shape
+    predicate, not a score.
+    """
 
-
-def _looks_like_exports(records: list[TableRecord]) -> bool:
-    if len(records) < 1:
-        return False
-    starts = [r.a for r in records]
-    cvals = [r.c for r in records]
-    normal = [r for r in records if r.b != 0xFFFFFFFF]
-    if not normal:
-        return False
-
-    starts_increasing = sum(1 for i in range(len(starts) - 1) if starts[i] < starts[i + 1]) >= max(0, int((len(starts) - 1) * 0.55))
-    small_ordinals = sum(1 for r in normal if r.b < 0x10000 and r.c == 0) >= max(1, int(len(normal) * 0.65))
-    mostly_zero_c = sum(1 for c in cvals if c == 0) >= max(1, int(len(records) * 0.7))
-    return starts_increasing and small_ordinals and mostly_zero_c
-
-
-def _score_defs(records: list[TableRecord]) -> float:
-    score = 0.0
-    prev = None
-    for r in records[:32]:
-        if r.c in KNOWN_FLAGS:
-            score += 4
-        if r.a <= r.b:
-            score += 2
-        if prev is not None and r.a >= prev:
-            score += 1
-        prev = r.a
-    return score
-
-
-def _score_globals(records: list[TableRecord]) -> float:
-    score = 0.0
-    prev = None
-    for r in records[:32]:
-        if r.b == 0xFFFFFFFF and r.c == 0:
-            score += 5
-        if prev is not None and r.a - prev == 5:
-            score += 2
-        prev = r.a
-    return score
-
-
-def _score_exports(records: list[TableRecord]) -> float:
-    score = 0.0
-    prev_a = None
-    prev_b = None
-    for r in records[:32]:
-        if r.b != 0xFFFFFFFF and r.c == 0:
-            score += 4
-        if r.b == 0xFFFFFFFF and r.c == 0:
-            score += 1.5
-        if prev_a is not None and r.a > prev_a:
-            score += 1
-        if r.b != 0xFFFFFFFF and prev_b is not None and prev_b != 0xFFFFFFFF and r.b == prev_b + 1:
-            score += 2
-        prev_a = r.a
-        prev_b = r.b
-    return score
-
-
-
-def _is_strict_definition_record(rec: TableRecord, code_size: int) -> bool:
     return rec.b != 0xFFFFFFFF and rec.a <= rec.b < code_size and rec.c in KNOWN_FLAGS
 
 
-def _iter_candidate_starts_in_window(data: bytes, start: int, end: int):
-    start = max(0, start)
-    end = min(len(data), end)
-    if start >= end:
-        return
+def _is_global_record(rec: TableRecord) -> bool:
+    """Authoritative globals/import record predicate."""
 
-    yielded = set()
-    if data[start:start + 1] == b"\x00":
-        yielded.add(start)
-        yield start
-
-    i = max(1, start)
-    while i < end:
-        if data[i] == 0 and data[i - 1] != 0:
-            run_start = i
-            j = i
-            while j + 1 < end and data[j + 1] == 0:
-                j += 1
-            next_pos = j + 1
-            if next_pos < end:
-                b = data[next_pos]
-                if ((65 <= b <= 90) or (97 <= b <= 122) or b == 95) and run_start not in yielded:
-                    yielded.add(run_start)
-                    yield run_start
-            i = j + 1
-            continue
-        i += 1
+    return rec.b == 0xFFFFFFFF and rec.c == 0
 
 
-def _score_header_guided_definition(start: int, records: list[TableRecord], predicted_start: int, code_size: int) -> float:
-    valid = sum(1 for rec in records if _is_strict_definition_record(rec, code_size))
-    import_like = sum(1 for rec in records if rec.b == 0xFFFFFFFF and rec.c == 0)
-    invalid = len(records) - valid - import_like
-    if valid == 0:
-        return float('-inf')
+def _is_export_record(rec: TableRecord) -> bool:
+    """Authoritative export-table record predicate.
 
-    score = (valid * 12.0) + (len(records) * 0.5) - (invalid * 30.0) - (import_like * 20.0)
-    if records and _is_strict_definition_record(records[0], code_size):
-        score += 10.0
-    score -= abs(start - predicted_start) * 0.05
-    return score
+    Export tables contain normal public exports (``b`` is the public ordinal)
+    and may also embed import-like extern records.  Both carry ``c == 0``.
+    """
+
+    if rec.c != 0:
+        return False
+    if rec.b == 0xFFFFFFFF:
+        return True
+    return 0 <= rec.b < 0x10000
 
 
-def _find_header_guided_definition(data: bytes) -> TableCandidate | None:
-    if len(data) < FIXED_CODE_BASE or not data.startswith(MAGIC_HEADER):
+def _is_normal_export_record(rec: TableRecord) -> bool:
+    return rec.c == 0 and rec.b != 0xFFFFFFFF and 0 <= rec.b < 0x10000
+
+
+def _record_at(data: bytes, offset: int) -> TableRecord | None:
+    name, end = read_cstr(data, offset)
+    if name is None or end + 12 > len(data):
         return None
+    if not _is_symbolish_name(name):
+        return None
+    a, b, c = struct.unpack_from("<III", data, end)
+    return TableRecord(offset, name, a, b, c)
 
-    header = [u32(data, 0x10 + i * 4) for i in range(4)]
-    code_size = header[2]
-    predicted_start = FIXED_CODE_BASE + header[2] + header[3] + 1
-    search_start = max(0, predicted_start - 128)
-    search_end = min(len(data), predicted_start + 512)
 
-    best: TableCandidate | None = None
-    best_score = float('-inf')
-    for pos in _iter_candidate_starts_in_window(data, search_start, search_end):
-        recs, end = parse_table_with_padding(data, pos, globals_mode=False, max_records=5000)
-        if not recs:
+def _find_record_start(data: bytes, start: int, *, limit: int | None = None) -> tuple[int, int] | None:
+    """Find the next NUL-padded table record start in a bounded window.
+
+    Returns ``(padding_start, record_name_offset)``.  The bounded sync is used
+    only to cross deterministic table-boundary padding / one-byte sentinels near
+    the header-predicted table anchor.  It does not rank candidates.
+    """
+
+    size = len(data)
+    stop = min(size, start + TABLE_ANCHOR_SYNC_WINDOW if limit is None else limit)
+    pos = max(0, start)
+    while pos < stop:
+        if data[pos] == 0:
+            pad_start = pos
+            while pos < size and data[pos] == 0:
+                pos += 1
+            if pos < size and pos < stop:
+                rec = _record_at(data, pos)
+                if rec is not None:
+                    return pad_start, pos
             continue
-        score = _score_header_guided_definition(pos, recs, predicted_start, code_size)
-        if score > best_score:
-            best_score = score
-            best = TableCandidate(pos, end, "definitions", score, recs)
-
-    return best if best_score != float('-inf') else None
-
-
-def _find_first_table_after(data: bytes, start: int, kind: str) -> TableCandidate | None:
-    scan_start = max(0, start - 64)
-    scan_end = min(len(data), start + 65536)
-    for pos in _iter_candidate_starts_in_window(data, scan_start, scan_end):
-        if kind == "globals":
-            recs, end = parse_table_with_padding(data, pos, globals_mode=True, max_records=5000)
-            if recs and recs[0].offset >= start and _looks_like_globals(recs):
-                return TableCandidate(pos, end, "globals", _score_globals(recs), recs)
-            continue
-
-        recs, end = parse_table_with_padding(data, pos, globals_mode=False, max_records=5000)
-        if recs and recs[0].offset >= start and _looks_like_exports(recs):
-            return TableCandidate(pos, end, "exports", _score_exports(recs), recs)
+        # A non-zero byte immediately before table padding is allowed at the
+        # header/table seam, but only inside this bounded sync window.
+        pos += 1
     return None
 
 
-def _iter_candidate_starts(data: bytes):
-    """
-    Yield only plausible table starts:
-    - file start
-    - the first byte of each zero-padding run that is followed by an ASCII-ish identifier start
+def _parse_strict_table(
+    data: bytes,
+    start: int,
+    *,
+    kind: str,
+    predicate,
+    max_records: int = 5000,
+    max_inter_record_zero_run: int = MAX_INTER_RECORD_ZERO_RUN,
+    sync_first_record: bool = True,
+) -> TableCandidate | None:
+    """Parse one table by a hard per-record predicate.
 
-    The old logic tried nearly every byte offset and relied on parse_table_with_padding()
-    to reject almost all of them. That is correct but far too slow on larger modules.
+    The table starts at the NUL padding before the first record.  Records may be
+    separated by short NUL padding runs; a longer run ends the table.  Encountering
+    a syntactically valid record that does not satisfy the table predicate also
+    ends the table without consuming that next table's record.
     """
+
     size = len(data)
-    if size == 0:
-        return
+    if start >= size:
+        return None
 
-    yield 0
-    i = 1
-    while i < size:
-        if data[i] == 0 and data[i - 1] != 0:
-            run_start = i
-            j = i
-            while j + 1 < size and data[j + 1] == 0:
-                j += 1
-            next_pos = j + 1
-            if next_pos < size:
-                b = data[next_pos]
-                if (65 <= b <= 90) or (97 <= b <= 122) or b == 95:
-                    yield run_start
-            i = j + 1
-            continue
-        i += 1
+    if sync_first_record:
+        found = _find_record_start(data, start)
+        if found is None:
+            return None
+        table_start, pos = found
+    else:
+        table_start = start
+        pos = start
+
+    records: list[TableRecord] = []
+    while pos < size and len(records) < max_records:
+        zero_start = pos
+        while pos < size and data[pos] == 0:
+            pos += 1
+        zero_run = pos - zero_start
+        if records and zero_run > max_inter_record_zero_run:
+            return TableCandidate(table_start, zero_start, kind, 1.0, records)
+        if pos >= size:
+            break
+        if pos > 0 and data[pos - 1] != 0:
+            break
+        rec = _record_at(data, pos)
+        if rec is None:
+            break
+        if not predicate(rec):
+            return TableCandidate(table_start, zero_start, kind, 1.0, records) if records else None
+        records.append(rec)
+        name_end = data.find(b"\x00", pos)
+        pos = name_end + 1 + 12
+
+    if not records:
+        return None
+    return TableCandidate(table_start, pos, kind, 1.0, records)
 
 
-def find_table_candidates(data: bytes, min_records: int = 3) -> list[TableCandidate]:
-    candidates: list[TableCandidate] = []
+def _next_table_anchor(data: bytes, start: int) -> int | None:
+    found = _find_record_start(data, start)
+    return found[0] if found is not None else None
 
-    for pos in _iter_candidate_starts(data):
-        grecs, gend = parse_table_with_padding(data, pos, globals_mode=True, max_records=500)
-        if len(grecs) >= min_records and _looks_like_globals(grecs):
-            candidates.append(TableCandidate(pos, gend, "globals", _score_globals(grecs), grecs))
 
-        recs, end = parse_table_with_padding(data, pos, globals_mode=False, max_records=500)
-        if len(recs) >= min_records:
-            if _looks_like_definition(recs):
-                candidates.append(TableCandidate(pos, end, "definitions", _score_defs(recs), recs))
-            if _looks_like_exports(recs):
-                candidates.append(TableCandidate(pos, end, "exports", _score_exports(recs), recs))
+def _header_table_anchor(data: bytes) -> int | None:
+    if len(data) < FIXED_CODE_BASE or not data.startswith(MAGIC_HEADER):
+        return None
+    header = [u32(data, 0x10 + i * 4) for i in range(4)]
+    code_size = int(header[2])
+    data_blob_size = int(header[3]) + 1
+    raw_anchor = FIXED_CODE_BASE + code_size + data_blob_size
+    if raw_anchor > len(data):
+        return None
+    synced = _find_record_start(data, raw_anchor)
+    if synced is None:
+        return None
+    return synced[0]
 
-    merged: list[TableCandidate] = []
-    for cand in sorted(candidates, key=lambda c: (c.kind, c.start, -c.score)):
-        if merged and cand.kind == merged[-1].kind and cand.start - merged[-1].start <= 12:
-            if cand.score > merged[-1].score:
-                merged[-1] = cand
+
+def _detect_module_layout_deterministic(data: bytes) -> dict:
+    """Detect MBC table layout from header and strict table predicates.
+
+    Model:
+    - The header fixes the end of code + data blob and therefore the table area.
+    - The first table in that area is the definition table.
+    - After definitions there may be a globals/import table.
+    - The export table is the next table that contains at least one normal export
+      record; import-like records inside that same stream remain embedded externs.
+
+    No score, majority vote, whole-file sweep, or candidate ranking is used.
+    """
+
+    diagnostics: dict[str, object] = {
+        "contract": PARSER_CONTRACT_VERSION,
+        "policy": "header anchored deterministic layout; strict record predicates; no fallback sweep or scoring",
+    }
+    anchor = _header_table_anchor(data)
+    diagnostics["header_table_anchor"] = anchor
+    if anchor is None:
+        return {"definitions": None, "globals": None, "exports": None, "candidates": [], "diagnostics": diagnostics}
+
+    header = [u32(data, 0x10 + i * 4) for i in range(4)]
+    code_size = int(header[2])
+    raw_anchor = FIXED_CODE_BASE + code_size + int(header[3]) + 1
+    diagnostics["raw_header_anchor"] = raw_anchor
+    diagnostics["anchor_sync_delta"] = int(anchor) - int(raw_anchor)
+
+    definitions = _parse_strict_table(
+        data,
+        anchor,
+        kind="definitions",
+        predicate=lambda rec: _is_definition_record(rec, code_size),
+        sync_first_record=True,
+    )
+    if definitions is None:
+        diagnostics["failure"] = "definition_table_missing"
+        return {"definitions": None, "globals": None, "exports": None, "candidates": [], "diagnostics": diagnostics}
+
+    diagnostics["definition_count"] = len(definitions.records)
+    pos = definitions.end
+    globals_table = None
+    exports_table = None
+
+    first_anchor = _next_table_anchor(data, pos)
+    diagnostics["post_definition_anchor"] = first_anchor
+    if first_anchor is not None:
+        first_found = _find_record_start(data, first_anchor)
+        first_record = _record_at(data, first_found[1]) if first_found is not None else None
+        if first_record is not None and _is_global_record(first_record):
+            globals_table = _parse_strict_table(
+                data,
+                first_anchor,
+                kind="globals",
+                predicate=_is_global_record,
+                sync_first_record=True,
+            )
+            # In this format the zero-valued ``c`` field of the final
+            # globals record doubles as the NUL padding before the first export
+            # name.  Therefore the export-table anchor is four bytes before the
+            # end of the globals stream, not after it.
+            second_anchor = max(first_anchor, globals_table.end - 4) if globals_table else None
+            diagnostics["post_globals_anchor"] = second_anchor
+            if second_anchor is not None:
+                exports_table = _parse_strict_table(
+                    data,
+                    second_anchor,
+                    kind="exports",
+                    predicate=_is_export_record,
+                    sync_first_record=True,
+                )
         else:
-            merged.append(cand)
-    return merged
+            exports_table = _parse_strict_table(
+                data,
+                first_anchor,
+                kind="exports",
+                predicate=_is_export_record,
+                sync_first_record=True,
+            )
+
+        if exports_table is not None and not any(_is_normal_export_record(rec) for rec in exports_table.records):
+            # A table containing only import-like records is not a public export
+            # table.  Keep the role explicit instead of guessing.
+            diagnostics["export_rejected"] = "no_normal_export_records"
+            exports_table = None
+
+    diagnostics["globals_count"] = len(globals_table.records) if globals_table else 0
+    diagnostics["export_record_count"] = len(exports_table.records) if exports_table else 0
+    diagnostics["normal_export_count"] = sum(1 for rec in exports_table.records if _is_normal_export_record(rec)) if exports_table else 0
+    return {
+        "definitions": definitions,
+        "globals": globals_table,
+        "exports": exports_table,
+        "candidates": [],
+        "diagnostics": diagnostics,
+    }
 
 
 def detect_module_layout(data: bytes, *, collect_candidates: bool = True, allow_fallback_scan: bool = True) -> dict:
-    cands: list[TableCandidate] = []
-    definitions_best = _find_header_guided_definition(data)
-    globals_best = None
-    exports_best = None
+    """Return deterministic MBC table layout.
 
-    if definitions_best is not None:
-        first_globals = _find_first_table_after(data, definitions_best.end, "globals")
-        first_exports = _find_first_table_after(data, definitions_best.end, "exports")
+    ``collect_candidates`` and ``allow_fallback_scan`` are accepted for API
+    compatibility only.  Parser v2 intentionally performs no candidate sweep,
+    score ranking, or fallback scan.
+    """
 
-        if first_globals is not None and first_exports is not None and first_globals.start == first_exports.start:
-            later_exports = _find_first_table_after(data, first_globals.end, "exports")
-            if later_exports is not None and later_exports.start > first_globals.start:
-                globals_best = first_globals
-                exports_best = later_exports
-            else:
-                exports_best = first_exports
-        elif first_globals is not None and (first_exports is None or first_globals.start < first_exports.start):
-            globals_best = first_globals
-            exports_best = _find_first_table_after(data, globals_best.end, "exports")
-        else:
-            exports_best = first_exports
-
-    need_full_sweep = collect_candidates or definitions_best is None or exports_best is None
-    if need_full_sweep and allow_fallback_scan:
-        cands = find_table_candidates(data)
-        if not cands:
-            cands = find_table_candidates(data, min_records=1)
-
-    if cands:
-        globals_cands = [c for c in cands if c.kind == "globals"]
-        export_cands = [c for c in cands if c.kind == "exports"]
-        def_cands = [c for c in cands if c.kind == "definitions"]
-
-        if globals_best is None:
-            if definitions_best is not None:
-                globals_after_defs = [c for c in globals_cands if c.start >= definitions_best.end]
-                if exports_best is not None:
-                    globals_after_defs = [c for c in globals_after_defs if c.start < exports_best.start]
-                globals_best = max(globals_after_defs or globals_cands, key=lambda c: (c.score, -c.start), default=None)
-            else:
-                globals_best = max(globals_cands, key=lambda c: (c.score, -c.start), default=None)
-
-        if exports_best is None:
-            if globals_best is not None:
-                exports_after_anchor = [c for c in export_cands if c.start >= globals_best.end]
-            elif definitions_best is not None:
-                exports_after_anchor = [c for c in export_cands if c.start >= definitions_best.end]
-            else:
-                exports_after_anchor = []
-            exports_best = max(exports_after_anchor or export_cands, key=lambda c: (c.score, -c.start), default=None)
-
-        if globals_best is not None:
-            defs_before = [c for c in def_cands if c.start < globals_best.start]
-            if defs_before:
-                definitions_best = max(defs_before, key=lambda c: (c.score, -c.start))
-        if definitions_best is None and exports_best is not None:
-            defs_before = [c for c in def_cands if c.start < exports_best.start]
-            if defs_before:
-                definitions_best = max(defs_before, key=lambda c: (c.score, -c.start))
-        if definitions_best is None and def_cands:
-            definitions_best = max(def_cands, key=lambda c: (c.score, -c.start))
-
-    return {
-        "definitions": definitions_best,
-        "globals": globals_best,
-        "exports": exports_best,
-        "candidates": cands,
-    }
+    return _detect_module_layout_deterministic(data)
 
 
 def read_adb_info(mbc_path: str | Path) -> ADBInfo:
@@ -634,13 +569,15 @@ class MBCModule:
         layout = detect_module_layout(
             self.data,
             collect_candidates=collect_auxiliary,
-            allow_fallback_scan=True,
+            allow_fallback_scan=False,
         )
 
+        self.parser_contract = PARSER_CONTRACT_VERSION
+        self.layout_diagnostics: dict = layout.get("diagnostics", {})
         self.definition_table: Optional[TableCandidate] = layout["definitions"]
         self.globals_table: Optional[TableCandidate] = layout["globals"]
         self.exports_table: Optional[TableCandidate] = layout["exports"]
-        self.candidates: list[TableCandidate] = layout["candidates"] if collect_auxiliary else []
+        self.candidates: list[TableCandidate] = []
 
         raw_exports = self.exports_table.records if self.exports_table else []
         self.embedded_import_like_exports: list[TableRecord] = [
@@ -678,73 +615,17 @@ class MBCModule:
             if len(records) == 1
         }
 
-        self.definition_sidecars: list[DefinitionSidecar] = self._detect_definition_sidecars()
-        self._definition_sidecar_indices: set[int] = {sidecar.record_index for sidecar in self.definition_sidecars}
-        self._definition_sidecars_by_owner_addr: dict[int, list[DefinitionSidecar]] = defaultdict(list)
-        self._definition_sidecars_by_owner_name: dict[str, list[DefinitionSidecar]] = defaultdict(list)
-        for sidecar in self.definition_sidecars:
-            self._definition_sidecars_by_owner_addr[int(sidecar.owner_record.a)].append(sidecar)
-            self._definition_sidecars_by_owner_name[sidecar.owner_record.name].append(sidecar)
-
         self._definition_function_entries: list[FunctionEntry] = []
         self._export_function_entries: list[FunctionEntry] = []
         self._function_entries: list[FunctionEntry] = []
         self._function_entry_by_name: dict[str, FunctionEntry] = {}
         self._build_function_entries()
 
-    def _detect_definition_sidecars(self) -> list[DefinitionSidecar]:
-        """Detect definition-table records that are metadata sidecars, not functions.
-
-        Hotfix for the CalcParam/Recalc layout seen in the corpus: a 0x201
-        record with body ``4a 02 00 23`` sits immediately before a real
-        callable record.  Treat the short record as table/runtime metadata
-        attached to the next definition instead of decoding it as a normal
-        callable function.  The predicate intentionally requires the whole
-        byte-shape; larger 0x201 definitions remain ordinary functions.
-        """
-
-        out: list[DefinitionSidecar] = []
-        records = self.definitions
-        for idx, record in enumerate(records[:-1]):
-            owner = records[idx + 1]
-            if record.c != 0x201:
-                continue
-            if record.b + 1 != owner.a:
-                continue
-            raw = self._slice_code_span(record.a, record.b + 1)
-            if raw != b"\x4a\x02\x00\x23":
-                continue
-            if record.name in self._export_records_by_name:
-                continue
-            out.append(
-                DefinitionSidecar(
-                    record_index=idx,
-                    owner_index=idx + 1,
-                    kind="runtime_parameter_stub",
-                    reason="0x201 CalcParam-like definition-table sidecar with tiny BR/END body attached to following callable",
-                    record=record,
-                    owner_record=owner,
-                    raw_hex=raw.hex(" "),
-                )
-            )
-        return out
-
-    def is_definition_sidecar_index(self, definition_index: int) -> bool:
-        return int(definition_index) in self._definition_sidecar_indices
-
-    def get_definition_sidecars_for_address(self, address: int) -> list[DefinitionSidecar]:
-        return list(self._definition_sidecars_by_owner_addr.get(int(address), []))
-
-    def get_definition_sidecars_for_symbol(self, symbol: str) -> list[DefinitionSidecar]:
-        return list(self._definition_sidecars_by_owner_name.get(symbol, []))
-
     def _build_function_entries(self) -> None:
         definition_occurrences: Counter[str] = Counter()
         export_occurrences: Counter[str] = Counter()
 
         for definition_index, record in enumerate(self.definitions):
-            if self.is_definition_sidecar_index(definition_index):
-                continue
             definition_occurrences[record.name] += 1
             duplicate_definition_symbol = len(self._definition_records_by_name.get(record.name, [])) > 1
             export_refs = self._export_records_by_name.get(record.name, [])
@@ -989,6 +870,8 @@ class MBCModule:
     def to_dict(self) -> dict:
         return {
             "path": str(self.path),
+            "parser_contract": self.parser_contract,
+            "layout_diagnostics": self.layout_diagnostics,
             "header": self.header,
             "has_magic_header": self.has_magic_header,
             "definition_table_start": self.definition_table.start if self.definition_table else None,
@@ -998,7 +881,6 @@ class MBCModule:
             "globals": [r.to_dict() for r in self.globals],
             "exports": [r.to_dict() for r in self.exports],
             "function_entries": [entry.to_dict() for entry in self._function_entries],
-            "definition_sidecars": [sidecar.to_dict() for sidecar in self.definition_sidecars],
             "embedded_import_like_exports": [r.to_dict() for r in self.embedded_import_like_exports],
             "definition_name_collisions": {
                 name: [record.to_dict() for record in records]

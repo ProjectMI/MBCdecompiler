@@ -13,9 +13,10 @@ from .vm_spec import (
     terminal_atom_offset,
     word_role,
 )
+from .semantic import classify_branch
 
 
-CONTROL_CONTRACT_VERSION = "vm-control-v2"
+CONTROL_CONTRACT_VERSION = "vm-control-v3"
 BRANCH_TARGET_FORMULA = "terminal_op_offset + 1 + signed_u16(off)"
 
 
@@ -56,6 +57,7 @@ class BranchResolution:
     operand_base_offset: Optional[int] = None
     target_entry_kind: Optional[str] = None
     target_decoder_rule: Optional[str] = None
+    semantic: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -247,6 +249,7 @@ def resolve_branch_target(
     status = "unresolved"
     target_entry_kind: Optional[str] = None
     target_decoder_rule: Optional[str] = None
+    semantic: Optional[dict[str, Any]] = None
 
     known_kind = _entry_kind_text(entry_kinds, target)
     if known_kind is not None:
@@ -297,6 +300,8 @@ def resolve_branch_target(
     if word_index is None:
         word_index = int(word.index) if int(word.index) >= 0 else None
 
+    semantic = classify_branch(word, source_word_index=word_index).to_dict()
+
     return BranchResolution(
         word_index=word_index,
         offset=word.offset,
@@ -315,6 +320,7 @@ def resolve_branch_target(
         operand_base_offset=operand_base,
         target_entry_kind=target_entry_kind,
         target_decoder_rule=target_decoder_rule,
+        semantic=semantic,
     )
 
 
@@ -436,8 +442,10 @@ def _discover_block_starts(
                     source_word_index=top_level_by_offset.get(pos),
                 )
                 branch_by_offset[pos] = res
+                sem = classify_branch(word, source_word_index=top_level_by_offset.get(pos))
                 _add_split_offset(split_offsets, queue, raw, res.selected_local_target)
-                _add_split_offset(split_offsets, queue, raw, next_pos)
+                if sem.has_fallthrough_edge:
+                    _add_split_offset(split_offsets, queue, raw, next_pos)
                 break
 
             if role == "return":
@@ -565,7 +573,8 @@ def build_control_graph(
                     source_word_index=top_level_by_offset.get(last_offset),
                 )
                 branch_by_offset[last_offset] = resolution
-            terminator = {"kind": "branch", "resolution": resolution.to_dict()}
+            semantic = classify_branch(last, source_word_index=resolution.word_index)
+            terminator = {"kind": "branch", "resolution": resolution.to_dict(), "semantic": semantic.to_dict()}
             if resolution.selected_local_target is not None:
                 target_id = start_to_id.get(resolution.selected_local_target)
                 if target_id:
@@ -574,7 +583,7 @@ def build_control_graph(
                         VMControlEdge(
                             source=block_id,
                             target=target_id,
-                            kind="branch",
+                            kind=semantic.taken_edge_kind,
                             status="proven",
                             word_index=resolution.word_index,
                             formula=resolution.selected_formula,
@@ -582,19 +591,20 @@ def build_control_graph(
                             instruction_offset=last_offset,
                         )
                     )
-            ft_id = start_to_id.get(end_offset)
-            if ft_id:
-                successors.append(ft_id)
-                edges.append(
-                    VMControlEdge(
-                        source=block_id,
-                        target=ft_id,
-                        kind="fallthrough",
-                        status="proven",
-                        word_index=resolution.word_index,
-                        instruction_offset=last_offset,
+            if semantic.has_fallthrough_edge:
+                ft_id = start_to_id.get(end_offset)
+                if ft_id:
+                    successors.append(ft_id)
+                    edges.append(
+                        VMControlEdge(
+                            source=block_id,
+                            target=ft_id,
+                            kind=semantic.fallthrough_edge_kind or "fallthrough",
+                            status="proven",
+                            word_index=resolution.word_index,
+                            instruction_offset=last_offset,
+                        )
                     )
-                )
         elif word_role(last) == "return":
             terminator = {"kind": "return"}
         else:
@@ -627,6 +637,12 @@ def build_control_graph(
 
     branch_resolutions = [branch_by_offset[offset] for offset in sorted(branch_by_offset)]
     status_hist = Counter(r.status for r in branch_resolutions)
+    branch_semantic_hist = Counter((r.semantic or {}).get("branch_kind", "unknown") for r in branch_resolutions)
+    branch_terminator_semantic_hist = Counter(
+        ((b.terminator or {}).get("semantic") or {}).get("branch_kind", "unknown")
+        for b in blocks
+        if (b.terminator or {}).get("kind") == "branch"
+    )
     edge_status_hist = Counter(e.status for e in edges)
     edge_kind_hist = Counter(e.kind for e in edges)
     reachable = _reachable_blocks(blocks, edges)
@@ -636,6 +652,9 @@ def build_control_graph(
         "subentry_block_count": subentry_blocks,
         "branch_count": len(branch_resolutions),
         "branch_status_histogram": dict(sorted(status_hist.items())),
+        "branch_semantic_kind_histogram": dict(sorted(branch_semantic_hist.items())),
+        "branch_terminator_count": sum(branch_terminator_semantic_hist.values()),
+        "branch_terminator_semantic_kind_histogram": dict(sorted(branch_terminator_semantic_hist.items())),
         "exact_entry_branch_count": status_hist.get("exact_entry", 0),
         "decoded_entry_branch_count": status_hist.get("decoded_entry", 0),
         "unresolved_branch_count": status_hist.get("unresolved", 0),
@@ -648,7 +667,7 @@ def build_control_graph(
         "unreachable_under_proven_edges_count": max(0, len(blocks) - len(reachable)),
         "entry_coordinate_policy": "word starts, prefix subentries, terminal atoms, aggregate tails, and decoded branch targets are legal VM entry coordinates.",
         "branch_target_formula": BRANCH_TARGET_FORMULA,
-        "policy": "BR targets use terminal-op operand-base byte/sub-entry coordinates; no nearest-word-start snapping or aligned target promotion is performed.",
+        "policy": "BR targets use terminal-op operand-base byte/sub-entry coordinates; op 0x4A is modelled as jump without fallthrough, op 0x4B/0x4C/0x4D as conditional taken/fallthrough branches.",
     }
     return VMControlGraph(
         contract=CONTROL_CONTRACT_VERSION,
