@@ -56,6 +56,44 @@ class VMWord:
         return payload
 
 
+def signed_u16(value: int) -> int:
+    """Interpret a 16-bit VM displacement as signed little-endian payload."""
+
+    value = int(value) & 0xFFFF
+    return value - 0x10000 if value & 0x8000 else value
+
+
+def terminal_atom_offset(word: VMWord) -> int:
+    """Return the byte offset of the terminal atom inside a decoded VM word.
+
+    For unprefixed words this is ``word.offset``.  For prefixed words it is the
+    first byte after the prefix chain.
+    """
+
+    return int(word.offset) + len(word.prefixes)
+
+
+def branch_operand_base_offset(word: VMWord) -> int:
+    """Return the coordinate base used by BR u16 displacements.
+
+    A branch atom is encoded as ``4A/4B/4C/4D <lo> <hi>``.  The displacement is
+    relative to ``<lo>``, i.e. the first operand byte, not to the start or end of
+    the fused VM word.
+    """
+
+    if word.terminal_kind != "BR":
+        raise ValueError("branch_operand_base_offset requires a BR word")
+    return terminal_atom_offset(word) + 1
+
+
+def branch_target_offset(word: VMWord) -> int:
+    """Resolve a BR target in local function byte/sub-entry coordinates."""
+
+    if word.terminal_kind != "BR":
+        raise ValueError("branch_target_offset requires a BR word")
+    return branch_operand_base_offset(word) + signed_u16(int(word.operands.get("off", 0) or 0))
+
+
 @dataclass(frozen=True)
 class DecodedAtom:
     kind: str
@@ -333,6 +371,64 @@ def _match_bare_u32(data: bytes, start: int, limit: int) -> DecodedAtom | None:
         return None
     return DecodedAtom("BARE_U32", 4, {"value": value, "width": 32, "signed": False, "follower_kind": follower}, "literal.bare_u32")
 
+def _decode_atom_at(data: bytes, offset: int, limit: int) -> tuple[DecodedAtom, list[int]]:
+    """Decode exactly one VM word candidate at ``offset``.
+
+    This is the shared primitive for the linear decoder and for byte/sub-entry
+    control-flow decoding.  The matching order is intentionally the same as the
+    historical linear decoder; only the entry coordinate changes.
+    """
+
+    atom = _match_aggregate(data, offset, limit)
+    prefixes: list[int] = []
+    if atom is None:
+        pair = _match_pair_return(data, offset, limit)
+        if pair is not None:
+            atom = pair
+        else:
+            pref = _match_prefixed(data, offset, limit)
+            if pref is not None:
+                atom, prefixes = pref
+            else:
+                atom = _match_atomic(data, offset, limit)
+                if atom is None:
+                    atom = _match_bare_u32(data, offset, limit)
+                if atom is None:
+                    atom = _match_structural_single(data, offset, limit)
+    if atom is None:
+        atom = DecodedAtom("UNKNOWN", 1, {"byte": data[offset]}, "unknown.byte")
+    return atom, prefixes
+
+
+def decode_word_at(data: bytes, offset: int, *, limit: Optional[int] = None, index: int = 0) -> VMWord:
+    """Decode one VM word from an explicit byte/sub-entry offset.
+
+    Branches in this VM may target prefix bytes or terminal atoms inside a
+    top-level linear ``VMWord``.  This helper keeps that semantics explicit:
+    callers choose the entry byte, and the VM decoder interprets bytes from
+    there without snapping to the nearest linear word boundary.
+    """
+
+    body_limit = len(data) if limit is None else min(len(data), max(0, int(limit)))
+    if offset < 0 or offset >= body_limit:
+        raise ValueError(f"decode_word_at offset {offset} outside 0..{body_limit}")
+    atom, prefixes = _decode_atom_at(data, offset, body_limit)
+    raw = data[offset:offset + atom.size]
+    kind = atom.kind if not prefixes else "PFX_" + "_".join(f"{p:02X}" for p in prefixes) + f"_{atom.kind}"
+    return VMWord(
+        index=index,
+        offset=offset,
+        size=atom.size,
+        kind=kind,
+        terminal_kind=atom.kind,
+        prefixes=prefixes,
+        operands=dict(atom.operands),
+        raw=raw,
+        confidence=0.0 if atom.kind == "UNKNOWN" else 1.0,
+        decoder_rule=atom.rule,
+    )
+
+
 def decode_words(data: bytes, *, limit: Optional[int] = None) -> list[VMWord]:
     """Decode raw function bytes into VM words without source-level signatures.
 
@@ -344,41 +440,9 @@ def decode_words(data: bytes, *, limit: Optional[int] = None) -> list[VMWord]:
     words: list[VMWord] = []
     i = 0
     while i < body_limit:
-        atom = _match_aggregate(data, i, body_limit)
-        prefixes: list[int] = []
-        if atom is None:
-            pair = _match_pair_return(data, i, body_limit)
-            if pair is not None:
-                atom = pair
-            else:
-                pref = _match_prefixed(data, i, body_limit)
-                if pref is not None:
-                    atom, prefixes = pref
-                else:
-                    atom = _match_atomic(data, i, body_limit)
-                    if atom is None:
-                        atom = _match_bare_u32(data, i, body_limit)
-                    if atom is None:
-                        atom = _match_structural_single(data, i, body_limit)
-        if atom is None:
-            atom = DecodedAtom("UNKNOWN", 1, {"byte": data[i]}, "unknown.byte")
-        raw = data[i:i + atom.size]
-        kind = atom.kind if not prefixes else "PFX_" + "_".join(f"{p:02X}" for p in prefixes) + f"_{atom.kind}"
-        words.append(
-            VMWord(
-                index=len(words),
-                offset=i,
-                size=atom.size,
-                kind=kind,
-                terminal_kind=atom.kind,
-                prefixes=prefixes,
-                operands=dict(atom.operands),
-                raw=raw,
-                confidence=0.0 if atom.kind == "UNKNOWN" else 1.0,
-                decoder_rule=atom.rule,
-            )
-        )
-        i += max(1, atom.size)
+        word = decode_word_at(data, i, limit=body_limit, index=len(words))
+        words.append(word)
+        i += max(1, word.size)
     return words
 
 

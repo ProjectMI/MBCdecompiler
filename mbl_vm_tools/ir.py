@@ -12,7 +12,7 @@ from .vm_spec import VMWord, decode_words, stack_contract, word_role
 from .control import build_control_graph
 
 
-IR_CONTRACT_VERSION = "vm-ir-v3"
+IR_CONTRACT_VERSION = "vm-ir-v4"
 VMIR_CONTRACT_VERSION = IR_CONTRACT_VERSION
 CALL_REL_BIAS = -4
 
@@ -414,11 +414,11 @@ def simulate_stack(words: list[VMWord]) -> tuple[list[VMStackEvent], dict[str, A
 
 
 def _branch_target_candidates(function_start: int, word: VMWord, valid_offsets: set[int]) -> list[dict[str, Any]]:
-    """Compatibility helper: expose exact/aligned branch observations.
+    """Compatibility helper: expose VM-spec branch target observations.
 
-    New code should consume ``control.build_control_graph``.  This helper no
-    longer chooses a first candidate as a CFG edge; it only reports what the VM
-    control layer can observe.
+    New code should consume ``control.build_control_graph``.  The helper uses
+    the terminal-op operand-base invariant and no longer reports aligned repair
+    candidates from the old word-start model.
     """
 
     from .control import resolve_branch_target
@@ -427,10 +427,10 @@ def _branch_target_candidates(function_start: int, word: VMWord, valid_offsets: 
     return [c.to_dict() for c in resolution.exact_candidates + resolution.aligned_candidates]
 
 
-def build_cfg(words: list[VMWord], *, function_start: int) -> dict[str, Any]:
-    """Build bytecode control facts using the independent control layer."""
+def build_cfg(words: list[VMWord], *, function_start: int, raw: bytes | None = None) -> dict[str, Any]:
+    """Build byte/sub-entry control facts using the independent control layer."""
 
-    return build_control_graph(words, function_start=function_start).to_dict()
+    return build_control_graph(words, function_start=function_start, raw=raw).to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +478,7 @@ def build_function_ir(
                 "opid": word.operands.get("opid"),
                 "target": {"target_name": f"syscall_{word.operands.get('opid')}", "target_kind": "native", "resolved": True},
             })
-    cfg = build_cfg(words, function_start=function_start)
+    cfg = build_cfg(words, function_start=function_start, raw=raw)
     kind_hist = Counter(w.terminal_kind for w in words)
     prefix_hist = Counter(" ".join(f"0x{p:02X}" for p in w.prefixes) for w in words if w.prefixes)
     diagnostics = {
@@ -492,7 +492,7 @@ def build_function_ir(
             "No stack balancing result is promoted to source arity.",
             "CALL63A arity is the encoded argc byte only.",
             "Externs are call targets, not synthetic local definitions.",
-            "Control graph distinguishes proven branch edges from aligned branch candidates.",
+            "Control graph uses terminal-op operand-base branch targets and byte/sub-entry blocks; it does not snap targets to word starts.",
             "Definition-table sidecars are preserved as metadata and are not indexed as callable functions.",
         ],
     }

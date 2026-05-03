@@ -6,3 +6,4 @@ mbl_vm_tools/__pycache__/*
 *.txt
 *.pyc
 *.lua
+*.zip
