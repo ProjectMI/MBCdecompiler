@@ -13,7 +13,7 @@ from .control import build_control_graph
 from .semantic import classify_branch
 
 
-IR_CONTRACT_VERSION = "vm-ir-v6"
+IR_CONTRACT_VERSION = "vm-ir-v8"
 VMIR_CONTRACT_VERSION = IR_CONTRACT_VERSION
 CALL_REL_BIAS = -4
 
@@ -599,9 +599,14 @@ def render_function_text(fn: VMFunctionIR) -> str:
         elif word.terminal_kind == "CALL_NATIVE":
             detail = f" argc={word.operands.get('argc')} -> syscall_{word.operands.get('opid')}"
         elif word.terminal_kind == "BR":
-            sem = classify_branch(word)
             op = int(word.operands.get("op", -1) or -1)
-            detail = f" op=0x{op:02X} off={word.operands.get('off')} target={branch_target_offset(word)} {sem.branch_kind}"
+            role = word_role(word)
+            if role == "branch":
+                sem = classify_branch(word)
+                kind = sem.branch_kind
+            else:
+                kind = role
+            detail = f" op=0x{op:02X} off={word.operands.get('off')} target={branch_target_offset(word)} {kind}"
         elif word.terminal_kind in {"AGG", "AGG0"}:
             detail = f" arity={word.operands.get('arity')}"
         elif "value" in word.operands:

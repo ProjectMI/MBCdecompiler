@@ -11,6 +11,7 @@ from .vm_spec import (
     VMWord,
     branch_operand_base_offset,
     branch_target_offset,
+    is_control_branch_word,
     signed_u16,
     terminal_atom_offset,
 )
@@ -19,22 +20,23 @@ if TYPE_CHECKING:  # pragma: no cover - avoids runtime import cycles with contro
     from .control import VMControlGraph
 
 
-SEMANTIC_CONTRACT_VERSION = "vm-semantic-v2"
-CFG_SEMANTIC_CONTRACT_VERSION = "vm-cfg-semantic-v3"
+SEMANTIC_CONTRACT_VERSION = "vm-semantic-v5"
+CFG_SEMANTIC_CONTRACT_VERSION = "vm-cfg-semantic-v7"
 BRANCH_SEMANTIC_POLICY = (
     "Opcode 0x4A is a VM control jump; opcodes 0x4B/0x4C/0x4D are "
-    "conditional VM branches. Predicate polarity and source-level condition "
-    "meaning are intentionally not inferred here."
+    "conditional VM branches. If a conditional branch target equals its "
+    "fallthrough coordinate, it is a VM conditional no-transfer atom, not a "
+    "control-flow split. Predicate polarity and source-level condition meaning "
+    "are intentionally not inferred here."
 )
 CFG_SEMANTIC_POLICY = (
     "CFG semantic lifting consumes proven VM control graphs plus hierarchical "
     "region/branch facts. It names VM-level control regions, preserves taken/"
     "fallthrough edge identity, and keeps predicate polarity unresolved. It does "
     "not rebuild CFG, mutate byte-level decoding, or emit source-level if/while/"
-    "break/return constructs. Same-SCC conditionals are deferred to cyclic "
-    "structuring instead of being patched as branch failures. Same-target taken/"
-    "fallthrough conditionals are reported as control-degenerate branch atoms, "
-    "not semantic branch regions."
+    "break/return constructs. Cross-SCC and cyclic-SCC branch envelopes are lifted "
+    "from branch facts; no-transfer conditional atoms remain byte/branch facts and "
+    "are not CFG branch regions."
 )
 
 
@@ -159,15 +161,15 @@ CONDITIONAL_BRANCH_OPS = {0x4B, 0x4C, 0x4D}
 
 
 def classify_branch(word: VMWord, *, source_word_index: Optional[int] = None) -> VMBranchSemantics:
-    """Classify VM branch control-flow semantics without source-level lowering.
+    """Classify VM control-branch semantics without source-level lowering.
 
-    This pass only labels edge behavior. It does not decide whether a condition
-    is ``true`` or ``false`` in source terms, and it does not transform regions
-    into ``if``/``while`` nodes.
+    This pass only labels control-edge behavior. BR-shaped words that cannot
+    change control flow, such as target==fallthrough predicate atoms, are handled
+    by ``vm_spec.word_role`` and are not valid inputs here.
     """
 
-    if word.terminal_kind != "BR":
-        raise ValueError("classify_branch requires a BR VMWord")
+    if word.terminal_kind != "BR" or not is_control_branch_word(word):
+        raise ValueError("classify_branch requires a control BR VMWord")
 
     op = int(word.operands.get("op", -1) or -1) & 0xFF
     encoded = int(word.operands.get("off", 0) or 0) & 0xFFFF
@@ -280,11 +282,14 @@ def _arm_role(edge_kind: str) -> str:
 
 
 def _semantic_region_kind(branch: dict[str, Any]) -> str:
-    if branch.get("kind") != "conditional_scc_branch":
-        return str(branch.get("kind") or "unknown_region")
-    if branch.get("exit_kind") == "virtual_function_exit":
+    region_kind = branch.get("region_kind")
+    if region_kind:
+        return str(region_kind)
+    if branch.get("kind") == "conditional_scc_branch" and branch.get("exit_kind") == "virtual_function_exit":
         return "conditional_multi_exit_region"
-    return "conditional_region"
+    if branch.get("kind") == "conditional_scc_branch":
+        return "conditional_region"
+    return str(branch.get("kind") or "unknown_region")
 
 
 def _semantic_arm_from_branch_arm(arm: dict[str, Any]) -> VMSemanticArm:
@@ -309,8 +314,8 @@ def analyze_cfg_semantics(cfg: "VMControlGraph | dict[str, Any]", *, include_det
 
     The semantic layer consumes ``control``, ``regions`` and ``branches`` output.
     It does not recompute byte decoding or patch region coverage. Branches are
-    emitted only for cross-SCC regions that were already proven by the branch
-    lifting pass. Same-SCC conditionals remain explicit deferred cyclic facts.
+    emitted only from canonical branch facts already proven by the branch lifting
+    pass, including cyclic-SCC branch envelopes.
     """
 
     # Lazy imports keep semantic.py usable by control.py without creating an
@@ -330,19 +335,18 @@ def analyze_cfg_semantics(cfg: "VMControlGraph | dict[str, Any]", *, include_det
     if not include_details:
         real_conditional_count = int(branch_summary.get("real_join_branch_count", 0) or 0)
         multi_exit_count = int(branch_summary.get("function_exit_branch_count", 0) or 0)
-        control_degenerate_count = int(branch_summary.get("conditional_control_degenerate_count", 0) or 0)
+        cyclic_branch_count = int(branch_summary.get("lifted_cyclic_scc_branch_count", 0) or 0)
         cyclic_region_count = int(branch_summary.get("cyclic_scc_count", 0) or 0)
-        same_scc_deferred_count = int(branch_summary.get("conditional_same_scc_successors_count", 0) or 0)
         kind_hist = Counter()
         if real_conditional_count:
             kind_hist["conditional_region"] = real_conditional_count
         if multi_exit_count:
             kind_hist["conditional_multi_exit_region"] = multi_exit_count
+        if cyclic_branch_count:
+            kind_hist["cyclic_branch_region"] = cyclic_branch_count
         if cyclic_region_count:
             kind_hist["cyclic_scc_region"] = cyclic_region_count
         deferred_hist = Counter()
-        if same_scc_deferred_count:
-            deferred_hist["same_scc_conditional"] = same_scc_deferred_count
         summary = {
             "block_count": len(blocks),
             "edge_count": len(edges),
@@ -352,23 +356,17 @@ def analyze_cfg_semantics(cfg: "VMControlGraph | dict[str, Any]", *, include_det
             "cyclic_scc_count": cyclic_region_count,
             "conditional_branch_count": int(branch_summary.get("conditional_branch_count", 0) or 0),
             "conditional_two_successor_count": int(branch_summary.get("conditional_two_successor_count", 0) or 0),
-            "conditional_not_two_successors_count": int(branch_summary.get("conditional_not_two_successors_count", 0) or 0),
             "conditional_two_edge_count": int(branch_summary.get("conditional_two_edge_count", 0) or 0),
-            "conditional_not_two_edge_count": int(branch_summary.get("conditional_not_two_edge_count", 0) or 0),
-            "conditional_same_target_edge_count": int(branch_summary.get("conditional_same_target_edge_count", 0) or 0),
-            "conditional_control_degenerate_count": control_degenerate_count,
-            "conditional_same_scc_successors_count": same_scc_deferred_count,
+            "conditional_same_scc_successors_count": int(branch_summary.get("conditional_same_scc_successors_count", 0) or 0),
             "conditional_cross_scc_count": int(branch_summary.get("conditional_cross_scc_count", 0) or 0),
-            "same_target_branch_count": int(branch_summary.get("same_target_branch_count", 0) or 0),
             "lifted_branch_count": int(branch_summary.get("lifted_branch_count", 0) or 0),
             "semantic_region_count": int(branch_summary.get("lifted_branch_count", 0) or 0) + cyclic_region_count,
             "semantic_conditional_region_count": real_conditional_count,
             "semantic_multi_exit_region_count": multi_exit_count,
-            "semantic_immediate_join_region_count": 0,
-            "semantic_control_degenerate_count": control_degenerate_count,
+            "semantic_cyclic_branch_region_count": cyclic_branch_count,
             "semantic_cyclic_region_count": cyclic_region_count,
             "semantic_region_kind_histogram": dict(sorted(kind_hist.items())),
-            "semantic_deferred_count": same_scc_deferred_count,
+            "semantic_deferred_count": 0,
             "semantic_deferred_kind_histogram": dict(sorted(deferred_hist.items())),
             "branch_contract": branch_report.get("contract"),
             "region_contract": REGION_CONTRACT_VERSION,
@@ -429,31 +427,11 @@ def analyze_cfg_semantics(cfg: "VMControlGraph | dict[str, Any]", *, include_det
             )
         )
 
-    for fact in region_report.get("facts") or []:
-        if fact.get("kind") != "conditional_same_scc":
-            continue
-        evidence = dict(fact.get("evidence") or {})
-        deferred.append(
-            VMSemanticDeferred(
-                id=f"defer_{fact.get('id')}",
-                kind="same_scc_conditional",
-                header=str(fact.get("header")),
-                nodes=list(fact.get("nodes") or []),
-                reason="conditional successors are inside one SCC; wait for cyclic structuring",
-                evidence={
-                    **evidence,
-                    "source_contract": region_report.get("contract"),
-                },
-            )
-        )
-
     region_summary = region_report.get("summary") or {}
     kind_hist = Counter(region.kind for region in semantic_regions)
     deferred_hist = Counter(item.kind for item in deferred)
     real_conditional_count = int(kind_hist.get("conditional_region", 0))
     multi_exit_count = int(kind_hist.get("conditional_multi_exit_region", 0))
-    control_degenerate_count = int(branch_summary.get("conditional_control_degenerate_count", 0) or 0)
-    immediate_join_count = int(kind_hist.get("conditional_immediate_join_region", 0))
     summary = {
         "block_count": len(blocks),
         "edge_count": len(edges),
@@ -463,20 +441,14 @@ def analyze_cfg_semantics(cfg: "VMControlGraph | dict[str, Any]", *, include_det
         "cyclic_scc_count": int(branch_summary.get("cyclic_scc_count", region_summary.get("cyclic_scc_count", 0)) or 0),
         "conditional_branch_count": int(branch_summary.get("conditional_branch_count", 0) or 0),
         "conditional_two_successor_count": int(branch_summary.get("conditional_two_successor_count", 0) or 0),
-        "conditional_not_two_successors_count": int(branch_summary.get("conditional_not_two_successors_count", 0) or 0),
         "conditional_two_edge_count": int(branch_summary.get("conditional_two_edge_count", 0) or 0),
-        "conditional_not_two_edge_count": int(branch_summary.get("conditional_not_two_edge_count", 0) or 0),
-        "conditional_same_target_edge_count": int(branch_summary.get("conditional_same_target_edge_count", 0) or 0),
-        "conditional_control_degenerate_count": control_degenerate_count,
         "conditional_same_scc_successors_count": int(branch_summary.get("conditional_same_scc_successors_count", 0) or 0),
         "conditional_cross_scc_count": int(branch_summary.get("conditional_cross_scc_count", 0) or 0),
-        "same_target_branch_count": int(branch_summary.get("same_target_branch_count", 0) or 0),
         "lifted_branch_count": int(branch_summary.get("lifted_branch_count", 0) or 0),
         "semantic_region_count": len(semantic_regions),
         "semantic_conditional_region_count": real_conditional_count,
         "semantic_multi_exit_region_count": multi_exit_count,
-        "semantic_immediate_join_region_count": immediate_join_count,
-        "semantic_control_degenerate_count": control_degenerate_count,
+        "semantic_cyclic_branch_region_count": int(kind_hist.get("cyclic_branch_region", 0)),
         "semantic_cyclic_region_count": cyclic_region_count,
         "semantic_region_kind_histogram": dict(sorted(kind_hist.items())),
         "semantic_deferred_count": len(deferred),
@@ -533,20 +505,14 @@ def analyze_module_cfg_semantics(
             "cyclic_scc_count",
             "conditional_branch_count",
             "conditional_two_successor_count",
-            "conditional_not_two_successors_count",
             "conditional_two_edge_count",
-            "conditional_not_two_edge_count",
-            "conditional_same_target_edge_count",
-            "conditional_control_degenerate_count",
             "conditional_same_scc_successors_count",
             "conditional_cross_scc_count",
-            "same_target_branch_count",
             "lifted_branch_count",
             "semantic_region_count",
             "semantic_conditional_region_count",
             "semantic_multi_exit_region_count",
-            "semantic_immediate_join_region_count",
-            "semantic_control_degenerate_count",
+            "semantic_cyclic_branch_region_count",
             "semantic_cyclic_region_count",
             "semantic_deferred_count",
         ]:

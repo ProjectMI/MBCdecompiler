@@ -450,6 +450,30 @@ VALUE_WORDS = {"BARE_U32", "IMM8", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32
 RETURN_WORDS = {"RETURN_PAIR", "END"}
 CALL_WORDS = {"CALL_NATIVE", "CALL_SCRIPT"}
 BRANCH_WORDS = {"BR"}
+CONTROL_BRANCH_OPS = {0x4A, 0x4B, 0x4C, 0x4D}
+CONDITIONAL_CONTROL_BRANCH_OPS = {0x4B, 0x4C, 0x4D}
+
+
+def is_control_branch_word(word: VMWord) -> bool:
+    """Return True only for BR atoms that can change control flow.
+
+    A BR-shaped conditional whose encoded target is exactly the next VM entry
+    coordinate is not a control edge. It is kept as a decoded VM word for byte
+    and stack/predicate accounting, but it must not enter CFG branch resolution
+    or region/branch structuring.
+    """
+
+    if word.terminal_kind != "BR":
+        return False
+    op = int(word.operands.get("op", -1) or -1) & 0xFF
+    if op not in CONTROL_BRANCH_OPS:
+        return False
+    try:
+        if op in CONDITIONAL_CONTROL_BRANCH_OPS and branch_target_offset(word) == int(word.offset) + int(word.size):
+            return False
+    except Exception:
+        return True
+    return True
 
 
 def word_role(word: VMWord) -> str:
@@ -457,7 +481,7 @@ def word_role(word: VMWord) -> str:
     if k in CALL_WORDS:
         return "call"
     if k in BRANCH_WORDS:
-        return "branch"
+        return "branch" if is_control_branch_word(word) else "predicate_no_transfer"
     if k in RETURN_WORDS:
         return "return"
     if k in {"NOP", "MARK"}:
@@ -486,10 +510,17 @@ def stack_contract(word: VMWord) -> dict[str, Any]:
         argc = int(word.operands.get("argc", 0) or 0)
         return {"pop": argc, "push": 1, "role": role, "encoded_argc": argc, "result": "unknown_script_return"}
     if k == "BR":
-        # Prefix-conditioned branches usually compare/consume stack values, but
-        # exact predicate shape belongs to a later analysis pass.  The IR keeps
-        # the bytes and target candidates instead of inventing a merged value.
-        return {"pop": None, "push": 0, "role": role, "predicate": "prefix_defined" if word.prefixes else "stack_top_or_flag"}
+        # Prefix-conditioned BR atoms usually compare/consume stack values, but
+        # exact predicate shape belongs to a later analysis pass.  A
+        # target==fallthrough conditional is not control flow; keep it as a VM
+        # predicate atom rather than a CFG branch.
+        return {
+            "pop": None,
+            "push": 0,
+            "role": role,
+            "predicate": "prefix_defined" if word.prefixes else "stack_top_or_flag",
+            "control_transfer": role == "branch",
+        }
     if k in RETURN_WORDS:
         return {"pop": None if word.operands.get("optional_value") else 1, "push": 0, "role": role}
     if k in {"NOP", "MARK", "UNKNOWN"}:

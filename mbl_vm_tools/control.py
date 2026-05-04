@@ -16,7 +16,7 @@ from .vm_spec import (
 from .semantic import classify_branch
 
 
-CONTROL_CONTRACT_VERSION = "vm-control-v3"
+CONTROL_CONTRACT_VERSION = "vm-control-v6"
 BRANCH_TARGET_FORMULA = "terminal_op_offset + 1 + signed_u16(off)"
 
 
@@ -324,6 +324,7 @@ def resolve_branch_target(
     )
 
 
+
 # ---------------------------------------------------------------------------
 # CFG construction
 
@@ -535,7 +536,19 @@ def build_control_graph(
             if pos in top_level_by_offset:
                 word_indices.append(top_level_by_offset[pos])
             role = word_role(word)
-            if role in {"branch", "return"}:
+            if role == "branch":
+                resolution = branch_by_offset.get(pos)
+                if resolution is None:
+                    resolution = resolve_branch_target(
+                        word,
+                        function_start=function_start,
+                        entry_kinds=entry_kinds_map,
+                        raw=raw,
+                        source_word_index=top_level_by_offset.get(pos),
+                    )
+                    branch_by_offset[pos] = resolution
+                break
+            elif role == "return":
                 break
             next_pos = pos + max(1, int(word.size))
             if next_pos <= pos:
@@ -667,7 +680,7 @@ def build_control_graph(
         "unreachable_under_proven_edges_count": max(0, len(blocks) - len(reachable)),
         "entry_coordinate_policy": "word starts, prefix subentries, terminal atoms, aggregate tails, and decoded branch targets are legal VM entry coordinates.",
         "branch_target_formula": BRANCH_TARGET_FORMULA,
-        "policy": "BR targets use terminal-op operand-base byte/sub-entry coordinates; op 0x4A is modelled as jump without fallthrough, op 0x4B/0x4C/0x4D as conditional taken/fallthrough branches.",
+        "policy": "BR targets use terminal-op operand-base byte/sub-entry coordinates. Only vm_spec.word_role == branch words become branch resolutions and CFG branch edges; predicate_no_transfer BR-shaped words remain decoded VM words below CFG.",
     }
     return VMControlGraph(
         contract=CONTROL_CONTRACT_VERSION,
