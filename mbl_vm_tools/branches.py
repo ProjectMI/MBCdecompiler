@@ -14,30 +14,35 @@ from .vm_spec import decode_words
 from .regions import (
     REGION_CONTRACT_VERSION,
     VIRTUAL_FUNCTION_EXIT,
-    CYCLIC_MULTI_EXIT,
+    CYCLIC_FEEDBACK_FRONTIER,
+    CYCLIC_FEEDBACK_EXIT_FRONTIER,
+    CYCLIC_EXTERNAL_EXIT_FRONTIER,
     REQUIRED_CONDITIONAL_EDGE_KINDS,
     _as_dicts,
-    _build_scc_model,
+    _build_structural_projection_model,
+    _entry_blocks_by_scc,
+    _normalize_cyclic_entry_blocks,
     _conditional_edge_kind_set,
     _conditional_edge_targets,
     _conditional_out_edges,
-    _canonical_conditional_contexts,
     _cyclic_branch_model,
     _nearest_common_postdominator_by_order,
     _stable_sorted,
 )
 
 
-BRANCH_CONTRACT_VERSION = "vm-branch-v13"
+BRANCH_CONTRACT_VERSION = "vm-branch-v15"
 BRANCH_LIFT_POLICY = (
-    "Branch lifting consumes hierarchical vm-region-v13 SCC facts. It lifts "
-    "cross-SCC conditional regions only when canonical conditional successors "
-    "enter distinct SCCs on the augmented SCC DAG. Same-SCC conditionals are "
-    "lifted only inside their owning cyclic SCC using a local projection that "
-    "distinguishes forward joins, feedback/boundary joins, and cyclic multi-exit "
-    "frontiers. The pass preserves VM taken/fallthrough edge identity, branch-arm "
-    "role, hierarchy parent, and unresolved predicate polarity. BR-shaped "
-    "predicate_no_transfer words live below CFG and are not branch-lift inputs."
+    "Branch lifting consumes hierarchical vm-region-v15 structural SCC facts. It "
+    "first uses the same canonical conditional context projection and cyclic "
+    "reentry-port normalization as region analysis. Cross-SCC conditional regions "
+    "are lifted only when canonical conditional successors enter distinct SCCs on "
+    "the augmented SCC DAG. Same-SCC conditionals are lifted only inside their "
+    "owning cyclic SCC using a local projection that distinguishes forward joins, "
+    "shared feedback/boundary joins, feedback frontiers, feedback/exit frontiers, and external exit frontiers. The pass preserves "
+    "VM taken/fallthrough edge identity, branch-arm role, hierarchy parent, and "
+    "unresolved predicate polarity. BR-shaped predicate_no_transfer words live "
+    "below CFG and are not branch-lift inputs."
 )
 
 
@@ -243,6 +248,16 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
             summary={
                 "block_count": 0,
                 "proven_edge_count": 0,
+                "raw_block_count": 0,
+                "raw_proven_edge_count": 0,
+                "structural_projection_block_count": 0,
+                "structural_projection_edge_count": 0,
+                "raw_multi_entry_cyclic_scc_count": 0,
+                "raw_cfg_multi_entry_cyclic_scc_count": 0,
+                "projected_multi_entry_cyclic_scc_count": 0,
+                "normalized_multi_entry_cyclic_scc_count": 0,
+                "cyclic_entry_port_count": 0,
+                "conditional_projection_no_split_count": 0,
                 "conditional_branch_count": 0,
                 "conditional_two_edge_count": 0,
                 "lifted_branch_count": 0,
@@ -251,7 +266,9 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                 "cyclic_local_join_branch_count": 0,
                 "cyclic_feedback_join_branch_count": 0,
                 "cyclic_boundary_join_branch_count": 0,
-                "cyclic_multi_exit_branch_count": 0,
+                "cyclic_feedback_frontier_branch_count": 0,
+                "cyclic_feedback_exit_frontier_branch_count": 0,
+                "cyclic_external_exit_frontier_branch_count": 0,
                 "cyclic_feedback_arm_count": 0,
                 "arm_role_histogram": {},
                 "policy": BRANCH_LIFT_POLICY,
@@ -259,7 +276,16 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
             branches=[],
         )
 
-    model = _build_scc_model(blocks, edges)
+    raw_blocks = blocks
+    raw_edges = edges
+    projection_model = _build_structural_projection_model(raw_blocks, raw_edges)
+    raw_model: dict[str, Any] = projection_model["raw_model"]
+    raw_conditional_contexts: dict[str, Any] = projection_model["raw_conditional_contexts"]
+    projection_summary: dict[str, Any] = projection_model["projection"]["summary"]
+
+    blocks = projection_model["blocks"]
+    edges = projection_model["edges"]
+    model = projection_model["model"]
     proven_edges: list[dict[str, Any]] = model["proven_edges"]
     succs: dict[str, set[str]] = model["succs"]
     preds: dict[str, set[str]] = model["preds"]
@@ -273,33 +299,34 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
     pdom: dict[str, set[str]] = model["pdom"]
 
     block_order = {str(block.get("id")): idx for idx, block in enumerate(blocks)}
-    entry_blocks_by_scc: dict[str, list[str]] = {}
-    for scc_id, nodes in blocks_by_scc.items():
-        node_set = set(nodes)
-        entry_blocks_by_scc[scc_id] = _stable_sorted([
-            block for block in nodes
-            if any(pred not in node_set for pred in preds.get(block, set())) or block == blocks[0].get("id")
-        ])
+    raw_entry_blocks_by_scc = _entry_blocks_by_scc(
+        blocks=blocks,
+        blocks_by_scc=blocks_by_scc,
+        preds=preds,
+    )
+    entry_blocks_by_scc, cyclic_entry_ports_by_scc = _normalize_cyclic_entry_blocks(
+        proven_edges=proven_edges,
+        blocks_by_scc=blocks_by_scc,
+        scc_by_block=scc_by_block,
+        cyclic_sccs=cyclic_sccs,
+        raw_entry_blocks_by_scc=raw_entry_blocks_by_scc,
+        block_order=block_order,
+    )
 
     edge_lookup: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for edge in proven_edges:
         edge_lookup[(str(edge.get("source")), str(edge.get("target")))].append(edge)
 
-    conditional_contexts = _canonical_conditional_contexts(
-        blocks,
-        out_edges_by_source,
-        reachable,
-        scc_by_block=scc_by_block,
-        cyclic_sccs=cyclic_sccs,
-    )
+    conditional_contexts: dict[str, Any] = projection_model["conditional_contexts"]
     canonical_conditional_headers: set[str] = conditional_contexts["canonical_headers"]
     conditional_alias_to_canonical: dict[str, str] = conditional_contexts["alias_to_canonical"]
-    conditional_aliases_by_canonical: dict[str, list[str]] = conditional_contexts["aliases_by_canonical"]
+    conditional_aliases_by_canonical: dict[str, list[str]] = raw_conditional_contexts["aliases_by_canonical"]
 
     branches: list[VMLiftedBranch] = []
     conditional_branch_count = 0
     conditional_two_successor_count = 0
     conditional_two_edge_count = 0
+    conditional_projection_no_split_count = 0
     conditional_same_scc_successors_count = 0
     conditional_cross_scc_count = 0
     function_exit_branch_count = 0
@@ -309,9 +336,11 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
     cyclic_local_join_branch_count = 0
     cyclic_feedback_join_branch_count = 0
     cyclic_boundary_join_branch_count = 0
-    cyclic_multi_exit_branch_count = 0
-    conditional_alias_context_count = int(conditional_contexts.get("alias_count", 0) or 0)
-    conditional_alias_group_count = int(conditional_contexts.get("alias_group_count", 0) or 0)
+    cyclic_feedback_frontier_branch_count = 0
+    cyclic_feedback_exit_frontier_branch_count = 0
+    cyclic_external_exit_frontier_branch_count = 0
+    conditional_alias_context_count = int(raw_conditional_contexts.get("alias_count", 0) or 0)
+    conditional_alias_group_count = int(raw_conditional_contexts.get("alias_group_count", 0) or 0)
     cyclic_feedback_arm_count = 0
     arm_scc_count_hist: Counter[str] = Counter()
     arm_role_hist: Counter[str] = Counter()
@@ -345,6 +374,9 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
         conditional_two_edge_count += 1
 
         header_scc = scc_by_block[header]
+        if len(successors) == 1:
+            conditional_projection_no_split_count += 1
+            continue
         if len(successors) != 2:
             raise ValueError("canonical conditional branch must have two distinct successor blocks")
 
@@ -367,6 +399,7 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                 cyclic_sccs=cyclic_sccs,
                 entry_blocks_by_scc=entry_blocks_by_scc,
                 block_order=block_order,
+                pdom=pdom,
             )
             lifted_branch_count += 1
             lifted_cyclic_scc_branch_count += 1
@@ -377,8 +410,12 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                 cyclic_feedback_join_branch_count += 1
             elif local_join_kind == "cyclic_boundary_join":
                 cyclic_boundary_join_branch_count += 1
-            elif local_join_kind == "cyclic_multi_exit":
-                cyclic_multi_exit_branch_count += 1
+            elif local_join_kind == "cyclic_feedback_frontier":
+                cyclic_feedback_frontier_branch_count += 1
+            elif local_join_kind == "cyclic_feedback_exit_frontier":
+                cyclic_feedback_exit_frontier_branch_count += 1
+            elif local_join_kind == "cyclic_external_exit_frontier":
+                cyclic_external_exit_frontier_branch_count += 1
             else:
                 raise ValueError(f"unsupported cyclic branch join kind: {local_join_kind}")
             feedback_successors = set(cyclic_model.get("feedback_successors") or [])
@@ -400,7 +437,16 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                 arm_role_hist[arm.role] += 1
 
             local_join = cyclic_model.get("local_join")
-            exit_text = str(local_join) if local_join is not None else CYCLIC_MULTI_EXIT
+            if local_join is not None:
+                exit_text = str(local_join)
+            elif local_join_kind == "cyclic_feedback_frontier":
+                exit_text = CYCLIC_FEEDBACK_FRONTIER
+            elif local_join_kind == "cyclic_feedback_exit_frontier":
+                exit_text = CYCLIC_FEEDBACK_EXIT_FRONTIER
+            elif local_join_kind == "cyclic_external_exit_frontier":
+                exit_text = CYCLIC_EXTERNAL_EXIT_FRONTIER
+            else:
+                raise ValueError(f"unsupported cyclic branch join kind: {local_join_kind}")
             branch_nodes = {header, *successors}
             if local_join is not None:
                 branch_nodes.add(str(local_join))
@@ -423,7 +469,7 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                     confidence=1.0,
                     evidence={
                         "region_contract": REGION_CONTRACT_VERSION,
-                        "rule": "header and both conditional successors stay inside one cyclic SCC; classify the local projection as forward-join, boundary-join, multi-exit, or open diagnostic",
+                        "rule": "header and both conditional successors stay inside one cyclic SCC; classify the local projection as forward-join, feedback/boundary join, or normalized frontier",
                         "successors": [succ for succ, _edges, _scc in sorted(arm_inputs, key=_arm_sort_key)],
                         "successor_sccs": successor_sccs,
                         "local_join": local_join,
@@ -431,6 +477,12 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                         "local_join_candidates": cyclic_model.get("local_join_candidates", [])[:8],
                         "boundary_join_candidates": cyclic_model.get("boundary_join_candidates", [])[:8],
                         "exit_frontier": cyclic_model.get("exit_frontier", [])[:16],
+                        "combined_boundary_frontier": cyclic_model.get("combined_boundary_frontier", [])[:16],
+                        "feedback_frontier": cyclic_model.get("feedback_frontier", [])[:16],
+                        "scc_exit_frontier": cyclic_model.get("scc_exit_frontier", [])[:16],
+                        "external_exit_join_scc": cyclic_model.get("external_exit_join_scc"),
+                        "external_exit_join_candidates": cyclic_model.get("external_exit_join_candidates", [])[:8],
+                        "external_exit_join_nodes": cyclic_model.get("external_exit_join_nodes", [])[:16],
                         "feedback_successors": cyclic_model.get("feedback_successors", []),
                         "cut_edge_count": cyclic_model.get("cut_edge_count", 0),
                         "boundary_edge_count": cyclic_model.get("boundary_edge_count", 0),
@@ -524,21 +576,53 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
             )
         )
 
+    raw_cfg_entry_blocks_by_scc = _entry_blocks_by_scc(
+        blocks=raw_blocks,
+        blocks_by_scc=raw_model.get("blocks_by_scc", {}),
+        preds=raw_model.get("preds", {}),
+    )
+    raw_cfg_multi_entry_scc_count = sum(
+        1 for scc in raw_model.get("cyclic_sccs", set())
+        if len(raw_cfg_entry_blocks_by_scc.get(scc, [])) > 1
+    )
+    projected_multi_entry_scc_count = sum(
+        1 for scc in cyclic_sccs
+        if len(raw_entry_blocks_by_scc.get(scc, [])) > 1
+    )
+    normalized_multi_entry_scc_count = sum(
+        1 for scc in cyclic_sccs
+        if len(entry_blocks_by_scc.get(scc, [])) > 1
+    )
+    cyclic_entry_port_count = sum(len(ports) for ports in cyclic_entry_ports_by_scc.values())
     summary = {
         "block_count": len(blocks),
         "proven_edge_count": len(proven_edges),
+        "raw_block_count": len(raw_blocks),
+        "raw_proven_edge_count": len(raw_model.get("proven_edges", [])),
+        "raw_scc_count": len(raw_model.get("blocks_by_scc", {})),
+        "raw_cyclic_scc_count": len(raw_model.get("cyclic_sccs", set())),
+        **projection_summary,
         "reachable_block_count": len(reachable),
         "unreachable_under_proven_edges_count": max(0, len(blocks) - len(reachable)),
         "scc_count": len(scc_nodes),
         "cyclic_scc_count": len(cyclic_sccs),
+        "raw_cfg_multi_entry_cyclic_scc_count": raw_cfg_multi_entry_scc_count,
+        "projected_multi_entry_cyclic_scc_count": projected_multi_entry_scc_count,
+        "raw_multi_entry_cyclic_scc_count": projected_multi_entry_scc_count,
+        "normalized_multi_entry_cyclic_scc_count": normalized_multi_entry_scc_count,
+        "cyclic_entry_port_count": cyclic_entry_port_count,
+        "cyclic_entry_port_scc_count": sum(1 for ports in cyclic_entry_ports_by_scc.values() if ports),
         "conditional_branch_count": conditional_branch_count,
         "conditional_branch_context_count": int(conditional_contexts.get("context_count", 0) or 0),
         "conditional_branch_atom_count": int(conditional_contexts.get("atom_count", 0) or 0),
+        "raw_conditional_branch_context_count": int(raw_conditional_contexts.get("context_count", 0) or 0),
+        "raw_conditional_branch_atom_count": int(raw_conditional_contexts.get("atom_count", 0) or 0),
         "conditional_alias_context_count": conditional_alias_context_count,
         "conditional_alias_group_count": conditional_alias_group_count,
-        "conditional_alias_group_size_histogram": dict(sorted((conditional_contexts.get("alias_group_size_histogram") or {}).items(), key=lambda kv: (int(kv[0]), kv[0]))),
+        "conditional_alias_group_size_histogram": dict(sorted((raw_conditional_contexts.get("alias_group_size_histogram") or {}).items(), key=lambda kv: (int(kv[0]), kv[0]))),
         "conditional_two_successor_count": conditional_two_successor_count,
         "conditional_two_edge_count": conditional_two_edge_count,
+        "conditional_projection_no_split_count": conditional_projection_no_split_count,
         "conditional_edge_count_histogram": dict(sorted(conditional_edge_count_hist.items(), key=lambda kv: (int(kv[0]), kv[0]))),
         "conditional_distinct_successor_count_histogram": dict(sorted(distinct_successor_count_hist.items(), key=lambda kv: (int(kv[0]), kv[0]))),
         "conditional_same_scc_successors_count": conditional_same_scc_successors_count,
@@ -549,7 +633,9 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
         "cyclic_local_join_branch_count": cyclic_local_join_branch_count,
         "cyclic_feedback_join_branch_count": cyclic_feedback_join_branch_count,
         "cyclic_boundary_join_branch_count": cyclic_boundary_join_branch_count,
-        "cyclic_multi_exit_branch_count": cyclic_multi_exit_branch_count,
+        "cyclic_feedback_frontier_branch_count": cyclic_feedback_frontier_branch_count,
+        "cyclic_feedback_exit_frontier_branch_count": cyclic_feedback_exit_frontier_branch_count,
+        "cyclic_external_exit_frontier_branch_count": cyclic_external_exit_frontier_branch_count,
         "cyclic_feedback_arm_count": cyclic_feedback_arm_count,
         "real_join_branch_count": real_join_branch_count,
         "function_exit_branch_count": function_exit_branch_count,
@@ -585,17 +671,36 @@ def analyze_module_branch_lifts(
         for key in [
             "block_count",
             "proven_edge_count",
+            "raw_block_count",
+            "raw_proven_edge_count",
+            "raw_scc_count",
+            "raw_cyclic_scc_count",
+            "structural_projection_block_count",
+            "structural_projection_edge_count",
+            "structural_projection_alias_block_count",
+            "structural_projection_alias_context_count",
+            "structural_projection_skipped_alias_internal_edge_count",
+            "structural_projection_duplicate_edge_count",
             "reachable_block_count",
             "unreachable_under_proven_edges_count",
             "scc_count",
             "cyclic_scc_count",
+            "raw_multi_entry_cyclic_scc_count",
+            "raw_cfg_multi_entry_cyclic_scc_count",
+            "projected_multi_entry_cyclic_scc_count",
+            "normalized_multi_entry_cyclic_scc_count",
+            "cyclic_entry_port_count",
+            "cyclic_entry_port_scc_count",
             "conditional_branch_count",
             "conditional_branch_context_count",
             "conditional_branch_atom_count",
+            "raw_conditional_branch_context_count",
+            "raw_conditional_branch_atom_count",
             "conditional_alias_context_count",
             "conditional_alias_group_count",
             "conditional_two_successor_count",
             "conditional_two_edge_count",
+            "conditional_projection_no_split_count",
             "conditional_same_scc_successors_count",
             "conditional_cross_scc_count",
             "lifted_branch_count",
@@ -604,7 +709,9 @@ def analyze_module_branch_lifts(
             "cyclic_local_join_branch_count",
             "cyclic_feedback_join_branch_count",
             "cyclic_boundary_join_branch_count",
-            "cyclic_multi_exit_branch_count",
+            "cyclic_feedback_frontier_branch_count",
+            "cyclic_feedback_exit_frontier_branch_count",
+            "cyclic_external_exit_frontier_branch_count",
             "cyclic_feedback_arm_count",
             "real_join_branch_count",
             "function_exit_branch_count",
