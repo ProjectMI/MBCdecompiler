@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from .control import VMControlGraph, build_control_graph
 from .parser import MBCModule
@@ -17,33 +17,23 @@ from .regions import (
     CYCLIC_FEEDBACK_FRONTIER,
     CYCLIC_FEEDBACK_EXIT_FRONTIER,
     CYCLIC_EXTERNAL_EXIT_FRONTIER,
-    REQUIRED_CONDITIONAL_EDGE_KINDS,
     _as_dicts,
     _build_structural_projection_model,
     _entry_blocks_by_scc,
     _normalize_cyclic_entry_blocks,
-    _conditional_edge_kind_set,
-    _conditional_edge_targets,
     _conditional_out_edges,
     _cyclic_branch_model,
-    _nearest_common_postdominator_by_order,
     _stable_sorted,
+    analyze_regions,
 )
 
 
 BRANCH_CONTRACT_VERSION = "vm-branch-v15"
 BRANCH_LIFT_POLICY = (
-    "Branch lifting consumes hierarchical vm-region-v15 structural SCC facts. It "
-    "first uses the same canonical conditional context projection and cyclic "
-    "reentry-port normalization as region analysis. Cross-SCC conditional regions "
-    "are lifted only when canonical conditional successors enter distinct SCCs on "
-    "the augmented SCC DAG. Same-SCC conditionals are lifted only inside their "
-    "owning cyclic SCC using a local projection that distinguishes forward joins, "
-    "shared feedback/boundary joins, feedback frontiers, feedback/exit frontiers, and external exit frontiers. The pass preserves "
-    "VM taken/fallthrough edge identity, branch-arm role, hierarchy parent, and "
-    "unresolved predicate polarity. BR-shaped predicate_no_transfer words live "
-    "below CFG and are not branch-lift inputs."
+    "Branch lifting consumes region facts from the projected VM CFG and emits "
+    "branch envelopes while preserving VM taken/fallthrough arm identity."
 )
+BRANCH_TOTAL_KEYS = "block_count proven_edge_count raw_block_count raw_proven_edge_count raw_scc_count raw_cyclic_scc_count structural_projection_block_count structural_projection_edge_count structural_projection_alias_block_count structural_projection_alias_context_count structural_projection_skipped_alias_internal_edge_count structural_projection_duplicate_edge_count reachable_block_count unreachable_under_proven_edges_count scc_count cyclic_scc_count raw_multi_entry_cyclic_scc_count raw_cfg_multi_entry_cyclic_scc_count projected_multi_entry_cyclic_scc_count normalized_multi_entry_cyclic_scc_count cyclic_entry_port_count cyclic_entry_port_scc_count conditional_branch_count conditional_branch_context_count conditional_branch_atom_count raw_conditional_branch_context_count raw_conditional_branch_atom_count conditional_alias_context_count conditional_alias_group_count conditional_two_successor_count conditional_two_edge_count conditional_projection_no_split_count conditional_same_scc_successors_count conditional_cross_scc_count lifted_branch_count lifted_cross_scc_branch_count lifted_cyclic_scc_branch_count cyclic_local_join_branch_count cyclic_feedback_join_branch_count cyclic_boundary_join_branch_count cyclic_feedback_frontier_branch_count cyclic_feedback_exit_frontier_branch_count cyclic_external_exit_frontier_branch_count cyclic_feedback_arm_count real_join_branch_count function_exit_branch_count".split()
 
 
 @dataclass(frozen=True)
@@ -98,12 +88,11 @@ class VMBranchLiftReport:
         }
 
 
-# ---------------------------------------------------------------------------
-
-
 def _edge_sort_key(edge: dict[str, Any]) -> tuple[int, str, str, int]:
+    kind = str(edge.get("kind"))
+    rank = 0 if kind == "conditional_taken" else 1 if kind == "conditional_fallthrough" else 2
     return (
-        0 if edge.get("kind") == "conditional_taken" else 1 if edge.get("kind") == "conditional_fallthrough" else 2,
+        rank,
         str(edge.get("source")),
         str(edge.get("target")),
         int(edge.get("instruction_offset", -1) or -1),
@@ -121,13 +110,7 @@ def _edge_payload(edge: dict[str, Any]) -> dict[str, Any]:
 def _arm_sort_key(item: tuple[str, list[dict[str, Any]], str]) -> tuple[int, str]:
     successor, edges, _scc = item
     kinds = {str(e.get("kind")) for e in edges}
-    if "conditional_taken" in kinds:
-        rank = 0
-    elif "conditional_fallthrough" in kinds:
-        rank = 1
-    else:
-        rank = 2
-    return rank, successor
+    return (0 if "conditional_taken" in kinds else 1 if "conditional_fallthrough" in kinds else 2, successor)
 
 
 def _arm_role(edge_kind: str) -> str:
@@ -141,13 +124,7 @@ def _arm_role(edge_kind: str) -> str:
     return "vm_edge"
 
 
-def _reachable_sccs_until(
-    *,
-    start_scc: str,
-    join_scc: str,
-    scc_succs: dict[str, set[str]],
-    scc_nodes: set[str],
-) -> set[str]:
+def _reachable_sccs_until(start_scc: str, join_scc: str, scc_succs: dict[str, set[str]], scc_nodes: set[str]) -> set[str]:
     if start_scc == join_scc or start_scc == VIRTUAL_FUNCTION_EXIT:
         return set()
     out: set[str] = set()
@@ -157,13 +134,11 @@ def _reachable_sccs_until(
         if cur == join_scc or cur == VIRTUAL_FUNCTION_EXIT or cur in out or cur not in scc_nodes:
             continue
         out.add(cur)
-        for nxt in sorted(scc_succs.get(cur, set())):
-            if nxt != join_scc and nxt not in out:
-                q.append(nxt)
+        q.extend(nxt for nxt in sorted(scc_succs.get(cur, set())) if nxt != join_scc and nxt not in out)
     return out
 
 
-def _build_arm(
+def _make_arm(
     *,
     arm_id: str,
     successor: str,
@@ -174,15 +149,8 @@ def _build_arm(
     scc_nodes: set[str],
     blocks_by_scc: dict[str, list[str]],
 ) -> VMBranchArm:
-    arm_sccs = _reachable_sccs_until(
-        start_scc=successor_scc,
-        join_scc=join_scc,
-        scc_succs=scc_succs,
-        scc_nodes=scc_nodes,
-    )
-    nodes: list[str] = []
-    for scc in _stable_sorted(arm_sccs):
-        nodes.extend(blocks_by_scc.get(scc, []))
+    arm_sccs = _reachable_sccs_until(successor_scc, join_scc, scc_succs, scc_nodes)
+    nodes = [node for scc in _stable_sorted(arm_sccs) for node in blocks_by_scc.get(scc, [])]
     kinds = _stable_sorted(str(e.get("kind")) for e in entry_edges)
     edge_kind = "|".join(kinds) if kinds else "unknown"
     return VMBranchArm(
@@ -193,16 +161,12 @@ def _build_arm(
         sccs=_stable_sorted(arm_sccs),
         nodes=_stable_sorted(nodes),
         entry_edges=[_edge_payload(e) for e in sorted(entry_edges, key=_edge_sort_key)],
-        diagnostics={
-            "direct_to_join": successor_scc == join_scc,
-            "scc_count": len(arm_sccs),
-            "node_count": len(nodes),
-        },
+        diagnostics={"direct_to_join": successor_scc == join_scc},
         role=_arm_role(edge_kind),
     )
 
 
-def _build_cyclic_arm(
+def _make_cyclic_arm(
     *,
     arm_id: str,
     successor: str,
@@ -212,10 +176,7 @@ def _build_cyclic_arm(
 ) -> VMBranchArm:
     kinds = _stable_sorted(str(e.get("kind")) for e in entry_edges)
     edge_kind = "|".join(kinds) if kinds else "unknown"
-    local_join = cyclic_model.get("local_join")
-    feedback_successors = set(cyclic_model.get("feedback_successors") or [])
-    arm_nodes_by_successor = cyclic_model.get("arm_nodes_by_successor") or {}
-    nodes = list(arm_nodes_by_successor.get(successor) or [])
+    nodes = list((cyclic_model.get("arm_nodes_by_successor") or {}).get(successor) or [])
     return VMBranchArm(
         id=arm_id,
         edge_kind=edge_kind,
@@ -225,332 +186,191 @@ def _build_cyclic_arm(
         nodes=_stable_sorted(nodes),
         entry_edges=[_edge_payload(e) for e in sorted(entry_edges, key=_edge_sort_key)],
         diagnostics={
-            "direct_to_join": local_join is not None and successor == local_join,
-            "local_join": local_join,
+            "direct_to_join": cyclic_model.get("local_join") is not None and successor == cyclic_model.get("local_join"),
             "local_join_kind": cyclic_model.get("local_join_kind"),
-            "cyclic_feedback_arm": successor in feedback_successors,
-            "scc_count": 1,
-            "node_count": len(nodes),
+            "cyclic_feedback_arm": successor in set(cyclic_model.get("feedback_successors") or []),
         },
         role=_arm_role(edge_kind),
     )
 
 
-# ---------------------------------------------------------------------------
-# Branch lifting
+def _branch_summary_from_regions(
+    region_summary: dict[str, Any],
+    *,
+    arm_role_hist: Counter[str],
+    arm_scc_count_hist: Counter[str],
+    cyclic_feedback_arm_count: int,
+) -> dict[str, Any]:
+    cyclic_count = int(region_summary.get("conditional_cyclic_scc_region_count", 0) or 0)
+    cross_count = int(region_summary.get("conditional_scc_region_count", 0) or 0)
+    summary = {key: int(region_summary.get(key, 0) or 0) for key in BRANCH_TOTAL_KEYS}
+    summary.update({
+        "lifted_branch_count": cross_count + cyclic_count,
+        "lifted_cross_scc_branch_count": cross_count,
+        "lifted_cyclic_scc_branch_count": cyclic_count,
+        "cyclic_local_join_branch_count": int(region_summary.get("conditional_cyclic_local_join_region_count", 0) or 0),
+        "cyclic_feedback_join_branch_count": int(region_summary.get("conditional_cyclic_feedback_join_region_count", 0) or 0),
+        "cyclic_boundary_join_branch_count": int(region_summary.get("conditional_cyclic_boundary_join_region_count", 0) or 0),
+        "cyclic_feedback_frontier_branch_count": int(region_summary.get("conditional_cyclic_feedback_frontier_region_count", 0) or 0),
+        "cyclic_feedback_exit_frontier_branch_count": int(region_summary.get("conditional_cyclic_feedback_exit_frontier_region_count", 0) or 0),
+        "cyclic_external_exit_frontier_branch_count": int(region_summary.get("conditional_cyclic_external_exit_frontier_region_count", 0) or 0),
+        "cyclic_feedback_arm_count": cyclic_feedback_arm_count,
+        "real_join_branch_count": int(region_summary.get("conditional_real_scc_join_region_count", 0) or 0),
+        "function_exit_branch_count": int(region_summary.get("conditional_function_exit_scc_region_count", 0) or 0),
+        "arm_scc_count_histogram": dict(sorted(arm_scc_count_hist.items(), key=lambda kv: (int(kv[0]), kv[0]))),
+        "arm_role_histogram": dict(sorted(arm_role_hist.items())),
+        "policy": BRANCH_LIFT_POLICY,
+    })
+    return summary
+
+
+def _exit_text(local_join: Any, local_join_kind: str) -> str:
+    if local_join is not None:
+        return str(local_join)
+    if local_join_kind == "cyclic_feedback_frontier":
+        return CYCLIC_FEEDBACK_FRONTIER
+    if local_join_kind == "cyclic_feedback_exit_frontier":
+        return CYCLIC_FEEDBACK_EXIT_FRONTIER
+    if local_join_kind == "cyclic_external_exit_frontier":
+        return CYCLIC_EXTERNAL_EXIT_FRONTIER
+    raise ValueError(f"unsupported cyclic branch join kind: {local_join_kind}")
 
 
 def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branches: bool = True) -> VMBranchLiftReport:
-    blocks, edges = _as_dicts(cfg)
-    if not blocks:
-        return VMBranchLiftReport(
-            contract=BRANCH_CONTRACT_VERSION,
-            summary={
-                "block_count": 0,
-                "proven_edge_count": 0,
-                "raw_block_count": 0,
-                "raw_proven_edge_count": 0,
-                "structural_projection_block_count": 0,
-                "structural_projection_edge_count": 0,
-                "raw_multi_entry_cyclic_scc_count": 0,
-                "raw_cfg_multi_entry_cyclic_scc_count": 0,
-                "projected_multi_entry_cyclic_scc_count": 0,
-                "normalized_multi_entry_cyclic_scc_count": 0,
-                "cyclic_entry_port_count": 0,
-                "conditional_projection_no_split_count": 0,
-                "conditional_branch_count": 0,
-                "conditional_two_edge_count": 0,
-                "lifted_branch_count": 0,
-                "lifted_cross_scc_branch_count": 0,
-                "lifted_cyclic_scc_branch_count": 0,
-                "cyclic_local_join_branch_count": 0,
-                "cyclic_feedback_join_branch_count": 0,
-                "cyclic_boundary_join_branch_count": 0,
-                "cyclic_feedback_frontier_branch_count": 0,
-                "cyclic_feedback_exit_frontier_branch_count": 0,
-                "cyclic_external_exit_frontier_branch_count": 0,
-                "cyclic_feedback_arm_count": 0,
-                "arm_role_histogram": {},
-                "policy": BRANCH_LIFT_POLICY,
-            },
-            branches=[],
-        )
-
-    raw_blocks = blocks
-    raw_edges = edges
-    projection_model = _build_structural_projection_model(raw_blocks, raw_edges)
-    raw_model: dict[str, Any] = projection_model["raw_model"]
-    raw_conditional_contexts: dict[str, Any] = projection_model["raw_conditional_contexts"]
-    projection_summary: dict[str, Any] = projection_model["projection"]["summary"]
-
-    blocks = projection_model["blocks"]
-    edges = projection_model["edges"]
-    model = projection_model["model"]
-    proven_edges: list[dict[str, Any]] = model["proven_edges"]
-    succs: dict[str, set[str]] = model["succs"]
-    preds: dict[str, set[str]] = model["preds"]
-    out_edges_by_source: dict[str, list[dict[str, Any]]] = model["out_edges_by_source"]
-    reachable: set[str] = model["reachable"]
-    scc_by_block: dict[str, str] = model["scc_by_block"]
-    blocks_by_scc: dict[str, list[str]] = model["blocks_by_scc"]
-    scc_succs: dict[str, set[str]] = model["scc_succs"]
-    scc_nodes: set[str] = model["scc_nodes"]
-    cyclic_sccs: set[str] = model["cyclic_sccs"]
-    pdom: dict[str, set[str]] = model["pdom"]
-
-    block_order = {str(block.get("id")): idx for idx, block in enumerate(blocks)}
-    raw_entry_blocks_by_scc = _entry_blocks_by_scc(
-        blocks=blocks,
-        blocks_by_scc=blocks_by_scc,
-        preds=preds,
-    )
-    entry_blocks_by_scc, cyclic_entry_ports_by_scc = _normalize_cyclic_entry_blocks(
-        proven_edges=proven_edges,
-        blocks_by_scc=blocks_by_scc,
-        scc_by_block=scc_by_block,
-        cyclic_sccs=cyclic_sccs,
-        raw_entry_blocks_by_scc=raw_entry_blocks_by_scc,
-        block_order=block_order,
-    )
-
-    edge_lookup: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-    for edge in proven_edges:
-        edge_lookup[(str(edge.get("source")), str(edge.get("target")))].append(edge)
-
-    conditional_contexts: dict[str, Any] = projection_model["conditional_contexts"]
-    canonical_conditional_headers: set[str] = conditional_contexts["canonical_headers"]
-    conditional_alias_to_canonical: dict[str, str] = conditional_contexts["alias_to_canonical"]
-    conditional_aliases_by_canonical: dict[str, list[str]] = raw_conditional_contexts["aliases_by_canonical"]
-
-    branches: list[VMLiftedBranch] = []
-    conditional_branch_count = 0
-    conditional_two_successor_count = 0
-    conditional_two_edge_count = 0
-    conditional_projection_no_split_count = 0
-    conditional_same_scc_successors_count = 0
-    conditional_cross_scc_count = 0
-    function_exit_branch_count = 0
-    real_join_branch_count = 0
-    lifted_cross_scc_branch_count = 0
-    lifted_cyclic_scc_branch_count = 0
-    cyclic_local_join_branch_count = 0
-    cyclic_feedback_join_branch_count = 0
-    cyclic_boundary_join_branch_count = 0
-    cyclic_feedback_frontier_branch_count = 0
-    cyclic_feedback_exit_frontier_branch_count = 0
-    cyclic_external_exit_frontier_branch_count = 0
-    conditional_alias_context_count = int(raw_conditional_contexts.get("alias_count", 0) or 0)
-    conditional_alias_group_count = int(raw_conditional_contexts.get("alias_group_count", 0) or 0)
-    cyclic_feedback_arm_count = 0
-    arm_scc_count_hist: Counter[str] = Counter()
+    region_report = analyze_regions(cfg)
+    region_summary = region_report.summary
     arm_role_hist: Counter[str] = Counter()
-    distinct_successor_count_hist: Counter[str] = Counter()
-    conditional_edge_count_hist: Counter[str] = Counter()
-    lifted_branch_count = 0
+    arm_scc_count_hist: Counter[str] = Counter()
+    cyclic_feedback_arm_count = 0
+    branches: list[VMLiftedBranch] = []
 
-    for block in blocks:
-        header = str(block.get("id"))
-        if header not in reachable:
-            continue
-        terminator = block.get("terminator") or {}
-        semantic = (terminator.get("semantic") or {}) if isinstance(terminator, dict) else {}
-        if semantic.get("branch_kind") != "conditional_branch":
-            continue
-        if header in conditional_alias_to_canonical:
-            continue
-        if header not in canonical_conditional_headers:
-            continue
-        conditional_branch_count += 1
-        conditional_edges = conditional_contexts["edges_by_header"].get(header) or _conditional_out_edges(out_edges_by_source, header, reachable)
-        edge_kinds = _conditional_edge_kind_set(conditional_edges)
-        edge_targets = _conditional_edge_targets(conditional_edges)
-        successors = _stable_sorted(set(edge_targets))
-        conditional_edge_count_hist[str(len(conditional_edges))] += 1
-        distinct_successor_count_hist[str(len(successors))] += 1
-        if len(conditional_edges) != 2 or edge_kinds != set(REQUIRED_CONDITIONAL_EDGE_KINDS):
-            raise ValueError(
-                "canonical conditional branch must have exactly one taken and one fallthrough proven edge"
-            )
-        conditional_two_edge_count += 1
+    if include_branches and region_report.facts:
+        raw_blocks, raw_edges = _as_dicts(cfg)
+        projection_model = _build_structural_projection_model(raw_blocks, raw_edges)
+        blocks = projection_model["blocks"]
+        model = projection_model["model"]
+        proven_edges: list[dict[str, Any]] = model["proven_edges"]
+        out_edges_by_source: dict[str, list[dict[str, Any]]] = model["out_edges_by_source"]
+        reachable: set[str] = model["reachable"]
+        scc_by_block: dict[str, str] = model["scc_by_block"]
+        blocks_by_scc: dict[str, list[str]] = model["blocks_by_scc"]
+        scc_succs: dict[str, set[str]] = model["scc_succs"]
+        scc_nodes: set[str] = model["scc_nodes"]
+        cyclic_sccs: set[str] = model["cyclic_sccs"]
+        pdom: dict[str, set[str]] = model["pdom"]
+        block_order = {str(block.get("id")): idx for idx, block in enumerate(blocks)}
+        raw_entry_blocks_by_scc = _entry_blocks_by_scc(blocks=blocks, blocks_by_scc=blocks_by_scc, preds=model["preds"])
+        entry_blocks_by_scc, _ports = _normalize_cyclic_entry_blocks(
+            proven_edges=proven_edges,
+            blocks_by_scc=blocks_by_scc,
+            scc_by_block=scc_by_block,
+            cyclic_sccs=cyclic_sccs,
+            raw_entry_blocks_by_scc=raw_entry_blocks_by_scc,
+            block_order=block_order,
+        )
+        edge_lookup: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+        for edge in proven_edges:
+            edge_lookup[(str(edge.get("source")), str(edge.get("target")))].append(edge)
 
-        header_scc = scc_by_block[header]
-        if len(successors) == 1:
-            conditional_projection_no_split_count += 1
-            continue
-        if len(successors) != 2:
-            raise ValueError("canonical conditional branch must have two distinct successor blocks")
-
-        conditional_two_successor_count += 1
-        arm_inputs = []
-        for successor in successors:
-            successor_scc = scc_by_block[successor]
-            arm_inputs.append((successor, edge_lookup.get((header, successor), []), successor_scc))
-        successor_sccs = _stable_sorted({scc for _succ, _edges, scc in arm_inputs})
-        if len(successor_sccs) == 1 and successor_sccs[0] == header_scc:
-            conditional_same_scc_successors_count += 1
-            cyclic_model = _cyclic_branch_model(
-                header=header,
-                successors=successors,
-                conditional_edges=conditional_edges,
-                header_scc=header_scc,
-                proven_edges=proven_edges,
-                scc_by_block=scc_by_block,
-                blocks_by_scc=blocks_by_scc,
-                cyclic_sccs=cyclic_sccs,
-                entry_blocks_by_scc=entry_blocks_by_scc,
-                block_order=block_order,
-                pdom=pdom,
-            )
-            lifted_branch_count += 1
-            lifted_cyclic_scc_branch_count += 1
-            local_join_kind = str(cyclic_model.get("local_join_kind"))
-            if local_join_kind == "cyclic_local_join":
-                cyclic_local_join_branch_count += 1
-            elif local_join_kind == "cyclic_feedback_join":
-                cyclic_feedback_join_branch_count += 1
-            elif local_join_kind == "cyclic_boundary_join":
-                cyclic_boundary_join_branch_count += 1
-            elif local_join_kind == "cyclic_feedback_frontier":
-                cyclic_feedback_frontier_branch_count += 1
-            elif local_join_kind == "cyclic_feedback_exit_frontier":
-                cyclic_feedback_exit_frontier_branch_count += 1
-            elif local_join_kind == "cyclic_external_exit_frontier":
-                cyclic_external_exit_frontier_branch_count += 1
-            else:
-                raise ValueError(f"unsupported cyclic branch join kind: {local_join_kind}")
-            feedback_successors = set(cyclic_model.get("feedback_successors") or [])
-            cyclic_feedback_arm_count += len(feedback_successors)
-            if not include_branches:
+        for fact in region_report.facts:
+            if fact.kind not in {"conditional_scc_region", "conditional_cyclic_scc_region"}:
+                continue
+            header = fact.header
+            evidence = dict(fact.evidence or {})
+            header_scc = str(evidence.get("header_scc") or scc_by_block.get(header, ""))
+            successors = list(evidence.get("successors") or [])
+            arm_inputs = [
+                (successor, edge_lookup.get((header, successor), []), scc_by_block[successor])
+                for successor in successors
+                if successor in scc_by_block
+            ]
+            if len(arm_inputs) != 2:
                 continue
 
-            arms: list[VMBranchArm] = []
-            for arm_index, (successor, entry_edges, successor_scc) in enumerate(sorted(arm_inputs, key=_arm_sort_key)):
-                arm = _build_cyclic_arm(
-                    arm_id=f"arm{arm_index}",
-                    successor=successor,
-                    successor_scc=successor_scc,
-                    entry_edges=entry_edges,
-                    cyclic_model=cyclic_model,
+            if fact.kind == "conditional_cyclic_scc_region":
+                conditional_edges = _conditional_out_edges(out_edges_by_source, header, reachable)
+                cyclic_model = _cyclic_branch_model(
+                    header=header,
+                    successors=successors,
+                    conditional_edges=conditional_edges,
+                    header_scc=header_scc,
+                    proven_edges=proven_edges,
+                    scc_by_block=scc_by_block,
+                    blocks_by_scc=blocks_by_scc,
+                    cyclic_sccs=cyclic_sccs,
+                    entry_blocks_by_scc=entry_blocks_by_scc,
+                    block_order=block_order,
+                    pdom=pdom,
                 )
-                arms.append(arm)
-                arm_scc_count_hist[str(len(arm.sccs))] += 1
-                arm_role_hist[arm.role] += 1
-
-            local_join = cyclic_model.get("local_join")
-            if local_join is not None:
-                exit_text = str(local_join)
-            elif local_join_kind == "cyclic_feedback_frontier":
-                exit_text = CYCLIC_FEEDBACK_FRONTIER
-            elif local_join_kind == "cyclic_feedback_exit_frontier":
-                exit_text = CYCLIC_FEEDBACK_EXIT_FRONTIER
-            elif local_join_kind == "cyclic_external_exit_frontier":
-                exit_text = CYCLIC_EXTERNAL_EXIT_FRONTIER
-            else:
-                raise ValueError(f"unsupported cyclic branch join kind: {local_join_kind}")
-            branch_nodes = {header, *successors}
-            if local_join is not None:
-                branch_nodes.add(str(local_join))
-            for frontier in cyclic_model.get("arm_exit_frontier_by_successor", {}).values():
-                branch_nodes.update(frontier)
-            for arm in arms:
-                branch_nodes.update(arm.nodes)
-            hierarchy_parent = f"scc:{header_scc}"
-            branches.append(
-                VMLiftedBranch(
+                local_join = cyclic_model.get("local_join")
+                local_join_kind = str(cyclic_model.get("local_join_kind"))
+                arms = [
+                    _make_cyclic_arm(
+                        arm_id=f"arm{idx}",
+                        successor=successor,
+                        successor_scc=successor_scc,
+                        entry_edges=entry_edges,
+                        cyclic_model=cyclic_model,
+                    )
+                    for idx, (successor, entry_edges, successor_scc) in enumerate(sorted(arm_inputs, key=_arm_sort_key))
+                ]
+                branch_nodes = {header, *successors}
+                if local_join is not None:
+                    branch_nodes.add(str(local_join))
+                for frontier in (cyclic_model.get("arm_exit_frontier_by_successor") or {}).values():
+                    branch_nodes.update(frontier)
+                for arm in arms:
+                    branch_nodes.update(arm.nodes)
+                    arm_role_hist[arm.role] += 1
+                    arm_scc_count_hist[str(len(arm.sccs))] += 1
+                cyclic_feedback_arm_count += len(cyclic_model.get("feedback_successors") or [])
+                branches.append(VMLiftedBranch(
                     id=f"branch{len(branches)}",
                     kind="conditional_cyclic_scc_branch",
                     header=header,
                     header_scc=header_scc,
-                    exit=exit_text,
+                    exit=_exit_text(local_join, local_join_kind),
                     exit_kind=local_join_kind,
                     join_scc=header_scc,
                     arms=arms,
                     nodes=_stable_sorted(branch_nodes),
-                    confidence=1.0,
                     evidence={
                         "region_contract": REGION_CONTRACT_VERSION,
-                        "rule": "header and both conditional successors stay inside one cyclic SCC; classify the local projection as forward-join, feedback/boundary join, or normalized frontier",
-                        "successors": [succ for succ, _edges, _scc in sorted(arm_inputs, key=_arm_sort_key)],
-                        "successor_sccs": successor_sccs,
+                        "successors": successors,
+                        "successor_sccs": evidence.get("successor_sccs", [header_scc]),
                         "local_join": local_join,
                         "local_join_kind": local_join_kind,
-                        "local_join_candidates": cyclic_model.get("local_join_candidates", [])[:8],
-                        "boundary_join_candidates": cyclic_model.get("boundary_join_candidates", [])[:8],
-                        "exit_frontier": cyclic_model.get("exit_frontier", [])[:16],
-                        "combined_boundary_frontier": cyclic_model.get("combined_boundary_frontier", [])[:16],
-                        "feedback_frontier": cyclic_model.get("feedback_frontier", [])[:16],
-                        "scc_exit_frontier": cyclic_model.get("scc_exit_frontier", [])[:16],
-                        "external_exit_join_scc": cyclic_model.get("external_exit_join_scc"),
-                        "external_exit_join_candidates": cyclic_model.get("external_exit_join_candidates", [])[:8],
-                        "external_exit_join_nodes": cyclic_model.get("external_exit_join_nodes", [])[:16],
-                        "feedback_successors": cyclic_model.get("feedback_successors", []),
-                        "cut_edge_count": cyclic_model.get("cut_edge_count", 0),
-                        "boundary_edge_count": cyclic_model.get("boundary_edge_count", 0),
-                        "predicate_polarity": semantic.get("predicate_polarity"),
-                        "alias_contexts": conditional_aliases_by_canonical.get(header, []),
-                        "hierarchy_parent": hierarchy_parent,
+                        "exit_frontier": cyclic_model.get("exit_frontier", []),
                     },
                     region_kind="cyclic_branch_region",
-                    hierarchy_parent=hierarchy_parent,
+                    hierarchy_parent=f"scc:{header_scc}",
+                ))
+                continue
+
+            join_scc = str(evidence.get("join_scc") or fact.exit)
+            join_nodes = [] if join_scc == VIRTUAL_FUNCTION_EXIT else blocks_by_scc.get(join_scc, [])
+            exit_kind = "virtual_function_exit" if join_scc == VIRTUAL_FUNCTION_EXIT else "real_scc_join"
+            region_kind = "conditional_multi_exit_region" if join_scc == VIRTUAL_FUNCTION_EXIT else "conditional_region"
+            arms = [
+                _make_arm(
+                    arm_id=f"arm{idx}",
+                    successor=successor,
+                    successor_scc=successor_scc,
+                    join_scc=join_scc,
+                    entry_edges=entry_edges,
+                    scc_succs=scc_succs,
+                    scc_nodes=scc_nodes,
+                    blocks_by_scc=blocks_by_scc,
                 )
-            )
-            continue
-
-        if len(successor_sccs) == 1:
-            raise ValueError(
-                "canonical conditional header is outside the single successor SCC; "
-                "expected this shape to be removed by branch-atom canonicalization"
-            )
-
-        conditional_cross_scc_count += 1
-        join_scc, join_candidates = _nearest_common_postdominator_by_order(
-            successor_sccs,
-            pdom=pdom,
-            exclude={header_scc},
-        )
-        if join_scc is None:
-            raise ValueError(
-                "cross-SCC conditional branch has no unique common postdominator on the augmented SCC DAG"
-            )
-
-        if join_scc == VIRTUAL_FUNCTION_EXIT:
-            exit_kind = "virtual_function_exit"
-            region_kind = "conditional_multi_exit_region"
-            function_exit_branch_count += 1
-            join_nodes: list[str] = []
-        else:
-            exit_kind = "real_scc_join"
-            region_kind = "conditional_region"
-            real_join_branch_count += 1
-            join_nodes = blocks_by_scc.get(join_scc, [])
-
-        hierarchy_parent = f"scc:{header_scc}" if header_scc in cyclic_sccs else "function"
-        lifted_branch_count += 1
-        lifted_cross_scc_branch_count += 1
-        if not include_branches:
-            continue
-
-        arms: list[VMBranchArm] = []
-        for arm_index, (successor, entry_edges, successor_scc) in enumerate(sorted(arm_inputs, key=_arm_sort_key)):
-            arm = _build_arm(
-                arm_id=f"arm{arm_index}",
-                successor=successor,
-                successor_scc=successor_scc,
-                join_scc=join_scc,
-                entry_edges=entry_edges,
-                scc_succs=scc_succs,
-                scc_nodes=scc_nodes,
-                blocks_by_scc=blocks_by_scc,
-            )
-            arms.append(arm)
-            arm_scc_count_hist[str(len(arm.sccs))] += 1
-            arm_role_hist[arm.role] += 1
-
-        branch_nodes = {header, *join_nodes}
-        for arm in arms:
-            branch_nodes.update(arm.nodes)
-        branches.append(
-            VMLiftedBranch(
+                for idx, (successor, entry_edges, successor_scc) in enumerate(sorted(arm_inputs, key=_arm_sort_key))
+            ]
+            branch_nodes = {header, *join_nodes}
+            for arm in arms:
+                branch_nodes.update(arm.nodes)
+                arm_role_hist[arm.role] += 1
+                arm_scc_count_hist[str(len(arm.sccs))] += 1
+            hierarchy_parent = f"scc:{header_scc}" if header_scc in cyclic_sccs else "function"
+            branches.append(VMLiftedBranch(
                 id=f"branch{len(branches)}",
                 kind="conditional_scc_branch",
                 header=header,
@@ -560,89 +380,22 @@ def analyze_branch_lifts(cfg: VMControlGraph | dict[str, Any], *, include_branch
                 join_scc=join_scc,
                 arms=arms,
                 nodes=_stable_sorted(branch_nodes),
-                confidence=1.0,
                 evidence={
                     "region_contract": REGION_CONTRACT_VERSION,
-                    "rule": "two proven conditional successors enter distinct SCCs and have a nearest common postdominator on the augmented SCC DAG",
-                    "successors": [succ for succ, _edges, _scc in sorted(arm_inputs, key=_arm_sort_key)],
-                    "successor_sccs": successor_sccs,
-                    "join_candidates": join_candidates[:8],
-                    "predicate_polarity": semantic.get("predicate_polarity"),
-                        "alias_contexts": conditional_aliases_by_canonical.get(header, []),
+                    "successors": successors,
+                    "successor_sccs": evidence.get("successor_sccs", []),
                     "hierarchy_parent": hierarchy_parent,
                 },
                 region_kind=region_kind,
                 hierarchy_parent=hierarchy_parent,
-            )
-        )
+            ))
 
-    raw_cfg_entry_blocks_by_scc = _entry_blocks_by_scc(
-        blocks=raw_blocks,
-        blocks_by_scc=raw_model.get("blocks_by_scc", {}),
-        preds=raw_model.get("preds", {}),
+    summary = _branch_summary_from_regions(
+        region_summary,
+        arm_role_hist=arm_role_hist,
+        arm_scc_count_hist=arm_scc_count_hist,
+        cyclic_feedback_arm_count=cyclic_feedback_arm_count,
     )
-    raw_cfg_multi_entry_scc_count = sum(
-        1 for scc in raw_model.get("cyclic_sccs", set())
-        if len(raw_cfg_entry_blocks_by_scc.get(scc, [])) > 1
-    )
-    projected_multi_entry_scc_count = sum(
-        1 for scc in cyclic_sccs
-        if len(raw_entry_blocks_by_scc.get(scc, [])) > 1
-    )
-    normalized_multi_entry_scc_count = sum(
-        1 for scc in cyclic_sccs
-        if len(entry_blocks_by_scc.get(scc, [])) > 1
-    )
-    cyclic_entry_port_count = sum(len(ports) for ports in cyclic_entry_ports_by_scc.values())
-    summary = {
-        "block_count": len(blocks),
-        "proven_edge_count": len(proven_edges),
-        "raw_block_count": len(raw_blocks),
-        "raw_proven_edge_count": len(raw_model.get("proven_edges", [])),
-        "raw_scc_count": len(raw_model.get("blocks_by_scc", {})),
-        "raw_cyclic_scc_count": len(raw_model.get("cyclic_sccs", set())),
-        **projection_summary,
-        "reachable_block_count": len(reachable),
-        "unreachable_under_proven_edges_count": max(0, len(blocks) - len(reachable)),
-        "scc_count": len(scc_nodes),
-        "cyclic_scc_count": len(cyclic_sccs),
-        "raw_cfg_multi_entry_cyclic_scc_count": raw_cfg_multi_entry_scc_count,
-        "projected_multi_entry_cyclic_scc_count": projected_multi_entry_scc_count,
-        "raw_multi_entry_cyclic_scc_count": projected_multi_entry_scc_count,
-        "normalized_multi_entry_cyclic_scc_count": normalized_multi_entry_scc_count,
-        "cyclic_entry_port_count": cyclic_entry_port_count,
-        "cyclic_entry_port_scc_count": sum(1 for ports in cyclic_entry_ports_by_scc.values() if ports),
-        "conditional_branch_count": conditional_branch_count,
-        "conditional_branch_context_count": int(conditional_contexts.get("context_count", 0) or 0),
-        "conditional_branch_atom_count": int(conditional_contexts.get("atom_count", 0) or 0),
-        "raw_conditional_branch_context_count": int(raw_conditional_contexts.get("context_count", 0) or 0),
-        "raw_conditional_branch_atom_count": int(raw_conditional_contexts.get("atom_count", 0) or 0),
-        "conditional_alias_context_count": conditional_alias_context_count,
-        "conditional_alias_group_count": conditional_alias_group_count,
-        "conditional_alias_group_size_histogram": dict(sorted((raw_conditional_contexts.get("alias_group_size_histogram") or {}).items(), key=lambda kv: (int(kv[0]), kv[0]))),
-        "conditional_two_successor_count": conditional_two_successor_count,
-        "conditional_two_edge_count": conditional_two_edge_count,
-        "conditional_projection_no_split_count": conditional_projection_no_split_count,
-        "conditional_edge_count_histogram": dict(sorted(conditional_edge_count_hist.items(), key=lambda kv: (int(kv[0]), kv[0]))),
-        "conditional_distinct_successor_count_histogram": dict(sorted(distinct_successor_count_hist.items(), key=lambda kv: (int(kv[0]), kv[0]))),
-        "conditional_same_scc_successors_count": conditional_same_scc_successors_count,
-        "conditional_cross_scc_count": conditional_cross_scc_count,
-        "lifted_branch_count": lifted_branch_count,
-        "lifted_cross_scc_branch_count": lifted_cross_scc_branch_count,
-        "lifted_cyclic_scc_branch_count": lifted_cyclic_scc_branch_count,
-        "cyclic_local_join_branch_count": cyclic_local_join_branch_count,
-        "cyclic_feedback_join_branch_count": cyclic_feedback_join_branch_count,
-        "cyclic_boundary_join_branch_count": cyclic_boundary_join_branch_count,
-        "cyclic_feedback_frontier_branch_count": cyclic_feedback_frontier_branch_count,
-        "cyclic_feedback_exit_frontier_branch_count": cyclic_feedback_exit_frontier_branch_count,
-        "cyclic_external_exit_frontier_branch_count": cyclic_external_exit_frontier_branch_count,
-        "cyclic_feedback_arm_count": cyclic_feedback_arm_count,
-        "real_join_branch_count": real_join_branch_count,
-        "function_exit_branch_count": function_exit_branch_count,
-        "arm_scc_count_histogram": dict(sorted(arm_scc_count_hist.items(), key=lambda kv: (int(kv[0]), kv[0]))),
-        "arm_role_histogram": dict(sorted(arm_role_hist.items())),
-        "policy": BRANCH_LIFT_POLICY,
-    }
     return VMBranchLiftReport(BRANCH_CONTRACT_VERSION, summary, branches)
 
 
@@ -668,54 +421,7 @@ def analyze_module_branch_lifts(
         cfg = build_control_graph(words, function_start=int(span.get("start", 0) or 0), raw=raw)
         report = analyze_branch_lifts(cfg).to_dict()
         summary = report["summary"]
-        for key in [
-            "block_count",
-            "proven_edge_count",
-            "raw_block_count",
-            "raw_proven_edge_count",
-            "raw_scc_count",
-            "raw_cyclic_scc_count",
-            "structural_projection_block_count",
-            "structural_projection_edge_count",
-            "structural_projection_alias_block_count",
-            "structural_projection_alias_context_count",
-            "structural_projection_skipped_alias_internal_edge_count",
-            "structural_projection_duplicate_edge_count",
-            "reachable_block_count",
-            "unreachable_under_proven_edges_count",
-            "scc_count",
-            "cyclic_scc_count",
-            "raw_multi_entry_cyclic_scc_count",
-            "raw_cfg_multi_entry_cyclic_scc_count",
-            "projected_multi_entry_cyclic_scc_count",
-            "normalized_multi_entry_cyclic_scc_count",
-            "cyclic_entry_port_count",
-            "cyclic_entry_port_scc_count",
-            "conditional_branch_count",
-            "conditional_branch_context_count",
-            "conditional_branch_atom_count",
-            "raw_conditional_branch_context_count",
-            "raw_conditional_branch_atom_count",
-            "conditional_alias_context_count",
-            "conditional_alias_group_count",
-            "conditional_two_successor_count",
-            "conditional_two_edge_count",
-            "conditional_projection_no_split_count",
-            "conditional_same_scc_successors_count",
-            "conditional_cross_scc_count",
-            "lifted_branch_count",
-            "lifted_cross_scc_branch_count",
-            "lifted_cyclic_scc_branch_count",
-            "cyclic_local_join_branch_count",
-            "cyclic_feedback_join_branch_count",
-            "cyclic_boundary_join_branch_count",
-            "cyclic_feedback_frontier_branch_count",
-            "cyclic_feedback_exit_frontier_branch_count",
-            "cyclic_external_exit_frontier_branch_count",
-            "cyclic_feedback_arm_count",
-            "real_join_branch_count",
-            "function_exit_branch_count",
-        ]:
+        for key in BRANCH_TOTAL_KEYS:
             totals[key] += int(summary.get(key, 0) or 0)
         arm_role_totals.update(summary.get("arm_role_histogram", {}))
         arm_scc_count_totals.update(summary.get("arm_scc_count_histogram", {}))

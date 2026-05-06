@@ -19,26 +19,15 @@ CYCLIC_FEEDBACK_FRONTIER = "__cyclic_feedback_frontier__"
 CYCLIC_FEEDBACK_EXIT_FRONTIER = "__cyclic_feedback_exit_frontier__"
 CYCLIC_EXTERNAL_EXIT_FRONTIER = "__cyclic_external_exit_frontier__"
 REGION_POLICY = (
-    "Region analysis is hierarchical. It first collapses proven VM control-flow "
-    "into SCCs only after a structural projection over canonical conditional branch "
-    "atoms. BR-shaped predicate_no_transfer words remain below CFG and never enter "
-    "region lifting. Overlapping byte/sub-entry block contexts that end at the "
-    "same terminal conditional BR are canonicalized to one structuring owner; outer "
-    "contexts remain diagnostics only. Cyclic SCC entry frontiers are then normalized: "
-    "a VM jump-only external entry that immediately routes through an internal feedback "
-    "edge into an existing entry frontier is recorded as a cyclic reentry port, not as "
-    "an independent loop entry. Cross-SCC conditionals are structured on the augmented "
-    "SCC DAG with a virtual function-exit node. Same-SCC conditionals are structured "
-    "only when the header and both successors live in the same owning cyclic SCC; the "
-    "local projection distinguishes forward joins, shared feedback/boundary joins, "
-    "feedback frontiers, feedback/exit frontiers, and external exit frontiers. "
-    "Edge roles inside cyclic SCCs are structural VM roles only; "
-    "the pass does not infer predicate polarity or source-level if/while/break/continue "
-    "constructs."
+    "Region analysis works on the projected VM CFG: branch-atom aliases are "
+    "canonicalized, cyclic entry ports are normalized, and conditional regions are "
+    "lifted only at VM topology level."
 )
 
 CONDITIONAL_EDGE_KINDS = {"conditional_taken", "conditional_fallthrough"}
 REQUIRED_CONDITIONAL_EDGE_KINDS = frozenset(CONDITIONAL_EDGE_KINDS)
+
+REGION_TOTAL_KEYS = "block_count proven_edge_count raw_block_count raw_proven_edge_count raw_scc_count raw_cyclic_scc_count structural_projection_block_count structural_projection_edge_count structural_projection_alias_block_count structural_projection_alias_context_count structural_projection_skipped_alias_internal_edge_count structural_projection_duplicate_edge_count reachable_block_count unreachable_under_proven_edges_count scc_count cyclic_scc_count raw_multi_entry_cyclic_scc_count raw_cfg_multi_entry_cyclic_scc_count projected_multi_entry_cyclic_scc_count normalized_multi_entry_cyclic_scc_count cyclic_entry_port_count cyclic_entry_port_scc_count raw_exit_scc_count region_fact_count hierarchy_node_count cyclic_edge_role_count conditional_branch_count conditional_branch_context_count conditional_branch_atom_count raw_conditional_branch_context_count raw_conditional_branch_atom_count conditional_alias_context_count conditional_alias_group_count conditional_two_successor_count conditional_two_edge_count conditional_projection_no_split_count conditional_same_scc_successors_count conditional_cross_scc_count conditional_scc_region_count conditional_real_scc_join_region_count conditional_function_exit_scc_region_count conditional_cyclic_scc_region_count conditional_cyclic_local_join_region_count conditional_cyclic_feedback_join_region_count conditional_cyclic_boundary_join_region_count conditional_cyclic_feedback_frontier_region_count conditional_cyclic_feedback_exit_frontier_region_count conditional_cyclic_external_exit_frontier_region_count".split()
 
 
 
@@ -48,12 +37,7 @@ class VMSCCRegion:
     nodes: list[str]
     cyclic: bool
     entry_blocks: list[str] = field(default_factory=list)
-    raw_entry_blocks: list[str] = field(default_factory=list)
-    normalized_entry_blocks: list[str] = field(default_factory=list)
-    cyclic_entry_ports: list[dict[str, Any]] = field(default_factory=list)
     exit_blocks: list[str] = field(default_factory=list)
-    edge_roles: list[dict[str, Any]] = field(default_factory=list)
-    conditional_headers: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -74,29 +58,12 @@ class VMRegionFact:
 
 
 @dataclass(frozen=True)
-class VMRegionHierarchyNode:
-    id: str
-    kind: str
-    parent: Optional[str]
-    children: list[str]
-    header: Optional[str]
-    nodes: list[str]
-    exit: Optional[str] = None
-    scc: Optional[str] = None
-    depth: int = 0
-    evidence: dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
 class VMRegionReport:
     contract: str
     summary: dict[str, Any]
     facts: list[VMRegionFact]
     scc_regions: list[VMSCCRegion] = field(default_factory=list)
-    hierarchy: list[VMRegionHierarchyNode] = field(default_factory=list)
+    hierarchy: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,7 +71,7 @@ class VMRegionReport:
             "summary": self.summary,
             "facts": [f.to_dict() for f in self.facts],
             "scc_regions": [s.to_dict() for s in self.scc_regions],
-            "hierarchy": [h.to_dict() for h in self.hierarchy],
+            "hierarchy": list(self.hierarchy),
         }
 
 
@@ -157,14 +124,6 @@ def _conditional_edge_targets(edges: list[dict[str, Any]]) -> list[str]:
 
 
 def _conditional_context_signature(edges: list[dict[str, Any]]) -> tuple[Any, ...]:
-    """Return the VM branch-atom identity for overlapping block contexts.
-
-    The control graph can expose several byte/sub-entry blocks that decode
-    different prefixes but share the same terminal conditional BR atom. Region
-    structuring must not treat those block-entry contexts as independent
-    branches. The signature is intentionally based on the terminal instruction
-    coordinate plus its proven VM edge identities.
-    """
 
     if not edges:
         return (None, None, ())
@@ -187,16 +146,6 @@ def _canonical_conditional_contexts(
     scc_by_block: Optional[dict[str, str]] = None,
     cyclic_sccs: Optional[set[str]] = None,
 ) -> dict[str, Any]:
-    """Canonicalize conditional branch analysis by VM branch atom.
-
-    ``control.py`` deliberately preserves byte/sub-entry entry points. That can
-    create overlapping blocks whose suffix contains the same terminal BR atom.
-    Region/branch lifting works on VM control atoms, so only one context may own
-    a conditional BR. The canonical owner is selected by structural ownership:
-    prefer a context whose SCC also contains the conditional successors, then a
-    cyclic context, then the innermost byte/sub-entry context as a deterministic
-    fallback. Outer contexts remain diagnostics only.
-    """
 
     block_by_id = {str(block.get("id")): block for block in blocks}
     scc_by_block = scc_by_block or {}
@@ -268,7 +217,6 @@ def _canonical_conditional_contexts(
 
 
 def _representative_closure(alias_to_canonical: dict[str, str]):
-    """Return a deterministic representative resolver for context aliases."""
 
     def rep(value: Any) -> str:
         cur = str(value)
@@ -286,13 +234,6 @@ def _project_control_graph(
     edges: list[dict[str, Any]],
     alias_to_canonical: dict[str, str],
 ) -> dict[str, Any]:
-    """Contract branch-atom alias contexts into their canonical owner.
-
-    ``control.py`` remains the byte/sub-entry CFG source of truth.  This helper
-    builds the structural projection consumed by SCC, region, and branch passes:
-    aliases are not deleted as evidence; they are attached to the representative
-    block as diagnostics.
-    """
 
     rep = _representative_closure(alias_to_canonical)
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -382,174 +323,7 @@ def _edge_payload(edge: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _edge_role_payload(
-    edge: dict[str, Any],
-    *,
-    source_scc: str,
-    target_scc: str,
-    cyclic_sccs: set[str],
-    entry_blocks_by_scc: dict[str, list[str]],
-    block_order: dict[str, int],
-) -> dict[str, Any]:
-    """Classify a proven VM edge by structural SCC role only.
-
-    These roles deliberately stop at VM control topology.  A cyclic exit edge is
-    not named ``break`` and a latch-looking edge is only a candidate, because
-    source-level loop intent is not proven at this layer.
-    """
-
-    src = str(edge.get("source"))
-    dst = str(edge.get("target"))
-    kind = str(edge.get("kind"))
-    roles: list[str] = []
-
-    if kind in CONDITIONAL_EDGE_KINDS:
-        roles.append(kind)
-    elif kind == "jump":
-        roles.append("jump")
-    else:
-        roles.append("plain_control_edge")
-
-    if source_scc == target_scc:
-        roles.append("scc_internal_edge")
-        if source_scc in cyclic_sccs:
-            roles.append("cyclic_internal_edge")
-            if kind in CONDITIONAL_EDGE_KINDS:
-                roles.append("cyclic_conditional_edge")
-            if dst in set(entry_blocks_by_scc.get(source_scc, [])):
-                roles.append("cyclic_entry_target_edge")
-            if block_order.get(dst, 10**9) <= block_order.get(src, -1):
-                roles.append("cyclic_latch_candidate_edge")
-    else:
-        roles.append("scc_cross_edge")
-        if source_scc in cyclic_sccs:
-            roles.append("cyclic_exit_edge")
-        if target_scc in cyclic_sccs:
-            roles.append("cyclic_entry_edge")
-
-    scope = "cyclic" if source_scc in cyclic_sccs or target_scc in cyclic_sccs else "acyclic"
-    return {
-        **_edge_payload(edge),
-        "source_scc": source_scc,
-        "target_scc": target_scc,
-        "roles": _stable_sorted(dict.fromkeys(roles)),
-        "scope": scope,
-    }
-
-
-def _build_region_hierarchy(
-    *,
-    reachable: set[str],
-    facts: list[VMRegionFact],
-    scc_regions: list[VMSCCRegion],
-    scc_by_block: dict[str, str],
-    cyclic_sccs: set[str],
-) -> list[VMRegionHierarchyNode]:
-    root_id = "function"
-    items: dict[str, dict[str, Any]] = {}
-    children: dict[str, list[str]] = defaultdict(list)
-
-    def add(item: dict[str, Any]) -> None:
-        item_id = str(item["id"])
-        parent = item.get("parent")
-        items[item_id] = item
-        if parent is not None:
-            children[str(parent)].append(item_id)
-
-    add({
-        "id": root_id,
-        "kind": "function_region",
-        "parent": None,
-        "header": _stable_sorted(reachable)[0] if reachable else None,
-        "nodes": _stable_sorted(reachable),
-        "exit": VIRTUAL_FUNCTION_EXIT,
-        "scc": None,
-        "evidence": {"rule": "root VM function region over reachable proven CFG blocks"},
-    })
-
-    for scc in scc_regions:
-        add({
-            "id": f"scc:{scc.id}",
-            "kind": "cyclic_region",
-            "parent": root_id,
-            "header": (scc.entry_blocks or scc.nodes or [None])[0],
-            "nodes": scc.nodes,
-            "exit": None,
-            "scc": scc.id,
-            "evidence": {
-                "entry_blocks": list(scc.entry_blocks),
-                "raw_entry_blocks": list(scc.raw_entry_blocks),
-                "normalized_entry_blocks": list(scc.normalized_entry_blocks),
-                "cyclic_entry_ports": list(scc.cyclic_entry_ports),
-                "exit_blocks": list(scc.exit_blocks),
-                "edge_role_count": len(scc.edge_roles),
-                "conditional_headers": list(scc.conditional_headers),
-                "rule": "strongly connected structural VM blocks form a cyclic region envelope; jump-only cyclic reentry ports are diagnostics, not independent entries",
-            },
-        })
-
-    for fact in facts:
-        evidence = dict(fact.evidence or {})
-        header_scc = str(evidence.get("header_scc") or scc_by_block.get(fact.header, ""))
-        parent = f"scc:{header_scc}" if header_scc in cyclic_sccs else root_id
-        if fact.kind == "conditional_scc_region":
-            kind = str(evidence.get("region_kind") or "conditional_region")
-        elif fact.kind == "conditional_cyclic_scc_region":
-            kind = "cyclic_branch_region"
-        else:
-            kind = fact.kind
-        add({
-            "id": f"fact:{fact.id}",
-            "kind": kind,
-            "parent": parent,
-            "header": fact.header,
-            "nodes": list(fact.nodes),
-            "exit": fact.exit,
-            "scc": header_scc or None,
-            "evidence": {
-                "source_fact_kind": fact.kind,
-                "source_fact_id": fact.id,
-                "confidence": fact.confidence,
-            },
-        })
-
-    def depth_of(item_id: str) -> int:
-        depth = 0
-        cur = items[item_id].get("parent")
-        seen: set[str] = set()
-        while cur is not None and cur in items and cur not in seen:
-            seen.add(cur)
-            depth += 1
-            cur = items[cur].get("parent")
-        return depth
-
-    out: list[VMRegionHierarchyNode] = []
-    for item_id in _stable_sorted(items):
-        item = items[item_id]
-        out.append(VMRegionHierarchyNode(
-            id=item_id,
-            kind=str(item.get("kind")),
-            parent=item.get("parent"),
-            children=_stable_sorted(children.get(item_id, [])),
-            header=item.get("header"),
-            nodes=_stable_sorted(item.get("nodes") or []),
-            exit=item.get("exit"),
-            scc=item.get("scc"),
-            depth=depth_of(item_id),
-            evidence=dict(item.get("evidence") or {}),
-        ))
-    return out
-
-
-
 def _is_cyclic_feedback_candidate(src: str, dst: str, block_order: dict[str, int]) -> bool:
-    """Return a structural feedback-edge predicate inside one SCC.
-
-    The bytecode block order is the only ordering fact available at this layer.
-    An internal edge to an earlier-or-same block is therefore a VM-level feedback
-    candidate.  This is a projection rule for cyclic branch envelopes, not a
-    source-level ``continue``/``latch`` inference.
-    """
 
     return block_order.get(dst, 10**9) <= block_order.get(src, -1)
 
@@ -560,7 +334,6 @@ def _entry_blocks_by_scc(
     blocks_by_scc: dict[str, list[str]],
     preds: dict[str, set[str]],
 ) -> dict[str, list[str]]:
-    """Return raw graph entry blocks for each SCC envelope."""
 
     start_id = str(blocks[0].get("id")) if blocks else ""
     out: dict[str, list[str]] = {}
@@ -578,7 +351,6 @@ def _exit_blocks_by_scc(
     blocks_by_scc: dict[str, list[str]],
     succs: dict[str, set[str]],
 ) -> dict[str, list[str]]:
-    """Return raw graph exit blocks for each SCC envelope."""
 
     out: dict[str, list[str]] = {}
     for scc_id, nodes in blocks_by_scc.items():
@@ -599,13 +371,6 @@ def _normalize_cyclic_entry_blocks(
     raw_entry_blocks_by_scc: dict[str, list[str]],
     block_order: dict[str, int],
 ) -> tuple[dict[str, list[str]], dict[str, list[dict[str, Any]]]]:
-    """Normalize cyclic entry frontiers without inferring source constructs.
-
-    A raw entry block inside a cyclic SCC may be a VM reentry port: all external
-    incoming edges are jumps, and the block immediately routes control through
-    internal feedback edges to an existing entry frontier.  Such ports are kept
-    as diagnostics but are not counted as independent normalized entries.
-    """
 
     in_by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
     out_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -733,32 +498,6 @@ def _cyclic_branch_model(
     block_order: dict[str, int],
     pdom: Optional[dict[str, set[str]]] = None,
 ) -> dict[str, Any]:
-    """Build a VM-level branch model for a conditional split inside one SCC.
-
-    Cross-SCC branches are structured on the SCC condensation DAG.  A true
-    same-SCC branch has the header and both block successors inside the same
-    cyclic SCC, so its local topology must be interpreted inside that SCC.
-
-    The stable invariant is not "every cyclic branch has a forward join".  In
-    this bytecode corpus many cyclic branches merge through cut feedback edges,
-    or deliberately terminate their arms at different cycle boundaries.  The
-    local projection therefore classifies, in order:
-
-    * ``cyclic_local_join``: both arms reach the same forward block after
-      cutting feedback edges.
-    * ``cyclic_feedback_join`` / ``cyclic_boundary_join``: no forward merge, but
-      both arms reach the same cut feedback or SCC-exit boundary.
-    * ``cyclic_feedback_frontier``: arms end at different internal feedback
-      frontiers, which are reentry boundaries, not exits from the cyclic envelope.
-    * ``cyclic_feedback_exit_frontier`` / ``cyclic_external_exit_frontier``:
-      at least one arm reaches an SCC-exit frontier that has a stable SCC-DAG
-      postdominator; internal feedback targets remain diagnostics.
-
-    If a branch has neither a local join nor a boundary frontier, or if an
-    external exit frontier cannot be normalized through the SCC-DAG
-    postdominator, the model is structurally inconsistent and the pass fails
-    instead of continuing with an unsupported region kind.
-    """
 
     scc_nodes = set(blocks_by_scc.get(header_scc, []))
     successor_set = set(successors)
@@ -773,15 +512,12 @@ def _cyclic_branch_model(
         if src not in scc_nodes:
             continue
         if dst not in scc_nodes:
-            payload = _edge_role_payload(
-                edge,
-                source_scc=header_scc,
-                target_scc=scc_by_block.get(dst, str(edge.get("target_scc", ""))),
-                cyclic_sccs=cyclic_sccs,
-                entry_blocks_by_scc=entry_blocks_by_scc,
-                block_order=block_order,
-            )
-            payload["boundary_kind"] = "scc_exit"
+            payload = _edge_payload(edge)
+            payload.update({
+                "source_scc": header_scc,
+                "target_scc": scc_by_block.get(dst, str(edge.get("target_scc", ""))),
+                "boundary_kind": "scc_exit",
+            })
             boundary_edges.append(payload)
             continue
 
@@ -789,15 +525,12 @@ def _cyclic_branch_model(
         is_feedback = _is_cyclic_feedback_candidate(src, dst, block_order)
         is_split_edge = src == header and dst in successor_set and str(edge.get("kind")) in CONDITIONAL_EDGE_KINDS
         if is_feedback and not is_split_edge:
-            payload = _edge_role_payload(
-                edge,
-                source_scc=header_scc,
-                target_scc=header_scc,
-                cyclic_sccs=cyclic_sccs,
-                entry_blocks_by_scc=entry_blocks_by_scc,
-                block_order=block_order,
-            )
-            payload["boundary_kind"] = "feedback"
+            payload = _edge_payload(edge)
+            payload.update({
+                "source_scc": header_scc,
+                "target_scc": header_scc,
+                "boundary_kind": "feedback",
+            })
             cut_edges.append(payload)
             boundary_edges.append(payload)
             continue
@@ -935,17 +668,6 @@ def _cyclic_branch_model(
         nodes.discard(header)
         arm_nodes[successor] = _stable_sorted(nodes)
 
-    edge_roles = [
-        _edge_role_payload(
-            edge,
-            source_scc=header_scc,
-            target_scc=scc_by_block[str(edge.get("target"))],
-            cyclic_sccs=cyclic_sccs,
-            entry_blocks_by_scc=entry_blocks_by_scc,
-            block_order=block_order,
-        )
-        for edge in sorted(conditional_edges, key=_conditional_edge_sort_key)
-    ]
     return {
         "header_scc": header_scc,
         "successors": list(successors),
@@ -971,12 +693,8 @@ def _cyclic_branch_model(
         "arm_reachable_by_successor": {k: _stable_sorted(v) for k, v in arm_reachable.items()},
         "feedback_successors": _stable_sorted(feedback_successors),
         "cut_edge_count": len(cut_edges),
-        "cut_edges": cut_edges[:8],
         "boundary_edge_count": len(boundary_edges),
-        "boundary_edges": boundary_edges[:8],
         "internal_edge_count": internal_edge_count,
-        "edge_roles": edge_roles,
-        "projection_rule": "same-SCC branch projection distinguishes forward joins, shared feedback/boundary joins, feedback frontiers, feedback/exit frontiers, and external exit frontiers",
     }
 
 def _reachable(start: str, succs: dict[str, set[str]]) -> set[str]:
@@ -1173,12 +891,6 @@ def _build_structural_projection_model(
     blocks: list[dict[str, Any]],
     edges: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Build raw CFG diagnostics plus the structural SCC projection.
-
-    Raw byte/sub-entry CFG facts remain available, but SCC and reducibility
-    decisions should consume the projected graph.  The projection contracts
-    canonical conditional context aliases before SCC construction.
-    """
 
     raw_model = _build_scc_model(blocks, edges)
     raw_conditional_contexts = _canonical_conditional_contexts(
@@ -1262,7 +974,6 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
     reachable: set[str] = model["reachable"]
     scc_by_block: dict[str, str] = model["scc_by_block"]
     blocks_by_scc: dict[str, list[str]] = model["blocks_by_scc"]
-    scc_preds: dict[str, set[str]] = model["scc_preds"]
     cyclic_sccs: set[str] = model["cyclic_sccs"]
     raw_exit_sccs: set[str] = model["raw_exit_sccs"]
     pdom: dict[str, set[str]] = model["pdom"]
@@ -1271,7 +982,6 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
     conditional_contexts: dict[str, Any] = projection_model["conditional_contexts"]
     canonical_conditional_headers: set[str] = conditional_contexts["canonical_headers"]
     conditional_alias_to_canonical: dict[str, str] = conditional_contexts["alias_to_canonical"]
-    conditional_aliases_by_canonical: dict[str, list[str]] = raw_conditional_contexts["aliases_by_canonical"]
     raw_entry_blocks_by_scc = _entry_blocks_by_scc(
         blocks=blocks,
         blocks_by_scc=blocks_by_scc,
@@ -1286,39 +996,6 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
         block_order=block_order,
     )
     exit_blocks_by_scc = _exit_blocks_by_scc(blocks_by_scc=blocks_by_scc, succs=succs)
-    conditional_headers_by_scc: dict[str, list[str]] = defaultdict(list)
-    for block in blocks:
-        header = str(block.get("id"))
-        if header not in reachable:
-            continue
-        terminator = block.get("terminator") or {}
-        semantic = (terminator.get("semantic") or {}) if isinstance(terminator, dict) else {}
-        if semantic.get("branch_kind") == "conditional_branch" and header in canonical_conditional_headers:
-            conditional_headers_by_scc[scc_by_block[header]].append(header)
-
-    cyclic_edge_roles_by_scc: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for edge in proven_edges:
-        src = str(edge.get("source"))
-        dst = str(edge.get("target"))
-        if src not in scc_by_block or dst not in scc_by_block:
-            continue
-        src_scc = scc_by_block[src]
-        dst_scc = scc_by_block[dst]
-        if src_scc not in cyclic_sccs and dst_scc not in cyclic_sccs:
-            continue
-        payload = _edge_role_payload(
-            edge,
-            source_scc=src_scc,
-            target_scc=dst_scc,
-            cyclic_sccs=cyclic_sccs,
-            entry_blocks_by_scc=entry_blocks_by_scc,
-            block_order=block_order,
-        )
-        if src_scc in cyclic_sccs:
-            cyclic_edge_roles_by_scc[src_scc].append(payload)
-        if dst_scc in cyclic_sccs and dst_scc != src_scc:
-            cyclic_edge_roles_by_scc[dst_scc].append(payload)
-
     scc_regions: list[VMSCCRegion] = []
     for scc_id in _stable_sorted(blocks_by_scc):
         nodes = blocks_by_scc[scc_id]
@@ -1330,12 +1007,7 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
                 nodes=nodes,
                 cyclic=True,
                 entry_blocks=entry_blocks_by_scc.get(scc_id, []),
-                raw_entry_blocks=raw_entry_blocks_by_scc.get(scc_id, []),
-                normalized_entry_blocks=entry_blocks_by_scc.get(scc_id, []),
-                cyclic_entry_ports=cyclic_entry_ports_by_scc.get(scc_id, []),
                 exit_blocks=exit_blocks_by_scc.get(scc_id, []),
-                edge_roles=sorted(cyclic_edge_roles_by_scc.get(scc_id, []), key=lambda item: _conditional_edge_sort_key(item)),
-                conditional_headers=_stable_sorted(conditional_headers_by_scc.get(scc_id, [])),
             )
         )
 
@@ -1453,10 +1125,13 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
                     exit=exit_text,
                     confidence=1.0,
                     evidence={
-                        "rule": "header and both conditional successors are inside one cyclic SCC; classify the local projection as forward-join, feedback/boundary join, or normalized frontier",
-                        **cyclic_model,
+                        "header_scc": header_scc,
+                        "successors": successors,
+                        "successor_sccs": successor_sccs,
+                        "local_join": local_join,
+                        "local_join_kind": local_join_kind,
+                        "exit_frontier": cyclic_model.get("exit_frontier", []),
                         "predicate_polarity": semantic.get("predicate_polarity"),
-                        "alias_contexts": conditional_aliases_by_canonical.get(header, []),
                     },
                 )
             )
@@ -1500,36 +1175,20 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
                 exit=exit_text,
                 confidence=1.0,
                 evidence={
-                    "rule": "two proven conditional successors enter distinct SCCs; nearest common postdominator is selected on the augmented SCC DAG",
                     "header_scc": header_scc,
                     "successor_sccs": successor_sccs,
                     "successors": successors,
                     "join_scc": join_scc,
                     "join_kind": join_kind,
                     "region_kind": "conditional_multi_exit_region" if join_kind == "virtual_function_exit" else "conditional_region",
-                    "join_candidates": join_candidates[:8],
-                    "raw_exit_scc_count": len(raw_exit_sccs),
                     "predicate_polarity": semantic.get("predicate_polarity"),
-                        "alias_contexts": conditional_aliases_by_canonical.get(header, []),
                 },
             )
         )
 
     fact_hist = Counter(f.kind for f in facts)
-    hierarchy = _build_region_hierarchy(
-        reachable=reachable,
-        facts=facts,
-        scc_regions=scc_regions,
-        scc_by_block=scc_by_block,
-        cyclic_sccs=cyclic_sccs,
-    )
-    hierarchy_hist = Counter(h.kind for h in hierarchy)
-    cyclic_edge_role_hist = Counter(
-        role
-        for scc in scc_regions
-        for edge_role in scc.edge_roles
-        for role in edge_role.get("roles", [])
-    )
+    hierarchy: list[dict[str, Any]] = []
+    hierarchy_hist: Counter[str] = Counter()
     raw_cfg_entry_blocks_by_scc = _entry_blocks_by_scc(
         blocks=raw_blocks,
         blocks_by_scc=raw_model.get("blocks_by_scc", {}),
@@ -1569,10 +1228,10 @@ def analyze_regions(cfg: VMControlGraph | dict[str, Any]) -> VMRegionReport:
         "raw_exit_scc_count": len(raw_exit_sccs),
         "region_fact_count": len(facts),
         "region_kind_histogram": dict(sorted(fact_hist.items())),
-        "hierarchy_node_count": len(hierarchy),
-        "hierarchy_kind_histogram": dict(sorted(hierarchy_hist.items())),
-        "cyclic_edge_role_count": sum(len(scc.edge_roles) for scc in scc_regions),
-        "cyclic_edge_role_histogram": dict(sorted(cyclic_edge_role_hist.items())),
+        "hierarchy_node_count": 0,
+        "hierarchy_kind_histogram": {},
+        "cyclic_edge_role_count": 0,
+        "cyclic_edge_role_histogram": {},
         "conditional_branch_count": conditional_branch_count,
         "conditional_branch_context_count": int(conditional_contexts.get("context_count", 0) or 0),
         "conditional_branch_atom_count": int(conditional_contexts.get("atom_count", 0) or 0),
@@ -1621,8 +1280,6 @@ def analyze_module_regions(
     functions: list[dict[str, Any]] = []
     totals: Counter[str] = Counter()
     region_kind_totals: Counter[str] = Counter()
-    hierarchy_kind_totals: Counter[str] = Counter()
-    cyclic_edge_role_totals: Counter[str] = Counter()
     for entry in entries:
         raw, selection = select_function_body_vmir(mod, entry)
         words = decode_words(raw)
@@ -1630,60 +1287,9 @@ def analyze_module_regions(
         cfg = build_control_graph(words, function_start=int(span.get("start", 0) or 0), raw=raw)
         report = analyze_regions(cfg).to_dict()
         summary = report["summary"]
-        for key in [
-            "block_count",
-            "proven_edge_count",
-            "raw_block_count",
-            "raw_proven_edge_count",
-            "raw_scc_count",
-            "raw_cyclic_scc_count",
-            "structural_projection_block_count",
-            "structural_projection_edge_count",
-            "structural_projection_alias_block_count",
-            "structural_projection_alias_context_count",
-            "structural_projection_skipped_alias_internal_edge_count",
-            "structural_projection_duplicate_edge_count",
-            "reachable_block_count",
-            "unreachable_under_proven_edges_count",
-            "scc_count",
-            "cyclic_scc_count",
-            "raw_multi_entry_cyclic_scc_count",
-            "raw_cfg_multi_entry_cyclic_scc_count",
-            "projected_multi_entry_cyclic_scc_count",
-            "normalized_multi_entry_cyclic_scc_count",
-            "cyclic_entry_port_count",
-            "cyclic_entry_port_scc_count",
-            "raw_exit_scc_count",
-            "region_fact_count",
-            "hierarchy_node_count",
-            "cyclic_edge_role_count",
-            "conditional_branch_count",
-            "conditional_branch_context_count",
-            "conditional_branch_atom_count",
-            "raw_conditional_branch_context_count",
-            "raw_conditional_branch_atom_count",
-            "conditional_alias_context_count",
-            "conditional_alias_group_count",
-            "conditional_two_successor_count",
-            "conditional_two_edge_count",
-            "conditional_projection_no_split_count",
-            "conditional_same_scc_successors_count",
-            "conditional_cross_scc_count",
-            "conditional_scc_region_count",
-            "conditional_real_scc_join_region_count",
-            "conditional_function_exit_scc_region_count",
-            "conditional_cyclic_scc_region_count",
-            "conditional_cyclic_local_join_region_count",
-            "conditional_cyclic_feedback_join_region_count",
-            "conditional_cyclic_boundary_join_region_count",
-            "conditional_cyclic_feedback_frontier_region_count",
-            "conditional_cyclic_feedback_exit_frontier_region_count",
-            "conditional_cyclic_external_exit_frontier_region_count",
-        ]:
+        for key in REGION_TOTAL_KEYS:
             totals[key] += int(summary.get(key, 0) or 0)
         region_kind_totals.update(summary.get("region_kind_histogram", {}))
-        hierarchy_kind_totals.update(summary.get("hierarchy_kind_histogram", {}))
-        cyclic_edge_role_totals.update(summary.get("cyclic_edge_role_histogram", {}))
         functions.append({
             "name": entry.name,
             "symbol": entry.symbol,
@@ -1700,8 +1306,6 @@ def analyze_module_regions(
             **dict(totals),
             "function_count": len(functions),
             "region_kind_histogram": dict(sorted(region_kind_totals.items())),
-            "hierarchy_kind_histogram": dict(sorted(hierarchy_kind_totals.items())),
-            "cyclic_edge_role_histogram": dict(sorted(cyclic_edge_role_totals.items())),
             "policy": REGION_POLICY,
         },
         "functions": functions,
