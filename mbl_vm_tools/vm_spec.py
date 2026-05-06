@@ -447,6 +447,10 @@ def decode_words(data: bytes, *, limit: Optional[int] = None) -> list[VMWord]:
 
 
 VALUE_WORDS = {"BARE_U32", "IMM8", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "F32", "U16", "REF", "REF16", "REC41", "REC61", "REC62", "AGG", "AGG0", "CODE_REF"}
+# Lower operand atoms are bytecode-level expression/argument payload atoms.  They
+# are deliberately not persistent CFG stack producers.  AGG/AGG0 are excluded:
+# they describe function ABI/prologue layout, not a local operand-frame value.
+LOWER_OPERAND_ATOM_WORDS = {"IMM8", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "F32", "U16", "REF", "REF16", "REC41", "REC61", "REC62", "CODE_REF"}
 RETURN_WORDS = {"RETURN_PAIR", "END"}
 CALL_WORDS = {"CALL_NATIVE", "CALL_SCRIPT"}
 BRANCH_WORDS = {"BR"}
@@ -493,42 +497,140 @@ def word_role(word: VMWord) -> str:
     return "vm_word"
 
 
-def stack_contract(word: VMWord) -> dict[str, Any]:
-    """Conservative VM-stack contract for a single word.
+def prefix_chain_signature(word: VMWord) -> str:
+    """Return a compact lower-byte prefix signature for provenance audits."""
 
-    Important invariant: encoded call argc is the only call arity source.  Prefix
-    chains are modifiers and are preserved, but never converted into hidden
-    function arguments at IR level.
+    return ".".join(f"{int(p):02X}" for p in word.prefixes) if word.prefixes else "-"
+
+
+def word_shape_signature(word: VMWord) -> str:
+    """Return a stable low-level VM word shape signature.
+
+    The signature includes prefix bytes and discriminating terminal operands.  It
+    is used as provenance evidence only; it is not a source-level opcode name.
+    """
+
+    pref = prefix_chain_signature(word)
+    k = word.terminal_kind
+    if k == "CALL_NATIVE":
+        return f"{pref}|CALL_NATIVE|opid={word.operands.get('opid')}|argc={word.operands.get('argc')}"
+    if k == "CALL_SCRIPT":
+        return f"{pref}|CALL_SCRIPT|argc={word.operands.get('argc')}"
+    if k == "BR":
+        return f"{pref}|BR|op={word.operands.get('op')}"
+    if k in {"REF", "REF16"}:
+        return f"{pref}|{k}|op={word.operands.get('op')}|mode={word.operands.get('mode')}"
+    if k in {"REC41", "REC61", "REC62"}:
+        return f"{pref}|{k}|mode={word.operands.get('mode')}|u16={word.operands.get('u16')}"
+    if k.startswith("IMM") or k in {"U16", "F32", "CODE_REF"}:
+        return f"{pref}|{k}|op={word.operands.get('op')}"
+    return f"{pref}|{k}"
+
+
+def is_lower_operand_atom(word: VMWord) -> bool:
+    """Return True for bytecode atoms that feed a local operand/effect frame.
+
+    This is intentionally lower than SSA and CFG.  The full corpus shows that
+    refs/literals/records/code refs are not persistent stack values by default;
+    they are local operands consumed by calls, branches, returns, or lower
+    opcode/effect forms.  AGG/AGG0 stay out because they are ABI prologue shapes.
+    """
+
+    if word.terminal_kind == "BARE_U32":
+        return False
+    if word.terminal_kind in {"AGG", "AGG0"}:
+        return False
+    if word.terminal_kind in LOWER_OPERAND_ATOM_WORDS:
+        return True
+    return False
+
+
+def stack_contract(word: VMWord) -> dict[str, Any]:
+    """Lower VM stack/effect contract for one decoded word.
+
+    A decoded VMWord is a byte-level word shape, not a proven persistent operand
+    stack instruction.  Value-shaped terminal atoms are local operand-frame data
+    until a consumer proves their use.  This removes the old false model where
+    every REF/IMM/REC/CODE_REF was pushed through CFG joins as a stack fact.
     """
 
     k = word.terminal_kind
     role = word_role(word)
+    prefixes_hex = [f"0x{int(p):02X}" for p in word.prefixes]
+    base: dict[str, Any] = {
+        "pop": 0,
+        "push": 0,
+        "role": role,
+        "shape_signature": word_shape_signature(word),
+    }
+    if prefixes_hex:
+        base["prefixes_hex"] = prefixes_hex
+        base["prefix_count"] = len(prefixes_hex)
+        base["prefix_effect_rule"] = "prefix_chain_is_lower_opcode_evidence_not_hidden_call_arity"
+
     if k == "CALL_NATIVE":
         argc = int(word.operands.get("argc", 0) or 0)
-        return {"pop": argc, "push": 1, "role": role, "encoded_argc": argc, "result": "unknown_native_return"}
+        base.update({
+            "encoded_argc": argc,
+            "opid": word.operands.get("opid"),
+            "result": "deferred_native_return",
+            "stack_effect_rule": "native_call_binds_lower_operand_frame_return_arity_deferred",
+        })
+        return base
     if k == "CALL_SCRIPT":
         argc = int(word.operands.get("argc", 0) or 0)
-        return {"pop": argc, "push": 1, "role": role, "encoded_argc": argc, "result": "unknown_script_return"}
+        base.update({
+            "encoded_argc": argc,
+            "encoded_rel": word.operands.get("rel"),
+            "result": "deferred_script_return",
+            "stack_effect_rule": "script_call_binds_lower_operand_frame_return_arity_deferred",
+        })
+        return base
     if k == "BR":
-        # Prefix-conditioned BR atoms usually compare/consume stack values, but
-        # exact predicate shape belongs to a later analysis pass.  A
-        # target==fallthrough conditional is not control flow; keep it as a VM
-        # predicate atom rather than a CFG branch.
-        return {
-            "pop": None,
-            "push": 0,
-            "role": role,
+        op = int(word.operands.get("op", -1) or -1) & 0xFF
+        base.update({
             "predicate": "prefix_defined" if word.prefixes else "stack_top_or_flag",
             "control_transfer": role == "branch",
-        }
+            "stack_effect_rule": "unconditional_branch_has_no_value_stack_transfer" if op == 0x4A else "conditional_predicate_transfer_deferred",
+        })
+        if op in CONDITIONAL_CONTROL_BRANCH_OPS:
+            base["predicate_stack_effect"] = "lower_operand_frame_deferred"
+            base["candidate_predicate_pop"] = [0, 1, 2]
+        return base
     if k in RETURN_WORDS:
-        return {"pop": None if word.operands.get("optional_value") else 1, "push": 0, "role": role}
+        base["stack_effect_rule"] = "terminal_return_is_lower_operand_frame_sink"
+        if word.operands.get("optional_value"):
+            base["return_payload"] = "optional_deferred"
+        return base
     if k in {"NOP", "MARK", "UNKNOWN"}:
-        return {"pop": 0, "push": 0, "role": role}
+        base["stack_effect_rule"] = "structural_word_has_no_persistent_stack_effect"
+        if k == "UNKNOWN":
+            base["unknown_byte"] = word.operands.get("byte")
+        return base
     if k in {"AGG", "AGG0"}:
-        return {"pop": 0, "push": 0, "role": "abi_prologue", "arity": word.operands.get("arity"), "children": word.operands.get("children", [])}
-    if k == "REF16" and word.operands.get("mode") == 0x20:
-        return {"pop": 0, "push": 1, "role": "literal_ref16_offset"}
-    if k in VALUE_WORDS:
-        return {"pop": 0, "push": 1, "role": role}
-    return {"pop": 0, "push": 0, "role": role}
+        base.update({
+            "role": "abi_prologue",
+            "arity": word.operands.get("arity"),
+            "children": word.operands.get("children", []),
+            "stack_effect_rule": "aggregate_prologue_declares_abi_not_operand_frame_value",
+        })
+        return base
+    if k == "BARE_U32":
+        base.update({
+            "role": "auxiliary_literal_payload",
+            "auxiliary_literal": True,
+            "value": word.operands.get("value"),
+            "follower_kind": word.operands.get("follower_kind"),
+            "stack_effect_rule": "bare_u32_is_follower_payload_not_stack_value",
+        })
+        return base
+    if is_lower_operand_atom(word):
+        atom_role = "literal_ref16_offset" if k == "REF16" and word.operands.get("mode") == 0x20 else "lower_operand_atom"
+        base.update({
+            "role": atom_role,
+            "operand_frame_atom": True,
+            "stack_effect_rule": "decoded_value_shape_is_local_operand_frame_atom_not_persistent_stack_value",
+        })
+        return base
+    base["stack_effect_rule"] = "vm_word_has_no_persistent_stack_effect"
+    return base

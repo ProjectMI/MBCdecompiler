@@ -8,12 +8,13 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .parser import FunctionEntry, MBCModule, TableRecord
-from .vm_spec import VMWord, branch_target_offset, decode_words, stack_contract, word_role
+from .vm_spec import VMWord, branch_target_offset, decode_words, word_role
 from .control import build_control_graph
+from .dataflow import analyze_stack_dataflow
 from .semantic import classify_branch
 
 
-IR_CONTRACT_VERSION = "vm-ir-v8"
+IR_CONTRACT_VERSION = "vm-ir-v19"
 VMIR_CONTRACT_VERSION = IR_CONTRACT_VERSION
 CALL_REL_BIAS = -4
 
@@ -36,34 +37,6 @@ class VMCallTarget:
 
 
 @dataclass(frozen=True)
-class VMStackEvent:
-    word_index: int
-    offset: int
-    role: str
-    pop: Optional[int]
-    push: int
-    depth_before: Optional[int]
-    depth_after: Optional[int]
-    underflow: bool = False
-    note: Optional[str] = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class VMBasicBlock:
-    id: str
-    start_offset: int
-    end_offset: int
-    word_indices: list[int]
-    successors: list[str]
-    terminator: Optional[dict[str, Any]] = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
 @dataclass
 class VMFunctionIR:
     name: str
@@ -74,7 +47,7 @@ class VMFunctionIR:
     body_selection: dict[str, Any]
     abi: dict[str, Any]
     words: list[VMWord]
-    stack_events: list[VMStackEvent]
+    dataflow: dict[str, Any]
     calls: list[dict[str, Any]]
     cfg: dict[str, Any]
     diagnostics: dict[str, Any]
@@ -90,7 +63,7 @@ class VMFunctionIR:
             "body_selection": self.body_selection,
             "abi": self.abi,
             "words": [w.to_dict() for w in self.words],
-            "stack_events": [e.to_dict() for e in self.stack_events],
+            "dataflow": self.dataflow,
             "calls": self.calls,
             "cfg": self.cfg,
             "diagnostics": self.diagnostics,
@@ -104,13 +77,14 @@ class VMModuleIR:
     callable_index: dict[str, Any]
     functions: list[VMFunctionIR]
 
-    def to_dict(self, *, include_words: bool = True) -> dict[str, Any]:
+    def to_dict(self, *, include_words: bool = True, include_dataflow: bool = True) -> dict[str, Any]:
         functions: list[dict[str, Any]] = []
         for fn in self.functions:
             payload = fn.to_dict()
             if not include_words:
                 payload.pop("words", None)
-                payload.pop("stack_events", None)
+            if not include_dataflow:
+                payload.pop("dataflow", None)
             functions.append(payload)
         return {
             "contract": VMIR_CONTRACT_VERSION,
@@ -341,76 +315,6 @@ def infer_abi(words: list[VMWord]) -> dict[str, Any]:
     }
 
 
-def simulate_stack(words: list[VMWord]) -> tuple[list[VMStackEvent], dict[str, Any]]:
-    depth: Optional[int] = 0
-    min_depth = 0
-    max_depth = 0
-    underflows = 0
-    unknown_transfers = 0
-    events: list[VMStackEvent] = []
-    for word in words:
-        contract = stack_contract(word)
-        pop = contract.get("pop")
-        push = int(contract.get("push", 0) or 0)
-        before = depth
-        after: Optional[int] = None
-        underflow = False
-        note: Optional[str] = None
-        if depth is None or pop is None:
-            unknown_transfers += 1
-            after = None
-            note = "unknown stack transfer; preserved for later VM predicate analysis"
-        else:
-            pop_i = int(pop)
-            if depth < pop_i:
-                underflow = True
-                underflows += 1
-                note = "linear stack underflow; not promoted to function argument"
-                depth = 0
-            else:
-                depth -= pop_i
-            depth += push
-            after = depth
-            min_depth = min(min_depth, depth)
-            max_depth = max(max_depth, depth)
-        events.append(
-            VMStackEvent(
-                word_index=word.index,
-                offset=word.offset,
-                role=str(contract.get("role", word_role(word))),
-                pop=pop if pop is None else int(pop),
-                push=push,
-                depth_before=before,
-                depth_after=after,
-                underflow=underflow,
-                note=note,
-            )
-        )
-    summary = {
-        "underflow_count": underflows,
-        "unknown_transfer_count": unknown_transfers,
-        "min_depth": min_depth,
-        "max_depth": max_depth,
-        "final_depth": depth,
-        "policy": "stack diagnostics never create source-level function parameters",
-    }
-    return events, summary
-
-
-def _branch_target_candidates(function_start: int, word: VMWord, valid_offsets: set[int]) -> list[dict[str, Any]]:
-    """Compatibility helper: expose VM-spec branch target observations.
-
-    New code should consume ``control.build_control_graph``.  The helper uses
-    the terminal-op operand-base invariant and no longer reports aligned repair
-    candidates from the old word-start model.
-    """
-
-    from .control import resolve_branch_target
-
-    resolution = resolve_branch_target(word, function_start=function_start, valid_offsets=valid_offsets)
-    return [c.to_dict() for c in resolution.exact_candidates + resolution.aligned_candidates]
-
-
 def build_cfg(words: list[VMWord], *, function_start: int, raw: bytes | None = None) -> dict[str, Any]:
     """Build byte/sub-entry control facts using the independent control layer."""
 
@@ -436,7 +340,6 @@ def build_function_ir(
     if callable_index is None:
         callable_index = build_callable_index(mod)
     abi = infer_abi(words)
-    stack_events, stack_summary = simulate_stack(words)
     calls: list[dict[str, Any]] = []
     unresolved_calls = 0
     for word in words:
@@ -463,6 +366,8 @@ def build_function_ir(
                 "target": {"target_name": f"syscall_{word.operands.get('opid')}", "target_kind": "native", "resolved": True},
             })
     cfg = build_cfg(words, function_start=function_start, raw=raw)
+    dataflow_report = analyze_stack_dataflow(words, cfg=cfg, raw=raw, function_start=function_start)
+    dataflow = dataflow_report.to_dict()
     kind_hist = Counter(w.terminal_kind for w in words)
     prefix_hist = Counter(" ".join(f"0x{p:02X}" for p in w.prefixes) for w in words if w.prefixes)
     diagnostics = {
@@ -470,10 +375,10 @@ def build_function_ir(
         "unknown_word_count": kind_hist.get("UNKNOWN", 0),
                 "kind_histogram": dict(sorted(kind_hist.items())),
         "prefix_histogram": dict(sorted(prefix_hist.items())),
-        "stack": stack_summary,
+        "dataflow": dataflow.get("summary", {}),
         "unresolved_script_call_count": unresolved_calls,
         "policy": [
-            "No stack balancing result is promoted to source arity.",
+            "Stack/dataflow SSA is the only stack model exposed by IR; legacy linear stack simulator was removed.",
             "CALL63A arity is the encoded argc byte only.",
             "Externs are call targets, not synthetic local definitions.",
             "Control graph uses terminal-op operand-base branch targets and byte/sub-entry blocks; op 0x4A is a jump edge, while op 0x4B/0x4C/0x4D keep taken/fallthrough conditional edges.",
@@ -489,7 +394,7 @@ def build_function_ir(
         body_selection=selection,
         abi=abi,
         words=words,
-        stack_events=stack_events,
+        dataflow=dataflow,
         calls=calls,
         cfg=cfg,
         diagnostics=diagnostics,
@@ -524,61 +429,110 @@ def build_module_ir(
 
 
 def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
+    """Return a compact module-level summary for VM IR output."""
+
     funcs = list(functions)
-    kind_hist: Counter[str] = Counter()
-    unresolved_calls = 0
-    script_calls = 0
-    native_calls = 0
-    external_calls = 0
-    definition_calls = 0
-    unknown_words = 0
-    max_words = 0
-    stack_underflows = 0
+    word_kind_hist: Counter[str] = Counter()
     branch_status_hist: Counter[str] = Counter()
     branch_semantic_hist: Counter[str] = Counter()
     edge_kind_hist: Counter[str] = Counter()
-    proven_edges = 0
-    candidate_edges = 0
+    dataflow_anomaly_hist: Counter[str] = Counter()
+    dataflow_value_kind_hist: Counter[str] = Counter()
+    dataflow_operation_role_hist: Counter[str] = Counter()
+
+    totals = Counter({
+        "unknown_word_count": 0,
+        "script_call_count": 0,
+        "native_call_count": 0,
+        "resolved_definition_script_call_count": 0,
+        "resolved_external_script_call_count": 0,
+        "unresolved_script_call_count": 0,
+        "proven_control_edge_count": 0,
+        "candidate_control_edge_count": 0,
+        "dataflow_operation_count": 0,
+        "dataflow_value_count": 0,
+        "dataflow_phi_count": 0,
+        "dataflow_unknown_transfer_count": 0,
+        "dataflow_operation_underflow_count": 0,
+        "dataflow_join_depth_mismatch_count": 0,
+        "dataflow_unresolved_block_count": 0,
+        "dataflow_nonconverged_function_count": 0,
+    })
+    max_function_word_count = 0
+    max_stack_depth = 0
+    max_operand_frame_depth = 0
+
     for fn in funcs:
-        max_words = max(max_words, len(fn.words))
-        unknown_words += int(fn.diagnostics.get("unknown_word_count", 0) or 0)
-        stack_underflows += int(fn.diagnostics.get("stack", {}).get("underflow_count", 0) or 0)
+        max_function_word_count = max(max_function_word_count, len(fn.words))
+        totals["unknown_word_count"] += int(fn.diagnostics.get("unknown_word_count", 0) or 0)
+        word_kind_hist.update(word.terminal_kind for word in fn.words)
+
         cfg_summary = fn.cfg.get("summary", {}) if isinstance(fn.cfg, dict) else {}
         branch_status_hist.update(cfg_summary.get("branch_status_histogram", {}))
         branch_semantic_hist.update(cfg_summary.get("branch_semantic_kind_histogram", {}))
         edge_kind_hist.update(cfg_summary.get("edge_kind_histogram", {}))
-        proven_edges += int(cfg_summary.get("proven_edge_count", 0) or 0)
-        candidate_edges += int(cfg_summary.get("candidate_edge_count", 0) or 0)
-        for word in fn.words:
-            kind_hist[word.terminal_kind] += 1
+        totals["proven_control_edge_count"] += int(cfg_summary.get("proven_edge_count", 0) or 0)
+        totals["candidate_control_edge_count"] += int(cfg_summary.get("candidate_edge_count", 0) or 0)
+
+        df_summary = fn.dataflow.get("summary", {}) if isinstance(fn.dataflow, dict) else {}
+        totals["dataflow_operation_count"] += int(df_summary.get("operation_count", 0) or 0)
+        totals["dataflow_value_count"] += int(df_summary.get("value_count", 0) or 0)
+        totals["dataflow_phi_count"] += int(df_summary.get("phi_count", 0) or 0)
+        totals["dataflow_unknown_transfer_count"] += int(df_summary.get("unknown_transfer_count", 0) or 0)
+        totals["dataflow_operation_underflow_count"] += int(df_summary.get("operation_underflow_count", 0) or 0)
+        totals["dataflow_join_depth_mismatch_count"] += int(df_summary.get("join_depth_mismatch_count", 0) or 0)
+        totals["dataflow_unresolved_block_count"] += int(df_summary.get("unresolved_block_count", 0) or 0)
+        max_stack_depth = max(max_stack_depth, int(df_summary.get("max_stack_depth", 0) or 0))
+        max_operand_frame_depth = max(max_operand_frame_depth, int(df_summary.get("max_operand_frame_depth", 0) or 0))
+        if not df_summary.get("fixed_point_converged", True):
+            totals["dataflow_nonconverged_function_count"] += 1
+        dataflow_anomaly_hist.update(df_summary.get("anomaly_kind_histogram", {}))
+        dataflow_value_kind_hist.update(df_summary.get("value_kind_histogram", {}))
+        dataflow_operation_role_hist.update(df_summary.get("operation_role_histogram", {}))
+
         for call in fn.calls:
             if call.get("kind") == "native":
-                native_calls += 1
-            elif call.get("kind") == "script":
-                script_calls += 1
-                target = call.get("target") or {}
-                if not target.get("resolved"):
-                    unresolved_calls += 1
-                elif target.get("target_kind") == "external":
-                    external_calls += 1
-                elif target.get("target_kind") == "definition":
-                    definition_calls += 1
+                totals["native_call_count"] += 1
+                continue
+            if call.get("kind") != "script":
+                continue
+            totals["script_call_count"] += 1
+            target = call.get("target") or {}
+            if not target.get("resolved"):
+                totals["unresolved_script_call_count"] += 1
+            elif target.get("target_kind") == "external":
+                totals["resolved_external_script_call_count"] += 1
+            elif target.get("target_kind") == "definition":
+                totals["resolved_definition_script_call_count"] += 1
+
     return {
         "total_word_count": sum(len(fn.words) for fn in funcs),
-        "max_function_word_count": max_words,
-        "unknown_word_count": unknown_words,
-        "stack_underflow_diagnostic_count": stack_underflows,
-        "script_call_count": script_calls,
-        "native_call_count": native_calls,
-        "resolved_definition_script_call_count": definition_calls,
-        "resolved_external_script_call_count": external_calls,
-        "unresolved_script_call_count": unresolved_calls,
+        "max_function_word_count": max_function_word_count,
+        "unknown_word_count": totals["unknown_word_count"],
+        "script_call_count": totals["script_call_count"],
+        "native_call_count": totals["native_call_count"],
+        "resolved_definition_script_call_count": totals["resolved_definition_script_call_count"],
+        "resolved_external_script_call_count": totals["resolved_external_script_call_count"],
+        "unresolved_script_call_count": totals["unresolved_script_call_count"],
         "control_branch_status_histogram": dict(sorted(branch_status_hist.items())),
         "control_branch_semantic_kind_histogram": dict(sorted(branch_semantic_hist.items())),
         "control_edge_kind_histogram": dict(sorted(edge_kind_hist.items())),
-        "proven_control_edge_count": proven_edges,
-        "candidate_control_edge_count": candidate_edges,
-        "word_kind_histogram": dict(sorted(kind_hist.items())),
+        "proven_control_edge_count": totals["proven_control_edge_count"],
+        "candidate_control_edge_count": totals["candidate_control_edge_count"],
+        "dataflow_operation_count": totals["dataflow_operation_count"],
+        "dataflow_value_count": totals["dataflow_value_count"],
+        "dataflow_phi_count": totals["dataflow_phi_count"],
+        "dataflow_unknown_transfer_count": totals["dataflow_unknown_transfer_count"],
+        "dataflow_operation_underflow_count": totals["dataflow_operation_underflow_count"],
+        "dataflow_join_depth_mismatch_count": totals["dataflow_join_depth_mismatch_count"],
+        "dataflow_unresolved_block_count": totals["dataflow_unresolved_block_count"],
+        "dataflow_nonconverged_function_count": totals["dataflow_nonconverged_function_count"],
+        "dataflow_max_stack_depth": max_stack_depth,
+        "dataflow_max_operand_frame_depth": max_operand_frame_depth,
+        "dataflow_anomaly_kind_histogram": dict(sorted(dataflow_anomaly_hist.items())),
+        "dataflow_value_kind_histogram": dict(sorted(dataflow_value_kind_hist.items())),
+        "dataflow_operation_role_histogram": dict(sorted(dataflow_operation_role_hist.items())),
+        "word_kind_histogram": dict(sorted(word_kind_hist.items())),
     }
 
 
@@ -638,6 +592,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--text", type=Path, default=None, help="write readable VMIR text")
     parser.add_argument("--function", default=None, help="only emit one function")
     parser.add_argument("--no-words", action="store_true", help="omit word streams from JSON")
+    parser.add_argument("--no-dataflow", action="store_true", help="omit CFG-aware stack/dataflow SSA from JSON")
     parser.add_argument("--limit-functions", type=int, default=None)
     args = parser.parse_args(argv)
 
@@ -649,7 +604,7 @@ def _main(argv: Optional[list[str]] = None) -> int:
         text = render_function_text(fn)
     else:
         module_ir = build_module_ir(mod, limit_functions=args.limit_functions)
-        payload = module_ir.to_dict(include_words=not args.no_words)
+        payload = module_ir.to_dict(include_words=not args.no_words, include_dataflow=not args.no_dataflow)
         text = render_module_text(module_ir)
 
     if args.json:
