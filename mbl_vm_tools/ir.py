@@ -9,12 +9,13 @@ from typing import Any, Iterable, Optional
 
 from .parser import FunctionEntry, MBCModule, TableRecord
 from .vm_spec import VMWord, branch_target_offset, decode_words, word_role
+from .native import native_call_fact_for_word
 from .control import build_control_graph
 from .dataflow import analyze_stack_dataflow
 from .semantic import classify_branch
 
 
-IR_CONTRACT_VERSION = "vm-ir-v19"
+IR_CONTRACT_VERSION = "vm-ir-v21"
 VMIR_CONTRACT_VERSION = IR_CONTRACT_VERSION
 CALL_REL_BIAS = -4
 
@@ -36,7 +37,6 @@ class VMCallTarget:
         return asdict(self)
 
 
-@dataclass(frozen=True)
 @dataclass
 class VMFunctionIR:
     name: str
@@ -335,6 +335,11 @@ def build_function_ir(
     entry = mod.get_function_entry(entry_or_name) if isinstance(entry_or_name, str) else entry_or_name
     raw, selection = select_function_body_vmir(mod, entry)
     words = decode_words(raw)
+    native_facts_by_word = native_call_fact_for_word(
+        module_name=Path(mod.path).name,
+        function_name=entry.name,
+        words=words,
+    )
     span = selection.get("span") or {"start": 0, "end": 0}
     function_start = int(span.get("start", 0))
     if callable_index is None:
@@ -356,6 +361,8 @@ def build_function_ir(
                 "target": target.to_dict(),
             })
         elif word.terminal_kind == "CALL_NATIVE":
+            native_fact = native_facts_by_word.get(int(word.index))
+            native_payload = native_fact.to_dict() if native_fact is not None else None
             calls.append({
                 "word_index": word.index,
                 "offset": word.offset,
@@ -363,7 +370,16 @@ def build_function_ir(
                 "prefixes_hex": [f"0x{p:02X}" for p in word.prefixes],
                 "encoded_argc": int(word.operands.get("argc", 0) or 0),
                 "opid": word.operands.get("opid"),
-                "target": {"target_name": f"syscall_{word.operands.get('opid')}", "target_kind": "native", "resolved": True},
+                "category": native_fact.category if native_fact is not None else "unresolved_frame",
+                "category_name": native_fact.category_name if native_fact is not None else "unresolved operand-frame binding",
+                "native": native_payload,
+                "target": {
+                    "target_name": None,
+                    "target_kind": "native",
+                    "resolved": False,
+                    "opid_is_module_local_evidence": True,
+                    "reason": "CALL_NATIVE opid is script/module-local and is not a stable semantic target name",
+                },
             })
     cfg = build_cfg(words, function_start=function_start, raw=raw)
     dataflow_report = analyze_stack_dataflow(words, cfg=cfg, raw=raw, function_start=function_start)
@@ -373,7 +389,7 @@ def build_function_ir(
     diagnostics = {
         "word_count": len(words),
         "unknown_word_count": kind_hist.get("UNKNOWN", 0),
-                "kind_histogram": dict(sorted(kind_hist.items())),
+        "kind_histogram": dict(sorted(kind_hist.items())),
         "prefix_histogram": dict(sorted(prefix_hist.items())),
         "dataflow": dataflow.get("summary", {}),
         "unresolved_script_call_count": unresolved_calls,
@@ -381,6 +397,7 @@ def build_function_ir(
             "Stack/dataflow SSA is the only stack model exposed by IR; legacy linear stack simulator was removed.",
             "CALL63A arity is the encoded argc byte only.",
             "Externs are call targets, not synthetic local definitions.",
+            "Native calls expose VM-level operand-frame categories; native opid remains module-local evidence and is not emitted as a resolved syscall name.",
             "Control graph uses terminal-op operand-base branch targets and byte/sub-entry blocks; op 0x4A is a jump edge, while op 0x4B/0x4C/0x4D keep taken/fallthrough conditional edges.",
             "Parser v2 treats every definition-table record as an authoritative table entry; no parser-level sidecar suppression is applied.",
         ],
@@ -439,6 +456,7 @@ def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
     dataflow_anomaly_hist: Counter[str] = Counter()
     dataflow_value_kind_hist: Counter[str] = Counter()
     dataflow_operation_role_hist: Counter[str] = Counter()
+    native_category_hist: Counter[str] = Counter()
 
     totals = Counter({
         "unknown_word_count": 0,
@@ -493,6 +511,9 @@ def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
         for call in fn.calls:
             if call.get("kind") == "native":
                 totals["native_call_count"] += 1
+                native_category = call.get("category")
+                if native_category:
+                    native_category_hist[str(native_category)] += 1
                 continue
             if call.get("kind") != "script":
                 continue
@@ -532,6 +553,7 @@ def summarize_functions(functions: Iterable[VMFunctionIR]) -> dict[str, Any]:
         "dataflow_anomaly_kind_histogram": dict(sorted(dataflow_anomaly_hist.items())),
         "dataflow_value_kind_histogram": dict(sorted(dataflow_value_kind_hist.items())),
         "dataflow_operation_role_histogram": dict(sorted(dataflow_operation_role_hist.items())),
+        "native_call_category_histogram": dict(sorted(native_category_hist.items())),
         "word_kind_histogram": dict(sorted(word_kind_hist.items())),
     }
 
@@ -551,7 +573,10 @@ def render_function_text(fn: VMFunctionIR) -> str:
             target_name = target.get("target_name") or f"unresolved@{target.get('absolute_target')}"
             detail = f" argc={word.operands.get('argc')} -> {target_name} ({target.get('target_kind')})"
         elif word.terminal_kind == "CALL_NATIVE":
-            detail = f" argc={word.operands.get('argc')} -> syscall_{word.operands.get('opid')}"
+            call = next((c for c in fn.calls if c.get("word_index") == word.index), None)
+            category = (call or {}).get("category") or "unresolved_frame"
+            category_name = (call or {}).get("category_name") or category
+            detail = f" argc={word.operands.get('argc')} native={category} ({category_name}); opid={word.operands.get('opid')} evidence-only"
         elif word.terminal_kind == "BR":
             op = int(word.operands.get("op", -1) or -1)
             role = word_role(word)
