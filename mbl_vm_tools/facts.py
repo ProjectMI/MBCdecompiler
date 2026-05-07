@@ -10,7 +10,7 @@ from typing import Any, Optional
 from .ir import VMModuleIR, build_module_ir
 
 
-FACTS_CONTRACT_VERSION = "vm-facts-v3"
+FACTS_CONTRACT_VERSION = "vm-facts-v4"
 
 
 @dataclass(frozen=True)
@@ -31,7 +31,7 @@ class CallableFact:
 @dataclass(frozen=True)
 class CallSiteFact:
     caller: str
-    word_index: int
+    word_index: Optional[int]
     offset: int
     kind: str
     encoded_argc: int
@@ -65,95 +65,31 @@ class VMFactsReport:
         }
 
 
-CALC_PARAM_RECALC_EXCEPTION_ID = "calcparam_recalc_exposed_abi"
-
-
-def _definition_entry(fn: Any) -> dict[str, Any]:
-    selection = getattr(fn, "body_selection", {}) or {}
-    entry = selection.get("entry") if isinstance(selection, dict) else None
-    return entry if isinstance(entry, dict) else {}
-
-
-def _definition_record(fn: Any) -> dict[str, Any]:
-    record = _definition_entry(fn).get("definition_record")
-    return record if isinstance(record, dict) else {}
-
-
-def _definition_span(fn: Any) -> dict[str, int]:
-    span = getattr(fn, "span", {}) or {}
-    return span if isinstance(span, dict) else {}
-
-
-def _calcparam_recalc_exception(
-    *,
-    caller: str,
-    offset: int,
-    target_name: str,
-    encoded_argc: int,
-    target_abi_arity: int,
-    definitions_by_name: dict[str, Any],
-) -> Optional[dict[str, Any]]:
-    """Return a VM-observed ABI exception for the CalcParam/Recalc pair.
-
-    Corpus invariant: in exposed calculator modules, the definition-table record
-    ``CalcParam`` is a short sidecar immediately adjacent to ``Recalc``
-    (``CalcParam.b + 1 == Recalc.a``).  Calls into ``Recalc`` pass one encoded
-    argument even though the target's AGG0 prologue declares zero source
-    parameters.  This is not a parser or stack-model repair; it is preserved as
-    an explicit ABI fact exception.
-    """
-
-    if target_name != "Recalc" or encoded_argc != 1 or target_abi_arity != 0:
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
         return None
-
-    calc_param = definitions_by_name.get("CalcParam")
-    recalc = definitions_by_name.get("Recalc")
-    if calc_param is None or recalc is None:
+    try:
+        ivalue = int(value)
+    except Exception:
         return None
+    return ivalue if ivalue >= 0 else None
 
-    calc_record = _definition_record(calc_param)
-    recalc_record = _definition_record(recalc)
-    calc_span = _definition_span(calc_param)
-    recalc_span = _definition_span(recalc)
 
-    calc_end = calc_record.get("b")
-    recalc_start = recalc_record.get("a")
-    if calc_end is None or recalc_start is None:
-        calc_end = int(calc_span.get("end", -1)) - 1
-        recalc_start = int(recalc_span.get("start", -2))
-
-    if int(calc_end) + 1 != int(recalc_start):
-        return None
-
-    return {
-        "caller": caller,
-        "offset": offset,
-        "target": target_name,
-        "encoded_argc": encoded_argc,
-        "target_abi_arity": target_abi_arity,
-        "exception": CALC_PARAM_RECALC_EXCEPTION_ID,
-        "reason": "CalcParam sidecar is adjacent to Recalc; exposed CALL_SCRIPT passes one VM argument while Recalc declares AGG0 arity 0",
-        "evidence": {
-            "sidecar": "CalcParam",
-            "sidecar_span": dict(calc_span),
-            "target_span": dict(recalc_span),
-            "sidecar_record": dict(calc_record),
-            "target_record": dict(recalc_record),
-            "adjacency_rule": "CalcParam.b + 1 == Recalc.a",
-        },
-    }
+def _int_or(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
     definitions: dict[str, CallableFact] = {}
-    definitions_by_name: dict[str, Any] = {}
     observed: dict[tuple[str, str], Counter[int]] = defaultdict(Counter)
     call_counts: Counter[tuple[str, str]] = Counter()
     call_sites: list[CallSiteFact] = []
     abi_mismatches: list[dict[str, Any]] = []
-    abi_mismatch_exceptions: list[dict[str, Any]] = []
+
     for fn in module_ir.functions:
-        definitions_by_name[fn.name] = fn
         definitions[fn.name] = CallableFact(
             name=fn.name,
             kind="definition",
@@ -170,14 +106,14 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
             target = call.get("target") or {}
             target_name = str(target.get("target_name") or f"unresolved@{target.get('absolute_target')}")
             target_kind = str(target.get("target_kind") or "unresolved")
-            encoded_argc = int(call.get("encoded_argc", 0) or 0)
+            encoded_argc = _int_or(call.get("encoded_argc"), 0)
             resolved = bool(target.get("resolved"))
             observed[(target_name, target_kind)][encoded_argc] += 1
             call_counts[(target_name, target_kind)] += 1
             fact = CallSiteFact(
                 caller=fn.name,
-                word_index=int(call.get("word_index", -1)),
-                offset=int(call.get("offset", -1)),
+                word_index=_optional_int(call.get("word_index")),
+                offset=_int_or(call.get("offset"), -1),
                 kind="script",
                 encoded_argc=encoded_argc,
                 target_name=target_name,
@@ -188,44 +124,32 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
             if target_kind == "definition":
                 target_def = definitions.get(target_name)
                 abi_arity = target_def.abi_arity if target_def else None
-                if abi_arity is not None and abi_arity != encoded_argc:
-                    exception = _calcparam_recalc_exception(
-                        caller=fn.name,
-                        offset=fact.offset,
-                        target_name=target_name,
-                        encoded_argc=encoded_argc,
-                        target_abi_arity=int(abi_arity),
-                        definitions_by_name=definitions_by_name,
-                    )
-                    if exception is not None:
-                        abi_mismatch_exceptions.append(exception)
-                    else:
-                        abi_mismatches.append({
-                            "caller": fn.name,
-                            "offset": fact.offset,
-                            "target": target_name,
-                            "encoded_argc": encoded_argc,
-                            "target_abi_arity": abi_arity,
-                            "reason": "CALL_SCRIPT encoded argc differs from target AGG/AGG0 ABI arity",
-                        })
+                if abi_arity is not None and int(abi_arity) != encoded_argc:
+                    abi_mismatches.append({
+                        "caller": fn.name,
+                        "offset": fact.offset,
+                        "word_index": fact.word_index,
+                        "target": target_name,
+                        "encoded_argc": encoded_argc,
+                        "target_abi_arity": abi_arity,
+                        "reason": "CALL_SCRIPT encoded argc differs from the target VM ABI fact",
+                    })
 
     callables: list[CallableFact] = []
     seen: set[tuple[str, str]] = set()
     for name, defn in sorted(definitions.items()):
         key = (name, "definition")
         hist = {str(k): v for k, v in sorted(observed.get(key, Counter()).items())}
-        callables.append(
-            CallableFact(
-                name=defn.name,
-                kind=defn.kind,
-                abi_arity=defn.abi_arity,
-                source_kind=defn.source_kind,
-                is_exported=defn.is_exported,
-                span=defn.span,
-                observed_argc_histogram=hist,
-                call_count=call_counts.get(key, 0),
-            )
-        )
+        callables.append(CallableFact(
+            name=defn.name,
+            kind=defn.kind,
+            abi_arity=defn.abi_arity,
+            source_kind=defn.source_kind,
+            is_exported=defn.is_exported,
+            span=defn.span,
+            observed_argc_histogram=hist,
+            call_count=call_counts.get(key, 0),
+        ))
         seen.add(key)
 
     external_argc_observations: dict[str, dict[str, int]] = {}
@@ -236,19 +160,15 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
         hist = {str(k): v for k, v in sorted(hist_counter.items())}
         if kind == "external":
             external_argc_observations[name] = hist
-        callables.append(
-            CallableFact(
-                name=name,
-                kind=kind,
-                abi_arity=None,
-                observed_argc_histogram=hist,
-                call_count=call_counts.get(key, 0),
-            )
-        )
+        callables.append(CallableFact(
+            name=name,
+            kind=kind,
+            abi_arity=None,
+            observed_argc_histogram=hist,
+            call_count=call_counts.get(key, 0),
+        ))
 
-    mixed_external_argc = {
-        name: hist for name, hist in external_argc_observations.items() if len(hist) > 1
-    }
+    mixed_external_argc = {name: hist for name, hist in external_argc_observations.items() if len(hist) > 1}
     unresolved_calls = [site for site in call_sites if not site.resolved]
     summary = {
         "contract": FACTS_CONTRACT_VERSION,
@@ -258,11 +178,11 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
         "script_call_site_count": len(call_sites),
         "unresolved_script_call_site_count": len(unresolved_calls),
         "definition_abi_mismatch_count": len(abi_mismatches),
-        "definition_abi_mismatch_exception_count": len(abi_mismatch_exceptions),
-        "definition_abi_mismatch_raw_count": len(abi_mismatches) + len(abi_mismatch_exceptions),
+        "definition_abi_mismatch_exception_count": 0,
+        "definition_abi_mismatch_raw_count": len(abi_mismatches),
         "external_callable_count": sum(1 for c in callables if c.kind == "external"),
         "mixed_external_argc_count": len(mixed_external_argc),
-        "policy": "Facts report compares explicit VM call argc against explicit AGG/AGG0 ABI only; CalcParam/Recalc exposed ABI is reported as an explicit facts-layer exception, not as parser or stack repair.",
+        "policy": "Facts report compares explicit VM call argc against proven VM callable ABI facts; name-specific ABI exceptions are not accepted here.",
     }
     return VMFactsReport(
         contract=FACTS_CONTRACT_VERSION,
@@ -270,7 +190,7 @@ def build_facts(module_ir: VMModuleIR) -> VMFactsReport:
         callables=callables,
         call_sites=call_sites,
         abi_mismatches=abi_mismatches,
-        abi_mismatch_exceptions=abi_mismatch_exceptions,
+        abi_mismatch_exceptions=[],
         external_argc_observations=external_argc_observations,
     )
 

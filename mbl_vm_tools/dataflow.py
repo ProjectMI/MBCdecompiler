@@ -11,15 +11,16 @@ from .vm_spec import VMWord, decode_word_at, decode_words, is_lower_operand_atom
 from .control import VMControlGraph, build_control_graph
 
 
-DATAFLOW_CONTRACT_VERSION = "vm-stack-dataflow-ssa-v15"
+DATAFLOW_CONTRACT_VERSION = "vm-stack-dataflow-ssa-v17"
 MAX_SSA_VALUE_OPERANDS = 64
 
 DATAFLOW_POLICY = (
-    "Stack/dataflow SSA v15 consumes the lower operand/effect facts exposed by vm_spec instead of re-promoting decoded value shapes to persistent stack. "
+    "Stack/dataflow SSA v17 consumes the lower operand/effect facts exposed by vm_spec instead of re-promoting decoded value shapes to persistent stack. "
     "AGG/AGG0 are ABI prologues and are no longer operand-frame atoms. "
     "CALL_* owns the complete local lower operand frame: encoded argc selects the argv suffix, while any older frame prefix is call-side non-argv effect/operator input. "
     "Pending call-result candidates are demand-bound lower values: one candidate may satisfy all missing argv slots required by the next CALL consumer without being promoted to persistent SSA. "
-    "Residual uncertainty is reported as lower opcode/effect provenance, not post-join repair."
+    "Residual uncertainty is reported as lower opcode/effect provenance, not post-join repair. "
+    "Lower operand frames propagate across transparent CFG boundaries until an explicit lower-frame consumer or function boundary consumes/expires them. Conditional taken edges into prefixed/sub-entry CALL_* blocks transfer the branch predicate frame suffix required by the overlapping call entry; this is an edge-level VM rule, not an accepted argc deficit."
 )
 
 
@@ -352,6 +353,196 @@ def _flatten_frame_clauses(clauses: list[list[str]]) -> list[str]:
     return [value_id for clause in clauses for value_id in clause]
 
 
+def _dedupe_ordered(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _call_result_signature(result: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        result.get("producer_op"),
+        result.get("terminal_kind"),
+        result.get("offset"),
+        result.get("word_index"),
+        result.get("opid"),
+        result.get("encoded_argc"),
+    )
+
+
+def _empty_frame_state() -> dict[str, Any]:
+    return {
+        "clauses": [],
+        "pending_aux": [],
+        "pending_call_results": [],
+        "variant_count": 1,
+        "empty_variant": True,
+    }
+
+
+def _frame_state_from_parts(
+    clauses: list[list[str]],
+    pending_aux: list[str],
+    pending_call_results: list[dict[str, Any]],
+    *,
+    variant_count: int = 1,
+    empty_variant: Optional[bool] = None,
+) -> dict[str, Any]:
+    clean_clauses = [list(dict.fromkeys(str(v) for v in clause if str(v))) for clause in clauses if clause]
+    clean_aux = _dedupe_ordered(pending_aux)
+    clean_pending: list[dict[str, Any]] = []
+    seen_pending: set[tuple[Any, ...]] = set()
+    for result in pending_call_results:
+        payload = dict(result)
+        sig = _call_result_signature(payload)
+        if sig in seen_pending:
+            continue
+        seen_pending.add(sig)
+        clean_pending.append(payload)
+    has_payload = bool(clean_clauses or clean_aux or clean_pending)
+    return {
+        "clauses": clean_clauses,
+        "pending_aux": clean_aux,
+        "pending_call_results": clean_pending,
+        "variant_count": max(1, int(variant_count)),
+        "empty_variant": (not has_payload) if empty_variant is None else bool(empty_variant),
+    }
+
+
+def _clone_frame_state(state: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not state:
+        return _empty_frame_state()
+    return _frame_state_from_parts(
+        [list(clause) for clause in state.get("clauses") or []],
+        [str(v) for v in state.get("pending_aux") or []],
+        [dict(result) for result in state.get("pending_call_results") or []],
+        variant_count=int(state.get("variant_count", 1) or 1),
+        empty_variant=bool(state.get("empty_variant", False)),
+    )
+
+
+def _frame_state_has_payload(state: Optional[dict[str, Any]]) -> bool:
+    if not state:
+        return False
+    return bool(state.get("clauses") or state.get("pending_aux") or state.get("pending_call_results"))
+
+
+def _frame_state_signature(state: Optional[dict[str, Any]]) -> tuple[Any, ...]:
+    if not state:
+        state = _empty_frame_state()
+    return (
+        tuple(tuple(str(v) for v in clause) for clause in state.get("clauses") or []),
+        tuple(str(v) for v in state.get("pending_aux") or []),
+        tuple(_call_result_signature(dict(result)) for result in state.get("pending_call_results") or []),
+        bool(state.get("empty_variant", False)),
+    )
+
+
+def _merge_frame_states(*states: Optional[dict[str, Any]]) -> dict[str, Any]:
+    clauses: list[list[str]] = []
+    pending_aux: list[str] = []
+    pending_results: list[dict[str, Any]] = []
+    variant_count = 0
+    empty_variant = False
+    seen_clause_values: set[tuple[str, ...]] = set()
+    for state in states:
+        if state is None:
+            continue
+        clone = _clone_frame_state(state)
+        variant_count += int(clone.get("variant_count", 1) or 1)
+        empty_variant = empty_variant or bool(clone.get("empty_variant", False))
+        for clause in clone.get("clauses") or []:
+            cleaned = tuple(_dedupe_ordered(clause))
+            if not cleaned or cleaned in seen_clause_values:
+                continue
+            seen_clause_values.add(cleaned)
+            clauses.append(list(cleaned))
+        pending_aux.extend(str(v) for v in clone.get("pending_aux") or [])
+        pending_results.extend(dict(result) for result in clone.get("pending_call_results") or [])
+    if variant_count <= 0:
+        return _empty_frame_state()
+    return _frame_state_from_parts(
+        clauses,
+        pending_aux,
+        pending_results,
+        variant_count=variant_count,
+        empty_variant=empty_variant,
+    )
+
+
+def _edge_transferred_entry_state(
+    edge: dict[str, Any],
+    *,
+    normal_exit_state: dict[str, Any],
+    source_ops: list[VMSSAOperation],
+    target_words: list[VMWord],
+) -> dict[str, Any]:
+    """Return the lower-frame state that flows over one CFG edge.
+
+    Branch predicates are real lower operand-frame consumers.  There is one
+    byte-level exception that belongs here rather than in CALL arity repair:
+    when a conditional taken edge lands in a prefixed/sub-entry CALL_* block,
+    the overlapping CALL entry consumes the suffix of the branch predicate frame
+    carried by that taken edge.  Other edges receive the ordinary block exit
+    state.
+    """
+
+    if str(edge.get("kind")) != "conditional_taken" or not target_words:
+        return _clone_frame_state(normal_exit_state)
+    first = target_words[0]
+    if first.terminal_kind not in {"CALL_NATIVE", "CALL_SCRIPT"}:
+        return _clone_frame_state(normal_exit_state)
+    if _word_index_or_none(first) is not None or not first.prefixes:
+        return _clone_frame_state(normal_exit_state)
+    try:
+        argc = int(first.operands.get("argc", 0) or 0)
+    except Exception:
+        argc = 0
+    if argc <= 0:
+        return _clone_frame_state(normal_exit_state)
+    instruction_offset = edge.get("instruction_offset")
+    try:
+        instruction_offset = int(instruction_offset)
+    except Exception:
+        instruction_offset = None
+    branch_ops = [
+        op for op in source_ops
+        if op.terminal_kind == "BR" and (instruction_offset is None or int(op.offset) == instruction_offset)
+    ]
+    if not branch_ops:
+        return _clone_frame_state(normal_exit_state)
+    branch_inputs = list(branch_ops[-1].inputs or [])
+    if len(branch_inputs) < argc:
+        return _clone_frame_state(normal_exit_state)
+    argv_suffix = branch_inputs[-argc:]
+    return _frame_state_from_parts(
+        [argv_suffix],
+        [],
+        [],
+        empty_variant=False,
+    )
+
+
+def _frame_state_evidence(state: Optional[dict[str, Any]]) -> dict[str, Any]:
+    state = _clone_frame_state(state)
+    clauses = [list(c) for c in state.get("clauses") or []]
+    return {
+        "entry_frame_clause_count": _nonempty_clause_count(clauses),
+        "entry_frame_atom_count": _frame_atom_count(clauses),
+        "entry_auxiliary_value_count": len(state.get("pending_aux") or []),
+        "entry_pending_call_result_count": len(state.get("pending_call_results") or []),
+        "entry_frame_variant_count": int(state.get("variant_count", 1) or 1),
+        "entry_frame_has_empty_variant": bool(state.get("empty_variant", False)),
+        "entry_frame_transfer_rule": "lower_operand_frame_flows_across_transparent_cfg_edges_until_a_real_consumer",
+    }
+
+
 def _nonempty_clause_count(clauses: list[list[str]]) -> int:
     return sum(1 for clause in clauses if clause)
 
@@ -482,8 +673,10 @@ def _transfer_block(
     *,
     block_id: str,
     block_words: list[VMWord],
-) -> list[VMSSAOperation]:
-    """Transfer one block using the v14 lower operand provenance model.
+    initial_frame_state: Optional[dict[str, Any]] = None,
+    report_open_frame_at_exit: bool = True,
+) -> tuple[list[VMSSAOperation], dict[str, Any]]:
+    """Transfer one block using the v16 lower operand-frame propagation model.
 
     Raw value-like atoms enter local operand-frame clauses.  A prefix-chain containing
     byte 0x30 starts a lower call/effect clause; this is not an argc rule.  CALL_*
@@ -494,12 +687,14 @@ def _transfer_block(
     without promoting call return arity to persistent SSA.
     """
 
-    clauses: list[list[str]] = []
-    clause_has_30_marker: list[bool] = []
-    clause_first_shape: list[Optional[str]] = []
-    pending_aux: list[str] = []
-    pending_call_results: list[dict[str, Any]] = []
+    initial_state = _clone_frame_state(initial_frame_state)
+    clauses: list[list[str]] = [list(clause) for clause in initial_state.get("clauses") or []]
+    clause_has_30_marker: list[bool] = [False for _ in clauses]
+    clause_first_shape: list[Optional[str]] = [None for _ in clauses]
+    pending_aux: list[str] = [str(v) for v in initial_state.get("pending_aux") or []]
+    pending_call_results: list[dict[str, Any]] = [dict(result) for result in initial_state.get("pending_call_results") or []]
     operations: list[VMSSAOperation] = []
+    initial_state_has_payload = _frame_state_has_payload(initial_state)
 
     def update_frame_max() -> None:
         ctx.max_operand_frame_depth = max(
@@ -528,21 +723,10 @@ def _transfer_block(
         return clauses[-1]
 
     def start_new_clause(word: VMWord, ordinal: int) -> None:
-        nonlocal pending_call_results, pending_aux
-        if pending_aux:
-            ctx.anomaly(VMDataflowAnomaly(
-                id=f"auxiliary_literal_unbound_by_clause_boundary:{block_id}:{int(word.offset):04x}:{ordinal}",
-                kind="auxiliary_literal_unbound_by_clause_boundary",
-                block=block_id,
-                offset=int(word.offset),
-                word_index=_word_index_or_none(word),
-                detail={
-                    "auxiliary_value_count": len(pending_aux),
-                    "prefixes_hex": [f"0x{int(p):02X}" for p in word.prefixes],
-                    "reason": "bare literal payload reached a clause boundary before a follower atom",
-                },
-            ))
-            pending_aux = []
+        _ = (word, ordinal)
+        # A 0x30 prefix starts a lower operand/effect clause, but it is not a
+        # boundary that invalidates a pending bare-u32 payload.  The payload still
+        # belongs to the following operand atom or CALL consumer.
         begin_clause(has_30_marker=True)
 
     def materialize_pending_call_results(word: VMWord, binding: str, consumer_kind: str) -> None:
@@ -650,6 +834,8 @@ def _transfer_block(
         outputs: list[str] = []
         op_id = f"op_{_safe_id_part(block_id)}_{int(word.offset):04x}_{ordinal}"
         contract = dict(base_contract)
+        if ordinal == 0 and initial_state_has_payload:
+            contract.update(_frame_state_evidence(initial_state))
         _append_prefix_evidence(contract, word)
 
         prefixes = [int(p) for p in word.prefixes]
@@ -707,14 +893,6 @@ def _transfer_block(
             pending_result_argc_pop = consume_pending_call_results_for_deficit(word, raw_argc_deficit, word.terminal_kind)
             argc_deficit = max(0, raw_argc_deficit - pending_result_argc_pop)
             subentry_argc_deficit = 0
-            if argc_deficit and _word_index_or_none(word) is None and word.prefixes:
-                # A prefixed/sub-entry decoded CALL is an overlapping VM entry
-                # context exposed by control.py.  Its lower frame is owned by the
-                # incoming entry edge / overlapping top-level word context, not by
-                # the local block prefix accumulated from word_start decoding.
-                # Do not report this as a local argv deficit.
-                subentry_argc_deficit = argc_deficit
-                argc_deficit = 0
             non_arg_frame_values, unexplained_frame_values, non_arg_clause_count, prefixed_call_non_arg_atom_count = split_non_arg_call_clauses(call_has_prefix=bool(word.prefixes))
             remaining_atom_count = _frame_atom_count(clauses)
             remaining_clause_count = _nonempty_clause_count(clauses)
@@ -786,7 +964,7 @@ def _transfer_block(
                 "call_argument_binding_rule": "call_consumes_encoded_argc_suffix_of_lower_operand_frame",
                 "call_non_arg_binding_rule": "call_owns_complete_local_lower_frame_prefix_as_non_argv_effect_or_operator_inputs",
                 "call_boundary_rule": "unexplained_surplus_prefix_is_archived_as_lower_provenance_not_carried_to_next_consumer",
-                "subentry_call_frame_rule": "prefixed_subentry_call_argc_belongs_to_overlapping_entry_context" if subentry_argc_deficit else None,
+                "subentry_call_frame_rule": "conditional_taken_edge_transfers_overlapping_prefixed_call_argv_suffix" if _word_index_or_none(word) is None and word.prefixes and consumed_atom_count else None,
                 "stack_effect_rule": "call_consumes_encoded_argc_suffix_binds_remaining_frame_prefix_and_uses_demand_bound_pending_call_result_for_argc_deficits",
             })
             if word.terminal_kind == "CALL_NATIVE":
@@ -903,34 +1081,27 @@ def _transfer_block(
                 note=None,
             )
         )
-    if pending_call_results:
-        _record_pending_call_results(
-            ctx,
-            block_id=block_id,
-            pending_call_results=pending_call_results,
-            binding="open_at_block_exit",
-            consumer_word=None,
-            consumer_kind="block_exit",
-            detail_extra={
-                "successor_boundary": True,
-                "reason": "block ended before the pending call result candidate was either consumed or discarded",
-            },
-        )
-    if clauses or pending_aux or pending_call_results:
-        ctx.anomaly(VMDataflowAnomaly(
-            id=f"operand_frame_open_at_block_exit:{block_id}",
-            kind="operand_frame_open_at_block_exit",
-            block=block_id,
-            detail={
-                "frame_clause_count": _nonempty_clause_count(clauses),
-                "frame_atom_count": _frame_atom_count(clauses),
-                "auxiliary_value_count": len(pending_aux),
-                "pending_call_result_count": len(pending_call_results),
-                "reason": "block ended before a local operand-frame consumer; frame is not promoted to persistent CFG stack",
-            },
-        ))
+    final_state = _frame_state_from_parts(clauses, pending_aux, pending_call_results)
+    if report_open_frame_at_exit and _frame_state_has_payload(final_state):
+        if pending_call_results:
+            _record_pending_call_results(
+                ctx,
+                block_id=block_id,
+                pending_call_results=pending_call_results,
+                binding="discarded_at_function_exit",
+                consumer_word=None,
+                consumer_kind="function_exit",
+                detail_extra={
+                    "function_exit_boundary": True,
+                    "discarded_lower_frame_candidate": True,
+                    "reason": "function ended before the pending call result candidate was consumed; demand-bound candidate expires at function exit",
+                },
+            )
+        # Residual lower-frame atoms at a structural function boundary are not
+        # promoted into model facts and are not expression diagnostics.  They have
+        # no consumer, so the frame expires at the VM function boundary.
 
-    return operations
+    return operations, final_state
 
 
 # ---------------------------------------------------------------------------
@@ -976,6 +1147,7 @@ def analyze_stack_dataflow(
     block_order = {str(b.get("id")): idx for idx, b in enumerate(blocks)}
     successors: dict[str, set[str]] = defaultdict(set)
     predecessors: dict[str, set[str]] = defaultdict(set)
+    proven_edges_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
     edge_kind_hist: Counter[str] = Counter()
     for edge in edges:
         if str(edge.get("status", "proven")) == "candidate":
@@ -986,6 +1158,7 @@ def analyze_stack_dataflow(
             continue
         successors[src].add(dst)
         predecessors[dst].add(src)
+        proven_edges_by_source[src].append(dict(edge))
         edge_kind_hist[str(edge.get("kind", "unknown"))] += 1
 
     entries = _entry_blocks(blocks, predecessors)
@@ -995,40 +1168,81 @@ def analyze_stack_dataflow(
     words_by_offset = {int(w.offset): w for w in words}
     decoded_by_block = {str(b.get("id")): _decode_block_words(b, words_by_offset, raw_bytes) for b in blocks}
 
-    ctx = _SSAContext()
+    entry_states: dict[str, dict[str, Any]] = {bid: _empty_frame_state() for bid in entries}
+    exit_states: dict[str, dict[str, Any]] = {}
     reached_blocks: set[str] = set()
-    operations_by_block: dict[str, list[VMSSAOperation]] = {}
 
     q: deque[str] = deque(entries)
     queued = set(entries)
     iteration = 0
-    limit = max_iterations if max_iterations is not None else max(1, len(blocks))
+    limit = max_iterations if max_iterations is not None else max(1, len(blocks) * 4)
     converged = True
 
+    # First pass: compute lower operand-frame entry states independently from
+    # persistent SSA.  This pass is intentionally used only for propagation; its
+    # temporary observations are discarded before the final report is built.
     while q:
         block_id = q.popleft()
         queued.discard(block_id)
-        if block_id in reached_blocks or block_id not in block_by_id:
+        if block_id not in block_by_id:
             continue
         iteration += 1
         if iteration > limit:
             converged = False
-            ctx.anomaly(VMDataflowAnomaly(
-                id="dataflow_traversal_limit",
-                kind="dataflow_traversal_limit",
-                detail={"iteration_limit": limit, "queued_block_count": len(q) + 1},
-            ))
             break
         reached_blocks.add(block_id)
-        operations_by_block[block_id] = _transfer_block(
+        dry_ctx = _SSAContext()
+        _ops, exit_state = _transfer_block(
+            dry_ctx,
+            block_id=block_id,
+            block_words=decoded_by_block.get(block_id, []),
+            initial_frame_state=entry_states.get(block_id),
+            report_open_frame_at_exit=False,
+        )
+        exit_states[block_id] = exit_state
+        outgoing_edges = sorted(
+            proven_edges_by_source.get(block_id, []),
+            key=lambda edge: block_order.get(str(edge.get("target")), 10**9),
+        )
+        for edge in outgoing_edges:
+            succ = str(edge.get("target"))
+            transfer_state = _edge_transferred_entry_state(
+                edge,
+                normal_exit_state=exit_state,
+                source_ops=_ops,
+                target_words=decoded_by_block.get(succ, []),
+            )
+            old_state = entry_states.get(succ)
+            new_state = _merge_frame_states(old_state, transfer_state) if old_state is not None else _clone_frame_state(transfer_state)
+            if old_state is None or _frame_state_signature(new_state) != _frame_state_signature(old_state):
+                entry_states[succ] = new_state
+                if succ not in queued:
+                    q.append(succ)
+                    queued.add(succ)
+
+    ctx = _SSAContext()
+    if not converged:
+        ctx.anomaly(VMDataflowAnomaly(
+            id="dataflow_traversal_limit",
+            kind="dataflow_traversal_limit",
+            detail={"iteration_limit": limit, "queued_block_count": len(q)},
+        ))
+
+    operations_by_block: dict[str, list[VMSSAOperation]] = {}
+    final_exit_states: dict[str, dict[str, Any]] = {}
+    for block in blocks:
+        block_id = str(block.get("id"))
+        if block_id not in reached_blocks:
+            continue
+        ops, exit_state = _transfer_block(
             ctx,
             block_id=block_id,
             block_words=decoded_by_block.get(block_id, []),
+            initial_frame_state=entry_states.get(block_id),
+            report_open_frame_at_exit=not bool(successors.get(block_id)),
         )
-        for succ in sorted(successors.get(block_id, set()), key=lambda bid: block_order.get(bid, 10**9)):
-            if succ not in reached_blocks and succ not in queued:
-                q.append(succ)
-                queued.add(succ)
+        operations_by_block[block_id] = ops
+        final_exit_states[block_id] = exit_state
 
     # Any disconnected block that was not discovered from an entry is reported.
     unresolved_blocks = [bid for bid in block_by_id if bid not in reached_blocks]
@@ -1091,13 +1305,16 @@ def analyze_stack_dataflow(
         binding = str(detail.get("binding"))
         key = f"{source_kind}:{binding}"
         call_result_binding_hist[key] += 1
-        is_open = binding == "open_at_block_exit"
-        is_observed = binding != "open_at_block_exit"
+        is_open = binding in {"open_at_block_exit", "open_at_function_exit"}
+        is_discarded = binding in {"discarded_at_function_exit"}
+        is_observed = not is_open and not is_discarded
         if source_kind == "CALL_NATIVE":
             native_call_result_open_count += 1 if is_open else 0
+            native_call_result_discarded_count += 1 if is_discarded else 0
             native_call_result_bound_count += 1 if is_observed else 0
         elif source_kind == "CALL_SCRIPT":
             script_call_result_open_count += 1 if is_open else 0
+            script_call_result_discarded_count += 1 if is_discarded else 0
             script_call_result_bound_count += 1 if is_observed else 0
     native_call_result_candidate_count = sum(
         1 for op in all_operations
@@ -1115,6 +1332,7 @@ def analyze_stack_dataflow(
     pending_call_result_argv_candidate_count = sum(int(op.contract.get("frame_pending_call_result_argc_pop", 0) or 0) for op in all_operations)
     raw_argc_deficit_count = sum(int(op.contract.get("frame_raw_argc_deficit", 0) or 0) for op in all_operations)
     final_argc_deficit_count = sum(int(op.contract.get("frame_argc_deficit", 0) or 0) for op in all_operations)
+    subentry_argc_deficit_deferred_count = sum(int(op.contract.get("frame_subentry_argc_deficit_deferred", 0) or 0) for op in all_operations)
     prefix_frame_operator_hist = Counter()
     call_frame_balance_hist = Counter()
     for op in all_operations:
@@ -1160,6 +1378,7 @@ def analyze_stack_dataflow(
         "pending_call_result_argv_candidate_count": pending_call_result_argv_candidate_count,
         "raw_argc_deficit_count": raw_argc_deficit_count,
         "final_argc_deficit_count": final_argc_deficit_count,
+        "subentry_argc_deficit_deferred_count": subentry_argc_deficit_deferred_count,
         "prefix_frame_operator_histogram": dict(sorted(prefix_frame_operator_hist.items())),
         "call_operand_frame_balance_histogram_top": dict(call_frame_balance_hist.most_common(32)),
         "call_operation_count": len(call_ops),
@@ -1224,7 +1443,7 @@ def _module_dataflow_payload(module_path: Path, *, function: Optional[str] = Non
         for key in [
             "operation_count", "value_count", "phi_count", "join_depth_mismatch_count", "operation_underflow_count",
             "unknown_transfer_count", "call_operation_count", "native_call_operation_count", "script_call_operation_count",
-            "subentry_operation_count", "unresolved_block_count", "native_return_deferred_count",
+            "subentry_operation_count", "subentry_argc_deficit_deferred_count", "unresolved_block_count", "native_return_deferred_count",
             "unresolved_predicate_stack_effect_count", "terminal_return_payload_deferred_count",
             "join_depth_mismatch_observation_count",
         ]:

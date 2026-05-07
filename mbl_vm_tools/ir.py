@@ -8,14 +8,14 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .parser import FunctionEntry, MBCModule, TableRecord
-from .vm_spec import VMWord, branch_target_offset, decode_words, word_role
+from .vm_spec import VMWord, branch_target_offset, decode_word_at, decode_words, word_role
 from .native import native_call_fact_for_word
 from .control import build_control_graph
 from .dataflow import analyze_stack_dataflow
 from .semantic import classify_branch
 
 
-IR_CONTRACT_VERSION = "vm-ir-v21"
+IR_CONTRACT_VERSION = "vm-ir-v22"
 VMIR_CONTRACT_VERSION = IR_CONTRACT_VERSION
 CALL_REL_BIAS = -4
 
@@ -315,6 +315,77 @@ def infer_abi(words: list[VMWord]) -> dict[str, Any]:
     }
 
 
+
+
+def _definition_sidecar_callable_abi(mod: MBCModule, entry: FunctionEntry) -> Optional[dict[str, Any]]:
+    """Infer callable ABI from an adjacent definition-table sidecar record.
+
+    This is a byte/table rule, not a symbol-name exception: the previous
+    definition record must end immediately before the callable body, its body
+    must be exactly ``BR +2; END`` (``4A 02 00 23``), and its ``c`` flag must be
+    in class ``0x0200``.  The low byte of ``c`` is the callable arity.
+    """
+
+    rec = entry.definition_record
+    if rec is None:
+        return None
+    definitions = sorted(getattr(mod, "definitions", []) or [], key=lambda item: (int(item.a), int(item.b), item.name))
+    prev = None
+    for idx, candidate in enumerate(definitions):
+        if candidate is rec or (candidate.name == rec.name and int(candidate.a) == int(rec.a) and int(candidate.b) == int(rec.b)):
+            prev = definitions[idx - 1] if idx > 0 else None
+            break
+    if prev is None:
+        return None
+    if int(prev.b) + 1 != int(rec.a):
+        return None
+    try:
+        sidecar_raw = mod._slice_code_span(int(prev.a), int(prev.b) + 1)
+    except Exception:
+        return None
+    if sidecar_raw != b"\x4A\x02\x00\x23":
+        return None
+    flag = int(prev.c) & 0xFFFF
+    if (flag & 0xFF00) != 0x0200:
+        return None
+    arity = flag & 0x00FF
+    return {
+        "source": "definition_table_sidecar",
+        "arity": arity,
+        "params": [
+            {"index": idx, "tag": None, "ref": None, "slot": f"arg{idx}", "source": "definition_table_sidecar"}
+            for idx in range(arity)
+        ],
+        "sidecar_record": prev.to_dict(),
+        "target_record": rec.to_dict(),
+        "sidecar_raw_hex": sidecar_raw.hex(" "),
+        "sidecar_rule": "previous_definition_record_adjacent_br_plus_2_end_low_flag_byte_is_callable_arity",
+        "sidecar_flag": flag,
+        "sidecar_flag_class": flag & 0xFF00,
+    }
+
+
+def _apply_definition_sidecar_abi(abi: dict[str, Any], sidecar: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not sidecar:
+        return abi
+    sidecar_arity = int(sidecar.get("arity", 0) or 0)
+    current_arity = abi.get("arity")
+    if current_arity == sidecar_arity and abi.get("source") not in {"none", None}:
+        merged = dict(abi)
+        merged["definition_sidecar"] = dict(sidecar)
+        return merged
+    return {
+        "source": "definition_table_sidecar",
+        "arity": sidecar_arity,
+        "params": list(sidecar.get("params") or []),
+        "prologue_source": abi.get("source"),
+        "prologue_arity": current_arity,
+        "prologue_params": list(abi.get("params") or []),
+        "prologue_word_index": abi.get("prologue_word_index"),
+        "raw_arity": abi.get("raw_arity"),
+        "definition_sidecar": dict(sidecar),
+    }
+
 def build_cfg(words: list[VMWord], *, function_start: int, raw: bytes | None = None) -> dict[str, Any]:
     """Build byte/sub-entry control facts using the independent control layer."""
 
@@ -344,7 +415,7 @@ def build_function_ir(
     function_start = int(span.get("start", 0))
     if callable_index is None:
         callable_index = build_callable_index(mod)
-    abi = infer_abi(words)
+    abi = _apply_definition_sidecar_abi(infer_abi(words), _definition_sidecar_callable_abi(mod, entry))
     calls: list[dict[str, Any]] = []
     unresolved_calls = 0
     for word in words:
@@ -383,6 +454,47 @@ def build_function_ir(
             })
     cfg = build_cfg(words, function_start=function_start, raw=raw)
     dataflow_report = analyze_stack_dataflow(words, cfg=cfg, raw=raw, function_start=function_start)
+
+    # Linear decode covers word-start CALLs.  The CFG/dataflow layer may also
+    # expose executable prefixed/sub-entry CALL_SCRIPT operations with
+    # ``word_index is None``.  Resolve their targets here, in IR, so higher
+    # layers do not reimplement call-target semantics.
+    subentry_script_call_count = 0
+    subentry_unresolved_script_call_count = 0
+    known_script_offsets = {int(call.get("offset")) for call in calls if call.get("kind") == "script" and call.get("offset") is not None}
+    for op in dataflow_report.operations:
+        if op.terminal_kind != "CALL_SCRIPT" or op.word_index is not None:
+            continue
+        try:
+            offset = int(op.offset)
+        except Exception:
+            continue
+        if offset in known_script_offsets:
+            continue
+        try:
+            word = decode_word_at(raw, offset, index=-1)
+        except Exception:
+            continue
+        if word.terminal_kind != "CALL_SCRIPT":
+            continue
+        target = resolve_call_target(mod, callable_index, function_start=function_start, word=word)
+        if not target.resolved:
+            unresolved_calls += 1
+            subentry_unresolved_script_call_count += 1
+        subentry_script_call_count += 1
+        known_script_offsets.add(offset)
+        calls.append({
+            "word_index": None,
+            "offset": word.offset,
+            "kind": "script",
+            "source": "dataflow_subentry_operation",
+            "operation_id": op.id,
+            "block": op.block,
+            "prefixes_hex": [f"0x{p:02X}" for p in word.prefixes],
+            "encoded_argc": int(word.operands.get("argc", 0) or 0),
+            "target": target.to_dict(),
+        })
+
     dataflow = dataflow_report.to_dict()
     kind_hist = Counter(w.terminal_kind for w in words)
     prefix_hist = Counter(" ".join(f"0x{p:02X}" for p in w.prefixes) for w in words if w.prefixes)
@@ -393,6 +505,8 @@ def build_function_ir(
         "prefix_histogram": dict(sorted(prefix_hist.items())),
         "dataflow": dataflow.get("summary", {}),
         "unresolved_script_call_count": unresolved_calls,
+        "subentry_script_call_count": subentry_script_call_count,
+        "subentry_unresolved_script_call_count": subentry_unresolved_script_call_count,
         "policy": [
             "Stack/dataflow SSA is the only stack model exposed by IR; legacy linear stack simulator was removed.",
             "CALL63A arity is the encoded argc byte only.",
@@ -400,6 +514,7 @@ def build_function_ir(
             "Native calls expose VM-level operand-frame categories; native opid remains module-local evidence and is not emitted as a resolved syscall name.",
             "Control graph uses terminal-op operand-base branch targets and byte/sub-entry blocks; op 0x4A is a jump edge, while op 0x4B/0x4C/0x4D keep taken/fallthrough conditional edges.",
             "Parser v2 treats every definition-table record as an authoritative table entry; no parser-level sidecar suppression is applied.",
+            "Definition-table sidecar ABI is resolved in IR when the adjacent byte/table rule is proven; this is not a facts-layer name exception.",
         ],
     }
     return VMFunctionIR(
