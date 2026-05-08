@@ -94,6 +94,22 @@ def branch_target_offset(word: VMWord) -> int:
     return branch_operand_base_offset(word) + signed_u16(int(word.operands.get("off", 0) or 0))
 
 
+def code_ref_target_offset(word: VMWord) -> int:
+    """Resolve a CODE_REF target in local function byte/sub-entry coordinates."""
+
+    if word.terminal_kind != "CODE_REF":
+        raise ValueError("code_ref_target_offset requires a CODE_REF word")
+    return terminal_atom_offset(word) + 1 + int(word.operands.get("rel", 0) or 0)
+
+
+def call_script_target_offset(word: VMWord) -> int:
+    """Resolve a CALL_SCRIPT target in local module/function coordinates."""
+
+    if word.terminal_kind != "CALL_SCRIPT":
+        raise ValueError("call_script_target_offset requires a CALL_SCRIPT word")
+    return terminal_atom_offset(word) + 3 + int(word.operands.get("rel", 0) or 0)
+
+
 @dataclass(frozen=True)
 class DecodedAtom:
     kind: str
@@ -118,7 +134,7 @@ STRUCTURAL_MARK_OPS = {
 }
 
 PREFIX_ALLOWED_ATOMIC: dict[int, set[str]] = {
-    0x21: {"BR", "CALL_SCRIPT"},
+    0x21: {"BR", "CALL_NATIVE", "CALL_SCRIPT"},
     0x25: {"IMM8", "IMM16", "CALL_NATIVE", "BR"},
     0x26: {"REF", "CALL_NATIVE", "IMM8", "IMM16", "IMM32", "CALL_SCRIPT"},
     0x2A: {"REF", "IMM8", "IMM16", "CALL_NATIVE", "U16", "F32"},
@@ -146,7 +162,7 @@ PREFIX_ALLOWED_ATOMIC: dict[int, set[str]] = {
 }
 
 PREFIX_ALLOWED_NESTED: dict[int, set[int]] = {
-    0x21: {0x3D},
+    0x21: {0x3D, 0xE8},
     0x25: {0x3D},
     0x26: {0x72, 0x3D},
     0x2A: {0x2B, 0x2D, 0x2E, 0x2F, 0x3A, 0x3C, 0x3D, 0x3E, 0x60, 0x72, 0xE1, 0xF0},
@@ -163,7 +179,7 @@ PREFIX_ALLOWED_NESTED: dict[int, set[int]] = {
     0x60: {0x3D},
     0x72: {0x30, 0x32, 0x72, 0xF1},
     0xE1: {0xE8, 0xEB},
-    0xE8: {0x3D, 0xEB},
+    0xE8: {0x3D, 0xEB, 0x21, 0xE8},
     0xEC: {0xE8, 0xEB},
     0xED: {0xE8, 0xEB},
     0xEB: {0x72, 0xE8},
@@ -353,20 +369,75 @@ def _bare_u32_follower_kind(data: bytes, start: int, limit: int) -> str | None:
     return None
 
 
+def _is_structural_single_entry(data: bytes, offset: int, limit: int) -> bool:
+    """Return True when ``offset`` is a valid one-byte structural VM entry."""
+
+    atom = _match_structural_single(data, offset, limit)
+    return atom is not None and atom.kind in {"MARK", "NOP", "END"}
+
+
+def _decodes_as_explicit_transfer_entry(data: bytes, start: int, limit: int) -> bool:
+    """Return True when ``start`` begins an explicit non-structural VM entry.
+
+    Untagged scalar payloads are the weakest parse form in this decoder.  A
+    tagged/prefixed call, branch, return, or code reference starts a real VM
+    entry and therefore takes precedence over a preceding untagged u32 parse.
+    """
+
+    prefixed = _match_prefixed(data, start, limit)
+    if prefixed is not None:
+        atom, _prefixes = prefixed
+        return atom.kind not in {"MARK", "NOP", "END", "UNKNOWN"}
+    atom = _match_atomic(data, start, limit)
+    if atom is not None:
+        return atom.kind in {"BR", "CALL_NATIVE", "CALL_SCRIPT", "CODE_REF", "RETURN_PAIR"}
+    return False
+
+
+def _bare_u32_has_shorter_explicit_parse(data: bytes, start: int, limit: int) -> bool:
+    """Return True when explicit VM entries outrank an untagged u32 parse.
+
+    ``BARE_U32`` is an untagged scalar operand.  It is accepted only when the
+    four bytes do not already form a shorter explicit entry sequence.  The rule
+    keeps the precedence order inside the bytecode grammar: structural entries
+    plus tagged/prefixed transfer entries are stronger than an untagged scalar
+    that is recognized only by looking ahead to its follower.
+    """
+
+    if start + 4 > limit:
+        return False
+
+    for inner in range(start + 1, min(start + 4, limit)):
+        prefix = range(start, inner)
+        if all(_is_structural_single_entry(data, j, limit) for j in prefix):
+            if _decodes_as_explicit_transfer_entry(data, inner, limit):
+                return True
+
+    # A dense non-zero run is not a scalar by default.  If every byte can begin
+    # an explicit entry, the explicit bytecode parse wins over the untagged
+    # follower-literal parse.  Zero-containing runs remain valid small scalar
+    # payloads such as 00 01 00 00, 30 00 00 00, and 5e 5b 04 00.
+    if all(data[j] != 0 for j in range(start, start + 4)):
+        return all(
+            _is_structural_single_entry(data, j, limit)
+            or _decodes_as_explicit_transfer_entry(data, j, limit)
+            for j in range(start, start + 4)
+        )
+
+    return False
+
+
 def _match_bare_u32(data: bytes, start: int, limit: int) -> DecodedAtom | None:
     """Match VM bare 32-bit literal words.
 
     Several bytecode forms encode a u32 value without a leading opcode and then
     immediately use it as the base literal for a following record/ref/call word.
-    This is a generic VM word shape, not a per-function signature.
+    Because it has no tag byte, it is matched after explicit/prefixed entries and
+    loses to any shorter explicit-entry parse inside the same four-byte window.
     """
     if start + 4 > limit:
         return None
-    # 0x31 and 0x7C are high-confidence structural bytes in this corpus.
-    # Treating 31 30 <word> or 7C 4A xx xx / 7C 7C 7C 7C as bare u32
-    # hides real marker/prefix/jump atoms and creates false overlap landings.
-    # Other apparent bare literals such as 48 00 00 00 remain allowed.
-    if data[start] in {0x31, 0x7C}:
+    if _bare_u32_has_shorter_explicit_parse(data, start, limit):
         return None
     follower = _bare_u32_follower_kind(data, start + 4, limit)
     if follower not in BARE_U32_FOLLOWER_KINDS:

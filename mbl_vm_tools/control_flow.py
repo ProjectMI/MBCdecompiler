@@ -11,6 +11,7 @@ from .vm_spec import (
     VMWord,
     branch_operand_base_offset,
     branch_target_offset,
+    code_ref_target_offset,
     decode_word_at,
     decode_words,
     is_control_branch_word,
@@ -21,7 +22,7 @@ from .vm_spec import (
 
 RETURN_TERMINALS = {"RETURN_PAIR", "END"}
 BRANCH_TERMINAL = "BR"
-UNCONDITIONAL_BRANCH_OP = None  # corpus evidence: 0x4A also has fallthrough semantics
+UNCONDITIONAL_BRANCH_OP = None  # all BR opcodes are modeled with fallthrough at CFG level
 NORMAL_TARGET_RELATIONS = {"linear_boundary", "prefix_byte_entry", "terminal_atom_entry"}
 OVERLAP_TARGET_RELATIONS = {
     "aggregate_overlap_entry",
@@ -30,6 +31,10 @@ OVERLAP_TARGET_RELATIONS = {
     "operand_payload_overlap_entry",
     "payload_overlap_entry",
 }
+
+STRUCTURAL_TERMINALS = {"MARK", "NOP"}
+IMPORTANT_ROLES = {"branch", "call", "return", "unknown", "predicate_no_transfer"}
+FORMAT_MODES = ("flow", "branches", "full")
 
 
 @dataclass(frozen=True)
@@ -385,7 +390,7 @@ def build_function_cfg(
 
         try:
             word = decode_word_at(body, offset, limit=body_size, index=len(nodes_raw))
-        except Exception as exc:  # pragma: no cover - defensive guard for unknown corpus shapes
+        except Exception as exc:  # pragma: no cover - defensive decoder boundary
             issues.append(
                 CFGIssue(
                     severity="error",
@@ -430,7 +435,7 @@ def build_function_cfg(
             if is_control_branch_word(word):
                 try:
                     target = branch_target_offset(word)
-                except Exception as exc:  # pragma: no cover - defensive guard
+                except Exception as exc:  # pragma: no cover - defensive decoder boundary
                     issues.append(
                         CFGIssue(
                             severity="error",
@@ -525,6 +530,57 @@ def build_function_cfg(
                     edge_buckets[offset].append(edge)
                     worklist.append(next_offset)
             continue
+
+        if word.terminal_kind == "CODE_REF":
+            try:
+                target = code_ref_target_offset(word)
+            except Exception as exc:  # pragma: no cover - defensive decoder boundary
+                issues.append(
+                    CFGIssue(
+                        severity="error",
+                        code="code_ref_target_resolution_error",
+                        offset=offset,
+                        message=str(exc),
+                        details=word_to_dict(word),
+                    )
+                )
+                target = None
+            if target is not None:
+                relation = classify_entry_offset(target, body_size, span_map, linear_starts)
+                target_kind = _decode_target_kind(body, target)
+                if target < 0 or target >= body_size:
+                    issues.append(
+                        CFGIssue(
+                            severity="error",
+                            code="code_ref_target_out_of_range",
+                            offset=offset,
+                            target=target,
+                            message=f"CODE_REF target {target} is outside function body size {body_size}.",
+                            details={"relation": relation.to_dict()},
+                        )
+                    )
+                elif target_kind is None or target_kind.endswith("UNKNOWN"):
+                    issues.append(
+                        CFGIssue(
+                            severity="error",
+                            code="code_ref_target_decodes_unknown",
+                            offset=offset,
+                            target=target,
+                            message="CODE_REF target is in-range, but decoding at the exact target is UNKNOWN.",
+                            details={"relation": relation.to_dict(), "target_decoded_kind": target_kind},
+                        )
+                    )
+                edge = CFGEdge(
+                    src=offset,
+                    dst=target if 0 <= target < body_size else None,
+                    kind="code_ref",
+                    target_relation=relation.relation,
+                    target_decoded_kind=target_kind,
+                )
+                edges.append(edge)
+                edge_buckets[offset].append(edge)
+                if 0 <= target < body_size:
+                    worklist.append(target)
 
         if next_offset < body_size:
             relation = classify_entry_offset(next_offset, body_size, span_map, linear_starts)
@@ -754,10 +810,35 @@ def _module_summary_lines(report: ModuleCFGReport) -> list[str]:
     return lines
 
 
-def format_function_cfg(cfg: FunctionCFG) -> str:
+def _should_show_formatted_word(
+    word: VMWord,
+    *,
+    mode: str,
+    has_label: bool,
+    has_non_next_edges: bool,
+    is_alt: bool,
+) -> bool:
+    if mode not in FORMAT_MODES:
+        raise ValueError(f"unknown format mode: {mode!r}")
+    if mode == "full":
+        return True
+
+    role = word_role(word)
+    if mode == "branches":
+        return has_label or has_non_next_edges or role in IMPORTANT_ROLES
+
+    # flow mode keeps the readable control-flow stream while suppressing plain
+    # structural padding.  Structural entries are still shown when they are CFG
+    # labels, branch targets, or non-linear alternate entries.
+    if word.terminal_kind in STRUCTURAL_TERMINALS and not (has_label or has_non_next_edges or is_alt):
+        return False
+    return True
+
+
+def format_function_cfg(cfg: FunctionCFG, *, mode: str = "flow") -> str:
     label_sources: defaultdict[int, list[str]] = defaultdict(list)
     for edge in cfg.edges:
-        if edge.kind.startswith("branch") and edge.dst is not None:
+        if edge.dst is not None and edge.kind != "next":
             label_sources[edge.dst].append(f"from {edge.src:04X}:{edge.kind}:{edge.target_relation}")
     label_sources[0].append("entry")
 
@@ -787,11 +868,25 @@ def format_function_cfg(cfg: FunctionCFG) -> str:
 
     linear_by_offset = {int(word.offset): word for word in cfg.linear_words}
     span_map, linear_starts = _build_linear_span_map(cfg.linear_words)
+    skipped = 0
     for offset in sorted_offsets:
         word = cfg.nodes[offset].word if offset in cfg.nodes and offset not in linear_by_offset else linear_by_offset[offset]
         is_alt = offset in cfg.nodes and offset not in linear_by_offset
         node = cfg.nodes.get(offset)
         labels = label_sources.get(offset, [])
+        non_next_edges = [edge for edge in node.edges if edge.kind != "next"] if node and node.edges else []
+        if not _should_show_formatted_word(
+            word,
+            mode=mode,
+            has_label=bool(labels),
+            has_non_next_edges=bool(non_next_edges),
+            is_alt=is_alt,
+        ):
+            skipped += 1
+            continue
+        if skipped:
+            lines.append(f"      ... {skipped} structural entries omitted")
+            skipped = 0
         label_text = f"L{offset:04X}:" if labels else "      "
         alt_text = "@ALT " if is_alt else "     "
         raw = _hex_raw(word.raw)
@@ -799,10 +894,8 @@ def format_function_cfg(cfg: FunctionCFG) -> str:
         relation = node.relation.relation if node is not None else classify_entry_offset(offset, cfg.body_size, span_map, linear_starts).relation
         relation_text = f" [{relation}]" if is_alt or relation != "linear_boundary" else ""
         edge_text = ""
-        if node and node.edges:
-            non_next_edges = [edge for edge in node.edges if edge.kind != "next"]
-            if non_next_edges:
-                edge_text = "  ; " + " | ".join(_format_edge(edge) for edge in non_next_edges)
+        if non_next_edges:
+            edge_text = "  ; " + " | ".join(_format_edge(edge) for edge in non_next_edges)
         source_text = ""
         if labels:
             source_text = "  ; labels=" + ", ".join(labels[:4])
@@ -811,6 +904,8 @@ def format_function_cfg(cfg: FunctionCFG) -> str:
         lines.append(
             f"{label_text} {alt_text}{offset:04X}-{offset + word.size:04X} {raw_pad} {format_word_concise(word)}{relation_text}{edge_text}{source_text}"
         )
+    if skipped:
+        lines.append(f"      ... {skipped} structural entries omitted")
     lines.append("")
     return "\n".join(lines)
 
@@ -820,6 +915,7 @@ def format_module_report(
     *,
     include_all_functions: bool = False,
     include_functions_without_branches: bool = False,
+    mode: str = "flow",
 ) -> str:
     lines = _module_summary_lines(report)
     selected: list[FunctionCFG] = []
@@ -831,7 +927,7 @@ def format_module_report(
         elif include_functions_without_branches and cfg.branch_count_linear == 0:
             selected.append(cfg)
 
-    lines.append(f"# emitted_functions={len(selected)} (use include_all_functions=True for a full token stream)\n")
+    lines.append(f"# emitted_functions={len(selected)} mode={mode} (use include_all_functions=True for a full token stream)\n")
     for cfg in selected:
-        lines.append(format_function_cfg(cfg))
+        lines.append(format_function_cfg(cfg, mode=mode))
     return "\n".join(lines)

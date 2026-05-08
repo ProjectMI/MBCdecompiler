@@ -14,8 +14,10 @@ MAGIC_HEADER = b"MBL script v4.0\x00"
 FIXED_CODE_BASE = 0x20
 MAX_INTER_RECORD_ZERO_RUN = 16
 SYMBOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{1,63}$")
-PARSER_CONTRACT_VERSION = "mbc-parser-v2"
+PARSER_CONTRACT_VERSION = "mbc-parser-v3"
 TABLE_ANCHOR_SYNC_WINDOW = 32
+INITIAL_SLOT_SIZE = 5
+INITIAL_SLOT_BYTES = b"\x67\x04\x00\x00\x00"
 
 
 
@@ -105,9 +107,9 @@ class FunctionEntry:
     """
     Stable analysis entry point built from definitions and exports.
 
-    Definitions carry exact code spans; exports carry public API order.  The
-    VM IR pipeline consumes this de-duplicated view so default corpus runs can
-    cover local definitions without doing the same exported definition twice.
+    Definition records give the function entry point and a nominal closed range.
+    The real owned bytecode range ends at the next definition start; CFG/CODE_REF
+    resolution decides which entries inside that owned range are executable.
     """
 
     name: str
@@ -135,6 +137,34 @@ class FunctionEntry:
             "duplicate_export_symbol": self.duplicate_export_symbol,
             "definition_record": self.definition_record.to_dict() if self.definition_record else None,
             "export_record": self.export_record.to_dict() if self.export_record else None,
+        }
+
+
+@dataclass(frozen=True)
+class InitialSlotEntry:
+    """One fixed-width pre-definition slot used by CALL_SCRIPT extern calls."""
+
+    slot_index: int
+    offset: int
+    size: int
+    name: str
+    table_kind: str
+    table_index: int
+    record: TableRecord
+    raw: bytes
+    valid: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "slot_index": self.slot_index,
+            "offset": self.offset,
+            "size": self.size,
+            "name": self.name,
+            "table_kind": self.table_kind,
+            "table_index": self.table_index,
+            "record": self.record.to_dict(),
+            "raw_hex": self.raw.hex(" "),
+            "valid": self.valid,
         }
 
 
@@ -620,6 +650,8 @@ class MBCModule:
         self._function_entries: list[FunctionEntry] = []
         self._function_entry_by_name: dict[str, FunctionEntry] = {}
         self._build_function_entries()
+        self._initial_slot_entries: list[InitialSlotEntry] = []
+        self._build_initial_slot_entries()
 
     def _build_function_entries(self) -> None:
         definition_occurrences: Counter[str] = Counter()
@@ -780,19 +812,117 @@ class MBCModule:
     def get_definition_records(self, name: str) -> list[TableRecord]:
         return list(self._definition_records_by_name.get(name, []))
 
+    def _definition_record_index(self, rec: TableRecord) -> Optional[int]:
+        for idx, candidate in enumerate(self.definitions):
+            if candidate is rec or candidate == rec:
+                return idx
+        return None
+
+    def _next_definition_start_after_index(self, idx: int) -> int:
+        code_limit = self.get_real_code_size()
+        if idx + 1 < len(self.definitions):
+            return max(0, min(int(self.definitions[idx + 1].a), code_limit))
+        return code_limit
+
+    def _slot_source_records(self) -> list[tuple[str, int, TableRecord]]:
+        records: list[tuple[str, int, TableRecord]] = []
+        records.extend(("globals", i, rec) for i, rec in enumerate(self.globals))
+        records.extend(("embedded_import_like_exports", i, rec) for i, rec in enumerate(self.embedded_import_like_exports))
+        return records
+
+    def get_first_definition_offset(self) -> int:
+        code_limit = self.get_real_code_size()
+        if not self.definitions:
+            return 0
+        return max(0, min(min(int(rec.a) for rec in self.definitions), code_limit))
+
+    def get_initial_slot_table_span(self) -> tuple[int, int]:
+        return 0, self.get_first_definition_offset()
+
+    def _build_initial_slot_entries(self) -> None:
+        self._initial_slot_entries.clear()
+        start, end = self.get_initial_slot_table_span()
+        if start != 0 or end <= 0:
+            return
+        for slot_index, (table_kind, table_index, record) in enumerate(self._slot_source_records()):
+            offset = slot_index * INITIAL_SLOT_SIZE
+            raw = self._slice_code_span(offset, min(offset + INITIAL_SLOT_SIZE, end))
+            valid = (
+                offset + INITIAL_SLOT_SIZE <= end
+                and int(record.a) == offset
+                and int(record.b) == 0xFFFFFFFF
+                and int(record.c) == 0
+                and raw == INITIAL_SLOT_BYTES
+            )
+            self._initial_slot_entries.append(InitialSlotEntry(
+                slot_index=slot_index,
+                offset=offset,
+                size=INITIAL_SLOT_SIZE,
+                name=record.name,
+                table_kind=table_kind,
+                table_index=table_index,
+                record=record,
+                raw=raw,
+                valid=valid,
+            ))
+
+    @property
+    def initial_slots(self) -> list[InitialSlotEntry]:
+        return list(self._initial_slot_entries)
+
+    def initial_slot_for_offset(self, offset: int) -> Optional[InitialSlotEntry]:
+        if offset < 0 or offset % INITIAL_SLOT_SIZE != 0:
+            return None
+        index = offset // INITIAL_SLOT_SIZE
+        if 0 <= index < len(self._initial_slot_entries):
+            return self._initial_slot_entries[index]
+        return None
+
+    def initial_slot_for_name(self, name: str) -> Optional[InitialSlotEntry]:
+        for slot in self._initial_slot_entries:
+            if slot.name == name:
+                return slot
+        return None
+
+    def validate_initial_slot_table(self) -> dict:
+        start, end = self.get_initial_slot_table_span()
+        data = self._slice_code_span(start, end) if end > start else b""
+        records = self._slot_source_records()
+        repeated = bool(data) and len(data) % INITIAL_SLOT_SIZE == 0 and all(
+            data[i:i + INITIAL_SLOT_SIZE] == INITIAL_SLOT_BYTES
+            for i in range(0, len(data), INITIAL_SLOT_SIZE)
+        )
+        return {
+            "span": (start, end),
+            "slot_size": INITIAL_SLOT_SIZE,
+            "slot_bytes_hex": INITIAL_SLOT_BYTES.hex(" "),
+            "initial_bytes": len(data),
+            "slot_count_from_bytes": len(data) // INITIAL_SLOT_SIZE if len(data) % INITIAL_SLOT_SIZE == 0 else None,
+            "slot_record_count": len(records),
+            "first_definition_equals_5x_records": end == INITIAL_SLOT_SIZE * len(records),
+            "all_initial_bytes_are_repeated_slot_pattern": repeated,
+            "all_slots_valid": all(slot.valid for slot in self._initial_slot_entries),
+        }
+
     def get_real_code_size(self) -> int:
         real_limit = max(0, len(self.data) - self.code_base)
         if self.code_size:
             return min(self.code_size, real_limit)
         return real_limit
 
-    def get_definition_record_code_span_with_reason(self, rec: TableRecord) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+    def get_definition_record_nominal_code_span_with_reason(self, rec: TableRecord) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        """Return the closed span stored in the definition table as an open interval.
+
+        This is the historical ``a .. b+1`` range.  It is intentionally exposed
+        for diagnostics only: corpus evidence shows that it may cut the last VM
+        word or omit CODE_REF-owned local code labels.
+        """
         if rec.b < rec.a:
             return None, "definition_inverted"
 
         code_limit = self.get_real_code_size()
-        start = max(0, rec.a)
-        end = rec.b + 1
+        start = max(0, int(rec.a))
+        end = int(rec.b) + 1
         if start >= code_limit:
             return None, "definition_start_oob"
         if end > code_limit:
@@ -800,6 +930,36 @@ class MBCModule:
         if end <= start:
             return None, "definition_empty"
         return (start, end), None
+
+    def get_definition_record_code_span_with_reason(self, rec: TableRecord) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        """Return the real code range owned by a definition.
+
+        Definition ``a`` is the function entry.  Definition ``b`` is a nominal
+        range marker, not a hard body terminator.  The owned range ends at the
+        next definition entry or at the end of the code segment.
+        """
+        nominal, reason = self.get_definition_record_nominal_code_span_with_reason(rec)
+        if nominal is None:
+            return None, reason
+        idx = self._definition_record_index(rec)
+        if idx is None:
+            return None, "definition_record_not_in_table"
+        start, nominal_end = nominal
+        end = self._next_definition_start_after_index(idx)
+        if end < nominal_end:
+            return None, "definition_next_start_before_nominal_end"
+        if end <= start:
+            return None, "definition_empty"
+        return (start, end), None
+
+    def get_function_nominal_code_span_with_reason(self, entry: FunctionEntry | str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        if isinstance(entry, str):
+            entry = self.get_function_entry(entry)
+        if entry.definition_record is None:
+            if entry.symbol in self._definition_records_by_name:
+                return self.get_export_nominal_code_span_with_reason(entry.symbol)
+            return None, "definition_missing"
+        return self.get_definition_record_nominal_code_span_with_reason(entry.definition_record)
 
     def get_function_exact_code_span_with_reason(self, entry: FunctionEntry | str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
         if isinstance(entry, str):
@@ -809,6 +969,14 @@ class MBCModule:
                 return self.get_export_exact_code_span_with_reason(entry.symbol)
             return None, "definition_missing"
         return self.get_definition_record_code_span_with_reason(entry.definition_record)
+
+    def get_export_nominal_code_span_with_reason(self, name: str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
+        definition_records = self.get_definition_records(name)
+        if not definition_records:
+            return None, "definition_missing"
+        if len(definition_records) > 1:
+            return None, "definition_ambiguous"
+        return self.get_definition_record_nominal_code_span_with_reason(definition_records[0])
 
     def get_export_exact_code_span_with_reason(self, name: str) -> tuple[Optional[tuple[int, int]], Optional[str]]:
         definition_records = self.get_definition_records(name)
@@ -881,6 +1049,8 @@ class MBCModule:
             "globals": [r.to_dict() for r in self.globals],
             "exports": [r.to_dict() for r in self.exports],
             "function_entries": [entry.to_dict() for entry in self._function_entries],
+            "initial_slot_table": self.validate_initial_slot_table(),
+            "initial_slots": [slot.to_dict() for slot in self._initial_slot_entries],
             "embedded_import_like_exports": [r.to_dict() for r in self.embedded_import_like_exports],
             "definition_name_collisions": {
                 name: [record.to_dict() for record in records]

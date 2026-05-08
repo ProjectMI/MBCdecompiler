@@ -1,43 +1,57 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from mbl_vm_tools.branch_model import (
-    BASE_MODELS,
-    BRANCH_SEMANTICS_CHOICES,
-    BRANCH_SEMANTICS_CONSERVATIVE,
-    BRANCH_SEMANTICS_STRICT,
+from mbl_vm_tools.control_flow import (
     CFGEdge,
+    CFGIssue,
     FunctionCFG,
-    branch_base_audit_for_module,
-    branch_op_name,
-    build_cfg_for_function,
-    classify_target_landing,
-    compare_4a_semantics_for_module,
-    normalize_branch_semantics,
-    validate_cfg,
+    ModuleCFGReport,
+    analyze_module,
+    FORMAT_MODES,
 )
-from mbl_vm_tools.parser import FunctionEntry, MBCModule
-from mbl_vm_tools.vm_spec import VMWord, branch_target_offset, decode_words, is_control_branch_word, signed_u16, word_role
+from mbl_vm_tools.parser import MBCModule
+from mbl_vm_tools.vm_spec import (
+    VMWord,
+    branch_operand_base_offset,
+    code_ref_target_offset,
+    signed_u16,
+    word_role,
+)
 
 
 STRUCTURAL_TERMINALS = {"MARK", "NOP"}
 IMPORTANT_ROLES = {"branch", "call", "return", "unknown", "predicate_no_transfer"}
+BRANCH_OP_NAMES = {
+    0x4A: "BR_4A",
+    0x4B: "BR_4B",
+    0x4C: "BR_4C",
+    0x4D: "BR_4D",
+}
+
+
+ISSUE_CODES_HIDDEN_BY_DEFAULT = {"cfg_uncovered_bytes"}
+OVERLAP_RELATIONS = {
+    "aggregate_overlap_entry",
+    "bare_u32_overlap_entry",
+    "literal_payload_overlap_entry",
+    "operand_payload_overlap_entry",
+    "payload_overlap_entry",
+}
 
 
 def resolve_script_path(script: str | Path, *, root: Optional[Path] = None) -> Path:
-    """Resolve a script name against the project layout.
+    """Resolve an MBC script name against the usual project/corpus layout.
 
     Intended use from project root:
         python -m mbl_vm_tools.dump_branch_flow _main
 
-    Search order keeps the user's requested spelling first, then tries the
-    conventional ``mbc/`` directory. Names may be passed with or without the
-    ``.mbc`` suffix.
+    Search order keeps the requested spelling first, then tries the conventional
+    ``mbc/`` directory. Names may be passed with or without the ``.mbc`` suffix.
     """
 
     root = Path.cwd() if root is None else Path(root)
@@ -54,17 +68,16 @@ def resolve_script_path(script: str | Path, *, root: Optional[Path] = None) -> P
     if raw.is_absolute() or raw.parent != Path("."):
         search_roots = [Path(""), root, root / "mbc", package_root / "mbc"]
     else:
-        # For a bare script name, prefer the project layout described by the
-        # corpus: scripts live in mbc/, tools live in mbl_vm_tools/.
         search_roots = [root / "mbc", root, package_root / "mbc", Path("")]
+
     for name in stem_candidates:
         if name.is_absolute():
             names.append(name)
-        else:
-            for base in search_roots:
-                candidate = base / name
-                if candidate not in names:
-                    names.append(candidate)
+            continue
+        for base in search_roots:
+            candidate = base / name
+            if candidate not in names:
+                names.append(candidate)
 
     for candidate in names:
         if candidate.exists() and candidate.is_file():
@@ -91,18 +104,8 @@ def signed(value: int) -> str:
     return f"{int(value):+d}"
 
 
-def _compact_value(value: Any) -> str:
-    if isinstance(value, int):
-        if abs(value) > 9999:
-            return f"{value}"
-        return str(value)
-    if isinstance(value, float):
-        return f"{value:g}"
-    if isinstance(value, list):
-        return f"[{len(value)}]"
-    if isinstance(value, dict):
-        return "{...}"
-    return str(value)
+def branch_op_name(op: int) -> str:
+    return BRANCH_OP_NAMES.get(int(op) & 0xFF, f"BR_0x{int(op) & 0xFF:02X}")
 
 
 def summarize_word(word: VMWord, *, include_raw: bool = False) -> str:
@@ -114,9 +117,11 @@ def summarize_word(word: VMWord, *, include_raw: bool = False) -> str:
     if term == "BR":
         op = int(operands.get("op", -1) or -1) & 0xFF
         off = signed_u16(int(operands.get("off", 0) or 0))
-        parts.append(f"{branch_op_name(op)} off={signed(off)}")
+        parts.append(f"{branch_op_name(op)} off={signed(off)} base={hx(branch_operand_base_offset(word))}")
     elif term == "CALL_NATIVE":
-        parts.append(f"argc={operands.get('argc')} opid={operands.get('opid')}")
+        opid = operands.get("opid")
+        opid_s = f"0x{int(opid):02X}" if isinstance(opid, int) else str(opid)
+        parts.append(f"argc={operands.get('argc')} opid={opid_s}")
     elif term == "CALL_SCRIPT":
         parts.append(f"argc={operands.get('argc')} rel={signed(int(operands.get('rel', 0) or 0))}")
     elif term in {"REF", "REF16"}:
@@ -138,100 +143,38 @@ def summarize_word(word: VMWord, *, include_raw: bool = False) -> str:
         if "op" in operands:
             parts.append(f"op=0x{int(operands.get('op')):02X}")
     elif term == "F32":
-        parts.append(f"value={operands.get('value')}")
+        value = operands.get("value")
+        bits = operands.get("bits")
+        suffix = f" bits=0x{int(bits):08X}" if isinstance(bits, int) else ""
+        parts.append(f"value={value}{suffix}")
     elif term in {"AGG", "AGG0"}:
         parts.append(f"arity={operands.get('arity')} raw_arity={operands.get('raw_arity')}")
     elif term == "CODE_REF":
-        parts.append(f"rel={signed(int(operands.get('rel', 0) or 0))}")
+        rel = int(operands.get("rel", 0) or 0)
+        try:
+            parts.append(f"rel={signed(rel)} target={hx(code_ref_target_offset(word))}")
+        except Exception:
+            parts.append(f"rel={signed(rel)}")
     elif term == "BARE_U32":
         parts.append(f"value={operands.get('value')} follower={operands.get('follower_kind')}")
     elif term == "UNKNOWN":
         parts.append(f"byte=0x{int(operands.get('byte', 0) or 0):02X}")
-    elif term in {"RETURN_PAIR", "END"}:
+    elif term == "RETURN_PAIR":
+        parts.append("return_pair")
+    elif term == "END":
         parts.append("return")
+    elif term == "MARK":
+        op = operands.get("op", operands.get("byte"))
+        if isinstance(op, int):
+            parts.append(f"op=0x{op:02X}")
+    elif term == "NOP":
+        pass
 
+    if word.prefixes:
+        parts.append("pfx=" + ".".join(f"{int(p):02X}" for p in word.prefixes))
     if include_raw:
         parts.append(f"raw={word.raw.hex(' ')}")
     return " ".join(str(p) for p in parts if p)
-
-
-def _edges_by_source(edges: Iterable[CFGEdge]) -> dict[int, list[CFGEdge]]:
-    grouped: dict[int, list[CFGEdge]] = defaultdict(list)
-    for edge in edges:
-        grouped[int(edge.source)].append(edge)
-    return grouped
-
-
-def _edge_summary(edge: CFGEdge, body_len: int) -> str:
-    if edge.target is None:
-        return f"{edge.kind}->-"
-    target = hx(edge.target, max(4, len(f"{body_len:X}")))
-    suffix = "" if edge.valid else f" !{edge.note or 'invalid'}"
-    return f"{edge.kind}->{target}{suffix}"
-
-
-def _target_kind_for_node(body: bytes, word: VMWord, linear_words: list[VMWord]) -> str:
-    if word.terminal_kind != "BR" or not is_control_branch_word(word):
-        return ""
-    landing = classify_target_landing(body, branch_target_offset(word), linear_words)
-    if landing.at_function_end:
-        return " target=function_end"
-    if not landing.in_range:
-        return " target=OUT_OF_RANGE"
-    if landing.linear_boundary:
-        return " target=linear"
-    if landing.inside_linear_word:
-        return f" target={landing.subentry_kind}@{hx(landing.inside_offset)}"
-    return f" target={landing.subentry_kind}"
-
-
-def should_show_node(word: VMWord, mode: str) -> bool:
-    role = word_role(word)
-    if mode == "full":
-        return True
-    if mode == "branches":
-        return role in IMPORTANT_ROLES
-    if mode == "flow":
-        if word.terminal_kind in STRUCTURAL_TERMINALS and role == "structural":
-            return False
-        return True
-    raise ValueError(f"unknown mode: {mode}")
-
-
-def render_cfg_stream(body: bytes, cfg: FunctionCFG, *, mode: str = "flow") -> list[str]:
-    linear_words = decode_words(body)
-    linear_offsets = {int(w.offset) for w in linear_words}
-    grouped_edges = _edges_by_source(cfg.edges)
-    width = max(4, len(f"{max(0, len(body)):X}"))
-    lines: list[str] = []
-    skipped = 0
-
-    for offset, node in sorted(cfg.nodes.items()):
-        word = node.word
-        if not should_show_node(word, mode):
-            skipped += 1
-            continue
-        if skipped:
-            lines.append(f"    ... {skipped} structural MARK/NOP entries omitted")
-            skipped = 0
-        sub = "!" if offset not in linear_offsets else " "
-        role = word_role(word)
-        edge_text = ""
-        if offset in grouped_edges:
-            interesting = [edge for edge in grouped_edges[offset] if edge.kind != "fallthrough"]
-            if interesting:
-                edge_text = " ; " + ", ".join(_edge_summary(edge, len(body)) for edge in interesting)
-            elif mode == "full":
-                edge_text = " ; " + ", ".join(_edge_summary(edge, len(body)) for edge in grouped_edges[offset])
-        target_note = _target_kind_for_node(body, word, linear_words)
-        raw = word.terminal_kind in {"UNKNOWN", "BR"}
-        lines.append(
-            f"  {sub}{hx(offset, width)} +{word.size:<2} {role:<21} "
-            f"{summarize_word(word, include_raw=raw)}{target_note}{edge_text}"
-        )
-    if skipped:
-        lines.append(f"    ... {skipped} structural MARK/NOP entries omitted")
-    return lines
 
 
 def _fmt_runs(runs: list[tuple[int, int]], *, width: int) -> str:
@@ -240,82 +183,247 @@ def _fmt_runs(runs: list[tuple[int, int]], *, width: int) -> str:
     return ", ".join(f"{hx(a, width)}..{hx(b, width)}" for a, b in runs)
 
 
-def render_function_report(module: MBCModule, entry: FunctionEntry, *, mode: str = "flow", branch_semantics: str = BRANCH_SEMANTICS_CONSERVATIVE, strict_4a_audit: Optional[dict[str, Any]] = None) -> str:
-    body = module.get_function_body(entry)
-    branch_semantics = normalize_branch_semantics(branch_semantics)
-    cfg = build_cfg_for_function(module, entry, branch_semantics=branch_semantics)
-    validation = validate_cfg(body, cfg)
-    width = max(4, len(f"{max(0, len(body)):X}"))
-    span = cfg.span
-    span_s = f"{hx(span[0])}..{hx(span[1])}" if span else "-"
-    flags = validation["issue_flags"]
+def _relation_short(relation: Optional[str]) -> str:
+    if not relation:
+        return "-"
+    aliases = {
+        "linear_boundary": "linear",
+        "prefix_byte_entry": "prefix",
+        "terminal_atom_entry": "terminal",
+        "function_end": "function_end",
+        "out_of_range": "OUT_OF_RANGE",
+        "not_covered_by_linear_decode": "linear_gap",
+        "aggregate_overlap_entry": "aggregate_overlap",
+        "bare_u32_overlap_entry": "bare_u32_overlap",
+        "literal_payload_overlap_entry": "literal_overlap",
+        "operand_payload_overlap_entry": "operand_overlap",
+        "payload_overlap_entry": "payload_overlap",
+    }
+    return aliases.get(relation, relation)
+
+
+def _target_note_for_node(cfg: FunctionCFG, word: VMWord, node_edges: Iterable[CFGEdge]) -> str:
+    if word.terminal_kind == "BR":
+        branch_edges = [edge for edge in node_edges if edge.kind == "branch_conditional"]
+        if not branch_edges:
+            return " target=fallthrough/predicate"
+        edge = branch_edges[0]
+        note = _relation_short(edge.target_relation)
+        target = hx(edge.dst, max(4, len(f"{cfg.body_size:X}"))) if edge.dst is not None else "-"
+        decoded = f" decodes={edge.target_decoded_kind}" if edge.target_decoded_kind else ""
+        return f" target={note}@{target}{decoded}"
+    if word.terminal_kind == "CODE_REF":
+        code_edges = [edge for edge in node_edges if edge.kind == "code_ref"]
+        if code_edges:
+            edge = code_edges[0]
+            note = _relation_short(edge.target_relation)
+            target = hx(edge.dst, max(4, len(f"{cfg.body_size:X}"))) if edge.dst is not None else "-"
+            decoded = f" decodes={edge.target_decoded_kind}" if edge.target_decoded_kind else ""
+            return f" target={note}@{target}{decoded}"
+    return ""
+
+
+def _edges_by_source(edges: Iterable[CFGEdge]) -> dict[int, list[CFGEdge]]:
+    grouped: dict[int, list[CFGEdge]] = defaultdict(list)
+    for edge in edges:
+        grouped[int(edge.src)].append(edge)
+    return grouped
+
+
+def _edge_kind_short(edge: CFGEdge) -> str:
+    return {
+        "branch_conditional": "branch",
+        "predicate_no_transfer_next": "predicate_no_transfer",
+        "fallthrough": "fallthrough",
+        "next": "next",
+        "code_ref": "code_ref",
+    }.get(edge.kind, edge.kind)
+
+
+def _edge_summary(edge: CFGEdge, body_len: int) -> str:
+    width = max(4, len(f"{max(0, body_len):X}"))
+    target = "-" if edge.dst is None else hx(edge.dst, width)
+    relation = _relation_short(edge.target_relation)
+    relation_text = "" if relation in {"-", "linear"} else f"/{relation}"
+    decoded = "" if not edge.target_decoded_kind else f"/{edge.target_decoded_kind}"
+    return f"{_edge_kind_short(edge)}->{target}{relation_text}{decoded}"
+
+
+def should_show_node(word: VMWord, mode: str, *, relation: str, has_interesting_edges: bool) -> bool:
+    role = word_role(word)
+    if mode == "full":
+        return True
+    if mode == "branches":
+        return has_interesting_edges or relation != "linear_boundary" or role in IMPORTANT_ROLES
+    if mode == "flow":
+        if word.terminal_kind in STRUCTURAL_TERMINALS and role == "structural" and relation == "linear_boundary" and not has_interesting_edges:
+            return False
+        return True
+    raise ValueError(f"unknown mode: {mode}")
+
+
+def render_cfg_stream(cfg: FunctionCFG, *, mode: str = "flow") -> list[str]:
+    linear_offsets = {int(w.offset) for w in cfg.linear_words}
+    grouped_edges = _edges_by_source(cfg.edges)
+    width = max(4, len(f"{max(0, cfg.body_size):X}"))
+    lines: list[str] = []
+    skipped = 0
+
+    for offset, node in sorted(cfg.nodes.items()):
+        word = node.word
+        node_edges = grouped_edges.get(offset, [])
+        if mode == "full":
+            interesting_edges = node_edges
+        else:
+            interesting_edges = [edge for edge in node_edges if edge.kind not in {"next", "fallthrough"}]
+        relation = node.relation.relation
+        if not should_show_node(word, mode, relation=relation, has_interesting_edges=bool(interesting_edges)):
+            skipped += 1
+            continue
+        if skipped:
+            lines.append(f"    ... {skipped} structural MARK/NOP entries omitted")
+            skipped = 0
+
+        sub = "!" if offset not in linear_offsets or relation != "linear_boundary" else " "
+        role = word_role(word)
+        edge_text = ""
+        if interesting_edges:
+            edge_text = " ; " + ", ".join(_edge_summary(edge, cfg.body_size) for edge in interesting_edges)
+        relation_text = "" if relation == "linear_boundary" else f" relation={_relation_short(relation)}"
+        target_note = _target_note_for_node(cfg, word, node_edges)
+        raw = word.terminal_kind in {"UNKNOWN", "BR"}
+        lines.append(
+            f"  {sub}{hx(offset, width)} +{word.size:<2} {role:<21} "
+            f"{summarize_word(word, include_raw=raw)}{relation_text}{target_note}{edge_text}"
+        )
+    if skipped:
+        lines.append(f"    ... {skipped} structural MARK/NOP entries omitted")
+    return lines
+
+
+def _issue_flags(cfg: FunctionCFG) -> list[str]:
+    flags: list[str] = []
+    if cfg.hard_error_count:
+        flags.append(f"errors={cfg.hard_error_count}")
+    if cfg.warning_count:
+        flags.append(f"warnings={cfg.warning_count}")
+    visible_notes = sum(1 for issue in cfg.issues if issue.severity == "note" and issue.code not in ISSUE_CODES_HIDDEN_BY_DEFAULT)
+    if visible_notes:
+        flags.append(f"notes={visible_notes}")
+    uncovered = cfg.body_size - cfg.cfg_covered_bytes
+    if uncovered:
+        flags.append(f"uncovered={uncovered}")
+    if cfg.overlap_target_count:
+        flags.append(f"overlap_targets={cfg.overlap_target_count}")
+    return flags
+
+
+def _issue_counts(cfgs: Iterable[FunctionCFG]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for cfg in cfgs:
+        for issue in cfg.issues:
+            counts[issue.code] += 1
+    return counts
+
+
+def _severity_counts(cfgs: Iterable[FunctionCFG]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    for cfg in cfgs:
+        for issue in cfg.issues:
+            counts[issue.severity] += 1
+    return counts
+
+
+def _target_relation_totals(cfgs: Iterable[FunctionCFG]) -> Counter[str]:
+    totals: Counter[str] = Counter()
+    for cfg in cfgs:
+        totals.update(cfg.branch_target_relations)
+    return totals
+
+
+def _branch_target_issue_count(cfgs: Iterable[FunctionCFG], code: str) -> int:
+    return sum(1 for cfg in cfgs for issue in cfg.issues if issue.code == code)
+
+
+def render_issue(issue: CFGIssue, *, width: int) -> str:
+    loc = ""
+    if issue.offset is not None:
+        loc += f" @{hx(issue.offset, width)}"
+    if issue.target is not None:
+        loc += f" target={hx(issue.target, width)}"
+    return f"  issue: {issue.severity}:{issue.code}{loc} {issue.message}".rstrip()
+
+
+def render_function_report(cfg: FunctionCFG, *, mode: str = "flow") -> str:
+    width = max(4, len(f"{max(0, cfg.body_size):X}"))
+    span_s = f"{hx(cfg.span[0])}..{hx(cfg.span[1])}" if cfg.span else "-"
+    flags = _issue_flags(cfg)
     status = "OK" if not flags else "WARN:" + ",".join(flags)
-    exported = " exported" if entry.is_exported else ""
+    relation_counts = cfg.branch_target_relations
+    linear_targets = relation_counts.get("linear_boundary", 0)
+    terminal_targets = relation_counts.get("terminal_atom_entry", 0)
+    prefix_targets = relation_counts.get("prefix_byte_entry", 0)
+    overlap_targets = sum(relation_counts.get(name, 0) for name in OVERLAP_RELATIONS)
+    subentry_targets = sum(
+        count
+        for relation, count in relation_counts.items()
+        if relation not in {"linear_boundary", "out_of_range", "function_end"}
+    )
+    branch_oob = sum(1 for issue in cfg.issues if issue.code == "branch_target_out_of_range")
+    branch_unknown = sum(1 for issue in cfg.issues if issue.code == "branch_target_decodes_unknown")
+    reachable_unknown = sum(1 for issue in cfg.issues if issue.code == "reachable_unknown_word")
+    uncovered = cfg.body_size - cfg.cfg_covered_bytes
 
     lines = [
-        f"FUNC {entry.name} [{entry.source_kind}{exported}] span={span_s} len={len(body)} status={status}",
+        f"FUNC {cfg.function_name} [{cfg.source_kind}] span={span_s} len={cfg.body_size} status={status}",
         (
             "  cfg: "
-            f"semantics={branch_semantics} "
-            f"nodes={validation['cfg_nodes']} edges={validation['cfg_edges']} "
-            f"linear_words={validation['linear_words']} "
-            f"branches={validation['cfg_control_branches']} "
-            f"predicate_no_transfer={validation['cfg_predicate_no_transfer']} "
-            f"unknown={validation['reachable_unknown_words']}"
+            f"nodes={len(cfg.nodes)} edges={len(cfg.edges)} "
+            f"linear_words={len(cfg.linear_words)} "
+            f"branches={cfg.control_branch_count_linear} "
+            f"predicate_no_transfer={cfg.predicate_no_transfer_count} "
+            f"unknown={reachable_unknown}"
         ),
         (
             "  branch targets: "
-            f"oob={validation['branch_targets_out_of_range']} "
-            f"unknown={validation['branch_targets_unknown']} "
-            f"linear={validation['branch_targets_linear_boundary']} "
-            f"subentry={validation['branch_targets_subentry']} "
-            f"terminal={validation['branch_targets_terminal_atom']} "
-            f"prefix={validation['branch_targets_prefix_byte']} "
-            f"operand={validation['branch_targets_operand_byte']}"
+            f"oob={branch_oob} "
+            f"unknown={branch_unknown} "
+            f"linear={linear_targets} "
+            f"subentry={subentry_targets} "
+            f"terminal={terminal_targets} "
+            f"prefix={prefix_targets} "
+            f"overlap={overlap_targets}"
         ),
     ]
-    if validation["uncovered_byte_count"]:
+    if relation_counts:
+        lines.append("  target relations: " + ", ".join(f"{k}={v}" for k, v in sorted(relation_counts.items())))
+    if uncovered:
         lines.append(
             "  uncovered bytes: "
-            f"count={validation['uncovered_byte_count']} "
-            f"runs={_fmt_runs(validation['uncovered_runs'], width=width)}"
+            f"count={uncovered} runs={_fmt_runs(cfg.cfg_uncovered_ranges, width=width)}"
         )
-    if strict_4a_audit is not None:
-        strict = strict_4a_audit.get("strict", {})
-        conservative = strict_4a_audit.get("conservative", {})
-        if strict.get("uncovered_byte_count", 0) and not conservative.get("uncovered_byte_count", 0):
-            lines.append(
-                "  strict 4A audit: "
-                f"strict_uncovered={strict.get('uncovered_byte_count')} "
-                f"runs={_fmt_runs(strict.get('uncovered_runs', []), width=width)} "
-                "=> covered when 4A fallthrough is followed"
-            )
-    if cfg.anomalies:
-        lines.append(f"  anomalies: {cfg.anomalies}")
-    lines.extend(render_cfg_stream(body, cfg, mode=mode))
+
+    visible_issues = [issue for issue in cfg.issues if issue.code not in ISSUE_CODES_HIDDEN_BY_DEFAULT]
+    for issue in visible_issues[:16]:
+        lines.append(render_issue(issue, width=width))
+    if len(visible_issues) > 16:
+        lines.append(f"  issue: ... {len(visible_issues) - 16} more issues omitted")
+
+    lines.extend(render_cfg_stream(cfg, mode=mode))
     return "\n".join(lines)
 
 
-def render_base_audit(audit: dict[str, Any]) -> list[str]:
-    lines = ["BR displacement base audit (CFG-reachable branches):"]
-    header = "  model              total  known  oob  unknown  linear  subentry  terminal  prefix  operand"
-    lines.append(header)
-    for model in BASE_MODELS:
-        stats = audit["models"][model]
-        mark = "*" if model == audit.get("branch_base_model") else " "
-        lines.append(
-            f"{mark} {model:<17} "
-            f"{stats['total']:>5} "
-            f"{stats['known_target']:>6} "
-            f"{stats['out_of_range']:>4} "
-            f"{stats['unknown_target']:>8} "
-            f"{stats['linear_boundary']:>7} "
-            f"{stats['subentry']:>9} "
-            f"{stats['terminal_atom']:>9} "
-            f"{stats['prefix_byte']:>7} "
-            f"{stats['operand_byte']:>8}"
-        )
-    return lines
+def _filter_cfgs(report: ModuleCFGReport, pattern: str | None) -> list[FunctionCFG]:
+    cfgs = list(report.function_cfgs)
+    if pattern:
+        cfgs = [cfg for cfg in cfgs if fnmatch(cfg.function_name, pattern) or fnmatch(cfg.symbol, pattern)]
+    return cfgs
+
+
+def _select_cfgs(cfgs: list[FunctionCFG], *, interesting_only: bool) -> list[FunctionCFG]:
+    if not interesting_only:
+        return cfgs
+    return [cfg for cfg in cfgs if cfg.has_control_interest or _issue_flags(cfg)]
 
 
 def render_module_report(
@@ -323,111 +431,89 @@ def render_module_report(
     *,
     mode: str = "flow",
     function_filter: Optional[str] = None,
-    include_base_audit: bool = True,
-    branch_semantics: str = BRANCH_SEMANTICS_CONSERVATIVE,
+    interesting_only: bool = False,
 ) -> str:
-    branch_semantics = normalize_branch_semantics(branch_semantics)
-    entries = module.function_entries()
-    if function_filter:
-        entries = [entry for entry in entries if fnmatch(entry.name, function_filter) or fnmatch(entry.symbol, function_filter)]
+    report = analyze_module(module)
+    cfgs = _filter_cfgs(report, function_filter)
+    selected = _select_cfgs(cfgs, interesting_only=interesting_only)
 
-    semantics_audit = compare_4a_semantics_for_module(module)
-    strict_4a_by_name = {item["function"]: item for item in semantics_audit["functions"]}
-
-    function_reports: list[str] = []
-    totals = {
-        "functions": 0,
-        "body_bytes": 0,
-        "linear_words": 0,
-        "cfg_nodes": 0,
-        "cfg_edges": 0,
-        "cfg_control_branches": 0,
-        "cfg_predicate_no_transfer": 0,
-        "branch_targets_out_of_range": 0,
-        "branch_targets_unknown": 0,
-        "branch_targets_linear_boundary": 0,
-        "branch_targets_subentry": 0,
-        "branch_targets_terminal_atom": 0,
-        "branch_targets_prefix_byte": 0,
-        "branch_targets_operand_byte": 0,
-        "reachable_unknown_words": 0,
-        "uncovered_byte_count": 0,
-        "functions_with_issues": 0,
-    }
-
-    for entry in entries:
-        body = module.get_function_body(entry)
-        cfg = build_cfg_for_function(module, entry, branch_semantics=branch_semantics)
-        validation = validate_cfg(body, cfg)
+    totals: Counter[str] = Counter()
+    for cfg in selected:
         totals["functions"] += 1
-        totals["body_bytes"] += len(body)
-        for key in totals:
-            if key in validation and isinstance(validation[key], int):
-                totals[key] += validation[key]
-        if validation["issue_flags"]:
-            totals["functions_with_issues"] += 1
-        function_reports.append(
-            render_function_report(
-                module,
-                entry,
-                mode=mode,
-                branch_semantics=branch_semantics,
-                strict_4a_audit=strict_4a_by_name.get(entry.name),
-            )
-        )
+        totals["body_bytes"] += cfg.body_size
+        totals["linear_words"] += len(cfg.linear_words)
+        totals["cfg_nodes"] += len(cfg.nodes)
+        totals["cfg_edges"] += len(cfg.edges)
+        totals["linear_branches"] += cfg.branch_count_linear
+        totals["control_branches"] += cfg.control_branch_count_linear
+        totals["predicate_no_transfer"] += cfg.predicate_no_transfer_count
+        totals["uncovered_bytes"] += cfg.body_size - cfg.cfg_covered_bytes
+        if _issue_flags(cfg):
+            totals["functions_with_warnings"] += 1
+
+    relations = _target_relation_totals(selected)
+    issue_counts = _issue_counts(selected)
+    severity_counts = _severity_counts(selected)
+    linear_targets = relations.get("linear_boundary", 0)
+    terminal_targets = relations.get("terminal_atom_entry", 0)
+    prefix_targets = relations.get("prefix_byte_entry", 0)
+    overlap_targets = sum(relations.get(name, 0) for name in OVERLAP_RELATIONS)
+    subentry_targets = sum(
+        count
+        for relation, count in relations.items()
+        if relation not in {"linear_boundary", "out_of_range", "function_end"}
+    )
 
     lines = [
         f"SCRIPT {module.path}",
         f"parser_contract={module.parser_contract}",
         (
-            f"definitions={len(module.definitions)} exports={len(module.exports)} "
-            f"functions_selected={totals['functions']} code_size={module.get_real_code_size()}"
+            f"definitions={len(module.definitions)} exports={len(module.exports)} globals={len(module.globals)} "
+            f"functions_selected={totals['functions']} functions_total={report.function_count} code_size={module.get_real_code_size()}"
         ),
         (
             "adb="
             f"{module.adb_info.quality} present={module.adb_info.present} "
             f"words={module.adb_info.word_count}"
         ),
-        (
-            "BRANCH_SEMANTICS "
-            f"active={branch_semantics} "
-            f"strict_uncovered_bytes={semantics_audit['summary']['strict_uncovered_bytes']} "
-            f"strict_functions={semantics_audit['summary']['strict_functions_with_uncovered']} "
-            f"conservative_uncovered_bytes={semantics_audit['summary']['conservative_uncovered_bytes']} "
-            f"explained_by_4a_fallthrough={semantics_audit['summary']['functions_explained_by_4a_fallthrough']}"
-        ),
+        "ANALYZER control_flow branch_model=deprecated",
         (
             "SUMMARY "
             f"body_bytes={totals['body_bytes']} "
             f"linear_words={totals['linear_words']} cfg_nodes={totals['cfg_nodes']} "
-            f"edges={totals['cfg_edges']} branches={totals['cfg_control_branches']} "
-            f"predicate_no_transfer={totals['cfg_predicate_no_transfer']}"
+            f"edges={totals['cfg_edges']} branches={totals['control_branches']} "
+            f"predicate_no_transfer={totals['predicate_no_transfer']}"
         ),
         (
             "VALIDATION "
-            f"branch_oob={totals['branch_targets_out_of_range']} "
-            f"branch_unknown={totals['branch_targets_unknown']} "
-            f"reachable_unknown={totals['reachable_unknown_words']} "
-            f"subentry_targets={totals['branch_targets_subentry']} "
-            f"linear_targets={totals['branch_targets_linear_boundary']} "
-            f"uncovered_bytes={totals['uncovered_byte_count']} "
-            f"functions_with_warnings={totals['functions_with_issues']}"
+            f"branch_oob={_branch_target_issue_count(selected, 'branch_target_out_of_range')} "
+            f"branch_unknown={_branch_target_issue_count(selected, 'branch_target_decodes_unknown')} "
+            f"reachable_unknown={issue_counts.get('reachable_unknown_word', 0)} "
+            f"subentry_targets={subentry_targets} "
+            f"linear_targets={linear_targets} "
+            f"uncovered_bytes={totals['uncovered_bytes']} "
+            f"functions_with_warnings={totals['functions_with_warnings']}"
         ),
         (
             "SUBENTRY BREAKDOWN "
-            f"terminal_atom={totals['branch_targets_terminal_atom']} "
-            f"prefix_byte={totals['branch_targets_prefix_byte']} "
-            f"operand_byte={totals['branch_targets_operand_byte']}"
+            f"terminal_atom={terminal_targets} "
+            f"prefix_byte={prefix_targets} "
+            f"overlap={overlap_targets}"
         ),
+        f"TARGET RELATIONS {dict(sorted(relations.items()))}",
+        f"ISSUES severity={dict(severity_counts)} codes={dict(issue_counts)}",
+        "",
+        "Legend: leading '!' before an offset means CFG entry is not a top-level linear token boundary.",
+        "Edges: branch/code_ref are transfer edges; next/fallthrough are shown only in --mode full.",
+        "Mode: " + mode,
+        "",
     ]
-    if include_base_audit:
-        lines.extend(render_base_audit(branch_base_audit_for_module(module, branch_semantics=branch_semantics)))
-    lines.append("")
-    lines.append("Legend: leading '!' before an offset means CFG entry is not a top-level linear token boundary.")
-    lines.append("Branch semantics: conservative_fallthrough follows fallthrough after 0x4A as an audit/over-approximation; strict_4a_jump preserves the old terminating-4A model.")
-    lines.append("Mode: " + mode)
-    lines.append("")
-    lines.extend("\n" + report for report in function_reports)
+    if function_filter:
+        lines.insert(4, f"function_filter={function_filter!r}")
+    if interesting_only:
+        lines.insert(5 if function_filter else 4, "selection=interesting_only")
+
+    lines.extend("\n" + render_function_report(cfg, mode=mode) for cfg in selected)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -439,18 +525,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--out", type=Path, default=None, help="Output text file. Default: out/<script>.branch_flow.txt")
     parser.add_argument(
         "--mode",
-        choices=("flow", "branches", "full"),
+        choices=FORMAT_MODES,
         default="flow",
-        help="flow: skip plain MARK/NOP; branches: calls/branches/returns only; full: every CFG node",
+        help="flow: omit plain structural MARK/NOP; branches: calls/branches/returns/labels; full: every CFG node edge",
     )
     parser.add_argument("--function", default=None, help="Optional fnmatch filter for function names/symbols, e.g. 'Win*'")
     parser.add_argument(
-        "--branch-semantics",
-        choices=BRANCH_SEMANTICS_CHOICES,
-        default=BRANCH_SEMANTICS_CONSERVATIVE,
-        help="CFG semantics for 0x4A. Default follows 0x4A fallthrough to avoid hiding clean bytecode islands.",
+        "--interesting-only",
+        action="store_true",
+        help="Emit only functions with control-flow interest or validation issues. Default emits all selected functions, like the old dump.",
     )
-    parser.add_argument("--no-base-audit", action="store_true", help="Do not include branch-base model comparison")
     return parser
 
 
@@ -465,8 +549,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         module,
         mode=args.mode,
         function_filter=args.function,
-        include_base_audit=not args.no_base_audit,
-        branch_semantics=args.branch_semantics,
+        interesting_only=args.interesting_only,
     )
     out_path.write_text(text, encoding="utf-8")
     print(out_path)
