@@ -8,12 +8,17 @@ from typing import Any, Iterable, Optional
 
 from mbl_vm_tools.branch_model import (
     BASE_MODELS,
+    BRANCH_SEMANTICS_CHOICES,
+    BRANCH_SEMANTICS_CONSERVATIVE,
+    BRANCH_SEMANTICS_STRICT,
     CFGEdge,
     FunctionCFG,
     branch_base_audit_for_module,
     branch_op_name,
     build_cfg_for_function,
     classify_target_landing,
+    compare_4a_semantics_for_module,
+    normalize_branch_semantics,
     validate_cfg,
 )
 from mbl_vm_tools.parser import FunctionEntry, MBCModule
@@ -235,9 +240,10 @@ def _fmt_runs(runs: list[tuple[int, int]], *, width: int) -> str:
     return ", ".join(f"{hx(a, width)}..{hx(b, width)}" for a, b in runs)
 
 
-def render_function_report(module: MBCModule, entry: FunctionEntry, *, mode: str = "flow") -> str:
+def render_function_report(module: MBCModule, entry: FunctionEntry, *, mode: str = "flow", branch_semantics: str = BRANCH_SEMANTICS_CONSERVATIVE, strict_4a_audit: Optional[dict[str, Any]] = None) -> str:
     body = module.get_function_body(entry)
-    cfg = build_cfg_for_function(module, entry)
+    branch_semantics = normalize_branch_semantics(branch_semantics)
+    cfg = build_cfg_for_function(module, entry, branch_semantics=branch_semantics)
     validation = validate_cfg(body, cfg)
     width = max(4, len(f"{max(0, len(body)):X}"))
     span = cfg.span
@@ -250,6 +256,7 @@ def render_function_report(module: MBCModule, entry: FunctionEntry, *, mode: str
         f"FUNC {entry.name} [{entry.source_kind}{exported}] span={span_s} len={len(body)} status={status}",
         (
             "  cfg: "
+            f"semantics={branch_semantics} "
             f"nodes={validation['cfg_nodes']} edges={validation['cfg_edges']} "
             f"linear_words={validation['linear_words']} "
             f"branches={validation['cfg_control_branches']} "
@@ -273,6 +280,16 @@ def render_function_report(module: MBCModule, entry: FunctionEntry, *, mode: str
             f"count={validation['uncovered_byte_count']} "
             f"runs={_fmt_runs(validation['uncovered_runs'], width=width)}"
         )
+    if strict_4a_audit is not None:
+        strict = strict_4a_audit.get("strict", {})
+        conservative = strict_4a_audit.get("conservative", {})
+        if strict.get("uncovered_byte_count", 0) and not conservative.get("uncovered_byte_count", 0):
+            lines.append(
+                "  strict 4A audit: "
+                f"strict_uncovered={strict.get('uncovered_byte_count')} "
+                f"runs={_fmt_runs(strict.get('uncovered_runs', []), width=width)} "
+                "=> covered when 4A fallthrough is followed"
+            )
     if cfg.anomalies:
         lines.append(f"  anomalies: {cfg.anomalies}")
     lines.extend(render_cfg_stream(body, cfg, mode=mode))
@@ -307,10 +324,15 @@ def render_module_report(
     mode: str = "flow",
     function_filter: Optional[str] = None,
     include_base_audit: bool = True,
+    branch_semantics: str = BRANCH_SEMANTICS_CONSERVATIVE,
 ) -> str:
+    branch_semantics = normalize_branch_semantics(branch_semantics)
     entries = module.function_entries()
     if function_filter:
         entries = [entry for entry in entries if fnmatch(entry.name, function_filter) or fnmatch(entry.symbol, function_filter)]
+
+    semantics_audit = compare_4a_semantics_for_module(module)
+    strict_4a_by_name = {item["function"]: item for item in semantics_audit["functions"]}
 
     function_reports: list[str] = []
     totals = {
@@ -335,7 +357,7 @@ def render_module_report(
 
     for entry in entries:
         body = module.get_function_body(entry)
-        cfg = build_cfg_for_function(module, entry)
+        cfg = build_cfg_for_function(module, entry, branch_semantics=branch_semantics)
         validation = validate_cfg(body, cfg)
         totals["functions"] += 1
         totals["body_bytes"] += len(body)
@@ -344,7 +366,15 @@ def render_module_report(
                 totals[key] += validation[key]
         if validation["issue_flags"]:
             totals["functions_with_issues"] += 1
-        function_reports.append(render_function_report(module, entry, mode=mode))
+        function_reports.append(
+            render_function_report(
+                module,
+                entry,
+                mode=mode,
+                branch_semantics=branch_semantics,
+                strict_4a_audit=strict_4a_by_name.get(entry.name),
+            )
+        )
 
     lines = [
         f"SCRIPT {module.path}",
@@ -357,6 +387,14 @@ def render_module_report(
             "adb="
             f"{module.adb_info.quality} present={module.adb_info.present} "
             f"words={module.adb_info.word_count}"
+        ),
+        (
+            "BRANCH_SEMANTICS "
+            f"active={branch_semantics} "
+            f"strict_uncovered_bytes={semantics_audit['summary']['strict_uncovered_bytes']} "
+            f"strict_functions={semantics_audit['summary']['strict_functions_with_uncovered']} "
+            f"conservative_uncovered_bytes={semantics_audit['summary']['conservative_uncovered_bytes']} "
+            f"explained_by_4a_fallthrough={semantics_audit['summary']['functions_explained_by_4a_fallthrough']}"
         ),
         (
             "SUMMARY "
@@ -383,9 +421,10 @@ def render_module_report(
         ),
     ]
     if include_base_audit:
-        lines.extend(render_base_audit(branch_base_audit_for_module(module)))
+        lines.extend(render_base_audit(branch_base_audit_for_module(module, branch_semantics=branch_semantics)))
     lines.append("")
     lines.append("Legend: leading '!' before an offset means CFG entry is not a top-level linear token boundary.")
+    lines.append("Branch semantics: conservative_fallthrough follows fallthrough after 0x4A as an audit/over-approximation; strict_4a_jump preserves the old terminating-4A model.")
     lines.append("Mode: " + mode)
     lines.append("")
     lines.extend("\n" + report for report in function_reports)
@@ -405,6 +444,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="flow: skip plain MARK/NOP; branches: calls/branches/returns only; full: every CFG node",
     )
     parser.add_argument("--function", default=None, help="Optional fnmatch filter for function names/symbols, e.g. 'Win*'")
+    parser.add_argument(
+        "--branch-semantics",
+        choices=BRANCH_SEMANTICS_CHOICES,
+        default=BRANCH_SEMANTICS_CONSERVATIVE,
+        help="CFG semantics for 0x4A. Default follows 0x4A fallthrough to avoid hiding clean bytecode islands.",
+    )
     parser.add_argument("--no-base-audit", action="store_true", help="Do not include branch-base model comparison")
     return parser
 
@@ -421,6 +466,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         mode=args.mode,
         function_filter=args.function,
         include_base_audit=not args.no_base_audit,
+        branch_semantics=args.branch_semantics,
     )
     out_path.write_text(text, encoding="utf-8")
     print(out_path)

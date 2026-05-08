@@ -176,6 +176,12 @@ PREFIX_ALLOWED_NESTED: dict[int, set[int]] = {
     0x3B: {0x2D},
 }
 
+# Prefix chains discovered by CFG sub-entry validation. These were previously
+# mis-tokenized as bare/u24 payloads in the linear pass, while branch targets
+# repeatedly entered the suffix prefixes and decoded them as normal VM words.
+PREFIX_ALLOWED_NESTED.setdefault(0xEB, set()).update({0x21, 0x3D, 0xEB})
+PREFIX_ALLOWED_NESTED.setdefault(0xF1, set()).update({0x2E})
+
 
 def _aggregate_arity_candidates(raw_arity: int) -> list[int]:
     candidates: list[int] = []
@@ -203,30 +209,23 @@ def _match_aggregate(data: bytes, start: int, limit: int) -> DecodedAtom | None:
         for arity in _aggregate_arity_candidates(raw_arity):
             body = 3 + 5 * arity
             end = start + body
-            if end + 2 <= limit and data[end] == 0x31 and data[end + 1] == 0x30:
-                return DecodedAtom("AGG", body + 2, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, start + 3, arity), "term2": 0x3130}, "aggregate.prefixed.term3130")
-            if end + 2 <= limit and data[end] == 0x72 and data[end + 1] == 0x23:
-                return DecodedAtom("AGG", body + 2, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, start + 3, arity), "term2": 0x7223}, "aggregate.prefixed.term7223")
-            if end + 1 <= limit and data[end] in (0x72, 0x30):
-                return DecodedAtom("AGG", body + 1, {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, start + 3, arity), "term": data[end]}, "aggregate.prefixed.term")
+            if end <= limit:
+                return DecodedAtom(
+                    "AGG",
+                    body,
+                    {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, start + 3, arity)},
+                    "aggregate.prefixed.raw",
+                )
 
-    if op == 0x4F and start + 2 < limit:
+    if op == 0x4F and start + 2 <= limit:
         raw_arity = data[start + 1]
         for arity in _aggregate_arity_candidates(raw_arity):
             body = 2 + 5 * arity
             end = start + body
-            if end > limit:
-                continue
-            payload = {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, start + 2, arity)}
-            if end + 2 <= limit and data[end] == 0x31 and data[end + 1] == 0x30:
-                return DecodedAtom("AGG0", body + 2, {**payload, "term2": 0x3130}, "aggregate0.term3130")
-            if end + 2 <= limit and data[end] == 0x72 and data[end + 1] == 0x23:
-                return DecodedAtom("AGG0", body + 2, {**payload, "term2": 0x7223}, "aggregate0.term7223")
-            if end + 1 <= limit and data[end] in (0x31, 0x72, 0x30):
-                return DecodedAtom("AGG0", body + 1, {**payload, "term": data[end]}, "aggregate0.term")
-            return DecodedAtom("AGG0", body, payload, "aggregate0.raw")
+            if end <= limit:
+                payload = {"op": op, "raw_arity": raw_arity, "arity": arity, "children": _parse_children(data, start + 2, arity)}
+                return DecodedAtom("AGG0", body, payload, "aggregate0.raw")
     return None
-
 
 def _match_pair_return(data: bytes, start: int, limit: int) -> DecodedAtom | None:
     if start + 2 <= limit and data[start] == 0x72 and data[start + 1] == 0x23:
@@ -363,6 +362,12 @@ def _match_bare_u32(data: bytes, start: int, limit: int) -> DecodedAtom | None:
     """
     if start + 4 > limit:
         return None
+    # 0x31 and 0x7C are high-confidence structural bytes in this corpus.
+    # Treating 31 30 <word> or 7C 4A xx xx / 7C 7C 7C 7C as bare u32
+    # hides real marker/prefix/jump atoms and creates false overlap landings.
+    # Other apparent bare literals such as 48 00 00 00 remain allowed.
+    if data[start] in {0x31, 0x7C}:
+        return None
     follower = _bare_u32_follower_kind(data, start + 4, limit)
     if follower not in BARE_U32_FOLLOWER_KINDS:
         return None
@@ -455,7 +460,7 @@ RETURN_WORDS = {"RETURN_PAIR", "END"}
 CALL_WORDS = {"CALL_NATIVE", "CALL_SCRIPT"}
 BRANCH_WORDS = {"BR"}
 CONTROL_BRANCH_OPS = {0x4A, 0x4B, 0x4C, 0x4D}
-CONDITIONAL_CONTROL_BRANCH_OPS = {0x4B, 0x4C, 0x4D}
+CONDITIONAL_CONTROL_BRANCH_OPS = {0x4A, 0x4B, 0x4C, 0x4D}
 
 
 def is_control_branch_word(word: VMWord) -> bool:
@@ -591,7 +596,7 @@ def stack_contract(word: VMWord) -> dict[str, Any]:
         base.update({
             "predicate": "prefix_defined" if word.prefixes else "stack_top_or_flag",
             "control_transfer": role == "branch",
-            "stack_effect_rule": "unconditional_branch_has_no_value_stack_transfer" if op == 0x4A else "conditional_predicate_transfer_deferred",
+            "stack_effect_rule": "conditional_predicate_transfer_deferred",
         })
         if op in CONDITIONAL_CONTROL_BRANCH_OPS:
             base["predicate_stack_effect"] = "lower_operand_frame_deferred"

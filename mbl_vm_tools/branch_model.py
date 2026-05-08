@@ -54,6 +54,7 @@ class FunctionCFG:
     source_kind: str
     span: Optional[tuple[int, int]]
     body_len: int
+    branch_semantics: str = "conservative_fallthrough"
     nodes: dict[int, CFGNode] = field(default_factory=dict)
     edges: list[CFGEdge] = field(default_factory=list)
     anomalies: list[dict[str, Any]] = field(default_factory=list)
@@ -65,6 +66,7 @@ class FunctionCFG:
             "source_kind": self.source_kind,
             "span": self.span,
             "body_len": self.body_len,
+            "branch_semantics": self.branch_semantics,
             "nodes": [node.to_dict() for _, node in sorted(self.nodes.items())],
             "edges": [edge.to_dict() for edge in self.edges],
             "anomalies": list(self.anomalies),
@@ -90,7 +92,7 @@ class TargetLanding:
 
 
 BRANCH_OP_NAMES = {
-    0x4A: "JMP_4A",
+    0x4A: "BR_4A",
     0x4B: "BR_4B",
     0x4C: "BR_4C",
     0x4D: "BR_4D",
@@ -98,6 +100,55 @@ BRANCH_OP_NAMES = {
 
 
 BASE_MODELS = ("word_start", "word_start_plus1", "terminal_start", "operand_base", "word_end")
+
+# CFG branch semantics used by the branch-flow layer.  The old/strict model
+# treats 0x4A as a terminating jump.  Corpus validation shows that this leaves
+# cleanly decodable bytecode islands immediately after 0x4A; the conservative
+# model keeps the branch edge and also follows fallthrough from every BR atom.
+# This is deliberately an analysis semantics, not a final source-level opcode
+# name.
+BRANCH_SEMANTICS_STRICT = "strict_4a_jump"
+BRANCH_SEMANTICS_CONSERVATIVE = "conservative_fallthrough"
+BRANCH_SEMANTICS_CHOICES = (BRANCH_SEMANTICS_STRICT, BRANCH_SEMANTICS_CONSERVATIVE)
+
+
+def normalize_branch_semantics(value: str | None) -> str:
+    if not value:
+        return BRANCH_SEMANTICS_CONSERVATIVE
+    aliases = {
+        "strict": BRANCH_SEMANTICS_STRICT,
+        "strict_4a_jump": BRANCH_SEMANTICS_STRICT,
+        "legacy": BRANCH_SEMANTICS_STRICT,
+        "conservative": BRANCH_SEMANTICS_CONSERVATIVE,
+        "fallthrough": BRANCH_SEMANTICS_CONSERVATIVE,
+        "all_branch_fallthrough": BRANCH_SEMANTICS_CONSERVATIVE,
+        "conservative_fallthrough": BRANCH_SEMANTICS_CONSERVATIVE,
+    }
+    normalized = aliases.get(str(value).strip().lower())
+    if normalized is None:
+        raise ValueError(f"unknown branch semantics: {value!r}; expected one of {BRANCH_SEMANTICS_CHOICES}")
+    return normalized
+
+
+def branch_opcode(word: VMWord) -> int:
+    return int(word.operands.get("op", -1) or -1) & 0xFF
+
+
+def branch_has_fallthrough(word: VMWord, branch_semantics: str = "conservative_fallthrough") -> bool:
+    if word.terminal_kind != "BR" or not is_control_branch_word(word):
+        return False
+    op = branch_opcode(word)
+    semantics = normalize_branch_semantics(branch_semantics)
+    if semantics == BRANCH_SEMANTICS_STRICT:
+        return op in {0x4B, 0x4C, 0x4D}
+    return op in {0x4A, 0x4B, 0x4C, 0x4D}
+
+
+def branch_edge_kind(word: VMWord, branch_semantics: str = "conservative_fallthrough") -> str:
+    op = branch_opcode(word)
+    if op == 0x4A:
+        return "branch_4a" if branch_has_fallthrough(word, branch_semantics) else "jump_4a"
+    return "branch"
 
 
 def branch_op_name(op: int) -> str:
@@ -107,7 +158,7 @@ def branch_op_name(op: int) -> str:
 def is_unconditional_branch(word: VMWord) -> bool:
     if word.terminal_kind != "BR" or not is_control_branch_word(word):
         return False
-    return (int(word.operands.get("op", -1) or -1) & 0xFF) == 0x4A
+    return branch_opcode(word) == 0x4A
 
 
 def _entry_label(entry: FunctionEntry) -> tuple[str, str, str]:
@@ -130,6 +181,7 @@ def build_cfg_for_body(
     span: Optional[tuple[int, int]] = None,
     entry_offset: int = 0,
     max_nodes: int = 200_000,
+    branch_semantics: str = "conservative_fallthrough",
 ) -> FunctionCFG:
     """Build a byte-entry CFG using the current VM decoder.
 
@@ -140,12 +192,14 @@ def build_cfg_for_body(
     """
 
     body_len = len(body)
+    branch_semantics = normalize_branch_semantics(branch_semantics)
     cfg = FunctionCFG(
         function_name=function_name,
         symbol=symbol or function_name,
         source_kind=source_kind,
         span=span,
         body_len=body_len,
+        branch_semantics=branch_semantics,
     )
     if body_len == 0:
         cfg.anomalies.append({"kind": "empty_body"})
@@ -188,8 +242,8 @@ def build_cfg_for_body(
 
         if word.terminal_kind == "BR" and is_control_branch_word(word):
             target = branch_target_offset(word)
-            op = int(word.operands.get("op", -1) or -1) & 0xFF
-            branch_kind = "jump" if op == 0x4A else "branch"
+            op = branch_opcode(word)
+            branch_kind = branch_edge_kind(word, branch_semantics)
             valid = 0 <= target <= body_len
             note = "" if valid else "target_out_of_range"
             cfg.edges.append(CFGEdge(source=offset, target=target, kind=branch_kind, valid=valid, note=note))
@@ -205,7 +259,7 @@ def build_cfg_for_body(
                     "op": op,
                 })
 
-            if op in CONDITIONAL_CONTROL_BRANCH_OPS:
+            if branch_has_fallthrough(word, branch_semantics):
                 if end < body_len:
                     cfg.edges.append(CFGEdge(source=offset, target=end, kind="fallthrough", valid=True))
                     if end not in queued:
@@ -228,7 +282,7 @@ def build_cfg_for_body(
     return cfg
 
 
-def build_cfg_for_function(module: MBCModule, entry: FunctionEntry | str) -> FunctionCFG:
+def build_cfg_for_function(module: MBCModule, entry: FunctionEntry | str, *, branch_semantics: str = "conservative_fallthrough") -> FunctionCFG:
     if isinstance(entry, str):
         entry = module.get_function_entry(entry)
     body = module.get_function_body(entry)
@@ -236,7 +290,7 @@ def build_cfg_for_function(module: MBCModule, entry: FunctionEntry | str) -> Fun
     if span is None and entry.source_kind == "export" and entry.definition_record is None:
         span = module.get_export_public_code_span(entry.symbol)
     name, symbol, source_kind = _entry_label(entry)
-    cfg = build_cfg_for_body(body, function_name=name, symbol=symbol, source_kind=source_kind, span=span)
+    cfg = build_cfg_for_body(body, function_name=name, symbol=symbol, source_kind=source_kind, span=span, branch_semantics=branch_semantics)
     if reason is not None and body:
         cfg.anomalies.append({"kind": "span_reason", "reason": reason})
     return cfg
@@ -372,6 +426,7 @@ def validate_cfg(body: bytes, cfg: FunctionCFG, *, linear_words: Optional[list[V
 
     return {
         "body_len": len(body),
+        "branch_semantics": cfg.branch_semantics,
         "linear_words": len(linear_words),
         "cfg_nodes": len(cfg.nodes),
         "cfg_edges": len(cfg.edges),
@@ -417,7 +472,7 @@ def _base_model_target(word: VMWord, model: str) -> int:
     raise KeyError(model)
 
 
-def branch_base_audit_for_module(module: MBCModule) -> dict[str, Any]:
+def branch_base_audit_for_module(module: MBCModule, *, branch_semantics: str = "conservative_fallthrough") -> dict[str, Any]:
     """Compare plausible BR displacement bases against reachable CFG branches.
 
     The current spec model is ``operand_base``: the signed u16 displacement is
@@ -428,6 +483,7 @@ def branch_base_audit_for_module(module: MBCModule) -> dict[str, Any]:
     fused linear VM word.
     """
 
+    branch_semantics = normalize_branch_semantics(branch_semantics)
     model_stats: dict[str, dict[str, int]] = {
         model: {
             "total": 0,
@@ -452,7 +508,7 @@ def branch_base_audit_for_module(module: MBCModule) -> dict[str, Any]:
         if not body:
             continue
         linear_words = decode_words(body)
-        cfg = build_cfg_for_function(module, entry)
+        cfg = build_cfg_for_function(module, entry, branch_semantics=branch_semantics)
         for node in cfg.nodes.values():
             word = node.word
             if word.terminal_kind != "BR" or not is_control_branch_word(word):
@@ -502,14 +558,16 @@ def branch_base_audit_for_module(module: MBCModule) -> dict[str, Any]:
         "module": str(module.path),
         "branch_base_model": "operand_base",
         "scope": "cfg_reachable_branches",
+        "branch_semantics": branch_semantics,
         "models": model_stats,
         "by_op": by_op,
         "bad_alternative_samples": samples,
     }
 
 
-def analyze_module(module_or_path: MBCModule | str | Path) -> dict[str, Any]:
+def analyze_module(module_or_path: MBCModule | str | Path, *, branch_semantics: str = "conservative_fallthrough") -> dict[str, Any]:
     module = module_or_path if isinstance(module_or_path, MBCModule) else MBCModule(module_or_path)
+    branch_semantics = normalize_branch_semantics(branch_semantics)
     functions: list[dict[str, Any]] = []
     totals = {
         "functions": 0,
@@ -532,7 +590,7 @@ def analyze_module(module_or_path: MBCModule | str | Path) -> dict[str, Any]:
     }
     for entry in module.function_entries():
         body = module.get_function_body(entry)
-        cfg = build_cfg_for_function(module, entry)
+        cfg = build_cfg_for_function(module, entry, branch_semantics=branch_semantics)
         validation = validate_cfg(body, cfg)
         totals["functions"] += 1
         totals["body_bytes"] += len(body)
@@ -559,6 +617,84 @@ def analyze_module(module_or_path: MBCModule | str | Path) -> dict[str, Any]:
         "export_count": len(module.exports),
         "adb_info": module.adb_info.to_dict(),
         "totals": totals,
-        "base_audit": branch_base_audit_for_module(module),
+        "branch_semantics": branch_semantics,
+        "base_audit": branch_base_audit_for_module(module, branch_semantics=branch_semantics),
+        "functions": functions,
+    }
+
+
+def compare_4a_semantics_for_function(module: MBCModule, entry: FunctionEntry | str) -> dict[str, Any]:
+    """Return strict-vs-conservative coverage evidence for one function.
+
+    This is an audit, not a claim that 0x4A is source-level conditional.  The
+    signal we care about is whether byte islands that are unreachable when 0x4A
+    terminates are cleanly covered when the analyzer also follows its fallthrough.
+    """
+
+    if isinstance(entry, str):
+        entry = module.get_function_entry(entry)
+    body = module.get_function_body(entry)
+    strict_cfg = build_cfg_for_function(module, entry, branch_semantics=BRANCH_SEMANTICS_STRICT)
+    conservative_cfg = build_cfg_for_function(module, entry, branch_semantics=BRANCH_SEMANTICS_CONSERVATIVE)
+    strict = validate_cfg(body, strict_cfg)
+    conservative = validate_cfg(body, conservative_cfg)
+    explained = (
+        strict["uncovered_byte_count"] > 0
+        and conservative["uncovered_byte_count"] == 0
+        and conservative["reachable_unknown_words"] == 0
+        and conservative["branch_targets_out_of_range"] == 0
+        and conservative["branch_targets_unknown"] == 0
+    )
+    return {
+        "function": entry.name,
+        "symbol": entry.symbol,
+        "span": strict_cfg.span,
+        "body_len": len(body),
+        "strict": strict,
+        "conservative": conservative,
+        "strict_uncovered_explained_by_4a_fallthrough": explained,
+    }
+
+
+def compare_4a_semantics_for_module(module: MBCModule) -> dict[str, Any]:
+    functions: list[dict[str, Any]] = []
+    totals = {
+        "functions": 0,
+        "strict_uncovered_bytes": 0,
+        "strict_uncovered_runs": 0,
+        "strict_functions_with_uncovered": 0,
+        "conservative_uncovered_bytes": 0,
+        "conservative_uncovered_runs": 0,
+        "conservative_functions_with_uncovered": 0,
+        "strict_reachable_unknown": 0,
+        "conservative_reachable_unknown": 0,
+        "strict_branch_oob": 0,
+        "conservative_branch_oob": 0,
+        "strict_branch_unknown": 0,
+        "conservative_branch_unknown": 0,
+        "functions_explained_by_4a_fallthrough": 0,
+    }
+    for entry in module.function_entries():
+        audit = compare_4a_semantics_for_function(module, entry)
+        functions.append(audit)
+        totals["functions"] += 1
+        strict = audit["strict"]
+        conservative = audit["conservative"]
+        totals["strict_uncovered_bytes"] += int(strict["uncovered_byte_count"])
+        totals["strict_uncovered_runs"] += len(strict["uncovered_runs"]) + int(strict.get("uncovered_runs_truncated", 0))
+        totals["strict_functions_with_uncovered"] += int(strict["uncovered_byte_count"] > 0)
+        totals["conservative_uncovered_bytes"] += int(conservative["uncovered_byte_count"])
+        totals["conservative_uncovered_runs"] += len(conservative["uncovered_runs"]) + int(conservative.get("uncovered_runs_truncated", 0))
+        totals["conservative_functions_with_uncovered"] += int(conservative["uncovered_byte_count"] > 0)
+        totals["strict_reachable_unknown"] += int(strict["reachable_unknown_words"])
+        totals["conservative_reachable_unknown"] += int(conservative["reachable_unknown_words"])
+        totals["strict_branch_oob"] += int(strict["branch_targets_out_of_range"])
+        totals["conservative_branch_oob"] += int(conservative["branch_targets_out_of_range"])
+        totals["strict_branch_unknown"] += int(strict["branch_targets_unknown"])
+        totals["conservative_branch_unknown"] += int(conservative["branch_targets_unknown"])
+        totals["functions_explained_by_4a_fallthrough"] += int(audit["strict_uncovered_explained_by_4a_fallthrough"])
+    return {
+        "module": str(module.path),
+        "summary": totals,
         "functions": functions,
     }
