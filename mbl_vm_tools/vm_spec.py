@@ -589,9 +589,9 @@ def word_shape_signature(word: VMWord) -> str:
     pref = prefix_chain_signature(word)
     k = word.terminal_kind
     if k == "CALL_NATIVE":
-        return f"{pref}|CALL_NATIVE|opid={word.operands.get('opid')}|argc={word.operands.get('argc')}"
+        return f"{pref}|CALL_NATIVE|opid={word.operands.get('opid')}|frame={word.operands.get('argc')}"
     if k == "CALL_SCRIPT":
-        return f"{pref}|CALL_SCRIPT|argc={word.operands.get('argc')}"
+        return f"{pref}|CALL_SCRIPT|frame={word.operands.get('argc')}"
     if k == "BR":
         return f"{pref}|BR|op={word.operands.get('op')}"
     if k in {"REF", "REF16"}:
@@ -647,19 +647,19 @@ def stack_contract(word: VMWord) -> dict[str, Any]:
     if k == "CALL_NATIVE":
         argc = int(word.operands.get("argc", 0) or 0)
         base.update({
-            "encoded_argc": argc,
+            "encoded_frame_count": argc,
             "opid": word.operands.get("opid"),
             "result": "deferred_native_return",
-            "stack_effect_rule": "native_call_binds_lower_operand_frame_return_arity_deferred",
+            "stack_effect_rule": "native_call_binds_operand_frame_and_value_stack_return_arity_deferred",
         })
         return base
     if k == "CALL_SCRIPT":
         argc = int(word.operands.get("argc", 0) or 0)
         base.update({
-            "encoded_argc": argc,
+            "encoded_frame_count": argc,
             "encoded_rel": word.operands.get("rel"),
             "result": "deferred_script_return",
-            "stack_effect_rule": "script_call_binds_lower_operand_frame_return_arity_deferred",
+            "stack_effect_rule": "script_call_binds_operand_frame_and_value_stack_return_arity_deferred",
         })
         return base
     if k == "BR":

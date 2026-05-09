@@ -121,9 +121,9 @@ def summarize_word(word: VMWord, *, include_raw: bool = False) -> str:
     elif term == "CALL_NATIVE":
         opid = operands.get("opid")
         opid_s = f"0x{int(opid):02X}" if isinstance(opid, int) else str(opid)
-        parts.append(f"argc={operands.get('argc')} opid={opid_s}")
+        parts.append(f"frame={operands.get('argc')} opid={opid_s}")
     elif term == "CALL_SCRIPT":
-        parts.append(f"argc={operands.get('argc')} rel={signed(int(operands.get('rel', 0) or 0))}")
+        parts.append(f"frame={operands.get('argc')} rel={signed(int(operands.get('rel', 0) or 0))}")
     elif term in {"REF", "REF16"}:
         mode = operands.get("mode")
         mode_s = f"0x{int(mode):02X}" if isinstance(mode, int) else str(mode)
