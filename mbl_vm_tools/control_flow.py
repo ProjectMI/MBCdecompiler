@@ -2,27 +2,24 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .parser import FunctionEntry, MBCModule
+from .parser import MBCModule
 from .vm_spec import (
     CONDITIONAL_CONTROL_BRANCH_OPS,
     VMWord,
-    branch_operand_base_offset,
     branch_target_offset,
+    call_script_target_offset,
     code_ref_target_offset,
     decode_word_at,
     decode_words,
     is_control_branch_word,
-    signed_u16,
     terminal_atom_offset,
     word_role,
 )
 
 RETURN_TERMINALS = {"RETURN_PAIR", "END"}
 BRANCH_TERMINAL = "BR"
-UNCONDITIONAL_BRANCH_OP = None  # all BR opcodes are modeled with fallthrough at CFG level
 NORMAL_TARGET_RELATIONS = {"linear_boundary", "prefix_byte_entry", "terminal_atom_entry"}
 OVERLAP_TARGET_RELATIONS = {
     "aggregate_overlap_entry",
@@ -31,15 +28,12 @@ OVERLAP_TARGET_RELATIONS = {
     "operand_payload_overlap_entry",
     "payload_overlap_entry",
 }
-
-STRUCTURAL_TERMINALS = {"MARK", "NOP"}
-IMPORTANT_ROLES = {"branch", "call", "return", "unknown", "predicate_no_transfer"}
 FORMAT_MODES = ("flow", "branches", "full")
 
 
 @dataclass(frozen=True)
 class EntryRelation:
-    """How a byte offset relates to the default linear tokenization."""
+    """Relationship between an exact byte entry and the default linear decode."""
 
     offset: int
     relation: str
@@ -72,6 +66,14 @@ class CFGEdge:
     target_decoded_kind: Optional[str] = None
     note: str = ""
 
+    @property
+    def is_reference(self) -> bool:
+        return self.kind.endswith("_reference")
+
+    @property
+    def is_transfer(self) -> bool:
+        return not self.is_reference
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -82,6 +84,8 @@ class CFGNode:
     word: VMWord
     relation: EntryRelation
     edges: list[CFGEdge] = field(default_factory=list)
+    region_root: int = 0
+    region_kind: str = "entry"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,6 +93,8 @@ class CFGNode:
             "word": word_to_dict(self.word),
             "relation": self.relation.to_dict(),
             "edges": [edge.to_dict() for edge in self.edges],
+            "region_root": self.region_root,
+            "region_kind": self.region_kind,
         }
 
 
@@ -116,13 +122,23 @@ class FunctionCFG:
     linear_words: list[VMWord]
     nodes: dict[int, CFGNode]
     edges: list[CFGEdge]
+    reference_edges: list[CFGEdge]
     issues: list[CFGIssue]
     branch_target_relations: Counter[str]
+    cfg_branch_target_relations: Counter[str]
+    code_ref_target_relations: Counter[str]
+    call_script_target_relations: Counter[str]
+    call_script_source_relations: Counter[str]
     branch_count_linear: int
     control_branch_count_linear: int
     predicate_no_transfer_count: int
+    code_ref_count_linear: int
+    call_script_count_linear: int
+    code_ref_region_roots: list[int]
     cfg_covered_bytes: int
     cfg_uncovered_ranges: list[tuple[int, int]]
+    entry_covered_bytes: int = 0
+    code_ref_region_boundary_count: int = 0
 
     @property
     def hard_error_count(self) -> int:
@@ -141,8 +157,30 @@ class FunctionCFG:
         return sum(self.branch_target_relations.get(name, 0) for name in OVERLAP_TARGET_RELATIONS)
 
     @property
+    def reference_edge_count(self) -> int:
+        return len(self.reference_edges)
+
+    @property
+    def transfer_edge_count(self) -> int:
+        return len(self.edges)
+
+    @property
+    def reachable_call_script_count(self) -> int:
+        return sum(1 for node in self.nodes.values() if node.word.terminal_kind == "CALL_SCRIPT")
+
+    @property
+    def all_edges(self) -> list[CFGEdge]:
+        return [*self.edges, *self.reference_edges]
+
+    @property
     def has_control_interest(self) -> bool:
-        return bool(self.control_branch_count_linear or self.hard_error_count or self.warning_count or self.overlap_target_count)
+        return bool(
+            self.control_branch_count_linear
+            or self.code_ref_count_linear
+            or self.hard_error_count
+            or self.warning_count
+            or self.overlap_target_count
+        )
 
     def to_summary_dict(self) -> dict[str, Any]:
         return {
@@ -154,15 +192,27 @@ class FunctionCFG:
             "body_size": self.body_size,
             "linear_word_count": len(self.linear_words),
             "cfg_node_count": len(self.nodes),
-            "edge_count": len(self.edges),
+            "transfer_edge_count": self.transfer_edge_count,
+            "reference_edge_count": self.reference_edge_count,
             "branch_count_linear": self.branch_count_linear,
             "control_branch_count_linear": self.control_branch_count_linear,
             "predicate_no_transfer_count": self.predicate_no_transfer_count,
-            "branch_target_relations": dict(self.branch_target_relations),
+            "code_ref_count_linear": self.code_ref_count_linear,
+            "call_script_count_linear": self.call_script_count_linear,
+            "call_script_count_reachable": self.reachable_call_script_count,
+            "branch_target_relations_linear": dict(self.branch_target_relations),
+            "branch_target_relations_reachable_cfg": dict(self.cfg_branch_target_relations),
+            "code_ref_target_relations": dict(self.code_ref_target_relations),
+            "call_script_target_relations_reachable": dict(self.call_script_target_relations),
+            "call_script_source_relations_reachable": dict(self.call_script_source_relations),
+            "code_ref_region_roots": self.code_ref_region_roots[:32],
+            "code_ref_region_root_count": len(self.code_ref_region_roots),
+            "code_ref_region_boundary_count": self.code_ref_region_boundary_count,
             "overlap_target_count": self.overlap_target_count,
             "hard_error_count": self.hard_error_count,
             "warning_count": self.warning_count,
             "note_count": self.note_count,
+            "entry_covered_bytes": self.entry_covered_bytes,
             "cfg_covered_bytes": self.cfg_covered_bytes,
             "cfg_uncovered_byte_count": self.body_size - self.cfg_covered_bytes,
             "cfg_uncovered_ranges": self.cfg_uncovered_ranges[:16],
@@ -183,7 +233,11 @@ class ModuleCFGReport:
 
     @property
     def summary(self) -> dict[str, Any]:
-        target_relations: Counter[str] = Counter()
+        branch_relations: Counter[str] = Counter()
+        cfg_branch_relations: Counter[str] = Counter()
+        code_ref_relations: Counter[str] = Counter()
+        call_script_relations: Counter[str] = Counter()
+        call_script_source_relations: Counter[str] = Counter()
         issue_counts: Counter[str] = Counter()
         severity_counts: Counter[str] = Counter()
         totals: Counter[str] = Counter()
@@ -191,19 +245,33 @@ class ModuleCFGReport:
         functions_with_errors = 0
         functions_with_overlap_targets = 0
         functions_with_uncovered_bytes = 0
+        functions_with_code_refs = 0
 
         for cfg in self.function_cfgs:
-            target_relations.update(cfg.branch_target_relations)
+            branch_relations.update(cfg.branch_target_relations)
+            cfg_branch_relations.update(cfg.cfg_branch_target_relations)
+            code_ref_relations.update(cfg.code_ref_target_relations)
+            call_script_relations.update(cfg.call_script_target_relations)
+            call_script_source_relations.update(cfg.call_script_source_relations)
             totals["body_bytes"] += cfg.body_size
             totals["linear_words"] += len(cfg.linear_words)
             totals["cfg_nodes"] += len(cfg.nodes)
-            totals["cfg_edges"] += len(cfg.edges)
+            totals["transfer_edges"] += cfg.transfer_edge_count
+            totals["reference_edges"] += cfg.reference_edge_count
             totals["linear_branches"] += cfg.branch_count_linear
             totals["control_branches"] += cfg.control_branch_count_linear
             totals["predicate_no_transfer_branches"] += cfg.predicate_no_transfer_count
+            totals["code_refs"] += cfg.code_ref_count_linear
+            totals["call_scripts"] += cfg.call_script_count_linear
+            totals["reachable_call_scripts"] += cfg.reachable_call_script_count
+            totals["code_ref_region_roots"] += len(cfg.code_ref_region_roots)
+            totals["code_ref_region_boundaries"] += cfg.code_ref_region_boundary_count
+            totals["entry_covered_bytes"] += cfg.entry_covered_bytes
             totals["cfg_uncovered_bytes"] += cfg.body_size - cfg.cfg_covered_bytes
             if cfg.control_branch_count_linear:
                 functions_with_branches += 1
+            if cfg.code_ref_count_linear:
+                functions_with_code_refs += 1
             if cfg.hard_error_count:
                 functions_with_errors += 1
             if cfg.overlap_target_count:
@@ -223,11 +291,16 @@ class ModuleCFGReport:
             "global_count": self.global_count,
             "function_count": self.function_count,
             "functions_with_control_branches": functions_with_branches,
+            "functions_with_code_refs": functions_with_code_refs,
             "functions_with_hard_errors": functions_with_errors,
             "functions_with_overlap_targets": functions_with_overlap_targets,
             "functions_with_uncovered_bytes": functions_with_uncovered_bytes,
             "totals": dict(totals),
-            "branch_target_relations": dict(target_relations),
+            "branch_target_relations_linear": dict(branch_relations),
+            "branch_target_relations_reachable_cfg": dict(cfg_branch_relations),
+            "code_ref_target_relations": dict(code_ref_relations),
+            "call_script_target_relations_reachable": dict(call_script_relations),
+            "call_script_source_relations_reachable": dict(call_script_source_relations),
             "issue_counts": dict(issue_counts),
             "severity_counts": dict(severity_counts),
             "notable_functions": [
@@ -276,7 +349,6 @@ def classify_entry_offset(offset: int, body_size: int, span_map: dict[int, VMWor
     if linear_word is None:
         return EntryRelation(offset=offset, relation="not_covered_by_linear_decode")
 
-    relation: str
     if offset in linear_starts and offset == int(linear_word.offset):
         relation = "linear_boundary"
     else:
@@ -325,17 +397,205 @@ def _ranges_from_covered(body_size: int, covered: set[int]) -> list[tuple[int, i
     return ranges
 
 
-def _decode_target_kind(body: bytes, target: int) -> str | None:
+def _decode_target_word(body: bytes, target: int) -> VMWord | None:
     if target < 0 or target >= len(body):
         return None
     try:
-        return decode_word_at(body, target, limit=len(body)).kind
+        return decode_word_at(body, target, limit=len(body))
     except Exception:
         return None
 
 
-def _signed_branch_off(word: VMWord) -> int:
-    return signed_u16(int(word.operands.get("off", 0) or 0))
+def _decode_target_kind(body: bytes, target: int) -> str | None:
+    word = _decode_target_word(body, target)
+    return word.kind if word is not None else None
+
+
+def _target_decodes_unknown(kind: str | None) -> bool:
+    return kind is None or kind.endswith("UNKNOWN")
+
+
+def _branch_target_suffix_frame_is_exact(target: int, relation: EntryRelation, target_word: VMWord | None) -> bool:
+    """Return True when an in-word branch target is a real suffix entry.
+
+    Linear entries are accepted directly.  Prefix/terminal entries are accepted
+    only when decoding from the branch target consumes exactly the suffix of the
+    containing linear word.  This keeps the branch entry frame narrow: branches
+    may enter declared linear words or suffixes of fused prefix words, but not
+    arbitrary shorter parses inside a word.
+    """
+
+    if relation.relation == "linear_boundary":
+        return True
+    if relation.relation not in {"prefix_byte_entry", "terminal_atom_entry"}:
+        return False
+    if target_word is None or relation.linear_word_offset is None or relation.linear_word_size is None:
+        return False
+    return int(target) + int(target_word.size) == int(relation.linear_word_offset) + int(relation.linear_word_size)
+
+
+def _validate_branch_target(
+    *,
+    body: bytes,
+    body_size: int,
+    word: VMWord,
+    target: int,
+    relation: EntryRelation,
+    target_word: VMWord | None,
+    target_kind: str | None,
+    op_hex: str,
+    issues: list[CFGIssue],
+    issue_prefix: str,
+) -> bool:
+    if target < 0 or target >= body_size:
+        issues.append(
+            CFGIssue(
+                severity="error",
+                code=f"{issue_prefix}branch_target_out_of_range",
+                offset=word.offset,
+                target=target,
+                message=f"Branch target {target} is outside function body size {body_size}.",
+                details={"op": op_hex, "relation": relation.to_dict()},
+            )
+        )
+        return False
+    if _target_decodes_unknown(target_kind):
+        issues.append(
+            CFGIssue(
+                severity="error",
+                code=f"{issue_prefix}branch_target_decodes_unknown",
+                offset=word.offset,
+                target=target,
+                message="Branch target is in-range, but decoding at the exact target is UNKNOWN.",
+                details={"op": op_hex, "relation": relation.to_dict(), "target_decoded_kind": target_kind},
+            )
+        )
+        return False
+    if relation.is_overlap:
+        issues.append(
+            CFGIssue(
+                severity="error",
+                code=f"{issue_prefix}branch_target_overlap_entry",
+                offset=word.offset,
+                target=target,
+                message="Branch target lands inside a payload/overlap area, not inside a legal branch entry frame.",
+                details={"op": op_hex, "relation": relation.to_dict(), "target_decoded_kind": target_kind},
+            )
+        )
+        return False
+    if not _branch_target_suffix_frame_is_exact(target, relation, target_word):
+        details = {"op": op_hex, "relation": relation.to_dict(), "target_decoded_kind": target_kind}
+        if target_word is not None:
+            details["target_word"] = word_to_dict(target_word)
+            if relation.linear_word_offset is not None and relation.linear_word_size is not None:
+                details["target_word_end"] = int(target) + int(target_word.size)
+                details["linear_word_end"] = int(relation.linear_word_offset) + int(relation.linear_word_size)
+        issues.append(
+            CFGIssue(
+                severity="error",
+                code=f"{issue_prefix}branch_target_not_suffix_entry_frame",
+                offset=word.offset,
+                target=target,
+                message="Branch target decodes, but it is not an exact suffix entry of the containing linear VM word.",
+                details=details,
+            )
+        )
+        return False
+    return True
+
+
+def _linear_branch_target_relations(
+    body: bytes,
+    body_size: int,
+    linear_words: list[VMWord],
+    span_map: dict[int, VMWord],
+    linear_starts: set[int],
+    issues: list[CFGIssue],
+) -> Counter[str]:
+    relations: Counter[str] = Counter()
+    for word in linear_words:
+        if not is_control_branch_word(word):
+            continue
+        op = int(word.operands.get("op", -1) or -1) & 0xFF
+        op_hex = f"0x{op:02X}"
+        try:
+            target = branch_target_offset(word)
+        except Exception as exc:
+            issues.append(CFGIssue("error", "linear_branch_target_resolution_error", word.offset, message=str(exc), details=word_to_dict(word)))
+            continue
+        relation = classify_entry_offset(target, body_size, span_map, linear_starts)
+        target_word = _decode_target_word(body, target)
+        target_kind = target_word.kind if target_word is not None else None
+        relations[relation.relation] += 1
+        _validate_branch_target(
+            body=body,
+            body_size=body_size,
+            word=word,
+            target=target,
+            relation=relation,
+            target_word=target_word,
+            target_kind=target_kind,
+            op_hex=op_hex,
+            issues=issues,
+            issue_prefix="linear_",
+        )
+    return relations
+
+
+def _linear_code_ref_target_relations(
+    body: bytes,
+    body_size: int,
+    linear_words: list[VMWord],
+    span_map: dict[int, VMWord],
+    linear_starts: set[int],
+    issues: list[CFGIssue],
+) -> Counter[str]:
+    relations: Counter[str] = Counter()
+    for word in linear_words:
+        if word.terminal_kind != "CODE_REF":
+            continue
+        try:
+            target = code_ref_target_offset(word)
+        except Exception as exc:
+            issues.append(CFGIssue("error", "linear_code_ref_target_resolution_error", word.offset, message=str(exc), details=word_to_dict(word)))
+            continue
+        relation = classify_entry_offset(target, body_size, span_map, linear_starts)
+        target_kind = _decode_target_kind(body, target)
+        relations[relation.relation] += 1
+        if target < 0 or target >= body_size:
+            issues.append(
+                CFGIssue(
+                    "error",
+                    "linear_code_ref_target_out_of_range",
+                    word.offset,
+                    target,
+                    f"CODE_REF target {target} is outside function body size {body_size}.",
+                    {"relation": relation.to_dict()},
+                )
+            )
+        elif _target_decodes_unknown(target_kind):
+            issues.append(
+                CFGIssue(
+                    "error",
+                    "linear_code_ref_target_decodes_unknown",
+                    word.offset,
+                    target,
+                    "CODE_REF target is in-range, but decoding at the exact target is UNKNOWN.",
+                    {"relation": relation.to_dict(), "target_decoded_kind": target_kind},
+                )
+            )
+        elif relation.relation != "linear_boundary":
+            issues.append(
+                CFGIssue(
+                    "warning",
+                    "linear_code_ref_target_not_linear_boundary",
+                    word.offset,
+                    target,
+                    "CODE_REF target is valid, but it is not a top-level linear word boundary.",
+                    {"relation": relation.to_dict(), "target_decoded_kind": target_kind},
+                )
+            )
+    return relations
 
 
 def build_function_cfg(
@@ -347,11 +607,11 @@ def build_function_cfg(
     definition_index: Optional[int] = None,
     span: Optional[tuple[int, int]] = None,
 ) -> FunctionCFG:
-    """Build a byte-entry CFG for one function body.
+    """Build a region-aware byte-entry CFG for one function body.
 
-    The important bit is that branch targets are decoded from their exact byte
-    offset.  This intentionally permits branch targets into prefix bytes, terminal
-    atoms, and overlap entries inside a linear fused word.
+    Control transfer is produced only by BR and by normal regional fallthrough.
+    CODE_REF is a reference to a local code island: it is validated and starts a
+    separate region, but it is not a transfer edge from the referencing word.
     """
 
     body_size = len(body)
@@ -360,240 +620,251 @@ def build_function_cfg(
     branch_count_linear = sum(1 for word in linear_words if word.terminal_kind == BRANCH_TERMINAL)
     control_branch_count_linear = sum(1 for word in linear_words if is_control_branch_word(word))
     predicate_no_transfer_count = branch_count_linear - control_branch_count_linear
+    code_ref_count_linear = sum(1 for word in linear_words if word.terminal_kind == "CODE_REF")
+    call_script_count_linear = sum(1 for word in linear_words if word.terminal_kind == "CALL_SCRIPT")
 
     nodes_raw: dict[int, VMWord] = {}
+    node_region_root: dict[int, int] = {}
+    node_region_kind: dict[int, str] = {}
     edge_buckets: defaultdict[int, list[CFGEdge]] = defaultdict(list)
-    edges: list[CFGEdge] = []
+    transfer_edges: list[CFGEdge] = []
+    reference_edges: list[CFGEdge] = []
     issues: list[CFGIssue] = []
-    branch_target_relations: Counter[str] = Counter()
+
+    linear_branch_relations = _linear_branch_target_relations(body, body_size, linear_words, span_map, linear_starts, issues)
+    code_ref_relations = _linear_code_ref_target_relations(body, body_size, linear_words, span_map, linear_starts, issues)
+    declared_code_ref_roots: set[int] = set()
+    for ref_word in linear_words:
+        if ref_word.terminal_kind != "CODE_REF":
+            continue
+        try:
+            ref_target = code_ref_target_offset(ref_word)
+        except Exception:
+            continue
+        ref_kind = _decode_target_kind(body, ref_target)
+        if 0 <= ref_target < body_size and not _target_decodes_unknown(ref_kind):
+            declared_code_ref_roots.add(ref_target)
+    cfg_branch_relations: Counter[str] = Counter()
+
+    pending_regions: deque[tuple[int, str]] = deque()
+    seen_region_roots: set[int] = set()
+    code_ref_region_roots: set[int] = set()
+    code_ref_region_boundary_count = 0
+
+    def add_transfer_edge(edge: CFGEdge, *, enqueue: bool = False, worklist: deque[int] | None = None) -> None:
+        transfer_edges.append(edge)
+        edge_buckets[edge.src].append(edge)
+        if enqueue and edge.dst is not None and worklist is not None:
+            worklist.append(edge.dst)
+
+    def add_reference_edge(edge: CFGEdge) -> None:
+        reference_edges.append(edge)
+        edge_buckets[edge.src].append(edge)
+
+    def enqueue_region(root: int, kind: str) -> None:
+        if 0 <= root < body_size and root not in seen_region_roots:
+            seen_region_roots.add(root)
+            pending_regions.append((root, kind))
 
     if body_size:
-        worklist: deque[int] = deque([0])
+        enqueue_region(0, "entry")
     else:
-        worklist = deque()
         issues.append(CFGIssue(severity="error", code="empty_function_body", message="No bytes available for function body."))
 
-    while worklist:
-        offset = worklist.popleft()
-        if offset in nodes_raw:
-            continue
-        if offset < 0 or offset >= body_size:
-            issues.append(
-                CFGIssue(
-                    severity="error",
-                    code="entry_offset_out_of_range",
-                    offset=offset,
-                    message=f"CFG entry offset {offset} is outside function body size {body_size}.",
-                )
-            )
-            continue
-
-        try:
-            word = decode_word_at(body, offset, limit=body_size, index=len(nodes_raw))
-        except Exception as exc:  # pragma: no cover - defensive decoder boundary
-            issues.append(
-                CFGIssue(
-                    severity="error",
-                    code="decode_error",
-                    offset=offset,
-                    message=str(exc),
-                )
-            )
-            continue
-
-        nodes_raw[offset] = word
-        if word.terminal_kind == "UNKNOWN":
-            issues.append(
-                CFGIssue(
-                    severity="error",
-                    code="reachable_unknown_word",
-                    offset=offset,
-                    message=f"Reachable byte 0x{body[offset]:02X} decoded as UNKNOWN.",
-                    details={"byte": body[offset]},
-                )
-            )
-
-        next_offset = offset + max(1, int(word.size))
-        if next_offset > body_size:
-            issues.append(
-                CFGIssue(
-                    severity="error",
-                    code="word_overruns_body",
-                    offset=offset,
-                    message=f"Decoded word reaches {next_offset}, beyond function body size {body_size}.",
-                    details=word_to_dict(word),
-                )
-            )
-            continue
-
-        if word.terminal_kind in RETURN_TERMINALS:
-            continue
-
-        if word.terminal_kind == BRANCH_TERMINAL:
-            op = int(word.operands.get("op", -1) or -1) & 0xFF
-            op_hex = f"0x{op:02X}"
-            if is_control_branch_word(word):
-                try:
-                    target = branch_target_offset(word)
-                except Exception as exc:  # pragma: no cover - defensive decoder boundary
-                    issues.append(
-                        CFGIssue(
-                            severity="error",
-                            code="branch_target_resolution_error",
-                            offset=offset,
-                            message=str(exc),
-                            details=word_to_dict(word),
-                        )
+    while pending_regions:
+        region_root, region_kind = pending_regions.popleft()
+        worklist: deque[int] = deque([region_root])
+        while worklist:
+            offset = worklist.popleft()
+            if offset in nodes_raw:
+                continue
+            if offset < 0 or offset >= body_size:
+                issues.append(
+                    CFGIssue(
+                        severity="error",
+                        code="entry_offset_out_of_range",
+                        offset=offset,
+                        message=f"CFG entry offset {offset} is outside function body size {body_size}.",
                     )
-                    target = None
+                )
+                continue
 
+            try:
+                word = decode_word_at(body, offset, limit=body_size, index=len(nodes_raw))
+            except Exception as exc:
+                issues.append(CFGIssue("error", "decode_error", offset, message=str(exc)))
+                continue
+
+            nodes_raw[offset] = word
+            node_region_root[offset] = region_root
+            node_region_kind[offset] = region_kind
+
+            if word.terminal_kind == "UNKNOWN":
+                issues.append(
+                    CFGIssue(
+                        severity="error",
+                        code="reachable_unknown_word",
+                        offset=offset,
+                        message=f"Reachable byte 0x{body[offset]:02X} decoded as UNKNOWN.",
+                        details={"byte": body[offset], "region_root": region_root, "region_kind": region_kind},
+                    )
+                )
+
+            next_offset = offset + max(1, int(word.size))
+            if next_offset > body_size:
+                issues.append(
+                    CFGIssue(
+                        severity="error",
+                        code="word_overruns_body",
+                        offset=offset,
+                        message=f"Decoded word reaches {next_offset}, beyond function body size {body_size}.",
+                        details=word_to_dict(word),
+                    )
+                )
+                continue
+
+            if word.terminal_kind in RETURN_TERMINALS:
+                continue
+
+            if word.terminal_kind == BRANCH_TERMINAL:
+                op = int(word.operands.get("op", -1) or -1) & 0xFF
+                op_hex = f"0x{op:02X}"
+                if is_control_branch_word(word):
+                    try:
+                        target = branch_target_offset(word)
+                    except Exception as exc:
+                        issues.append(CFGIssue("error", "branch_target_resolution_error", offset, message=str(exc), details=word_to_dict(word)))
+                        target = None
+
+                    if target is not None:
+                        relation = classify_entry_offset(target, body_size, span_map, linear_starts)
+                        target_word = _decode_target_word(body, target)
+                        target_kind = target_word.kind if target_word is not None else None
+                        cfg_branch_relations[relation.relation] += 1
+                        valid_branch_entry = _validate_branch_target(
+                            body=body,
+                            body_size=body_size,
+                            word=word,
+                            target=target,
+                            relation=relation,
+                            target_word=target_word,
+                            target_kind=target_kind,
+                            op_hex=op_hex,
+                            issues=issues,
+                            issue_prefix="",
+                        )
+                        edge = CFGEdge(
+                            src=offset,
+                            dst=target if 0 <= target < body_size else None,
+                            kind="branch_conditional",
+                            op=op,
+                            op_hex=op_hex,
+                            target_relation=relation.relation,
+                            target_decoded_kind=target_kind,
+                        )
+                        add_transfer_edge(edge, enqueue=valid_branch_entry, worklist=worklist)
+
+                    if op in CONDITIONAL_CONTROL_BRANCH_OPS and next_offset < body_size:
+                        relation = classify_entry_offset(next_offset, body_size, span_map, linear_starts)
+                        edge = CFGEdge(
+                            src=offset,
+                            dst=next_offset,
+                            kind="fallthrough",
+                            op=op,
+                            op_hex=op_hex,
+                            target_relation=relation.relation,
+                            target_decoded_kind=_decode_target_kind(body, next_offset),
+                        )
+                        add_transfer_edge(edge, enqueue=True, worklist=worklist)
+                else:
+                    if next_offset < body_size:
+                        relation = classify_entry_offset(next_offset, body_size, span_map, linear_starts)
+                        edge = CFGEdge(
+                            src=offset,
+                            dst=next_offset,
+                            kind="predicate_no_transfer_next",
+                            op=op,
+                            op_hex=op_hex,
+                            target_relation=relation.relation,
+                            target_decoded_kind=_decode_target_kind(body, next_offset),
+                            note="BR-shaped predicate; encoded target is fallthrough, so it is not a CFG branch.",
+                        )
+                        add_transfer_edge(edge, enqueue=True, worklist=worklist)
+                continue
+
+            if word.terminal_kind == "CODE_REF":
+                try:
+                    target = code_ref_target_offset(word)
+                except Exception as exc:
+                    issues.append(CFGIssue("error", "code_ref_target_resolution_error", offset, message=str(exc), details=word_to_dict(word)))
+                    target = None
                 if target is not None:
                     relation = classify_entry_offset(target, body_size, span_map, linear_starts)
-                    branch_target_relations[relation.relation] += 1
                     target_kind = _decode_target_kind(body, target)
                     if target < 0 or target >= body_size:
                         issues.append(
                             CFGIssue(
-                                severity="error",
-                                code="branch_target_out_of_range",
-                                offset=offset,
-                                target=target,
-                                message=f"Branch target {target} is outside function body size {body_size}.",
-                                details={"op": op_hex, "relation": relation.to_dict()},
+                                "error",
+                                "code_ref_target_out_of_range",
+                                offset,
+                                target,
+                                f"CODE_REF target {target} is outside function body size {body_size}.",
+                                {"relation": relation.to_dict(), "region_root": region_root, "region_kind": region_kind},
                             )
                         )
-                    elif target_kind is None or target_kind.endswith("UNKNOWN"):
+                    elif _target_decodes_unknown(target_kind):
                         issues.append(
                             CFGIssue(
-                                severity="error",
-                                code="branch_target_decodes_unknown",
-                                offset=offset,
-                                target=target,
-                                message="Branch target is in-range, but decoding at the exact target is UNKNOWN.",
-                                details={"op": op_hex, "relation": relation.to_dict(), "target_decoded_kind": target_kind},
+                                "error",
+                                "code_ref_target_decodes_unknown",
+                                offset,
+                                target,
+                                "CODE_REF target is in-range, but decoding at the exact target is UNKNOWN.",
+                                {"relation": relation.to_dict(), "target_decoded_kind": target_kind},
                             )
                         )
-                    elif relation.is_overlap:
+                    elif relation.relation != "linear_boundary":
                         issues.append(
                             CFGIssue(
-                                severity="note",
-                                code="branch_target_overlap_entry",
-                                offset=offset,
-                                target=target,
-                                message="Branch target lands inside a linear fused word but decodes as a valid byte/sub-entry word.",
-                                details={"op": op_hex, "relation": relation.to_dict(), "target_decoded_kind": target_kind},
+                                "warning",
+                                "code_ref_target_not_linear_boundary",
+                                offset,
+                                target,
+                                "CODE_REF target is valid, but it is not a top-level linear word boundary.",
+                                {"relation": relation.to_dict(), "target_decoded_kind": target_kind},
                             )
                         )
-
                     edge = CFGEdge(
                         src=offset,
                         dst=target if 0 <= target < body_size else None,
-                        kind="branch_conditional",
-                        op=op,
-                        op_hex=op_hex,
+                        kind="code_ref_reference",
                         target_relation=relation.relation,
                         target_decoded_kind=target_kind,
+                        note="CODE_REF is a local code-island reference, not a control-transfer edge.",
                     )
-                    edges.append(edge)
-                    edge_buckets[offset].append(edge)
-                    if 0 <= target < body_size:
-                        worklist.append(target)
+                    add_reference_edge(edge)
+                    if 0 <= target < body_size and not _target_decodes_unknown(target_kind):
+                        code_ref_region_roots.add(target)
+                        enqueue_region(target, "code_ref")
 
-                if op in CONDITIONAL_CONTROL_BRANCH_OPS and next_offset < body_size:
+            if next_offset < body_size:
+                crosses_declared_code_ref_root = (
+                    region_kind == "code_ref"
+                    and next_offset in declared_code_ref_roots
+                    and next_offset != region_root
+                )
+                if crosses_declared_code_ref_root:
+                    code_ref_region_boundary_count += 1
+                else:
                     relation = classify_entry_offset(next_offset, body_size, span_map, linear_starts)
                     edge = CFGEdge(
                         src=offset,
                         dst=next_offset,
-                        kind="fallthrough",
-                        op=op,
-                        op_hex=op_hex,
+                        kind="next",
                         target_relation=relation.relation,
                         target_decoded_kind=_decode_target_kind(body, next_offset),
                     )
-                    edges.append(edge)
-                    edge_buckets[offset].append(edge)
-                    worklist.append(next_offset)
-            else:
-                relation = classify_entry_offset(next_offset, body_size, span_map, linear_starts) if next_offset <= body_size else EntryRelation(next_offset, "out_of_range")
-                if next_offset < body_size:
-                    edge = CFGEdge(
-                        src=offset,
-                        dst=next_offset,
-                        kind="predicate_no_transfer_next",
-                        op=op,
-                        op_hex=op_hex,
-                        target_relation=relation.relation,
-                        target_decoded_kind=_decode_target_kind(body, next_offset),
-                        note="BR-shaped predicate; encoded target is fallthrough, so it is not a CFG branch.",
-                    )
-                    edges.append(edge)
-                    edge_buckets[offset].append(edge)
-                    worklist.append(next_offset)
-            continue
-
-        if word.terminal_kind == "CODE_REF":
-            try:
-                target = code_ref_target_offset(word)
-            except Exception as exc:  # pragma: no cover - defensive decoder boundary
-                issues.append(
-                    CFGIssue(
-                        severity="error",
-                        code="code_ref_target_resolution_error",
-                        offset=offset,
-                        message=str(exc),
-                        details=word_to_dict(word),
-                    )
-                )
-                target = None
-            if target is not None:
-                relation = classify_entry_offset(target, body_size, span_map, linear_starts)
-                target_kind = _decode_target_kind(body, target)
-                if target < 0 or target >= body_size:
-                    issues.append(
-                        CFGIssue(
-                            severity="error",
-                            code="code_ref_target_out_of_range",
-                            offset=offset,
-                            target=target,
-                            message=f"CODE_REF target {target} is outside function body size {body_size}.",
-                            details={"relation": relation.to_dict()},
-                        )
-                    )
-                elif target_kind is None or target_kind.endswith("UNKNOWN"):
-                    issues.append(
-                        CFGIssue(
-                            severity="error",
-                            code="code_ref_target_decodes_unknown",
-                            offset=offset,
-                            target=target,
-                            message="CODE_REF target is in-range, but decoding at the exact target is UNKNOWN.",
-                            details={"relation": relation.to_dict(), "target_decoded_kind": target_kind},
-                        )
-                    )
-                edge = CFGEdge(
-                    src=offset,
-                    dst=target if 0 <= target < body_size else None,
-                    kind="code_ref",
-                    target_relation=relation.relation,
-                    target_decoded_kind=target_kind,
-                )
-                edges.append(edge)
-                edge_buckets[offset].append(edge)
-                if 0 <= target < body_size:
-                    worklist.append(target)
-
-        if next_offset < body_size:
-            relation = classify_entry_offset(next_offset, body_size, span_map, linear_starts)
-            edge = CFGEdge(
-                src=offset,
-                dst=next_offset,
-                kind="next",
-                target_relation=relation.relation,
-                target_decoded_kind=_decode_target_kind(body, next_offset),
-            )
-            edges.append(edge)
-            edge_buckets[offset].append(edge)
-            worklist.append(next_offset)
+                    add_transfer_edge(edge, enqueue=True, worklist=worklist)
 
     nodes: dict[int, CFGNode] = {}
     for offset, word in nodes_raw.items():
@@ -602,18 +873,24 @@ def build_function_cfg(
             word=word,
             relation=classify_entry_offset(offset, body_size, span_map, linear_starts),
             edges=list(edge_buckets.get(offset, [])),
+            region_root=node_region_root.get(offset, 0),
+            region_kind=node_region_kind.get(offset, "entry"),
         )
 
     covered: set[int] = set()
+    entry_covered: set[int] = set()
     for offset, word in nodes_raw.items():
-        covered.update(range(offset, min(body_size, offset + max(1, int(word.size)))))
+        byte_range = range(offset, min(body_size, offset + max(1, int(word.size))))
+        covered.update(byte_range)
+        if node_region_kind.get(offset) == "entry":
+            entry_covered.update(byte_range)
     uncovered_ranges = _ranges_from_covered(body_size, covered)
     if uncovered_ranges:
         issues.append(
             CFGIssue(
                 severity="note",
                 code="cfg_uncovered_bytes",
-                message="Some bytes are present in the function span but are not reached from CFG entry 0.",
+                message="Some bytes are present in the function span but are not covered by entry or CODE_REF regions.",
                 details={"ranges": uncovered_ranges[:16], "uncovered_byte_count": body_size - len(covered)},
             )
         )
@@ -627,14 +904,142 @@ def build_function_cfg(
         body_size=body_size,
         linear_words=linear_words,
         nodes=nodes,
-        edges=edges,
+        edges=transfer_edges,
+        reference_edges=reference_edges,
         issues=issues,
-        branch_target_relations=branch_target_relations,
+        branch_target_relations=linear_branch_relations,
+        cfg_branch_target_relations=cfg_branch_relations,
+        code_ref_target_relations=code_ref_relations,
+        call_script_target_relations=Counter(),
+        call_script_source_relations=Counter(),
         branch_count_linear=branch_count_linear,
         control_branch_count_linear=control_branch_count_linear,
         predicate_no_transfer_count=predicate_no_transfer_count,
+        code_ref_count_linear=code_ref_count_linear,
+        call_script_count_linear=call_script_count_linear,
+        code_ref_region_roots=sorted(code_ref_region_roots),
         cfg_covered_bytes=len(covered),
         cfg_uncovered_ranges=uncovered_ranges,
+        entry_covered_bytes=len(entry_covered),
+        code_ref_region_boundary_count=code_ref_region_boundary_count,
+    )
+
+
+def _classify_call_script_absolute_target(module: MBCModule, target: int) -> tuple[str, dict[str, Any]]:
+    code_size = module.get_real_code_size()
+    if target < 0 or target >= code_size:
+        return "out_of_range", {"code_size": code_size}
+
+    slot = module.initial_slot_for_offset(target)
+    if slot is not None:
+        return "initial_slot" if slot.valid else "invalid_initial_slot", {"slot": slot.to_dict()}
+
+    definition_names = [rec.name for rec in module.definitions if int(rec.a) == target]
+    if definition_names:
+        return "definition_entry", {"definitions": definition_names}
+
+    return "code_offset", {"code_size": code_size}
+
+
+def _validate_call_script_targets(module: MBCModule, cfg: FunctionCFG) -> None:
+    """Validate every reachable CALL_SCRIPT entry in the region CFG.
+
+    Linear CALL_SCRIPT words are still counted separately by
+    ``call_script_count_linear``.  Validation must use CFG nodes, not only the
+    linear stream, because legal branch suffix entries can expose prefixed
+    CALL_SCRIPT atoms at prefix-byte coordinates.
+    """
+
+    if cfg.span is None:
+        return
+    function_start = int(cfg.span[0])
+    cfg.call_script_target_relations.clear()
+    cfg.call_script_source_relations.clear()
+
+    for node in sorted(cfg.nodes.values(), key=lambda n: n.offset):
+        word = node.word
+        if word.terminal_kind != "CALL_SCRIPT":
+            continue
+        local_target = call_script_target_offset(word)
+        absolute_target = function_start + local_target
+        relation, details = _classify_call_script_absolute_target(module, absolute_target)
+        source_relation = node.relation.relation
+        source_kind = "linear" if source_relation == "linear_boundary" else "subentry"
+        cfg.call_script_target_relations[relation] += 1
+        cfg.call_script_source_relations[f"{source_kind}:{source_relation}"] += 1
+        details = dict(details)
+        details.update({
+            "local_target": local_target,
+            "absolute_target": absolute_target,
+            "function_start": function_start,
+            "source_kind": source_kind,
+            "source_relation": source_relation,
+            "region_root": node.region_root,
+            "region_kind": node.region_kind,
+            "word": word_to_dict(word),
+        })
+        if relation == "out_of_range":
+            cfg.issues.append(
+                CFGIssue(
+                    "error",
+                    "call_script_target_out_of_range",
+                    word.offset,
+                    absolute_target,
+                    "CALL_SCRIPT absolute target is outside module code.",
+                    details,
+                )
+            )
+        elif relation == "invalid_initial_slot":
+            cfg.issues.append(
+                CFGIssue(
+                    "error",
+                    "call_script_target_invalid_initial_slot",
+                    word.offset,
+                    absolute_target,
+                    "CALL_SCRIPT target points at an initial slot whose bytes/table record are invalid.",
+                    details,
+                )
+            )
+        elif relation == "code_offset":
+            cfg.issues.append(
+                CFGIssue(
+                    "warning",
+                    "call_script_target_not_definition_or_initial_slot",
+                    word.offset,
+                    absolute_target,
+                    "CALL_SCRIPT target is inside module code but not at a definition entry or valid initial slot.",
+                    details,
+                )
+            )
+
+def _empty_cfg_for_unavailable_span(entry_name: str, symbol: str, source_kind: str, definition_index: Optional[int], issues: list[CFGIssue]) -> FunctionCFG:
+    return FunctionCFG(
+        function_name=entry_name,
+        symbol=symbol,
+        source_kind=source_kind,
+        definition_index=definition_index,
+        span=None,
+        body_size=0,
+        linear_words=[],
+        nodes={},
+        edges=[],
+        reference_edges=[],
+        issues=issues,
+        branch_target_relations=Counter(),
+        cfg_branch_target_relations=Counter(),
+        code_ref_target_relations=Counter(),
+        call_script_target_relations=Counter(),
+        call_script_source_relations=Counter(),
+        branch_count_linear=0,
+        control_branch_count_linear=0,
+        predicate_no_transfer_count=0,
+        code_ref_count_linear=0,
+        call_script_count_linear=0,
+        code_ref_region_roots=[],
+        cfg_covered_bytes=0,
+        cfg_uncovered_ranges=[],
+        entry_covered_bytes=0,
+        code_ref_region_boundary_count=0,
     )
 
 
@@ -643,34 +1048,16 @@ def analyze_module(module: MBCModule) -> ModuleCFGReport:
     for entry in module.function_entries(include_definitions=True, include_exports=True, dedupe=True):
         span, reason = module.get_function_exact_code_span_with_reason(entry)
         body = module.get_function_body(entry)
-        issues: list[CFGIssue] = []
         if span is None:
-            issues.append(
+            issues = [
                 CFGIssue(
                     severity="error",
                     code="function_span_unavailable",
                     message=f"Function body span unavailable: {reason}",
                     details=entry.to_dict(),
                 )
-            )
-            cfg = FunctionCFG(
-                function_name=entry.name,
-                symbol=entry.symbol,
-                source_kind=entry.source_kind,
-                definition_index=entry.definition_index,
-                span=None,
-                body_size=0,
-                linear_words=[],
-                nodes={},
-                edges=[],
-                issues=issues,
-                branch_target_relations=Counter(),
-                branch_count_linear=0,
-                control_branch_count_linear=0,
-                predicate_no_transfer_count=0,
-                cfg_covered_bytes=0,
-                cfg_uncovered_ranges=[],
-            )
+            ]
+            cfg = _empty_cfg_for_unavailable_span(entry.name, entry.symbol, entry.source_kind, entry.definition_index, issues)
         else:
             cfg = build_function_cfg(
                 body,
@@ -680,6 +1067,7 @@ def analyze_module(module: MBCModule) -> ModuleCFGReport:
                 definition_index=entry.definition_index,
                 span=span,
             )
+            _validate_call_script_targets(module, cfg)
         function_cfgs.append(cfg)
 
     return ModuleCFGReport(
@@ -692,242 +1080,3 @@ def analyze_module(module: MBCModule) -> ModuleCFGReport:
         function_count=len(function_cfgs),
         function_cfgs=function_cfgs,
     )
-
-
-def resolve_mbc_path(target: str | Path, *, mbc_dir: str | Path = "mbc") -> Path:
-    target_path = Path(target)
-    candidates: list[Path] = []
-    if target_path.suffix.lower() == ".mbc":
-        candidates.append(target_path)
-        candidates.append(Path(mbc_dir) / target_path.name)
-    else:
-        candidates.append(target_path.with_suffix(".mbc"))
-        candidates.append(Path(mbc_dir) / f"{target_path.name}.mbc")
-        candidates.append(Path(mbc_dir) / target_path.name)
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-    joined = ", ".join(str(candidate) for candidate in candidates)
-    raise FileNotFoundError(f"Cannot find target MBC script {target!r}. Tried: {joined}")
-
-
-def _hex_raw(raw: bytes, *, max_bytes: int = 18) -> str:
-    text = raw[:max_bytes].hex(" ")
-    if len(raw) > max_bytes:
-        text += " ..."
-    return text
-
-
-def _format_value(value: Any) -> str:
-    if isinstance(value, int):
-        if value < 0:
-            return str(value)
-        return f"{value}"
-    return str(value)
-
-
-def format_word_concise(word: VMWord) -> str:
-    k = word.terminal_kind
-    op = word.operands.get("op")
-    prefix = ""
-    if word.prefixes:
-        prefix = " pfx=" + ".".join(f"{int(p):02X}" for p in word.prefixes)
-
-    if k == "BR":
-        op_int = int(word.operands.get("op", -1) or -1) & 0xFF
-        raw_off = int(word.operands.get("off", 0) or 0)
-        return f"{word.kind}{prefix} op=0x{op_int:02X} off={signed_u16(raw_off)} base={branch_operand_base_offset(word)}"
-    if k == "CALL_NATIVE":
-        return f"{word.kind}{prefix} argc={word.operands.get('argc')} opid=0x{int(word.operands.get('opid', 0) or 0):02X}"
-    if k == "CALL_SCRIPT":
-        return f"{word.kind}{prefix} argc={word.operands.get('argc')} rel={word.operands.get('rel')}"
-    if k in {"AGG", "AGG0"}:
-        children = word.operands.get("children") or []
-        child_text = ",".join(f"{ch.get('tag')}:{ch.get('ref')}" for ch in children[:6])
-        if len(children) > 6:
-            child_text += ",..."
-        return f"{word.kind} arity={word.operands.get('arity')} children=[{child_text}]"
-    if k in {"REF", "REF16"}:
-        return f"{word.kind}{prefix} op=0x{int(op or 0):02X} mode=0x{int(word.operands.get('mode', 0) or 0):02X} ref={word.operands.get('ref')}"
-    if k in {"REC41", "REC61", "REC62"}:
-        keys = ["mode", "u16", "ref", "imm", "a", "b", "c"]
-        body = " ".join(f"{key}={_format_value(word.operands[key])}" for key in keys if key in word.operands)
-        return f"{word.kind}{prefix} {body}".rstrip()
-    if k == "CODE_REF":
-        return f"{word.kind}{prefix} rel={word.operands.get('rel')}"
-    if k == "BARE_U32":
-        return f"{word.kind} value={word.operands.get('value')} follower={word.operands.get('follower_kind')}"
-    if k in {"IMM8", "IMM16", "IMM24S", "IMM24U", "IMM24Z", "IMM32", "F32", "U16"}:
-        if k == "F32":
-            return f"{word.kind}{prefix} value={word.operands.get('value')} bits=0x{int(word.operands.get('bits', 0) or 0):08X}"
-        return f"{word.kind}{prefix} op={f'0x{int(op):02X}' if op is not None else '-'} value={word.operands.get('value')}"
-    if k == "RETURN_PAIR":
-        return f"{word.kind} return_pair"
-    if k == "END":
-        return f"{word.kind} end"
-    if k == "MARK":
-        return f"{word.kind}{prefix} op=0x{int(op or word.operands.get('byte', 0) or 0):02X}"
-    if k == "NOP":
-        return f"{word.kind}"
-    if k == "UNKNOWN":
-        return f"{word.kind} byte=0x{int(word.operands.get('byte', 0) or 0):02X}"
-    return f"{word.kind}{prefix}"
-
-
-def _format_edge(edge: CFGEdge) -> str:
-    dst = "EXIT" if edge.dst is None else f"L{edge.dst:04X}"
-    if edge.kind == "next":
-        return f"next {dst}"
-    if edge.kind == "fallthrough":
-        return f"fallthrough {dst}"
-    if edge.kind == "predicate_no_transfer_next":
-        return f"predicate-no-transfer {dst}"
-    relation = f" [{edge.target_relation}]" if edge.target_relation else ""
-    target_kind = f" decodes={edge.target_decoded_kind}" if edge.target_decoded_kind else ""
-    return f"{edge.kind} -> {dst}{relation}{target_kind}"
-
-
-def _module_summary_lines(report: ModuleCFGReport) -> list[str]:
-    summary = report.summary
-    totals = summary["totals"]
-    lines = [
-        f"# module: {report.module_path}",
-        f"# parser_contract: {report.parser_contract}",
-        f"# defs={report.definition_count} exports={report.export_count} globals={report.global_count} functions={report.function_count}",
-        (
-            "# cfg: "
-            f"branch_functions={summary['functions_with_control_branches']} "
-            f"linear_branches={totals.get('linear_branches', 0)} "
-            f"control_branches={totals.get('control_branches', 0)} "
-            f"nodes={totals.get('cfg_nodes', 0)} edges={totals.get('cfg_edges', 0)}"
-        ),
-        f"# target_relations: {dict(summary['branch_target_relations'])}",
-        f"# issues: severity={dict(summary['severity_counts'])} codes={dict(summary['issue_counts'])}",
-        "# note: overlap target = branch lands inside a linear fused word, but exact byte target decodes as a valid CFG entry.",
-        "",
-    ]
-    return lines
-
-
-def _should_show_formatted_word(
-    word: VMWord,
-    *,
-    mode: str,
-    has_label: bool,
-    has_non_next_edges: bool,
-    is_alt: bool,
-) -> bool:
-    if mode not in FORMAT_MODES:
-        raise ValueError(f"unknown format mode: {mode!r}")
-    if mode == "full":
-        return True
-
-    role = word_role(word)
-    if mode == "branches":
-        return has_label or has_non_next_edges or role in IMPORTANT_ROLES
-
-    # flow mode keeps the readable control-flow stream while suppressing plain
-    # structural padding.  Structural entries are still shown when they are CFG
-    # labels, branch targets, or non-linear alternate entries.
-    if word.terminal_kind in STRUCTURAL_TERMINALS and not (has_label or has_non_next_edges or is_alt):
-        return False
-    return True
-
-
-def format_function_cfg(cfg: FunctionCFG, *, mode: str = "flow") -> str:
-    label_sources: defaultdict[int, list[str]] = defaultdict(list)
-    for edge in cfg.edges:
-        if edge.dst is not None and edge.kind != "next":
-            label_sources[edge.dst].append(f"from {edge.src:04X}:{edge.kind}:{edge.target_relation}")
-    label_sources[0].append("entry")
-
-    display_offsets = {int(word.offset) for word in cfg.linear_words}
-    display_offsets.update(cfg.nodes.keys())
-    sorted_offsets = sorted(display_offsets)
-
-    relation_counts = dict(cfg.branch_target_relations)
-    uncovered_count = cfg.body_size - cfg.cfg_covered_bytes
-    span_text = "-" if cfg.span is None else f"{cfg.span[0]}..{cfg.span[1]}"
-    lines = [
-        f"== {cfg.function_name}  symbol={cfg.symbol} source={cfg.source_kind} def_index={cfg.definition_index} span={span_text} bytes={cfg.body_size}",
-        (
-            f"   words={len(cfg.linear_words)} cfg_nodes={len(cfg.nodes)} edges={len(cfg.edges)} "
-            f"branches={cfg.control_branch_count_linear}/{cfg.branch_count_linear} "
-            f"target_relations={relation_counts} errors={cfg.hard_error_count} notes={cfg.note_count} uncovered={uncovered_count}"
-        ),
-    ]
-
-    interesting_issues = [issue for issue in cfg.issues if issue.code != "cfg_uncovered_bytes"]
-    for issue in interesting_issues[:12]:
-        target = "" if issue.target is None else f" target={issue.target:04X}"
-        offset = "" if issue.offset is None else f" @{issue.offset:04X}"
-        lines.append(f"   ! {issue.severity}:{issue.code}{offset}{target} {issue.message}")
-    if len(interesting_issues) > 12:
-        lines.append(f"   ! ... {len(interesting_issues) - 12} more issues omitted")
-
-    linear_by_offset = {int(word.offset): word for word in cfg.linear_words}
-    span_map, linear_starts = _build_linear_span_map(cfg.linear_words)
-    skipped = 0
-    for offset in sorted_offsets:
-        word = cfg.nodes[offset].word if offset in cfg.nodes and offset not in linear_by_offset else linear_by_offset[offset]
-        is_alt = offset in cfg.nodes and offset not in linear_by_offset
-        node = cfg.nodes.get(offset)
-        labels = label_sources.get(offset, [])
-        non_next_edges = [edge for edge in node.edges if edge.kind != "next"] if node and node.edges else []
-        if not _should_show_formatted_word(
-            word,
-            mode=mode,
-            has_label=bool(labels),
-            has_non_next_edges=bool(non_next_edges),
-            is_alt=is_alt,
-        ):
-            skipped += 1
-            continue
-        if skipped:
-            lines.append(f"      ... {skipped} structural entries omitted")
-            skipped = 0
-        label_text = f"L{offset:04X}:" if labels else "      "
-        alt_text = "@ALT " if is_alt else "     "
-        raw = _hex_raw(word.raw)
-        raw_pad = raw.ljust(54)
-        relation = node.relation.relation if node is not None else classify_entry_offset(offset, cfg.body_size, span_map, linear_starts).relation
-        relation_text = f" [{relation}]" if is_alt or relation != "linear_boundary" else ""
-        edge_text = ""
-        if non_next_edges:
-            edge_text = "  ; " + " | ".join(_format_edge(edge) for edge in non_next_edges)
-        source_text = ""
-        if labels:
-            source_text = "  ; labels=" + ", ".join(labels[:4])
-            if len(labels) > 4:
-                source_text += ", ..."
-        lines.append(
-            f"{label_text} {alt_text}{offset:04X}-{offset + word.size:04X} {raw_pad} {format_word_concise(word)}{relation_text}{edge_text}{source_text}"
-        )
-    if skipped:
-        lines.append(f"      ... {skipped} structural entries omitted")
-    lines.append("")
-    return "\n".join(lines)
-
-
-def format_module_report(
-    report: ModuleCFGReport,
-    *,
-    include_all_functions: bool = False,
-    include_functions_without_branches: bool = False,
-    mode: str = "flow",
-) -> str:
-    lines = _module_summary_lines(report)
-    selected: list[FunctionCFG] = []
-    for cfg in report.function_cfgs:
-        if include_all_functions:
-            selected.append(cfg)
-        elif cfg.has_control_interest:
-            selected.append(cfg)
-        elif include_functions_without_branches and cfg.branch_count_linear == 0:
-            selected.append(cfg)
-
-    lines.append(f"# emitted_functions={len(selected)} mode={mode} (use include_all_functions=True for a full token stream)\n")
-    for cfg in selected:
-        lines.append(format_function_cfg(cfg, mode=mode))
-    return "\n".join(lines)

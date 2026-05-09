@@ -665,13 +665,14 @@ def stack_contract(word: VMWord) -> dict[str, Any]:
     if k == "BR":
         op = int(word.operands.get("op", -1) or -1) & 0xFF
         base.update({
-            "predicate": "prefix_defined" if word.prefixes else "stack_top_or_flag",
+            "predicate": "prefix_defined" if word.prefixes else "opaque_vm_condition",
             "control_transfer": role == "branch",
+            "branch_op": op,
             "stack_effect_rule": "conditional_predicate_transfer_deferred",
+            "predicate_frame_rule": "do_not_greedily_bind_preceding_lower_operand_atoms",
         })
         if op in CONDITIONAL_CONTROL_BRANCH_OPS:
-            base["predicate_stack_effect"] = "lower_operand_frame_deferred"
-            base["candidate_predicate_pop"] = [0, 1, 2]
+            base["predicate_stack_effect"] = "opaque_deferred"
         return base
     if k in RETURN_WORDS:
         base["stack_effect_rule"] = "terminal_return_is_lower_operand_frame_sink"

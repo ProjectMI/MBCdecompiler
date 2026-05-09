@@ -85,11 +85,10 @@ class TableRecord:
 
 
 @dataclass
-class TableCandidate:
+class TableBlock:
     start: int
     end: int
     kind: str
-    score: float
     records: list[TableRecord]
 
     def to_dict(self) -> dict:
@@ -97,7 +96,6 @@ class TableCandidate:
             "start": self.start,
             "end": self.end,
             "kind": self.kind,
-            "score": self.score,
             "records": [r.to_dict() for r in self.records],
         }
 
@@ -207,54 +205,13 @@ EMPTY_ADB_INFO = ADBInfo(
 )
 
 
-def parse_table_with_padding(data: bytes, start: int, globals_mode: bool = False, max_records: int = 5000, max_inter_record_zero_run: int = MAX_INTER_RECORD_ZERO_RUN) -> tuple[list[TableRecord], int]:
-    records: list[TableRecord] = []
-    pos = start
-    size = len(data)
-    seen_record = False
-
-    while pos < size and len(records) < max_records:
-        zero_start = pos
-        while pos < size and data[pos] == 0:
-            pos += 1
-        if pos >= size:
-            break
-
-        zero_run = pos - zero_start
-        if seen_record and zero_run > max_inter_record_zero_run:
-            break
-
-        if pos > 0 and data[pos - 1] != 0:
-            break
-
-        name, end = read_cstr(data, pos)
-        if name is None or end + 12 > size:
-            break
-
-        a, b, c = struct.unpack_from("<III", data, end)
-
-        if not _is_symbolish_name(name):
-            break
-        if a > size * 2:
-            break
-
-        if globals_mode and not (b == 0xFFFFFFFF and c == 0):
-            break
-
-        records.append(TableRecord(pos, name, a, b, c))
-        seen_record = True
-        pos = end + 12
-
-    return records, pos
-
-
 
 def _is_definition_record(rec: TableRecord, code_size: int) -> bool:
     """Authoritative definition-table record predicate.
 
     Definition records address a closed byte range inside the code segment and
     carry one of the observed VM definition flags.  This is a hard table-shape
-    predicate, not a score.
+    predicate, not a ranking score.
     """
 
     return rec.b != 0xFFFFFFFF and rec.a <= rec.b < code_size and rec.c in KNOWN_FLAGS
@@ -330,7 +287,7 @@ def _parse_strict_table(
     max_records: int = 5000,
     max_inter_record_zero_run: int = MAX_INTER_RECORD_ZERO_RUN,
     sync_first_record: bool = True,
-) -> TableCandidate | None:
+) -> TableBlock | None:
     """Parse one table by a hard per-record predicate.
 
     The table starts at the NUL padding before the first record.  Records may be
@@ -359,7 +316,7 @@ def _parse_strict_table(
             pos += 1
         zero_run = pos - zero_start
         if records and zero_run > max_inter_record_zero_run:
-            return TableCandidate(table_start, zero_start, kind, 1.0, records)
+            return TableBlock(table_start, zero_start, kind, records)
         if pos >= size:
             break
         if pos > 0 and data[pos - 1] != 0:
@@ -368,14 +325,14 @@ def _parse_strict_table(
         if rec is None:
             break
         if not predicate(rec):
-            return TableCandidate(table_start, zero_start, kind, 1.0, records) if records else None
+            return TableBlock(table_start, zero_start, kind, records) if records else None
         records.append(rec)
         name_end = data.find(b"\x00", pos)
         pos = name_end + 1 + 12
 
     if not records:
         return None
-    return TableCandidate(table_start, pos, kind, 1.0, records)
+    return TableBlock(table_start, pos, kind, records)
 
 
 def _next_table_anchor(data: bytes, start: int) -> int | None:
@@ -408,17 +365,17 @@ def _detect_module_layout_deterministic(data: bytes) -> dict:
     - The export table is the next table that contains at least one normal export
       record; import-like records inside that same stream remain embedded externs.
 
-    No score, majority vote, whole-file sweep, or candidate ranking is used.
+    No majority vote, whole-file sweep, or candidate ranking is used.
     """
 
     diagnostics: dict[str, object] = {
         "contract": PARSER_CONTRACT_VERSION,
-        "policy": "header anchored deterministic layout; strict record predicates; no fallback sweep or scoring",
+        "policy": "header anchored deterministic layout; strict record predicates; no fallback sweep",
     }
     anchor = _header_table_anchor(data)
     diagnostics["header_table_anchor"] = anchor
     if anchor is None:
-        return {"definitions": None, "globals": None, "exports": None, "candidates": [], "diagnostics": diagnostics}
+        return {"definitions": None, "globals": None, "exports": None, "diagnostics": diagnostics}
 
     header = [u32(data, 0x10 + i * 4) for i in range(4)]
     code_size = int(header[2])
@@ -435,7 +392,7 @@ def _detect_module_layout_deterministic(data: bytes) -> dict:
     )
     if definitions is None:
         diagnostics["failure"] = "definition_table_missing"
-        return {"definitions": None, "globals": None, "exports": None, "candidates": [], "diagnostics": diagnostics}
+        return {"definitions": None, "globals": None, "exports": None, "diagnostics": diagnostics}
 
     diagnostics["definition_count"] = len(definitions.records)
     pos = definitions.end
@@ -491,18 +448,12 @@ def _detect_module_layout_deterministic(data: bytes) -> dict:
         "definitions": definitions,
         "globals": globals_table,
         "exports": exports_table,
-        "candidates": [],
         "diagnostics": diagnostics,
     }
 
 
-def detect_module_layout(data: bytes, *, collect_candidates: bool = True, allow_fallback_scan: bool = True) -> dict:
-    """Return deterministic MBC table layout.
-
-    ``collect_candidates`` and ``allow_fallback_scan`` are accepted for API
-    compatibility only.  Parser v2 intentionally performs no candidate sweep,
-    score ranking, or fallback scan.
-    """
+def detect_module_layout(data: bytes) -> dict:
+    """Return the deterministic, header-anchored MBC table layout."""
 
     return _detect_module_layout_deterministic(data)
 
@@ -596,19 +547,13 @@ class MBCModule:
         self.data_blob_size = (self.header[3] + 1) if self.has_magic_header else 0
         self.adb_info = read_adb_info(self.path) if collect_auxiliary else EMPTY_ADB_INFO
 
-        layout = detect_module_layout(
-            self.data,
-            collect_candidates=collect_auxiliary,
-            allow_fallback_scan=False,
-        )
+        layout = detect_module_layout(self.data)
 
         self.parser_contract = PARSER_CONTRACT_VERSION
         self.layout_diagnostics: dict = layout.get("diagnostics", {})
-        self.definition_table: Optional[TableCandidate] = layout["definitions"]
-        self.globals_table: Optional[TableCandidate] = layout["globals"]
-        self.exports_table: Optional[TableCandidate] = layout["exports"]
-        self.candidates: list[TableCandidate] = []
-
+        self.definition_table: Optional[TableBlock] = layout["definitions"]
+        self.globals_table: Optional[TableBlock] = layout["globals"]
+        self.exports_table: Optional[TableBlock] = layout["exports"]
         raw_exports = self.exports_table.records if self.exports_table else []
         self.embedded_import_like_exports: list[TableRecord] = [
             r for r in raw_exports if r.b == 0xFFFFFFFF and r.c == 0

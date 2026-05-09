@@ -4,7 +4,7 @@ import argparse
 from collections import Counter, defaultdict
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Iterable, Optional
 
 from mbl_vm_tools.control_flow import (
     CFGEdge,
@@ -213,7 +213,7 @@ def _target_note_for_node(cfg: FunctionCFG, word: VMWord, node_edges: Iterable[C
         decoded = f" decodes={edge.target_decoded_kind}" if edge.target_decoded_kind else ""
         return f" target={note}@{target}{decoded}"
     if word.terminal_kind == "CODE_REF":
-        code_edges = [edge for edge in node_edges if edge.kind == "code_ref"]
+        code_edges = [edge for edge in node_edges if edge.kind == "code_ref_reference"]
         if code_edges:
             edge = code_edges[0]
             note = _relation_short(edge.target_relation)
@@ -236,7 +236,7 @@ def _edge_kind_short(edge: CFGEdge) -> str:
         "predicate_no_transfer_next": "predicate_no_transfer",
         "fallthrough": "fallthrough",
         "next": "next",
-        "code_ref": "code_ref",
+        "code_ref_reference": "code_ref_ref",
     }.get(edge.kind, edge.kind)
 
 
@@ -264,12 +264,14 @@ def should_show_node(word: VMWord, mode: str, *, relation: str, has_interesting_
 
 def render_cfg_stream(cfg: FunctionCFG, *, mode: str = "flow") -> list[str]:
     linear_offsets = {int(w.offset) for w in cfg.linear_words}
-    grouped_edges = _edges_by_source(cfg.edges)
+    grouped_edges = _edges_by_source(cfg.all_edges)
     width = max(4, len(f"{max(0, cfg.body_size):X}"))
     lines: list[str] = []
     skipped = 0
 
     for offset, node in sorted(cfg.nodes.items()):
+        if offset == node.region_root:
+            lines.append(f"    -- region {node.region_kind} root={hx(node.region_root, width)} --")
         word = node.word
         node_edges = grouped_edges.get(offset, [])
         if mode == "full":
@@ -290,11 +292,12 @@ def render_cfg_stream(cfg: FunctionCFG, *, mode: str = "flow") -> list[str]:
         if interesting_edges:
             edge_text = " ; " + ", ".join(_edge_summary(edge, cfg.body_size) for edge in interesting_edges)
         relation_text = "" if relation == "linear_boundary" else f" relation={_relation_short(relation)}"
+        region_text = "" if node.region_kind == "entry" else f" region={node.region_kind}@{hx(node.region_root, width)}"
         target_note = _target_note_for_node(cfg, word, node_edges)
         raw = word.terminal_kind in {"UNKNOWN", "BR"}
         lines.append(
             f"  {sub}{hx(offset, width)} +{word.size:<2} {role:<21} "
-            f"{summarize_word(word, include_raw=raw)}{relation_text}{target_note}{edge_text}"
+            f"{summarize_word(word, include_raw=raw)}{relation_text}{region_text}{target_note}{edge_text}"
         )
     if skipped:
         lines.append(f"    ... {skipped} structural MARK/NOP entries omitted")
@@ -341,9 +344,6 @@ def _target_relation_totals(cfgs: Iterable[FunctionCFG]) -> Counter[str]:
     return totals
 
 
-def _branch_target_issue_count(cfgs: Iterable[FunctionCFG], code: str) -> int:
-    return sum(1 for cfg in cfgs for issue in cfg.issues if issue.code == code)
-
 
 def render_issue(issue: CFGIssue, *, width: int) -> str:
     loc = ""
@@ -369,8 +369,8 @@ def render_function_report(cfg: FunctionCFG, *, mode: str = "flow") -> str:
         for relation, count in relation_counts.items()
         if relation not in {"linear_boundary", "out_of_range", "function_end"}
     )
-    branch_oob = sum(1 for issue in cfg.issues if issue.code == "branch_target_out_of_range")
-    branch_unknown = sum(1 for issue in cfg.issues if issue.code == "branch_target_decodes_unknown")
+    branch_oob = sum(1 for issue in cfg.issues if issue.code in {"branch_target_out_of_range", "linear_branch_target_out_of_range"})
+    branch_unknown = sum(1 for issue in cfg.issues if issue.code in {"branch_target_decodes_unknown", "linear_branch_target_decodes_unknown"})
     reachable_unknown = sum(1 for issue in cfg.issues if issue.code == "reachable_unknown_word")
     uncovered = cfg.body_size - cfg.cfg_covered_bytes
 
@@ -378,10 +378,14 @@ def render_function_report(cfg: FunctionCFG, *, mode: str = "flow") -> str:
         f"FUNC {cfg.function_name} [{cfg.source_kind}] span={span_s} len={cfg.body_size} status={status}",
         (
             "  cfg: "
-            f"nodes={len(cfg.nodes)} edges={len(cfg.edges)} "
+            f"nodes={len(cfg.nodes)} transfer_edges={cfg.transfer_edge_count} reference_edges={cfg.reference_edge_count} "
             f"linear_words={len(cfg.linear_words)} "
             f"branches={cfg.control_branch_count_linear} "
             f"predicate_no_transfer={cfg.predicate_no_transfer_count} "
+            f"code_refs={cfg.code_ref_count_linear} code_ref_roots={len(cfg.code_ref_region_roots)} "
+            f"code_ref_boundaries={cfg.code_ref_region_boundary_count} "
+            f"call_scripts_linear={cfg.call_script_count_linear} "
+            f"call_scripts_reachable={cfg.reachable_call_script_count} "
             f"unknown={reachable_unknown}"
         ),
         (
@@ -396,7 +400,13 @@ def render_function_report(cfg: FunctionCFG, *, mode: str = "flow") -> str:
         ),
     ]
     if relation_counts:
-        lines.append("  target relations: " + ", ".join(f"{k}={v}" for k, v in sorted(relation_counts.items())))
+        lines.append("  branch target relations(linear): " + ", ".join(f"{k}={v}" for k, v in sorted(relation_counts.items())))
+    if cfg.cfg_branch_target_relations:
+        lines.append("  branch target relations(reachable_cfg): " + ", ".join(f"{k}={v}" for k, v in sorted(cfg.cfg_branch_target_relations.items())))
+    if cfg.code_ref_target_relations:
+        lines.append("  code_ref target relations: " + ", ".join(f"{k}={v}" for k, v in sorted(cfg.code_ref_target_relations.items())))
+    if cfg.call_script_target_relations:
+        lines.append("  call_script target relations: " + ", ".join(f"{k}={v}" for k, v in sorted(cfg.call_script_target_relations.items())))
     if uncovered:
         lines.append(
             "  uncovered bytes: "
@@ -443,10 +453,16 @@ def render_module_report(
         totals["body_bytes"] += cfg.body_size
         totals["linear_words"] += len(cfg.linear_words)
         totals["cfg_nodes"] += len(cfg.nodes)
-        totals["cfg_edges"] += len(cfg.edges)
+        totals["transfer_edges"] += cfg.transfer_edge_count
+        totals["reference_edges"] += cfg.reference_edge_count
         totals["linear_branches"] += cfg.branch_count_linear
         totals["control_branches"] += cfg.control_branch_count_linear
         totals["predicate_no_transfer"] += cfg.predicate_no_transfer_count
+        totals["code_refs"] += cfg.code_ref_count_linear
+        totals["call_scripts"] += cfg.call_script_count_linear
+        totals["reachable_call_scripts"] += cfg.reachable_call_script_count
+        totals["code_ref_roots"] += len(cfg.code_ref_region_roots)
+        totals["code_ref_region_boundaries"] += cfg.code_ref_region_boundary_count
         totals["uncovered_bytes"] += cfg.body_size - cfg.cfg_covered_bytes
         if _issue_flags(cfg):
             totals["functions_with_warnings"] += 1
@@ -476,18 +492,23 @@ def render_module_report(
             f"{module.adb_info.quality} present={module.adb_info.present} "
             f"words={module.adb_info.word_count}"
         ),
-        "ANALYZER control_flow branch_model=deprecated",
+        "ANALYZER control_flow model=region_cfg_v4 code_ref=reference_not_transfer code_ref_roots_are_region_boundaries branch_targets=require_exact_suffix_entry_frame call_script=reachable_cfg_validation",
         (
             "SUMMARY "
             f"body_bytes={totals['body_bytes']} "
             f"linear_words={totals['linear_words']} cfg_nodes={totals['cfg_nodes']} "
-            f"edges={totals['cfg_edges']} branches={totals['control_branches']} "
-            f"predicate_no_transfer={totals['predicate_no_transfer']}"
+            f"transfer_edges={totals['transfer_edges']} reference_edges={totals['reference_edges']} "
+            f"branches={totals['control_branches']} predicate_no_transfer={totals['predicate_no_transfer']} "
+            f"code_refs={totals['code_refs']} code_ref_roots={totals['code_ref_roots']} "
+            f"code_ref_boundaries={totals['code_ref_region_boundaries']} "
+            f"call_scripts_linear={totals['call_scripts']} "
+            f"call_scripts_reachable={totals['reachable_call_scripts']}"
         ),
         (
             "VALIDATION "
-            f"branch_oob={_branch_target_issue_count(selected, 'branch_target_out_of_range')} "
-            f"branch_unknown={_branch_target_issue_count(selected, 'branch_target_decodes_unknown')} "
+            f"branch_oob={issue_counts.get('branch_target_out_of_range', 0) + issue_counts.get('linear_branch_target_out_of_range', 0)} "
+            f"branch_unknown={issue_counts.get('branch_target_decodes_unknown', 0) + issue_counts.get('linear_branch_target_decodes_unknown', 0)} "
+            f"branch_frame_bad={issue_counts.get('branch_target_not_suffix_entry_frame', 0) + issue_counts.get('linear_branch_target_not_suffix_entry_frame', 0)} "
             f"reachable_unknown={issue_counts.get('reachable_unknown_word', 0)} "
             f"subentry_targets={subentry_targets} "
             f"linear_targets={linear_targets} "
@@ -500,11 +521,15 @@ def render_module_report(
             f"prefix_byte={prefix_targets} "
             f"overlap={overlap_targets}"
         ),
-        f"TARGET RELATIONS {dict(sorted(relations.items()))}",
+        f"BRANCH TARGET RELATIONS linear={dict(sorted(relations.items()))}",
+        f"BRANCH TARGET RELATIONS reachable_cfg={dict(sorted(sum((cfg.cfg_branch_target_relations for cfg in selected), Counter()).items()))}",
+        f"CODE_REF TARGET RELATIONS {dict(sorted(sum((cfg.code_ref_target_relations for cfg in selected), Counter()).items()))}",
+        f"CALL_SCRIPT TARGET RELATIONS reachable={dict(sorted(sum((cfg.call_script_target_relations for cfg in selected), Counter()).items()))}",
+        f"CALL_SCRIPT SOURCE RELATIONS reachable={dict(sorted(sum((cfg.call_script_source_relations for cfg in selected), Counter()).items()))}",
         f"ISSUES severity={dict(severity_counts)} codes={dict(issue_counts)}",
         "",
         "Legend: leading '!' before an offset means CFG entry is not a top-level linear token boundary.",
-        "Edges: branch/code_ref are transfer edges; next/fallthrough are shown only in --mode full.",
+        "Edges: branch/fallthrough/next are transfer edges; code_ref_ref is a reference edge that starts a separate region. Branch subentries must decode as exact suffixes of their containing linear word.",
         "Mode: " + mode,
         "",
     ]
