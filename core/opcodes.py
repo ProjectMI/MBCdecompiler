@@ -16,17 +16,19 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import struct
 
-CODE_FILE_OFFSET = 0x20
-
-TYPE_NAMES: Dict[int, str] = {
-    0: "i8/char",
-    1: "span/string",
-    16: "int32",
-    17: "int32_ref_or_span",
-    32: "float32",
-    33: "float32_ref_or_span",
-    48: "slice_descriptor",
-}
+from .common import (
+    CODE_FILE_OFFSET,
+    TYPE_BASE_NAMES,
+    TYPE_NAMES,
+    f32_from_u32 as _f32_from_u32,
+    safe_chr,
+    s8 as _s8,
+    s16 as _s16,
+    s32 as _s32,
+    type_name,
+    u16 as _u16,
+    u32 as _u32,
+)
 
 
 @dataclass(frozen=True)
@@ -76,39 +78,6 @@ class DecodedOpcode:
     known: bool
     edges: List[DecodedEdge]
 
-
-def _s8(value: int) -> int:
-    return value - 0x100 if value >= 0x80 else value
-
-
-def _s16(buf: bytes, off: int) -> int:
-    return struct.unpack_from("<h", buf, off)[0]
-
-
-def _u16(buf: bytes, off: int) -> int:
-    return struct.unpack_from("<H", buf, off)[0]
-
-
-def _s32(buf: bytes, off: int) -> int:
-    return struct.unpack_from("<i", buf, off)[0]
-
-
-def _u32(buf: bytes, off: int) -> int:
-    return struct.unpack_from("<I", buf, off)[0]
-
-
-def _f32_from_u32(value: int) -> float:
-    return struct.unpack("<f", struct.pack("<I", value & 0xFFFFFFFF))[0]
-
-
-def safe_chr(value: int) -> str:
-    if 32 <= value < 127:
-        return chr(value)
-    return "."
-
-
-def type_name(type_id: int) -> str:
-    return TYPE_NAMES.get(type_id, f"type_{type_id}")
 
 
 _TOP_OPCODE_ROWS: Dict[int, Dict[str, Any]] = {0: {'char': '\\x00',

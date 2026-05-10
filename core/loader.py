@@ -5,30 +5,14 @@ from pathlib import Path
 import struct
 from typing import List, Optional
 
-
-MAGIC = b"MBL script v4.0\x00"
-CODE_FILE_OFFSET = 0x20
-
-
-def _u32(buf: bytes, off: int) -> int:
-    return struct.unpack_from("<I", buf, off)[0]
-
-
-def _i8(value: int) -> int:
-    return value - 0x100 if value >= 0x80 else value
-
-
-def _i32(value: int) -> int:
-    value &= 0xFFFFFFFF
-    return value - 0x100000000 if value & 0x80000000 else value
-
-
-def _read_c_string(buf: bytes, off: int, encoding: str = "cp1251") -> tuple[str, int]:
-    end = buf.find(b"\x00", off)
-    if end < 0:
-        raise ValueError(f"Unterminated string at 0x{off:X}")
-    raw = buf[off:end]
-    return raw.decode(encoding, errors="replace"), end + 1
+from .common import (
+    CODE_FILE_OFFSET,
+    MAGIC,
+    i32 as _i32,
+    read_c_string as _read_c_string,
+    s8 as _i8,
+    u32 as _u32,
+)
 
 
 @dataclass

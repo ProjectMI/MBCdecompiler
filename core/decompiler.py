@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+"""High-level pseudo-source generation for MBC scripts.
+
+This is the orchestration layer: project loading, local-helper discovery,
+per-program CFG traversal, stack-AST building, and final text assembly.
+"""
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+from .bytecode import MbcControlFlow, MbcDecoder
+from .linker import MbcProjectLinker, MbcStaticLinker
+from .loader import MbcLoader, MbcProgram, MbcProject, MbcScript
+from .vm_ast import build_program_ast
+
+LOCAL_HELPER_PREFIX = "local"
+
+
+def helper_name(offset: int) -> str:
+    return f"{LOCAL_HELPER_PREFIX}_{offset:08X}"
+
+
+@dataclass(frozen=True)
+class LocalHelper:
+    offset: int
+    name: str
+    owner_index: int
+    program: MbcProgram
+
+
+@dataclass
+class LocalHelperIndex:
+    helpers: dict[int, LocalHelper] = field(default_factory=dict)
+
+    @property
+    def names(self) -> dict[int, str]:
+        return {offset: helper.name for offset, helper in self.helpers.items()}
+
+    @property
+    def stop_offsets(self) -> set[int]:
+        return set(self.helpers)
+
+    def by_owner(self) -> dict[int, list[LocalHelper]]:
+        grouped: dict[int, list[LocalHelper]] = {}
+        for helper in self.helpers.values():
+            grouped.setdefault(helper.owner_index, []).append(helper)
+        for items in grouped.values():
+            items.sort(key=lambda item: item.offset)
+        return grouped
+
+    def annotate_call_names(self, instructions: Iterable[object]) -> None:
+        names = self.names
+        for ins in instructions:
+            if getattr(ins, "mnemonic", None) != "call_rel32":
+                continue
+            operands = getattr(ins, "operands", None)
+            if not isinstance(operands, dict):
+                continue
+            target = operands.get("target")
+            if isinstance(target, int) and target in names:
+                operands["target_name"] = names[target]
+
+
+def synthetic_helper_program(script: MbcScript, entry: int, owner: MbcProgram | None = None) -> MbcProgram:
+    """Create a synthetic program-table-like record for a local helper entry."""
+    if owner is None:
+        owner = script.program_for_offset(entry)
+    if owner is not None:
+        end = owner.end if owner.end >= entry else len(script.code) - 1
+        return MbcProgram(owner.index, helper_name(entry), entry, end, owner.state_raw, owner.queue_id, owner.unknown_48)
+    return MbcProgram(-1, helper_name(entry), entry, len(script.code) - 1, 0, 0, 0)
+
+
+def discover_local_helpers(script: MbcScript, flow: MbcControlFlow, linker: MbcStaticLinker) -> LocalHelperIndex:
+    """Find anonymous same-script call targets and expose them as local helpers.
+
+    We intentionally do not infer semantic names here.  The only commitment is
+    structural: a direct call target that is neither a named program entry nor an
+    import/native stub should be rendered as a separate local routine instead of
+    being inlined into the caller's linear stream.
+    """
+    named_starts = {program.start for program in script.programs}
+    entries_by_offset: dict[int, MbcProgram] = {program.start: program for program in script.programs}
+    helpers: dict[int, LocalHelper] = {}
+    seen_entries: set[int] = set()
+    queue: list[MbcProgram] = list(script.programs)
+
+    while queue:
+        entry_program = queue.pop(0)
+        entry = entry_program.start
+        if entry in seen_entries or not (0 <= entry < len(script.code)):
+            continue
+        seen_entries.add(entry)
+
+        stop_offsets = set(entries_by_offset)
+        instructions = flow.decode_program(entry_program, follow_local_calls=False, stop_offsets=stop_offsets)
+
+        for ins in instructions:
+            if ins.mnemonic != "call_rel32":
+                continue
+            target = ins.operands.get("target")
+            if not isinstance(target, int) or not (0 <= target < len(script.code)):
+                continue
+            if target in named_starts or linker.import_stub_at(target) is not None:
+                continue
+
+            target_owner = script.program_for_offset(target)
+            if target_owner is not None and entry_program.index >= 0 and target_owner.index != entry_program.index:
+                # A call into another named program range is not a local helper of
+                # the current body.  Leave it as an ordinary call edge.
+                continue
+
+            if target in entries_by_offset:
+                continue
+
+            owner = target_owner or (entry_program if entry_program.index >= 0 else None)
+            helper_program = synthetic_helper_program(script, target, owner)
+            entries_by_offset[target] = helper_program
+            helper = LocalHelper(
+                offset=target,
+                name=helper_name(target),
+                owner_index=owner.index if owner is not None else -1,
+                program=helper_program,
+            )
+            helpers[target] = helper
+            queue.append(helper_program)
+
+    return LocalHelperIndex(helpers=helpers)
+
+def load_project_for(mbc_path: Path) -> tuple[MbcProject, MbcScript, MbcProjectLinker]:
+    project = MbcProject.load_for_script(mbc_path)
+    script = project.by_module.get(mbc_path.stem)
+    if script is None:
+        # Fallback for unusual paths outside the default mbc/ tree.
+        script = MbcLoader.load(mbc_path)
+        project = MbcProject(root=mbc_path.parent, scripts=[script])
+    project_linker = MbcProjectLinker(project.scripts)
+    return project, script, project_linker
+
+
+def _program_header(program: MbcProgram, linker: MbcStaticLinker, *, local_helper: LocalHelper | None = None) -> str:
+    if local_helper is not None:
+        return f"// === {local_helper.name}() @ 0x{local_helper.offset:08X} ==="
+
+    symbol = linker.internal_at(program.start) or linker.symbol_at(program.start)
+    name = program.name or (symbol.name if symbol else f"program_{program.index}")
+    signature = symbol.signature.render(include_storage=True) if symbol is not None else "()"
+    return f"// === {name}{signature} @ 0x{program.start:08X} ==="
+
+
+def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | None = None) -> str:
+    linker = (project_linker.module(script.path.stem) if project_linker is not None else None) or MbcStaticLinker(script)
+    decoder = MbcDecoder(script, linker=linker)
+    flow = MbcControlFlow(script, decoder=decoder)
+    local_index = discover_local_helpers(script, flow, linker)
+    helpers_by_owner = local_index.by_owner()
+    stop_offsets = {program.start for program in script.programs} | local_index.stop_offsets
+
+    chunks: list[str] = [
+        "// Experimental MBC pseudo-source",
+        f"// source: {script.path.name}",
+        f"// programs: {len(script.programs)}",
+        "// data naming: argN = program_prologue binding; global_XXXX/global_span_XXXX = current process data-section slot",
+        "// synthetic call returns are now kept as expressions, not ret_* placeholder variables",
+        "// local call targets are split into local_XXXXXXXX() helpers instead of being inlined into caller bodies",
+    ]
+    if local_index.helpers:
+        chunks.append(f"// local helpers: {len(local_index.helpers)}")
+    if project_linker is not None:
+        chunks.extend(project_linker.summary_lines())
+    chunks.extend([*linker.summary_lines(), ""])
+
+    def render_entry(entry_program: MbcProgram, *, local_helper: LocalHelper | None = None) -> None:
+        chunks.append(_program_header(entry_program, linker, local_helper=local_helper))
+
+        if not (0 <= entry_program.start < len(script.code)):
+            chunks.append("// warning: program start is outside code section")
+            chunks.append("")
+            return
+        if entry_program.end < entry_program.start:
+            chunks.append("// warning: program end is before start")
+            chunks.append("")
+            return
+
+        instructions = flow.decode_program(entry_program, follow_local_calls=False, stop_offsets=stop_offsets)
+        local_index.annotate_call_names(instructions)
+        ast = build_program_ast(script, entry_program, instructions, linker=linker)
+        source = ast.get("source", "")
+        chunks.append(source if source else "// no decoded statements")
+        chunks.append("")
+
+    for program in script.programs:
+        render_entry(program)
+        for helper in helpers_by_owner.get(program.index, []):
+            render_entry(helper.program, local_helper=helper)
+
+    for helper in helpers_by_owner.get(-1, []):
+        # Recreate from the offset for safety if callers mutate/helper.program is stale.
+        render_entry(synthetic_helper_program(script, helper.offset, None), local_helper=helper)
+
+    return "\n".join(chunks).rstrip() + "\n"

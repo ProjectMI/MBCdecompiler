@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-"""Instruction-level MBC bytecode decoder.
+"""Decoded bytecode stream and program-local reachability traversal.
 
-This module owns only bytecode decoding and direct edge extraction. It does not
-walk program reachability, assemble basic blocks, render DOT, or produce dump
-artifacts.
+The opcode table remains in :mod:`opcodes`; this module wraps decoded opcodes
+into instruction objects and follows direct control-flow edges for one program.
 """
 
 from dataclasses import dataclass
 from typing import List, Optional
 
+from .common import CODE_FILE_OFFSET
 from .loader import MbcProgram, MbcScript
 from .linker import MbcStaticLinker
-from .opcodes import CODE_FILE_OFFSET, decode_opcode
-
+from .opcodes import decode_opcode
 
 @dataclass
 class Edge:
@@ -166,3 +165,89 @@ class MbcDecoder:
             return None
         p = self.script.program_for_offset(offset)
         return None if p is None else p.name
+
+CONTROL_EDGE_KINDS = {
+    "jmp",
+    "jfalse",
+    "jtrue",
+    "jfalse_fallthrough",
+    "jtrue_fallthrough",
+    "call_rel32",
+    "call_return",
+}
+
+
+class MbcControlFlow:
+    def __init__(self, script: MbcScript, *, decoder: Optional[MbcDecoder] = None):
+        self.script = script
+        self.code = script.code
+        self.decoder = decoder or MbcDecoder(script)
+
+    def decode_program(
+        self,
+        program: MbcProgram,
+        *,
+        follow_local_calls: bool = True,
+        stop_offsets: set[int] | None = None,
+    ) -> List[Instruction]:
+        """Decode the instruction stream reachable from a program entry.
+
+        Recovered MBC files can place local helper routines after a nominal
+        program-table body. Those helpers are reached by ``call_rel32`` and may
+        live outside ``program.end``. When ``follow_local_calls`` is false, call
+        targets are preserved as calls but not inlined into the caller stream;
+        this is the mode used by the decompiler renderer to split local helpers
+        into separate synthetic functions.
+        """
+        stop_offsets = stop_offsets or set()
+        if not (0 <= program.start < len(self.code)):
+            return []
+        if program.end < program.start:
+            return []
+
+        decoded: dict[int, Instruction] = {}
+        worklist: list[int] = [program.start]
+
+        def enqueue(target: Optional[int]) -> None:
+            if target is None:
+                return
+            if not (0 <= target < len(self.code)):
+                return
+            if target != program.start and target in stop_offsets:
+                return
+            owner = self.script.program_for_offset(target)
+            if owner is not None and owner.index != program.index:
+                # Keep the edge in the instruction metadata, but do not merge a
+                # different named program into this program's stream.
+                return
+            if self.decoder.linker.import_stub_at(target) is not None:
+                # 0x67 function-table stubs are runtime link points, not real
+                # bytecode bodies.  Calls keep their resolved-call metadata in
+                # the instruction operands, but CFG traversal must not inline
+                # the stub as an `extern` pseudo-statement.
+                return
+            if target in decoded or target in worklist:
+                return
+            worklist.append(target)
+
+        while worklist:
+            off = worklist.pop()
+            if off in decoded or not (0 <= off < len(self.code)):
+                continue
+
+            ins = self.decoder.decode_at(off, program)
+            if ins.length <= 0:
+                ins.length = 1
+                ins.known = False
+            decoded[off] = ins
+
+            for edge in ins.edges:
+                if edge.kind == "call_rel32" and not follow_local_calls:
+                    continue
+                if edge.kind in CONTROL_EDGE_KINDS:
+                    enqueue(edge.dst)
+
+            if not ins.terminal:
+                enqueue(ins.offset + ins.length)
+
+        return [decoded[o] for o in sorted(decoded)]

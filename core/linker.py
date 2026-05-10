@@ -14,22 +14,12 @@ from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
 from .loader import MbcFunction, MbcProgram, MbcScript
-from .native_api import NativeCallSpec, engine_native_import
-from .opcodes import CODE_FILE_OFFSET, TYPE_NAMES, decode_opcode
+from .calls import NativeCallSpec, engine_native_import
+from .opcodes import decode_opcode
+from .common import CODE_FILE_OFFSET, TYPE_NAMES, i32 as _i32, type_name as _type_name
 
 
 LINK_PATCH_OPCODE = 0x47  # 'G' / jmp_rel32
-
-
-def _i32(value: int) -> int:
-    value &= 0xFFFFFFFF
-    return value - 0x100000000 if value & 0x80000000 else value
-
-
-def _type_name(type_id: int | None) -> str:
-    if type_id is None:
-        return "unknown"
-    return TYPE_NAMES.get(type_id, f"type_{type_id}")
 
 
 @dataclass(frozen=True)
