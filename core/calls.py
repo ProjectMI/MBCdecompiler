@@ -252,6 +252,14 @@ ENGINE_NATIVE_IMPORTS: dict[str, NativeCallSpec] = {
         note="Money/transaction UI helper; native body is not present in the MBC corpus.",
         layer="engine_import",
     ),
+    "GetMoney": _int(
+        "native.GetMoney",
+        arity=None,
+        side_effects=("ui", "process", "runtime_call"),
+        confidence="engine-native-unobserved",
+        note="Money/transaction query helper. It appears as the native counterpart of PutMoney in cs_knot/cs_table/town_table function tables; no MBC provider and no direct corpus call-site were observed.",
+        layer="engine_import",
+    ),
 }
 
 # Selectors recovered from the nested switch under builtin subopcode 0x67 in

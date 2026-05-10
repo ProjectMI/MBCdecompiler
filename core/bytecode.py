@@ -7,12 +7,14 @@ into instruction objects and follows direct control-flow edges for one program.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 from .common import CODE_FILE_OFFSET
 from .loader import MbcProgram, MbcScript
-from .linker import MbcStaticLinker
 from .opcodes import decode_opcode
+
+if TYPE_CHECKING:
+    from .linker import MbcStaticLinker
 
 @dataclass
 class Edge:
@@ -45,14 +47,39 @@ class MbcDecoder:
     handler, so relative branches are based at ``off + 1``.
     """
 
-    def __init__(self, script: MbcScript, *, linker: MbcStaticLinker | None = None):
+    def __init__(
+        self,
+        script: MbcScript,
+        *,
+        linker: MbcStaticLinker | None = None,
+        annotate_linkage: bool = True,
+        import_stub_offsets: set[int] | None = None,
+        cache_decodes: bool = False,
+    ):
         self.script = script
         self.code = script.code
-        self.linker = linker or MbcStaticLinker(script)
+        self.annotate_linkage = annotate_linkage
+        self._decode_cache_enabled = cache_decodes
+        self._decode_cache: dict[int, Instruction] = {}
+        self._import_stub_offsets = import_stub_offsets
+        if linker is None and annotate_linkage:
+            # Import lazily so linker.py can reuse the CFG decoder without a
+            # module-level circular import.
+            from .linker import MbcStaticLinker
+
+            linker = MbcStaticLinker(script)
+        self.linker = linker
+
+    def is_import_stub_offset(self, off: int) -> bool:
+        if self.linker is not None:
+            return self.linker.import_stub_at(off) is not None
+        return off in self._import_stub_offsets if self._import_stub_offsets is not None else False
 
     def decode_at(self, off: int, program: Optional[MbcProgram] = None) -> Instruction:
         if not (0 <= off < len(self.code)):
             raise ValueError(f"code offset 0x{off:X} is outside code section")
+        if self._decode_cache_enabled and off in self._decode_cache:
+            return self._decode_cache[off]
 
         decoded = decode_opcode(self.code, off)
         length = max(decoded.length, 1)
@@ -73,9 +100,10 @@ class MbcDecoder:
             operands["program_start_file"] = target_program.file_start
             edges.append(Edge("program_ref", off, target_program.start, target_program.name, decoded.mnemonic))
 
-        self._annotate_linkage(off, operands, edges)
+        if self.annotate_linkage and self.linker is not None:
+            self._annotate_linkage(off, operands, edges)
 
-        return Instruction(
+        instruction = Instruction(
             offset=off,
             file_offset=off + CODE_FILE_OFFSET,
             opcode=self.code[off],
@@ -87,9 +115,14 @@ class MbcDecoder:
             terminal=decoded.terminal,
             known=decoded.known,
         )
+        if self._decode_cache_enabled:
+            self._decode_cache[off] = instruction
+        return instruction
 
 
     def _annotate_linkage(self, off: int, operands: dict, edges: List[Edge]) -> None:
+        if self.linker is None:
+            return
         symbols_here = self.linker.symbols_at(off)
         if symbols_here:
             operands["function_symbols"] = [symbol.to_dict() for symbol in symbols_here]
@@ -182,6 +215,12 @@ class MbcControlFlow:
         self.script = script
         self.code = script.code
         self.decoder = decoder or MbcDecoder(script)
+        self._program_owner_cache: dict[int, Optional[MbcProgram]] = {}
+
+    def _program_for_offset_cached(self, code_offset: int) -> Optional[MbcProgram]:
+        if code_offset not in self._program_owner_cache:
+            self._program_owner_cache[code_offset] = self.script.program_for_offset(code_offset)
+        return self._program_owner_cache[code_offset]
 
     def decode_program(
         self,
@@ -215,12 +254,12 @@ class MbcControlFlow:
                 return
             if target != program.start and target in stop_offsets:
                 return
-            owner = self.script.program_for_offset(target)
+            owner = self._program_for_offset_cached(target)
             if owner is not None and owner.index != program.index:
                 # Keep the edge in the instruction metadata, but do not merge a
                 # different named program into this program's stream.
                 return
-            if self.decoder.linker.import_stub_at(target) is not None:
+            if self.decoder.is_import_stub_offset(target):
                 # 0x67 function-table stubs are runtime link points, not real
                 # bytecode bodies.  Calls keep their resolved-call metadata in
                 # the instruction operands, but CFG traversal must not inline

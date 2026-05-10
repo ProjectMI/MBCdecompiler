@@ -93,9 +93,11 @@ class MbcScript:
     metadata: bytes
 
     def program_by_name(self, name: str) -> Optional[MbcProgram]:
-        folded = name.casefold()
+        # Program names are matched strictly.  The runtime quickfile/module
+        # lookup is case-insensitive, but function/program symbols are not
+        # normalized with casefold; doing so creates false provider matches.
         for program in self.programs:
-            if program.name.casefold() == folded:
+            if program.name == name:
                 return program
         return None
 

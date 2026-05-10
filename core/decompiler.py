@@ -136,7 +136,7 @@ def load_project_for(mbc_path: Path) -> tuple[MbcProject, MbcScript, MbcProjectL
         # Fallback for unusual paths outside the default mbc/ tree.
         script = MbcLoader.load(mbc_path)
         project = MbcProject(root=mbc_path.parent, scripts=[script])
-    project_linker = MbcProjectLinker(project.scripts)
+    project_linker = MbcProjectLinker.from_ffprc_plan(project.scripts)
     return project, script, project_linker
 
 
@@ -152,7 +152,7 @@ def _program_header(program: MbcProgram, linker: MbcStaticLinker, *, local_helpe
 
 def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | None = None) -> str:
     linker = (project_linker.module(script.path.stem) if project_linker is not None else None) or MbcStaticLinker(script)
-    decoder = MbcDecoder(script, linker=linker)
+    decoder = MbcDecoder(script, linker=linker, cache_decodes=True)
     flow = MbcControlFlow(script, decoder=decoder)
     local_index = discover_local_helpers(script, flow, linker)
     helpers_by_owner = local_index.by_owner()
