@@ -8,6 +8,17 @@ from .loader import MbcProgram, MbcScript
 from .opcodes import CODE_FILE_OFFSET, OPCODES, BUILTINS, decode_opcode, safe_chr, opcode_to_dict, builtin_to_dict
 
 
+CONTROL_EDGE_KINDS = {
+    "jmp",
+    "jfalse",
+    "jtrue",
+    "jfalse_fallthrough",
+    "jtrue_fallthrough",
+    "call_rel32",
+    "call_return",
+}
+
+
 @dataclass
 class Edge:
     kind: str
@@ -90,10 +101,13 @@ class MbcInterpreter:
     handler, so relative branches are based at ``off + 1``.
     """
 
-    def __init__(self, script: MbcScript, *, include_ast: bool = True):
+    def __init__(self, script: MbcScript, *, include_ast: bool = True, decode_mode: str = "reachable"):
+        if decode_mode not in {"reachable", "linear"}:
+            raise ValueError("decode_mode must be 'reachable' or 'linear'")
         self.script = script
         self.code = script.code
         self.include_ast = include_ast
+        self.decode_mode = decode_mode
 
     def build_cfg(self) -> dict:
         programs = []
@@ -113,6 +127,8 @@ class MbcInterpreter:
                 "pc_rule": "Relative targets are computed from pc_after_opcode (off + 1), matching sub_489410.",
                 "opcode_model": "core/opcodes.py contains recovered top and builtin dispatch tables plus operand decoders.",
                 "ast_precision": "The AST is an experimental symbolic stack AST seed; it is not yet a structured source-level decompilation.",
+                "decode_mode": self.decode_mode,
+                "program_end_note": "Program table end offsets are nominal scheduler/body boundaries, not safe hard stops for local call_rel32 helper code; reachable mode follows direct branches/calls outside the nominal span.",
             },
             "opcode_tables": {
                 "top_count": len(OPCODES),
@@ -151,19 +167,20 @@ class MbcInterpreter:
 
     def _build_program_cfg(self, program: MbcProgram) -> dict:
         instructions = self.decode_program(program)
+        instruction_offsets = {ins.offset for ins in instructions}
 
         leaders = {program.start}
         for ins in instructions:
             next_off = ins.offset + ins.length
             for edge in ins.edges:
-                if edge.dst is not None and program.start <= edge.dst <= program.end:
+                if edge.dst is not None and edge.dst in instruction_offsets:
                     leaders.add(edge.dst)
                 if edge.kind in {
                     "jfalse", "jtrue", "jfalse_fallthrough", "jtrue_fallthrough",
                     "call_rel32", "call_return",
-                } and program.start <= next_off <= program.end:
+                } and next_off in instruction_offsets:
                     leaders.add(next_off)
-            if ins.terminal and program.start <= next_off <= program.end:
+            if ins.terminal and next_off in instruction_offsets:
                 leaders.add(next_off)
 
         leader_set = set(sorted(leaders))
@@ -173,14 +190,21 @@ class MbcInterpreter:
         while idx < len(instructions):
             start = instructions[idx].offset
             if start not in leader_set:
-                # Resync safeguard for malformed bytecode or a still-imperfect length.
+                # Resync safeguard for malformed bytecode, non-contiguous reachable
+                # regions, or a still-imperfect instruction length.
                 leader_set.add(start)
 
             block_ins: List[Instruction] = []
             while idx < len(instructions):
                 ins = instructions[idx]
-                if block_ins and ins.offset in leader_set:
-                    break
+                if block_ins:
+                    prev = block_ins[-1]
+                    if ins.offset in leader_set:
+                        break
+                    if ins.offset != prev.offset + prev.length:
+                        # A reachable program may include helper functions in gaps after
+                        # the nominal body.  Do not synthesize fallthrough over gaps.
+                        break
                 block_ins.append(ins)
                 idx += 1
                 if ins.terminal:
@@ -197,7 +221,7 @@ class MbcInterpreter:
             edges = list(last.edges)
             if not last.terminal:
                 next_off = last.offset + last.length
-                if program.start <= next_off <= program.end:
+                if next_off in instruction_offsets:
                     edges.append(Edge("fallthrough", last.offset, next_off, self._program_name_for(next_off)))
 
             blocks.append(
@@ -210,6 +234,13 @@ class MbcInterpreter:
                 )
             )
 
+        outside_nominal = [
+            ins for ins in instructions
+            if not (program.start <= ins.offset <= program.end)
+        ]
+        decoded_start = min(instruction_offsets) if instruction_offsets else program.start
+        decoded_end = max((ins.offset + ins.length - 1 for ins in instructions), default=program.end)
+
         out = {
             "index": program.index,
             "name": program.name,
@@ -217,6 +248,11 @@ class MbcInterpreter:
             "start_file": program.file_start,
             "end": program.end,
             "end_file": program.file_end,
+            "decoded_start": decoded_start,
+            "decoded_start_file": decoded_start + CODE_FILE_OFFSET,
+            "decoded_end": decoded_end,
+            "decoded_end_file": decoded_end + CODE_FILE_OFFSET,
+            "decoded_outside_nominal_count": len(outside_nominal),
             "state": program.state,
             "queue_id": program.queue_id,
             "blocks": [b.to_dict() for b in blocks],
@@ -227,6 +263,17 @@ class MbcInterpreter:
         return out
 
     def decode_program(self, program: MbcProgram) -> List[Instruction]:
+        if self.decode_mode == "linear":
+            return self.decode_program_linear(program)
+        return self.decode_program_reachable(program)
+
+    def decode_program_linear(self, program: MbcProgram) -> List[Instruction]:
+        """Decode only the nominal program-table span.
+
+        This preserves the original conservative behaviour and is useful when
+        auditing raw program table boundaries.  It intentionally clamps operands
+        that cross ``program.end``.
+        """
         out: List[Instruction] = []
         off = program.start
         hard_end = min(program.end, len(self.code) - 1)
@@ -237,7 +284,8 @@ class MbcInterpreter:
                 ins.length = 1
                 ins.known = False
             if ins.offset + ins.length - 1 > hard_end:
-                # Do not let a malformed/truncated operand swallow the next program.
+                # Do not let a malformed/truncated operand swallow the next program
+                # in strict nominal-boundary mode.
                 ins.length = 1
                 ins.raw = self.code[off:off + 1].hex(" ")
                 ins.mnemonic = f"{ins.mnemonic}_clamped"
@@ -247,6 +295,52 @@ class MbcInterpreter:
             out.append(ins)
             off += ins.length
         return out
+
+    def decode_program_reachable(self, program: MbcProgram) -> List[Instruction]:
+        """Decode direct-control-flow reachable bytecode from a program entry.
+
+        Recovered MBC files often place local helper routines immediately after a
+        nominal program-table body.  Those helpers are reached by ``call_rel32``
+        and may live outside ``program.end``.  A linear ``start..end`` pass loses
+        such code and can mark valid calls as truncated.
+        """
+        decoded: dict[int, Instruction] = {}
+        worklist: list[int] = [program.start]
+
+        def enqueue(target: Optional[int]) -> None:
+            if target is None:
+                return
+            if not (0 <= target < len(self.code)):
+                return
+            owner = self.script.program_for_offset(target)
+            if owner is not None and owner.index != program.index:
+                # Keep the edge, but do not inline another named program into this
+                # program's CFG/AST.  Helper routines in unowned gaps are still
+                # decoded, which fixes call_rel32 bodies placed after program.end.
+                return
+            if target in decoded or target in worklist:
+                return
+            worklist.append(target)
+
+        while worklist:
+            off = worklist.pop()
+            if off in decoded or not (0 <= off < len(self.code)):
+                continue
+
+            ins = self.decode_at(off)
+            if ins.length <= 0:
+                ins.length = 1
+                ins.known = False
+            decoded[off] = ins
+
+            for edge in ins.edges:
+                if edge.kind in CONTROL_EDGE_KINDS:
+                    enqueue(edge.dst)
+
+            if not ins.terminal:
+                enqueue(ins.offset + ins.length)
+
+        return [decoded[o] for o in sorted(decoded)]
 
     def decode_at(self, off: int, program: Optional[MbcProgram] = None) -> Instruction:
         decoded = decode_opcode(self.code, off)

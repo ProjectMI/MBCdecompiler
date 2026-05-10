@@ -32,11 +32,16 @@ def main() -> int:
     parser.add_argument("--tables", dest="tables_out", type=Path, help="Write recovered opcode tables as JSON")
     parser.add_argument("--program", help="Limit output to a program name or numeric index")
     parser.add_argument("--no-ast", action="store_true", help="Skip pseudo-AST construction in JSON")
+    parser.add_argument(
+        "--linear",
+        action="store_true",
+        help="Use legacy nominal start..end decoding instead of reachable CFG decoding",
+    )
     parser.add_argument("--indent", type=int, default=2, help="JSON indentation; use 0 for compact JSON")
     args = parser.parse_args()
 
     script = MbcLoader.load(args.mbc)
-    interpreter = MbcInterpreter(script, include_ast=not args.no_ast)
+    interpreter = MbcInterpreter(script, include_ast=not args.no_ast, decode_mode="linear" if args.linear else "reachable")
     cfg = interpreter.build_cfg()
     cfg = _select_programs(cfg, args.program)
 
