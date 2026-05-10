@@ -483,12 +483,12 @@ _TOP_OPCODE_ROWS: Dict[int, Dict[str, Any]] = {0: {'char': '\\x00',
        'semantic': 'second-level dispatcher; subopcode:u8 indexes jpt_47754E / low_mbc_opcode_table',
        'table_ea': 5634304},
  103: {'char': 'g',
-       'format': 'none',
+       'format': 'import_stub_u32',
        'handler_ea': 4691040,
        'handler_name': 'sub_479460',
-       'mnemonic': 'unlinked_call_error',
+       'mnemonic': 'import_stub_u32',
        'opcode': 103,
-       'semantic': 'runtime error path: unlinked function was called',
+       'semantic': '5-byte import/unlinked-call stub: opcode 0x67 plus a u32 payload; terminal error path until linker/import resolution patches it',
        'table_ea': 5634360},
  104: {'char': 'h',
        'format': 'slice_offset_span',
@@ -2134,6 +2134,18 @@ def decode_opcode(buf: bytes, off: int) -> DecodedOpcode:
             typ = buf[off + 1]
             operands.update({"type": typ, "type_name": type_name(typ), "value": _s8(buf[off + 2]), "value_u8": buf[off + 2]})
 
+        elif fmt == "import_stub_u32":
+            if not have(5):
+                raise ValueError("truncated import stub payload")
+            length = 5
+            operands.update({
+                "value": _u32(buf, off + 1),
+                "payload_u32": _u32(buf, off + 1),
+                "stub_note": "0x67 import/unlinked-call stubs are 5 bytes; treating them as length 1 desynchronizes linear decoding",
+            })
+            terminal = True
+            edges.append(DecodedEdge("import_stub", None, spec.semantic))
+
         elif fmt == "inline_span":
             if not have(7):
                 raise ValueError("truncated inline span operand")
@@ -2258,7 +2270,7 @@ def decode_opcode(buf: bytes, off: int) -> DecodedOpcode:
     elif opcode == 0x48:
         terminal = True
         edges.append(DecodedEdge("halt", None, spec.semantic))
-    elif opcode == 0x67:
+    elif opcode == 0x67 and fmt != "import_stub_u32":
         terminal = True
         edges.append(DecodedEdge("error", None, spec.semantic))
 

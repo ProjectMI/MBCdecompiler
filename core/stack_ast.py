@@ -1,40 +1,29 @@
 from __future__ import annotations
 
-"""A small, deliberately conservative AST seed for MBC bytecode.
+"""Symbolic stack-machine pass for the experimental pseudo-AST.
 
 The real VM is stack based and many opcodes carry reference metadata, not just a
-plain value.  This builder therefore does not pretend to be a finished source
+plain value.  This pass therefore does not pretend to be a finished source
 reconstructor.  It keeps a symbolic expression stack, emits pseudo-statements for
 obvious operations, and preserves instruction offsets so later structural passes
 can fold gotos into if/while blocks.
 """
 
-from dataclasses import dataclass, asdict
-from typing import Any, Iterable, List, Optional
-import math
+from typing import Any, Iterable, Optional
 
+from .ast_model import AstStatement, ast_payload
+from .ast_render import AstExpressionRenderer
 from .loader import MbcProgram, MbcScript
-from .opcodes import BINARY_AST_OPS, UNARY_AST_OPS, safe_chr
-
-
-@dataclass
-class AstStatement:
-    offset: int
-    file_offset: int
-    kind: str
-    text: str
-    opcode: int
-    mnemonic: str
-    operands: dict[str, Any]
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+from .opcodes import BINARY_AST_OPS, UNARY_AST_OPS
 
 
 class StackAstBuilder:
+    """Interpret decoded instructions as a conservative symbolic stack AST seed."""
+
     def __init__(self, script: MbcScript, program: MbcProgram):
         self.script = script
         self.program = program
+        self.renderer = AstExpressionRenderer(script, program)
         self.stack: list[str] = []
         self.statements: list[AstStatement] = []
         self.pending_arg_count: Optional[int] = None
@@ -44,18 +33,11 @@ class StackAstBuilder:
     def build(self, instructions: Iterable[Any]) -> dict[str, Any]:
         for ins in instructions:
             self._visit(ins)
-        return {
-            "format": "experimental_stack_ast_v0",
-            "warning": (
-                "This is a symbolic stack AST seed, not a final decompilation. "
-                "It is meant to preserve expression intent and control-flow anchors for later structuring."
-            ),
-            "statement_count": len(self.statements),
-            "underflow_placeholders": self.underflows,
-            "residual_stack": list(self.stack[-16:]),
-            "statements": [stmt.to_dict() for stmt in self.statements],
-            "source": "\n".join(stmt.text for stmt in self.statements),
-        }
+        return ast_payload(
+            statements=self.statements,
+            residual_stack=self.stack,
+            underflows=self.underflows,
+        )
 
     def _visit(self, ins: Any) -> None:
         op = ins.opcode
@@ -68,11 +50,11 @@ class StackAstBuilder:
             return
 
         if op in (0x69, 0x39, 0x28, 0x29, 0x41, 0x65, 0x6C):
-            self._push(self._render_push_value(ins))
+            self._push(self.renderer.push_value(ins))
             return
 
         if op in (0x61, 0x62, 0x6D, 0x64, 0x68):
-            self._push(self._render_index_expr(ins))
+            self._push(self.renderer.index_expr(ins, lambda name: self._pop(ins, name)))
             return
 
         if op in BINARY_AST_OPS:
@@ -202,14 +184,16 @@ class StackAstBuilder:
 
         if m in {"program_restart", "program_restart_child", "program_activate", "program_reset_alt_pc", "program_stop"}:
             idx = operands.get("program_index", "?")
-            pname = self._program_name(idx)
-            arg = f"{idx}" if pname is None else f"{idx} /* {pname} */"
-            self._emit(ins, "program", f"{m}({arg});")
+            self._emit(ins, "program", f"{m}({self.renderer.program_arg(idx)});")
             return
 
         if m == "program_prologue":
             descriptors = operands.get("descriptors", [])
             self._emit(ins, "prologue", f"prologue(argc={operands.get('signed_count')}, descriptors={len(descriptors)});")
+            return
+
+        if m == "import_stub_u32":
+            self._emit(ins, "import_stub", f"// import stub payload={operands.get('value', '?')}")
             return
 
         if not ins.known:
@@ -220,63 +204,6 @@ class StackAstBuilder:
         # when they are likely useful for later passes.
         if m not in {"stack_frame_reset", "push_stack_frame", "pop_stack_frame"}:
             self._emit(ins, "op", f"// {m}")
-
-    def _render_push_value(self, ins: Any) -> str:
-        operands = ins.operands or {}
-        m = ins.mnemonic
-        typ = operands.get("type")
-        tname = operands.get("type_name") or (f"type_{typ}" if typ is not None else None)
-
-        if m == "push_data_ref":
-            off = operands.get("data_offset", 0)
-            preview = self._data_preview(off)
-            extra = f", {preview!r}" if preview else ""
-            return f"data[{off:#x}:{tname}{extra}]"
-
-        if m in {"push_imm32", "push_imm_u16", "push_imm_i8"}:
-            if typ == 32 and "value_float" in operands:
-                value = operands["value_float"]
-                if isinstance(value, float) and (math.isinf(value) or math.isnan(value)):
-                    value_text = repr(value)
-                else:
-                    value_text = f"{value:.9g}"
-            elif "value_i32" in operands:
-                value_text = str(operands["value_i32"])
-            else:
-                value_text = str(operands.get("value", operands.get("value_u32", "?")))
-            return f"{value_text} /* {tname} */"
-
-        if m == "push_inline_span":
-            off = operands.get("data_offset", 0)
-            length = operands.get("length", 0)
-            preview = self._data_preview(off, length)
-            return f"span[{off:#x}, {length}]" + (f" /* {preview!r} */" if preview else "")
-
-        if m in {"push_typed_span_ref", "push_inline_typed_span"}:
-            off = operands.get("data_offset", 0)
-            length = operands.get("length", 0)
-            preview = self._data_preview(off, length)
-            return f"span[{off:#x}, {length}:{tname}]" + (f" /* {preview!r} */" if preview else "")
-
-        return f"{m}(...)"
-
-    def _render_index_expr(self, ins: Any) -> str:
-        operands = ins.operands or {}
-        typ = operands.get("type_name", "?")
-        if ins.mnemonic == "array_index_abs":
-            idx = self._pop(ins, "index")
-            return f"array[{operands.get('base', 0):#x} + {idx}*{operands.get('element_size', '?')}:{typ}]"
-        if ins.mnemonic in {"array2_index", "array2_index_checked"}:
-            idx = self._pop(ins, "index")
-            base = self._pop(ins, "base")
-            return f"{base}[{idx}*{operands.get('element_size', '?')}:{typ}]"
-        if ins.mnemonic == "slice_offset_ref":
-            base = self._pop(ins, "base")
-            return f"{base}+{operands.get('offset', '?')}:{typ}"
-        if ins.mnemonic == "slice_offset_span":
-            base = self._pop(ins, "base")
-            return f"span({base}+{operands.get('offset', '?')}, {operands.get('length', '?')}:{typ})"
-        return f"{ins.mnemonic}(...)"
 
     def _pop_args(self, ins: Any) -> list[str]:
         count = self.pending_arg_count
@@ -308,28 +235,6 @@ class StackAstBuilder:
                 operands=dict(ins.operands or {}),
             )
         )
-
-    def _program_name(self, idx: Any) -> Optional[str]:
-        if not isinstance(idx, int):
-            return None
-        if 0 <= idx < len(self.script.programs):
-            return self.script.programs[idx].name
-        return None
-
-    def _data_preview(self, off: Any, max_len: int | None = None) -> str:
-        if not isinstance(off, int) or off < 0 or off >= len(self.script.data):
-            return ""
-        limit = len(self.script.data) if max_len is None or max_len <= 0 else min(len(self.script.data), off + max_len)
-        end = self.script.data.find(b"\x00", off, limit)
-        if end < 0:
-            end = min(limit, off + 48)
-        raw = self.script.data[off:end]
-        if not raw:
-            return ""
-        text = raw.decode("cp1251", errors="replace")
-        if any(ord(ch) < 32 and ch not in "\t\r\n" for ch in text):
-            return ""
-        return text[:80]
 
 
 def build_program_ast(script: MbcScript, program: MbcProgram, instructions: Iterable[Any]) -> dict[str, Any]:

@@ -2,77 +2,82 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import Any
 
-from core.interpreter import MbcInterpreter, cfg_to_dot
-from core.loader import MbcLoader
+from core.cfg import MbcControlFlow
+from core.decoder import MbcDecoder
+from core.loader import MbcLoader, MbcProgram, MbcScript
+from core.stack_ast import build_program_ast
 
 
-def _select_programs(cfg: dict[str, Any], selector: str | None) -> dict[str, Any]:
-    if not selector:
-        return cfg
-    wanted = selector.casefold()
-    selected = []
-    for program in cfg.get("programs", []):
-        if str(program.get("index")) == selector or str(program.get("name", "")).casefold() == wanted:
-            selected.append(program)
-    clone = dict(cfg)
-    clone["programs"] = selected
-    return clone
+SCRIPT_DIR = Path(__file__).resolve().parent
+MBC_DIR = SCRIPT_DIR / "mbc"
+
+
+def _resolve_mbc_path(script_name: str) -> Path:
+    name = Path(script_name).name
+    if not name.lower().endswith(".mbc"):
+        name = f"{name}.mbc"
+    path = MBC_DIR / name
+    if not path.exists():
+        raise FileNotFoundError(f"MBC script not found: {path}")
+    return path
+
+
+def _output_path(mbc_path: Path) -> Path:
+    return SCRIPT_DIR / f"{mbc_path.stem}.txt"
+
+
+def _program_header(program: MbcProgram) -> str:
+    name = program.name or f"program_{program.index}"
+    return f"// === {name} @ 0x{program.start:08X} ==="
+
+
+def decompile_to_text(script: MbcScript) -> str:
+    decoder = MbcDecoder(script)
+    flow = MbcControlFlow(script, decoder=decoder)
+
+    chunks: list[str] = [
+        "// Experimental MBC pseudo-source",
+        f"// source: {script.path.name}",
+        f"// programs: {len(script.programs)}",
+        "",
+    ]
+
+    for program in script.programs:
+        chunks.append(_program_header(program))
+
+        if not (0 <= program.start < len(script.code)):
+            chunks.append("// warning: program start is outside code section")
+            chunks.append("")
+            continue
+        if program.end < program.start:
+            chunks.append("// warning: program end is before start")
+            chunks.append("")
+            continue
+
+        instructions = flow.decode_program(program)
+        ast = build_program_ast(script, program, instructions)
+        source = ast.get("source", "")
+        chunks.append(source if source else "// no decoded statements")
+        chunks.append("")
+
+    return "\n".join(chunks).rstrip() + "\n"
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Decode Sphere MBC bytecode into CFG JSON/DOT and experimental pseudo-AST.")
-    parser.add_argument("mbc", type=Path, help="Path to .mbc file")
-    parser.add_argument("--json", dest="json_out", type=Path, help="Write full CFG JSON")
-    parser.add_argument("--dot", dest="dot_out", type=Path, help="Write Graphviz DOT CFG")
-    parser.add_argument("--ast", dest="ast_out", type=Path, help="Write pseudo-AST text")
-    parser.add_argument("--tables", dest="tables_out", type=Path, help="Write recovered opcode tables as JSON")
-    parser.add_argument("--program", help="Limit output to a program name or numeric index")
-    parser.add_argument("--no-ast", action="store_true", help="Skip pseudo-AST construction in JSON")
-    parser.add_argument(
-        "--linear",
-        action="store_true",
-        help="Use legacy nominal start..end decoding instead of reachable CFG decoding",
+    parser = argparse.ArgumentParser(
+        description="Decompile an MBC script from ./mbc/ into a .txt file next to mbc_tool.py."
     )
-    parser.add_argument("--indent", type=int, default=2, help="JSON indentation; use 0 for compact JSON")
+    parser.add_argument("script", help="Script name inside ./mbc/; .mbc extension is optional")
     args = parser.parse_args()
 
-    script = MbcLoader.load(args.mbc)
-    interpreter = MbcInterpreter(script, include_ast=not args.no_ast, decode_mode="linear" if args.linear else "reachable")
-    cfg = interpreter.build_cfg()
-    cfg = _select_programs(cfg, args.program)
+    mbc_path = _resolve_mbc_path(args.script)
+    script = MbcLoader.load(mbc_path)
+    out_path = _output_path(mbc_path)
+    out_path.write_text(decompile_to_text(script), encoding="utf-8")
 
-    indent = None if args.indent == 0 else args.indent
-
-    if args.tables_out:
-        args.tables_out.write_text(json.dumps(interpreter.opcode_tables(), ensure_ascii=False, indent=indent), encoding="utf-8")
-
-    if args.json_out:
-        args.json_out.write_text(json.dumps(cfg, ensure_ascii=False, indent=indent), encoding="utf-8")
-
-    if args.dot_out:
-        args.dot_out.write_text(cfg_to_dot(cfg), encoding="utf-8")
-
-    if args.ast_out:
-        chunks: list[str] = []
-        for program in cfg.get("programs", []):
-            ast = program.get("ast") or {}
-            name = program.get("name") or f"program_{program.get('index')}"
-            chunks.append(f"// === {name} @ 0x{program.get('start', 0):08X} ===")
-            chunks.append(ast.get("source", ""))
-            chunks.append("")
-        args.ast_out.write_text("\n".join(chunks), encoding="utf-8")
-
-    if not any([args.json_out, args.dot_out, args.ast_out, args.tables_out]):
-        total_programs = len(cfg.get("programs", []))
-        total_instructions = sum(len(p.get("instructions", [])) for p in cfg.get("programs", []))
-        known = sum(1 for p in cfg.get("programs", []) for ins in p.get("instructions", []) if ins.get("known"))
-        print(f"{script.path}: {total_programs} programs, {total_instructions} decoded instructions, {known} known")
-        print("Use --json, --dot, --ast, or --tables to write artifacts.")
-
+    print(f"{mbc_path.relative_to(SCRIPT_DIR)} -> {out_path.name}")
     return 0
 
 
