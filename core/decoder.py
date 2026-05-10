@@ -96,9 +96,11 @@ class MbcDecoder:
             operands["function_symbols"] = [symbol.to_dict() for symbol in symbols_here]
             preferred = next((symbol for symbol in symbols_here if symbol.is_internal), symbols_here[0])
             operands["function_name"] = preferred.name
+            operands["function_qualified_name"] = preferred.qualified_name
             operands["function_kind"] = preferred.kind
             operands["function_index"] = preferred.index
             operands["function_program_index"] = preferred.program_index
+            operands["function_signature"] = preferred.signature.to_dict()
 
         import_symbol = self.linker.import_stub_at(off)
         if import_symbol is not None:
@@ -106,7 +108,26 @@ class MbcDecoder:
             operands["link_kind"] = import_symbol.kind
             operands["link_function_index"] = import_symbol.index
             operands["link_program_index"] = import_symbol.program_index
-            edges.append(Edge("import_symbol", off, None, None, import_symbol.name))
+            link = self.linker.runtime_link_for_import(import_symbol)
+            if link is not None:
+                operands["resolved_import"] = link.to_dict()
+                operands["link_target_name"] = link.target.qualified_name
+                operands["link_target_module"] = link.target.module_name
+                operands["link_target_program_index"] = link.target.program_index
+                operands["link_target_program_name"] = link.target.program_name
+                operands["link_target_offset"] = link.target.code_offset
+                operands["link_target_signature"] = link.target.signature.to_dict()
+                edges.append(Edge("runtime_link_symbol", off, None, link.target.program_name, link.target.qualified_name))
+            else:
+                native = self.linker.native_link_for_import(import_symbol)
+                if native is not None:
+                    operands["resolved_native_import"] = native.to_dict()
+                    operands["link_target_name"] = native.spec.name
+                    operands["link_target_module"] = native.spec.layer
+                    operands["link_target_signature"] = native.to_dict().get("signature")
+                    edges.append(Edge("engine_native_symbol", off, None, None, native.spec.name))
+                else:
+                    edges.append(Edge("import_symbol", off, None, None, import_symbol.name))
 
         target = operands.get("target")
         if isinstance(target, int):
@@ -117,6 +138,28 @@ class MbcDecoder:
                 if symbol is not None:
                     operands["target_function_index"] = symbol.index
                     operands["target_function_kind"] = symbol.kind
+                    operands["target_signature"] = self.linker.signature_for_offset(target).to_dict()
+                    if symbol.is_import:
+                        link = self.linker.runtime_link_for_import(symbol)
+                        if link is not None:
+                            operands["resolved_call"] = link.to_dict()
+                            operands["target_function_kind"] = "runtime_link"
+                            operands["target_module"] = link.target.module_name
+                            operands["target_script"] = link.target.script_path
+                            operands["target_program_index"] = link.target.program_index
+                            operands["target_program_name"] = link.target.program_name
+                            operands["target_offset"] = link.target.code_offset
+                            operands["target_signature"] = link.target.signature.to_dict()
+                            edges.append(Edge("runtime_link_call", off, None, link.target.program_name, link.target.qualified_name))
+                        else:
+                            native = self.linker.native_link_for_import(symbol)
+                            if native is not None:
+                                operands["resolved_native_call"] = native.to_dict()
+                                operands["target_function_kind"] = "engine_native"
+                                operands["target_module"] = native.spec.layer
+                                operands["target_script"] = "<interpreter-native>"
+                                operands["target_signature"] = native.to_dict().get("signature")
+                                edges.append(Edge("engine_native_call", off, None, None, native.spec.name))
 
     def _program_name_for(self, offset: Optional[int]) -> Optional[str]:
         if offset is None:

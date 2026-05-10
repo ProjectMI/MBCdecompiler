@@ -249,3 +249,29 @@ class MbcLoader:
             begin, end = struct.unpack_from("<II", buf, index * 8)
             records.append(AdbArrayGuard(index, begin, end))
         return records
+
+
+@dataclass
+class MbcProject:
+    root: Path
+    scripts: List[MbcScript]
+
+    @property
+    def by_module(self) -> dict[str, MbcScript]:
+        return {script.path.stem: script for script in self.scripts}
+
+    def script(self, module_name: str) -> Optional[MbcScript]:
+        return self.by_module.get(Path(module_name).stem)
+
+    @classmethod
+    def load_dir(cls, path: str | Path) -> "MbcProject":
+        root = Path(path)
+        scripts: List[MbcScript] = []
+        for mbc_path in sorted(root.glob("*.mbc")):
+            scripts.append(MbcLoader.load(mbc_path))
+        return cls(root=root, scripts=scripts)
+
+    @classmethod
+    def load_for_script(cls, mbc_path: str | Path) -> "MbcProject":
+        path = Path(mbc_path)
+        return cls.load_dir(path.parent)

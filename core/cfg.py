@@ -57,6 +57,12 @@ class MbcControlFlow:
                 # Keep the edge in the instruction metadata, but do not merge a
                 # different named program into this program's stream.
                 return
+            if self.decoder.linker.import_stub_at(target) is not None:
+                # 0x67 function-table stubs are runtime link points, not real
+                # bytecode bodies.  Calls keep their resolved-call metadata in
+                # the instruction operands, but CFG traversal must not inline
+                # the stub as an `extern` pseudo-statement.
+                return
             if target in decoded or target in worklist:
                 return
             worklist.append(target)
