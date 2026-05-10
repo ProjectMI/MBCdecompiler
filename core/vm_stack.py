@@ -33,6 +33,26 @@ TYPE_NAMES = {
     TYPE_SLICE: "slice_descriptor",
 }
 
+# Recovered from the big IDA ASM slice around sub_477500/sub_47AA30..sub_47AF10.
+# This is documentation data used by the linker/VM layer to keep the symbolic
+# model aligned with the real interpreter contract, without introducing another
+# tiny module just for notes.
+VM_HELPER_CONTRACTS: dict[str, str] = {
+    "sub_477500": "builtin dispatcher: reads subopcode byte, stores old stack top in dword_9C6430, subtracts argc (dword_86232C) from dword_474C684, and starts the argument cursor dword_3E6D19C at the first argument slot",
+    "sub_47AA30": "popint from normal VM stack top; coerces char/int/float slot to int32 and decrements dword_474C684",
+    "sub_47AA90": "popsliceref from normal VM stack top; returns pointer to slot descriptor and normalizes empty scalar-ish descriptors",
+    "sub_47AAF0": "read next builtin argument as int32 through dword_3E6D19C; advances the argument cursor but does not alter the normal stack top",
+    "sub_47AB60": "read next builtin argument as float32 through dword_3E6D19C; advances the argument cursor; sub_47AF10 is an alias jump to this helper",
+    "sub_47AC00": "read next builtin argument as slice descriptor by value into a caller buffer; advances dword_3E6D19C",
+    "sub_47AC70": "read next builtin argument as pointer/ref/slice descriptor and return a pointer to slot+0x14; advances dword_3E6D19C",
+    "sub_47ACD0": "push int32 slot with type 0x10 and one-cell storage markers",
+    "sub_47AD30": "push float32 slot with type 0x20 and one-cell storage markers",
+    "sub_47AD90": "push descriptor/ref/slice slot from ecx[0..8] with type in edx",
+    "sub_47AE00": "push int32 like sub_47ACD0 and also store the value in dword_9C643C as the last process/native result",
+    "loc_47AE60": "push pointer/string descriptor: type 1, base-relative begin/end; null pointer becomes an empty descriptor",
+    "sub_47AF10": "alias jump to sub_47AB60",
+}
+
 SCALAR_TYPES = {TYPE_CHAR, TYPE_INT, TYPE_FLOAT}
 FLOAT_TYPES = {TYPE_FLOAT, TYPE_FLOAT_REF}
 INT_TYPES = {TYPE_CHAR, TYPE_INT, TYPE_INT_REF}

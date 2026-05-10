@@ -376,19 +376,127 @@ FFSYS_SELECTORS: dict[int, NativeCallSpec] = {
 }
 
 CONFIG_API_SELECTORS: dict[int, NativeCallSpec] = {
-    13: _int("native_config.set_value", side_effects=("config", "memory", "runtime_call"), confidence="recovered", note="sub_486A60 selector 13: set/replace key value and push status 0", layer="native_config", selector=13, source="sub_486A60"),
-    14: _int("native_config.get_value", side_effects=("config", "memory", "runtime_call"), confidence="recovered", note="sub_486A60 selector 14: cfg_get, writes typed output and pushes status", layer="native_config", selector=14, source="sub_486A60"),
-    15: _int("native_config.find_key", side_effects=("config", "runtime_call"), confidence="recovered", note="sub_486A60 selector 15: key lookup, pushes status/result", layer="native_config", selector=15, source="sub_486A60"),
-    16: _int("native_config.reset_cursor", side_effects=("config", "runtime_call"), confidence="recovered", note="sub_486A60 selector 16: cursor/state reset, pushes status", layer="native_config", selector=16, source="sub_486A60"),
-    17: _void("native_config.load_file", side_effects=("config", "file", "runtime_call"), confidence="recovered", note="sub_486A60 selector 17: load config text/file", layer="native_config", selector=17, source="sub_486A60"),
-    30: _int("native_config.save_file", side_effects=("config", "file", "runtime_call"), confidence="recovered", note="sub_486A60 selector 30: save config file and push status 0", layer="native_config", selector=30, source="sub_486A60"),
-    54: _int("native_config.load_current_script_blob", side_effects=("config", "memory", "runtime_call"), confidence="recovered", note="sub_486A60 selector 54: import current script config blob and push status", layer="native_config", selector=54, source="sub_486A60"),
-    55: _int("native_config.next_entry", side_effects=("config", "runtime_call"), confidence="recovered", note="sub_486A60 selector 55: advance/query config cursor, pushes status", layer="native_config", selector=55, source="sub_486A60"),
-    56: _int("native_config.read_blob", side_effects=("config", "memory", "runtime_call"), confidence="recovered", note="sub_486A60 selector 56: read config blob into destination and push result", layer="native_config", selector=56, source="sub_486A60"),
-    57: _int("native_config.get_size_or_state", side_effects=("config", "runtime_call"), confidence="recovered", note="sub_486A60 selector 57: pushes config size/state", layer="native_config", selector=57, source="sub_486A60"),
-    62: _void("native_config.set_source_text", side_effects=("config", "memory", "runtime_call"), confidence="recovered", note="sub_486A60 selector 62: set/parse source text", layer="native_config", selector=62, source="sub_486A60"),
+    # sub_486A60 is reached from sub_477500 case 117 (builtin 0x75).  It first
+    # consumes the selector with sub_47AAF0, then switches on selector - 13.
+    # Cases not listed here fall to the default branch and return without push.
+    13: _int(
+        "native_config.set_typed_value",
+        arity=None,
+        arg_types=("span/string", "unknown"),
+        side_effects=("config", "memory", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 13: key string plus typed value; serializes int/float/string/bit-array forms and pushes status 0",
+        layer="native_config",
+        selector=13,
+        source="sub_486A60/case_13",
+    ),
+    14: _int(
+        "native_config.get_typed_value",
+        arity=None,
+        arg_types=("pointer", "pointer", "int32"),
+        side_effects=("config", "memory", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 14: key pointer, destination pointer and optional mode; writes int/float/string/bit-array destination and pushes 0 on success or -1 on failure",
+        layer="native_config",
+        selector=14,
+        source="sub_486A60/case_14",
+    ),
+    15: _int(
+        "native_config.find_key",
+        arity=None,
+        arg_types=("pointer",),
+        side_effects=("config", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 15: key lookup through sub_441990; pushes 0 on success or -1 on miss/failure",
+        layer="native_config",
+        selector=15,
+        source="sub_486A60/case_15",
+    ),
+    16: _int(
+        "native_config.apply_mode_0",
+        arity=0,
+        side_effects=("config", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 16: calls sub_441AC0 with mode 0 and pushes 0/-1 status",
+        layer="native_config",
+        selector=16,
+        source="sub_486A60/case_16",
+    ),
+    17: _void(
+        "native_config.load_source_text",
+        arity=None,
+        arg_types=("pointer",),
+        side_effects=("config", "memory", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 17: source pointer; calls sub_441700 and returns without pushing",
+        layer="native_config",
+        selector=17,
+        source="sub_486A60/case_17",
+    ),
+    30: _int(
+        "native_config.save_to_path",
+        arity=None,
+        arg_types=("pointer",),
+        side_effects=("config", "file", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 30: path pointer; calls sub_441730 and pushes status 0",
+        layer="native_config",
+        selector=30,
+        source="sub_486A60/case_30",
+    ),
+    54: _int(
+        "native_config.consume_current_script_blob",
+        arity=0,
+        side_effects=("config", "memory", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 54: consumes [current_context+0xB0] blob into config storage; pushes 0, or -1 when absent",
+        layer="native_config",
+        selector=54,
+        source="sub_486A60/case_54",
+    ),
+    55: _int(
+        "native_config.apply_mode_1",
+        arity=0,
+        side_effects=("config", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 55: calls sub_441AC0 with mode 1 and pushes 0/-1 status",
+        layer="native_config",
+        selector=55,
+        source="sub_486A60/case_55",
+    ),
+    56: _int(
+        "native_config.read_blob_into",
+        arity=None,
+        arg_types=("pointer", "int32"),
+        side_effects=("config", "memory", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 56: destination pointer plus size/count; calls sub_441B70 and pushes its int result",
+        layer="native_config",
+        selector=56,
+        source="sub_486A60/case_56",
+    ),
+    57: _int(
+        "native_config.get_size_or_state",
+        arity=0,
+        side_effects=("config", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 57: pushes sub_4415F0 size/state result",
+        layer="native_config",
+        selector=57,
+        source="sub_486A60/case_57",
+    ),
+    62: _void(
+        "native_config.set_source_text",
+        arity=None,
+        arg_types=("pointer",),
+        side_effects=("config", "memory", "runtime_call"),
+        confidence="asm-verified",
+        note="sub_486A60 selector 62: source text pointer; calls sub_441570 and returns without pushing",
+        layer="native_config",
+        selector=62,
+        source="sub_486A60/case_62",
+    ),
 }
-
 
 def engine_native_import(name: str) -> NativeCallSpec | None:
     return ENGINE_NATIVE_IMPORTS.get(name)
@@ -447,14 +555,14 @@ def builtin_api_spec(subopcode: int, selector: int) -> NativeCallSpec | None:
         spec = FFSYS_SELECTORS.get(selector)
         if spec is not None:
             return spec
-        return _unknown_value(
+        return _void(
             f"ffsys.sel_{selector:03d}",
             side_effects=("memory", "process", "ui", "runtime_call"),
-            confidence="ffsys-selector-unknown",
-            note=f"builtin 0x67 selector {selector}; selector observed in bytecode but not named in the current registry",
+            confidence="ffsys-selector-default-no-push",
+            note=f"builtin 0x67 selector {selector}; not present in the recovered ffsys registry, and the sub_477500 default path returns without pushing",
             layer="ffsys",
             selector=selector,
-            source="sub_477500/case_0x67",
+            source="sub_477500/case_0x67/default",
         )
     if subopcode == 0x75:
         spec = CONFIG_API_SELECTORS.get(selector)

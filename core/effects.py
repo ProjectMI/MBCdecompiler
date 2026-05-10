@@ -170,6 +170,61 @@ def _arg_types_for(name: str, arity: int | None) -> tuple[str, ...]:
     return tuple("unknown" for _ in range(arity))
 
 
+# A value-returning call can be rendered as an expression when its value is
+# consumed, but the call still has to survive when the VM later discards the
+# returned slot.  This list/token model is intentionally conservative for
+# operations that mutate memory, process state, files, UI, objects or config.
+_VALUE_CALL_STATEMENT_NAMES = {
+    "send_to_process_id", "send_to_process_zero", "send_message_marshaled", "receive_message_marshaled",
+    "effect_attach", "object_get_or_set_flag_0x278", "object_create", "sprite_create_or_update",
+    "file_create", "file_open", "file_close", "file_read", "file_write", "file_seek", "file_remove",
+    "sscanf", "typed_store_width_1", "typed_store_width_2", "typed_store_width_3", "typed_store_width_4",
+    "process_translate_ptr", "span_write_float", "span_write_cstring", "ptr_store_i32_from_ptr", "ptr_copy_cstring",
+    "alloc_span", "text_api", "window_api", "native_config_api", "item_inventory_api", "entity_ref_api",
+    "resource_handle_api",
+}
+
+_VALUE_CALL_STATEMENT_TOKENS = (
+    "set", "write", "store", "send", "receive", "create", "delete", "remove", "open", "close",
+    "load", "save", "copy", "memcpy", "memset", "alloc", "free", "attach", "update", "patch",
+    "flush", "rename", "truncate", "translate", "wait", "lock", "unlock", "consume", "apply",
+)
+
+_READONLY_VALUE_CALL_NAMES = {
+    "current_process_id", "current_process_state", "current_sender_id", "last_process_result", "arg_count",
+    "ffprc_state", "object_state_query", "object_get_x", "object_get_y", "object_get_z",
+    "object_get_vec14_x", "object_get_vec14_y", "object_get_vec14_z", "get_float_field_0x294",
+    "strlen_checked", "strcmp", "stricmp", "strncmp", "strnicmp", "memcmp",
+    "binary_search_i32", "buffer_hash_or_checksum", "distance_or_distance_sq", "angle_delta",
+    "file_length", "file_stat_time_field", "file_lookup_476310", "find_effect_id", "assoc_array_get",
+    "CountAnim", "native.CountAnim", "native.SpeedObj", "native.DirectOfObj",
+    "native.QueryShowWebShop", "native_config.get_size_or_state",
+}
+
+
+def _value_call_needs_statement(name: str, semantic: str, side_effects: tuple[str, ...]) -> bool:
+    if name in _READONLY_VALUE_CALL_NAMES:
+        return False
+    if name in _VALUE_CALL_STATEMENT_NAMES:
+        return True
+    text = f"{name} {semantic}".lower()
+    if any(token in text for token in _VALUE_CALL_STATEMENT_TOKENS):
+        return True
+    # Unknown runtime/native calls are safer to preserve when their return value
+    # is discarded; losing a call is worse than an occasional noisy statement.
+    if any(effect in side_effects for effect in ("memory", "file", "ui", "config", "engine_object", "ai", "native_or_unresolved_call")):
+        return True
+    return False
+
+
+def _statement_for_call(name: str, semantic: str, returns: bool, side_effects: tuple[str, ...]) -> bool:
+    if not side_effects:
+        return False
+    if not returns:
+        return True
+    return _value_call_needs_statement(name, semantic, side_effects)
+
+
 def builtin_effect(subopcode: int, *, argc: int | None = None) -> CallEffect:
     builtin = BUILTINS[subopcode]
     name = builtin.mnemonic
@@ -178,7 +233,10 @@ def builtin_effect(subopcode: int, *, argc: int | None = None) -> CallEffect:
     arity = argc if argc is not None else _EXPLICIT_ARITY.get(name)
     returns = pushes > 0 and return_type != "void"
     side_effects = _side_effects_for(name, semantic, returns)
-    statement = bool(side_effects)
+    # `statement` means “must be preserved if the returned VM slot is later
+    # discarded”.  Value-returning queries may be inlined or dropped; mutating
+    # value-returning calls must not disappear.
+    statement = _statement_for_call(name, semantic, returns, side_effects)
     effect = CallEffect(
         name=name,
         arity=arity,
@@ -214,9 +272,9 @@ def effect_from_native_spec(spec: NativeCallSpec, *, argc: int | None = None, na
         pushes=spec.push_count,
         side_effects=spec.side_effects,
         confidence=spec.confidence,
-        # For native value-returning calls, keep them as expressions even when
-        # they have side effects; otherwise assignments become noisy ret_* pairs.
-        statement=not spec.returns_value,
+        # Value-returning native calls are still rendered as expressions when
+        # consumed, but mutating ones must be emitted if their result is dropped.
+        statement=_statement_for_call(name or spec.name, spec.note, spec.returns_value, spec.side_effects),
         note=spec.note,
     )
 

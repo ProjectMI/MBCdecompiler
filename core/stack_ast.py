@@ -52,6 +52,7 @@ class StackAstBuilder:
     def build(self, instructions: Iterable[Any]) -> dict[str, Any]:
         for ins in instructions:
             self._visit(ins)
+        self._flush_pending_side_effect_slots()
         payload = ast_payload(
             statements=normalize_ast_statements(self.statements),
             residual_stack=self.vm.residual(),
@@ -70,6 +71,7 @@ class StackAstBuilder:
             return
 
         if m == "stack_frame_reset":
+            self._flush_pending_side_effect_slots(fallback_ins=ins)
             self.vm.reset_frame()
             return
 
@@ -164,6 +166,7 @@ class StackAstBuilder:
             return
 
         if m in {"jmp_rel16", "jmp_rel32"}:
+            self._flush_pending_side_effect_slots(fallback_ins=ins)
             target = operands.get("target", 0)
             self._emit(ins, "goto", f"goto {label_for_offset(target)};")
             return
@@ -194,6 +197,11 @@ class StackAstBuilder:
             self._apply_call(ins, "call", "linked_call", args, effect)
             return
 
+        if m == "discard_value":
+            discarded = self._pop_value(ins, "discard")
+            self._emit_side_effect_call_if_discarded(discarded, fallback_ins=ins)
+            return
+
         if operands.get("subopcode") is not None:
             argc = self._consume_arg_count()
             subopcode = int(operands["subopcode"])
@@ -206,15 +214,24 @@ class StackAstBuilder:
 
         if m in {"return", "return_local"}:
             top = self.vm.peek()
-            suffix = f" {top.render()}" if top is not None else ""
+            self._flush_pending_side_effect_slots(except_slot=top, fallback_ins=ins)
+            return_expr = self._return_expr_for_slot(top)
+            suffix = f" {return_expr}" if return_expr else ""
             self._emit(ins, "return", f"return{suffix};", extra={"uses": self._uses(top) if top is not None else []})
             return
 
         if m == "halt_interpreter":
+            self._flush_pending_side_effect_slots(fallback_ins=ins)
             self._emit(ins, "halt", "halt_interpreter();")
             return
 
+        if m == "end_program":
+            self._flush_pending_side_effect_slots(fallback_ins=ins)
+            self._emit(ins, "op", "// end_program")
+            return
+
         if m in {"program_restart", "program_restart_child", "program_activate", "program_reset_alt_pc", "program_stop"}:
+            self._flush_pending_side_effect_slots(fallback_ins=ins)
             idx = operands.get("program_index", "?")
             self._emit(ins, "program", f"{m}({self.renderer.program_arg(idx)});")
             return
@@ -269,7 +286,8 @@ class StackAstBuilder:
     def _apply_call(self, ins: Any, kind: str, name: str, args: list[VMSlot], effect: CallEffect) -> None:
         rendered_args = [arg.render() for arg in args]
         call_expr = f"{name}({', '.join(rendered_args)})"
-        extra = {"call_effect": effect.to_dict(), "uses": self._uses(*args)}
+        uses = self._uses(*args)
+        extra = {"call_effect": effect.to_dict(), "uses": uses}
 
         if effect.returns_value:
             if name in {"push_zero", "push_zero_alias"}:
@@ -278,16 +296,71 @@ class StackAstBuilder:
             if name == "push_minus_one":
                 self.vm.push_int("(-1)", value=-1, metadata={"call_effect": effect.to_dict()})
                 return
-            if effect.statement:
-                self._emit(ins, kind, f"{call_expr};", extra=extra)
-                ret_name = f"ret_{self._safe_name(name)}_{ins.offset:08X}"
-                self.vm.push_unknown(ret_name, type_id=effect.return_type_id, metadata={"call_effect": effect.to_dict(), "call": call_expr})
-                return
+
+            embedded_side_effect = any(arg.metadata.get("emit_on_discard") for arg in args)
+            metadata = {
+                "call_effect": effect.to_dict(),
+                "call": call_expr,
+                "call_kind": kind,
+                "call_offset": ins.offset,
+                "call_file_offset": ins.file_offset,
+                "call_opcode": ins.opcode,
+                "call_mnemonic": ins.mnemonic,
+                "uses": uses,
+                # Inline when consumed, but emit as a standalone statement if the
+                # returned VM slot is later discarded by stack_frame_reset / discard_value.
+                "emit_on_discard": bool(effect.statement or embedded_side_effect),
+            }
             slot_kind = "slice" if effect.return_type_id == TYPE_SLICE else "value"
-            self.vm.push(VMSlot(expr=call_expr, type_id=effect.return_type_id, kind=slot_kind, metadata={"call_effect": effect.to_dict()}))
+            self.vm.push(VMSlot(expr=call_expr, type_id=effect.return_type_id, kind=slot_kind, metadata=metadata))
             return
 
         self._emit(ins, kind, f"{call_expr};", extra=extra)
+
+    def _flush_pending_side_effect_slots(self, *, except_slot: VMSlot | None = None, fallback_ins: Any | None = None) -> None:
+        for slot in list(self.vm.stack):
+            if except_slot is not None and slot is except_slot:
+                continue
+            self._emit_side_effect_call_if_discarded(slot, fallback_ins=fallback_ins)
+
+    def _return_expr_for_slot(self, slot: VMSlot | None) -> str:
+        if slot is None:
+            return ""
+
+        metadata = slot.metadata
+        if metadata.get("emit_on_discard"):
+            # Returning the slot is a real use of the value produced by the call.
+            # The call is already represented in the return expression, so the
+            # final end-of-program stack flush must not preserve it again as a
+            # discarded-return side-effect statement.
+            metadata["emitted_on_discard"] = True
+        return slot.render()
+
+    def _emit_side_effect_call_if_discarded(self, slot: VMSlot | None, *, fallback_ins: Any | None = None) -> bool:
+        if slot is None:
+            return False
+        metadata = slot.metadata
+        if not metadata.get("emit_on_discard") or metadata.get("emitted_on_discard"):
+            return False
+        call_expr = metadata.get("call") or slot.render()
+        operands = {
+            "discarded_return": True,
+            "call_effect": metadata.get("call_effect", {}),
+            "uses": list(metadata.get("uses", [])),
+        }
+        self.statements.append(
+            AstStatement(
+                offset=int(metadata.get("call_offset", getattr(fallback_ins, "offset", self.program.start))),
+                file_offset=int(metadata.get("call_file_offset", getattr(fallback_ins, "file_offset", 0))),
+                kind=str(metadata.get("call_kind", "call")),
+                text=f"{call_expr};",
+                opcode=int(metadata.get("call_opcode", getattr(fallback_ins, "opcode", 0))),
+                mnemonic=str(metadata.get("call_mnemonic", getattr(fallback_ins, "mnemonic", "call"))),
+                operands=operands,
+            )
+        )
+        metadata["emitted_on_discard"] = True
+        return True
 
     def _bind_program_prologue(self, operands: dict[str, Any]) -> None:
         signature = FunctionSignature.from_prologue(
