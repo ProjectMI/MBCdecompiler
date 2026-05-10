@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Recovered MBC opcode model.
 
-This module deliberately keeps opcode semantics out of the CFG interpreter.  The
+This module owns recovered opcode tables and operand decoding only. The
 upper dispatcher table is the byte_55F7F0 / funcs_48983F table recovered from the
 client, while the lower table is the jpt_47754E table reached by opcode 0x66
 (`f`).  Lengths are expressed in bytecode bytes and include the opcode byte.
@@ -1906,13 +1906,6 @@ BINARY_AST_OPS = {
 UNARY_AST_OPS = {0xF1: "-", 0x21: "!"}
 
 
-def opcode_to_dict() -> Dict[str, Dict[str, Any]]:
-    return {f"0x{op:02X}": dict(row) for op, row in _TOP_OPCODE_ROWS.items()}
-
-
-def builtin_to_dict() -> Dict[str, Dict[str, Any]]:
-    return {f"0x{op:02X}": dict(row) for op, row in _LOW_OPCODE_ROWS.items()}
-
 
 def decode_opcode(buf: bytes, off: int) -> DecodedOpcode:
     """Decode one bytecode instruction according to the recovered opcode specs."""
@@ -2234,27 +2227,21 @@ def decode_opcode(buf: bytes, off: int) -> DecodedOpcode:
                 raise ValueError("truncated builtin subopcode")
             length = 2
             sub = buf[off + 1]
-            builtin = BUILTINS.get(sub)
-            if builtin is None:
-                operands.update({"subopcode": sub, "subopcode_hex": f"0x{sub:02X}"})
-                mnemonic = f"builtin_{sub:02X}"
-                known = False
-            else:
-                mnemonic = builtin.mnemonic
-                operands.update({
-                    "subopcode": sub,
-                    "subopcode_hex": builtin.subopcode_hex,
-                    "target_ea": f"0x{builtin.target_ea:08X}",
-                    "target_name": builtin.target_name,
-                    "builtin_semantic": builtin.semantic,
-                    "builtin_confidence": builtin.confidence,
-                })
+            if sub not in BUILTINS:
+                raise AssertionError(f"missing recovered builtin subopcode 0x{sub:02X}")
+            builtin = BUILTINS[sub]
+            mnemonic = builtin.mnemonic
+            operands.update({
+                "subopcode": sub,
+                "subopcode_hex": builtin.subopcode_hex,
+                "target_ea": f"0x{builtin.target_ea:08X}",
+                "target_name": builtin.target_name,
+                "builtin_semantic": builtin.semantic,
+                "builtin_confidence": builtin.confidence,
+            })
 
         else:
-            # Spec exists but the decoder has not been taught the operand layout yet.
-            length = 1
-            known = False
-            operands["undecoded_format"] = fmt
+            raise AssertionError(f"unhandled recovered opcode format: {fmt!r}")
 
     except (struct.error, ValueError) as exc:
         length = 1

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from core.cfg import MbcControlFlow
 from core.decoder import MbcDecoder
+from core.linker import MbcStaticLinker
 from core.loader import MbcLoader, MbcProgram, MbcScript
 from core.stack_ast import build_program_ast
 
@@ -34,13 +35,15 @@ def _program_header(program: MbcProgram) -> str:
 
 
 def decompile_to_text(script: MbcScript) -> str:
-    decoder = MbcDecoder(script)
+    linker = MbcStaticLinker(script)
+    decoder = MbcDecoder(script, linker=linker)
     flow = MbcControlFlow(script, decoder=decoder)
 
     chunks: list[str] = [
         "// Experimental MBC pseudo-source",
         f"// source: {script.path.name}",
         f"// programs: {len(script.programs)}",
+        *linker.summary_lines(),
         "",
     ]
 
@@ -57,7 +60,7 @@ def decompile_to_text(script: MbcScript) -> str:
             continue
 
         instructions = flow.decode_program(program)
-        ast = build_program_ast(script, program, instructions)
+        ast = build_program_ast(script, program, instructions, linker=linker)
         source = ast.get("source", "")
         chunks.append(source if source else "// no decoded statements")
         chunks.append("")

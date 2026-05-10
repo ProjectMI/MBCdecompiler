@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 import struct
 from typing import List, Optional
@@ -16,6 +16,11 @@ def _u32(buf: bytes, off: int) -> int:
 
 def _i8(value: int) -> int:
     return value - 0x100 if value >= 0x80 else value
+
+
+def _i32(value: int) -> int:
+    value &= 0xFFFFFFFF
+    return value - 0x100000000 if value & 0x80000000 else value
 
 
 def _read_c_string(buf: bytes, off: int, encoding: str = "cp1251") -> tuple[str, int]:
@@ -69,9 +74,21 @@ class MbcProgram:
 class MbcFunction:
     index: int
     name: str
-    field_36: int
-    field_40: int
-    field_44: int
+    code_offset: int
+    program_index_raw: int
+    flags_or_module: int
+
+    @property
+    def program_index(self) -> int:
+        return _i32(self.program_index_raw)
+
+    @property
+    def is_import(self) -> bool:
+        return self.program_index < 0
+
+    @property
+    def file_offset(self) -> int:
+        return CODE_FILE_OFFSET + self.code_offset
 
 
 @dataclass
@@ -105,15 +122,6 @@ class MbcScript:
             if program.contains(code_offset):
                 return program
         return None
-
-    def to_summary_dict(self) -> dict:
-        return {
-            "path": str(self.path),
-            "header": asdict(self.header),
-            "program_count": len(self.programs),
-            "function_count": len(self.functions),
-            "metadata_size": len(self.metadata),
-        }
 
 
 class MbcLoader:

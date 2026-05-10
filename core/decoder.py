@@ -11,13 +11,8 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from .loader import MbcProgram, MbcScript
-from .opcodes import (
-    CODE_FILE_OFFSET,
-    builtin_to_dict,
-    decode_opcode,
-    opcode_to_dict,
-    safe_chr,
-)
+from .linker import MbcStaticLinker
+from .opcodes import CODE_FILE_OFFSET, decode_opcode
 
 
 @dataclass
@@ -27,17 +22,6 @@ class Edge:
     dst: Optional[int]
     dst_program: Optional[str] = None
     note: str = ""
-
-    def to_dict(self) -> dict:
-        return {
-            "kind": self.kind,
-            "src": self.src,
-            "src_file": self.src + CODE_FILE_OFFSET,
-            "dst": self.dst,
-            "dst_file": None if self.dst is None else self.dst + CODE_FILE_OFFSET,
-            "dst_program": self.dst_program,
-            "note": self.note,
-        }
 
 
 @dataclass
@@ -53,22 +37,6 @@ class Instruction:
     terminal: bool = False
     known: bool = True
 
-    def to_dict(self) -> dict:
-        return {
-            "offset": self.offset,
-            "file_offset": self.file_offset,
-            "opcode": self.opcode,
-            "opcode_hex": f"0x{self.opcode:02X}",
-            "opcode_chr": safe_chr(self.opcode),
-            "mnemonic": self.mnemonic,
-            "length": self.length,
-            "raw": self.raw,
-            "operands": self.operands,
-            "terminal": self.terminal,
-            "known": self.known,
-            "edges": [e.to_dict() for e in self.edges],
-        }
-
 
 class MbcDecoder:
     """Decode a single MBC instruction at a code-section offset.
@@ -78,15 +46,10 @@ class MbcDecoder:
     handler, so relative branches are based at ``off + 1``.
     """
 
-    def __init__(self, script: MbcScript):
+    def __init__(self, script: MbcScript, *, linker: MbcStaticLinker | None = None):
         self.script = script
         self.code = script.code
-
-    def opcode_tables(self) -> dict:
-        return {
-            "top_opcodes": opcode_to_dict(),
-            "builtins": builtin_to_dict(),
-        }
+        self.linker = linker or MbcStaticLinker(script)
 
     def decode_at(self, off: int, program: Optional[MbcProgram] = None) -> Instruction:
         if not (0 <= off < len(self.code)):
@@ -111,6 +74,8 @@ class MbcDecoder:
             operands["program_start_file"] = target_program.file_start
             edges.append(Edge("program_ref", off, target_program.start, target_program.name, decoded.mnemonic))
 
+        self._annotate_linkage(off, operands, edges)
+
         return Instruction(
             offset=off,
             file_offset=off + CODE_FILE_OFFSET,
@@ -123,6 +88,35 @@ class MbcDecoder:
             terminal=decoded.terminal,
             known=decoded.known,
         )
+
+
+    def _annotate_linkage(self, off: int, operands: dict, edges: List[Edge]) -> None:
+        symbols_here = self.linker.symbols_at(off)
+        if symbols_here:
+            operands["function_symbols"] = [symbol.to_dict() for symbol in symbols_here]
+            preferred = next((symbol for symbol in symbols_here if symbol.is_internal), symbols_here[0])
+            operands["function_name"] = preferred.name
+            operands["function_kind"] = preferred.kind
+            operands["function_index"] = preferred.index
+            operands["function_program_index"] = preferred.program_index
+
+        import_symbol = self.linker.import_stub_at(off)
+        if import_symbol is not None:
+            operands["link_name"] = import_symbol.name
+            operands["link_kind"] = import_symbol.kind
+            operands["link_function_index"] = import_symbol.index
+            operands["link_program_index"] = import_symbol.program_index
+            edges.append(Edge("import_symbol", off, None, None, import_symbol.name))
+
+        target = operands.get("target")
+        if isinstance(target, int):
+            target_name = self.linker.callable_name_for_offset(target)
+            if target_name is not None:
+                operands["target_name"] = target_name
+                symbol = self.linker.internal_at(target) or self.linker.symbol_at(target)
+                if symbol is not None:
+                    operands["target_function_index"] = symbol.index
+                    operands["target_function_kind"] = symbol.kind
 
     def _program_name_for(self, offset: Optional[int]) -> Optional[str]:
         if offset is None:
