@@ -598,6 +598,7 @@ def normalize_ast_statements(statements: Iterable[AstStatement]) -> list[AstStat
     cleaned = [_normalize_statement(stmt) for stmt in statements if not _is_argc_meta(stmt)]
     cleaned = _collapse_consecutive_yields(cleaned)
     cleaned = _fold_short_circuit_conditions(cleaned)
+    cleaned = _rewrite_residual_short_circuit_guards(cleaned)
     cleaned = _structure_control_flow(cleaned)
     cleaned = _retarget_branches_to_visible_offsets(cleaned)
     return _insert_branch_labels(cleaned)
@@ -775,15 +776,18 @@ def _retarget_branches_to_visible_offsets(statements: list[AstStatement]) -> lis
 
 
 def _fold_short_circuit_conditions(statements: list[AstStatement]) -> list[AstStatement]:
-    """Fold VM short-circuit helper branches into the final boolean test.
+    """Fold VM short-circuit helper branches into source-level boolean uses.
 
     Opcodes ``logical_or_rel16`` and ``logical_and_rel16`` are not source-level
     branches.  They are VM helpers used while constructing a boolean value on
     the stack.  Emitting them as visible ``goto`` statements makes many ordinary
     conditions look like tangled control flow and prevents later if/switch
-    recovery.  This pass recognizes a contiguous run of short-circuit helper
-    tests followed by the real ``jfalse`` consumer and replaces the whole run
-    with one source-level conditional branch.
+    recovery.
+
+    Two consumer shapes are recognized:
+    * helper chain + real ``jfalse`` consumer -> one source-level conditional;
+    * helper chain + expression consumer (return/assignment) -> the consumer's
+      final value expression becomes the full short-circuit expression.
     """
     if not statements:
         return statements
@@ -807,7 +811,16 @@ def _fold_short_circuit_conditions(statements: list[AstStatement]) -> list[AstSt
                 i += 1
                 continue
 
-        # The run was not a complete condition, so keep it unchanged.
+        if i < len(statements):
+            folded_consumer = _make_folded_short_circuit_consumer_statement(statements[start:i], statements[i])
+            if folded_consumer is not None:
+                result.append(folded_consumer)
+                i += 1
+                continue
+
+        # The run was not a complete condition, so keep it unchanged.  A later
+        # guard-rewrite pass may still convert single helper branches that guard
+        # a visible side-effect block.
         result.extend(statements[start:i])
 
     return result
@@ -880,6 +893,170 @@ def _make_folded_short_circuit_statement(chain: list[AstStatement], final_branch
         mnemonic="folded_short_circuit",
         operands=operands,
     )
+
+
+def _make_folded_short_circuit_consumer_statement(chain: list[AstStatement], consumer: AstStatement) -> AstStatement | None:
+    """Fold helper chain into a value consumer such as ``return rhs`` or ``x = rhs``."""
+    if not chain:
+        return None
+
+    final_expr = _consumer_value_expression(consumer)
+    if final_expr is None:
+        return None
+
+    final_condition = AstStatement(
+        offset=consumer.offset,
+        file_offset=consumer.file_offset,
+        kind=consumer.kind,
+        text=consumer.text,
+        opcode=consumer.opcode,
+        mnemonic=consumer.mnemonic,
+        operands={"condition": final_expr},
+    )
+    condition_stmts = list(chain) + [final_condition]
+    offset_to_pos = {stmt.offset: idx for idx, stmt in enumerate(condition_stmts)}
+
+    ops: list[str] = []
+    target_positions: list[int | None] = []
+    for stmt in chain:
+        op_name = stmt.operands.get("short_circuit")
+        ops.append("&&" if op_name == "and" else "||")
+        target_positions.append(_target_position_for_short_circuit(stmt, condition_stmts, offset_to_pos))
+
+    for idx, target_pos in enumerate(target_positions):
+        if target_pos is None or target_pos <= idx:
+            return None
+
+    conditions = [_ControlStructurer._clean_condition(str(stmt.operands.get("condition", ""))) for stmt in condition_stmts]
+    if any(not cond for cond in conditions):
+        return None
+
+    combined = _render_short_circuit_expression(conditions, ops, target_positions, 0, len(conditions) - 1)
+    if combined is None:
+        return None
+
+    rewritten_text = _rewrite_consumer_value_expression(consumer.text, final_expr, combined)
+    if rewritten_text is None:
+        return None
+
+    operands = dict(consumer.operands or {})
+    uses = list(operands.get("uses") or [])
+    if uses:
+        uses[-1] = combined
+        operands["uses"] = uses
+    operands["short_circuit_folded"] = True
+    operands["folded_offsets"] = [stmt.offset for stmt in condition_stmts]
+    operands["folded_ops"] = list(ops)
+    operands["folded_value"] = combined
+
+    first = chain[0]
+    return AstStatement(
+        offset=first.offset,
+        file_offset=first.file_offset,
+        kind=consumer.kind,
+        text=rewritten_text,
+        opcode=consumer.opcode,
+        mnemonic=consumer.mnemonic,
+        operands=operands,
+    )
+
+
+def _consumer_value_expression(stmt: AstStatement) -> str | None:
+    uses = stmt.operands.get("uses") if isinstance(stmt.operands, dict) else None
+    if isinstance(uses, list) and uses:
+        candidate = uses[-1]
+        if isinstance(candidate, str) and candidate.strip():
+            return _ControlStructurer._clean_condition(candidate)
+
+    text = stmt.text.strip()
+    if stmt.kind == "return" and text.startswith("return ") and text.endswith(";"):
+        return _ControlStructurer._clean_condition(text[len("return "):-1])
+    if stmt.kind == "assign" and "=" in text and text.endswith(";"):
+        return _ControlStructurer._clean_condition(text.split("=", 1)[1][:-1])
+    return None
+
+
+def _rewrite_consumer_value_expression(text: str, old_expr: str, new_expr: str) -> str | None:
+    old_expr = old_expr.strip()
+    if not old_expr:
+        return None
+
+    # Prefer the exact rendered expression, then common parenthesized variants.
+    candidates = [old_expr]
+    cleaned = _ControlStructurer._clean_condition(old_expr)
+    if cleaned != old_expr:
+        candidates.append(cleaned)
+    candidates.extend([f"({cleaned})", f"(({cleaned}))"])
+
+    for candidate in candidates:
+        if candidate and candidate in text:
+            return text.replace(candidate, new_expr, 1)
+
+    stripped = text.strip()
+    if stripped.startswith("return ") and stripped.endswith(";"):
+        return f"return {new_expr};"
+    if "=" in stripped and stripped.endswith(";"):
+        lhs = stripped.split("=", 1)[0].rstrip()
+        return f"{lhs} = {new_expr};"
+    return None
+
+
+def _rewrite_residual_short_circuit_guards(statements: list[AstStatement]) -> list[AstStatement]:
+    """Convert leftover helper branches that guard visible side-effect blocks.
+
+    Some bytecode uses a short-circuit helper to skip a small RHS side-effect
+    block before a later consumer, e.g. ``a || ++i > n``.  The symbolic stack may
+    have already emitted the side effect as a normal statement, so full boolean
+    folding is unsafe.  Rewriting the helper to an ordinary guard preserves the
+    visible control flow and removes the misleading ``// short-circuit`` pseudo
+    goto.
+    """
+    if not statements:
+        return statements
+
+    offset_to_index = {stmt.offset: idx for idx, stmt in enumerate(statements)}
+    result: list[AstStatement] = []
+    for i, stmt in enumerate(statements):
+        if not _is_short_circuit_branch(stmt):
+            result.append(stmt)
+            continue
+
+        target = stmt.operands.get("target") if isinstance(stmt.operands, dict) else None
+        target_idx = offset_to_index.get(target) if isinstance(target, int) else None
+        if target_idx is None or target_idx <= i + 1:
+            result.append(stmt)
+            continue
+
+        cond = stmt.operands.get("condition")
+        if not isinstance(cond, str) or not cond.strip():
+            result.append(stmt)
+            continue
+
+        op_name = stmt.operands.get("short_circuit")
+        guarded_cond = _ControlStructurer._clean_condition(cond)
+        if op_name == "or":
+            guarded_cond = _ControlStructurer._negated_condition(guarded_cond)
+        elif op_name != "and":
+            result.append(stmt)
+            continue
+
+        operands = dict(stmt.operands or {})
+        operands.pop("short_circuit", None)
+        operands["condition"] = guarded_cond
+        operands["branch_when"] = "false"
+        operands["short_circuit_guard_rewrite"] = True
+        result.append(
+            AstStatement(
+                offset=stmt.offset,
+                file_offset=stmt.file_offset,
+                kind="if_goto",
+                text=f"if (!({guarded_cond})) goto {label_for_offset(target)};",
+                opcode=stmt.opcode,
+                mnemonic="short_circuit_guard",
+                operands=operands,
+            )
+        )
+    return result
 
 
 def _target_position_for_short_circuit(stmt: AstStatement, condition_stmts: list[AstStatement], offset_to_pos: dict[int, int]) -> int | None:
@@ -1018,6 +1195,9 @@ def _make_label_statement(offset: int, *, unresolved: bool = False) -> AstStatem
 
 _TERMINAL_STATEMENT_KINDS = {"return", "halt", "yield"}
 _SWITCH_MIN_CASES = 2
+_STRUCTURER_MAX_RECURSION_DEPTH = 64
+_STRUCTURER_MAX_CACHE_ITEMS = 20000
+
 
 
 def _structure_control_flow(statements: list[AstStatement]) -> list[AstStatement]:
@@ -1041,14 +1221,48 @@ class _SwitchCase:
 
 
 class _ControlStructurer:
-    def __init__(self, statements: list[AstStatement]):
+    def __init__(
+        self,
+        statements: list[AstStatement],
+        *,
+        depth: int = 0,
+        memo: dict[tuple[int, ...], list[AstStatement]] | None = None,
+        active: set[tuple[int, ...]] | None = None,
+    ):
         self.statements = statements
+        self._depth = depth
+        self._memo = memo if memo is not None else {}
+        self._active = active if active is not None else set()
         self._offset_to_index: dict[int, int] = {}
         for idx, stmt in enumerate(statements):
             self._offset_to_index.setdefault(stmt.offset, idx)
 
     def structure(self) -> list[AstStatement]:
-        return self._structure_range(0, len(self.statements))
+        if not self.statements:
+            return []
+        if self._depth > _STRUCTURER_MAX_RECURSION_DEPTH:
+            return self.statements
+
+        key = tuple(id(stmt) for stmt in self.statements)
+        cached = self._memo.get(key)
+        if cached is not None:
+            return list(cached)
+        if key in self._active:
+            # Defensive recursion fuse.  Some large dispatcher functions contain
+            # overlapping if/else/switch candidate regions; if a candidate ever
+            # re-enters the exact same visible statement slice, preserve the
+            # low-level form instead of spinning.
+            return self.statements
+
+        self._active.add(key)
+        try:
+            result = self._structure_range(0, len(self.statements))
+        finally:
+            self._active.discard(key)
+
+        if len(self._memo) < _STRUCTURER_MAX_CACHE_ITEMS:
+            self._memo[key] = list(result)
+        return result
 
     def _structure_range(self, start: int, end: int) -> list[AstStatement]:
         result: list[AstStatement] = []
@@ -1386,7 +1600,12 @@ class _ControlStructurer:
     def _structure_range_by_statements(self, stmts: list[AstStatement]) -> list[AstStatement]:
         if not stmts:
             return []
-        sub = _ControlStructurer(stmts)
+        sub = _ControlStructurer(
+            stmts,
+            depth=self._depth + 1,
+            memo=self._memo,
+            active=self._active,
+        )
         return sub.structure()
 
     def _safe_region(self, start: int, end: int) -> bool:
