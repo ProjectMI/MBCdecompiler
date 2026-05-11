@@ -78,6 +78,32 @@ INT_TYPES = {TYPE_CHAR, TYPE_INT, TYPE_INT_REF, TYPE_INT_REF_REF}
 
 REFERENCE_TYPES = {tid for tid in TYPE_NAMES if is_reference_type(tid)}
 
+PSEUDO_TYPE_NAMES: dict[int, str] = {
+    TYPE_CHAR: "char",
+    TYPE_STRING: "string",
+    TYPE_STRING_REF: "string_ref",
+    TYPE_INT: "int",
+    TYPE_INT_REF: "int_ref",
+    TYPE_INT_REF_REF: "int_ref_ref",
+    TYPE_FLOAT: "float",
+    TYPE_FLOAT_REF: "float_ref",
+    TYPE_FLOAT_REF_REF: "float_ref_ref",
+    TYPE_SLICE: "record",
+    TYPE_SLICE_REF: "record_ref",
+}
+
+
+def pseudo_type_name(type_id: int | None) -> str:
+    if type_id in PSEUDO_TYPE_NAMES:
+        return PSEUDO_TYPE_NAMES[type_id]  # type: ignore[index]
+    return type_name(type_id).replace("span/", "").replace("_or_span", "")
+
+
+def _escape_string_literal(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    escaped = escaped.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return f'"{escaped}"'
+
 
 @dataclass(frozen=True)
 class MemoryLocation:
@@ -88,10 +114,15 @@ class MemoryLocation:
     name: str | None = None
     role: str = "data"
     length: int | None = None
+    scope: str = "global"
 
     @property
     def type_name(self) -> str:
         return type_name(self.type_id)
+
+    @property
+    def pseudo_type_name(self) -> str:
+        return pseudo_type_name(self.type_id)
 
     def render(self) -> str:
         if self.name:
@@ -108,6 +139,7 @@ class MemoryLocation:
             "name": self.name or self.render(),
             "role": self.role,
             "length": self.length,
+            "scope": self.scope,
         }
 
 
@@ -116,13 +148,17 @@ class SymbolicDataMemory:
 
     Program prologues bind argument descriptors to concrete data offsets.  Later
     ``push_data_ref`` operations for those offsets render as ``argN`` instead of
-    anonymous data cells.  Other data offsets are stable symbolic variables.
+    anonymous data cells.  Other data offsets are named with recovered scope:
+    ``local_*`` for program-private slots and ``global_*`` for slots shared by
+    several programs.
     """
 
-    def __init__(self, *, module_name: str, data: bytes):
+    def __init__(self, *, module_name: str, data: bytes, scope_map: dict[int, str] | None = None):
         self.module_name = module_name
         self.data = data
+        self.scope_map = scope_map or {}
         self._bindings: dict[int, MemoryLocation] = {}
+        self._locations: dict[tuple[int, str], MemoryLocation] = {}
         self._versions: dict[str, int] = {}
 
     def bind_argument(self, *, index: int, type_id: int, data_offset: int, name: str | None = None) -> MemoryLocation:
@@ -133,6 +169,7 @@ class SymbolicDataMemory:
             type_id=type_id,
             name=name or f"arg{index}",
             role="arg",
+            scope="arg",
         )
         self._bindings[data_offset] = loc
         return loc
@@ -150,17 +187,105 @@ class SymbolicDataMemory:
                 name=bound.name,
                 role=bound.role,
                 length=length or bound.length,
+                scope=bound.scope,
             )
-        prefix = "span" if role == "span" or (isinstance(type_id, int) and type_id not in {TYPE_CHAR, TYPE_INT, TYPE_FLOAT}) else "var"
-        return MemoryLocation(
+
+        category = self._category_for(role, type_id)
+        key = (offset, category)
+        cached = self._locations.get(key)
+        if cached is not None:
+            new_type_id = type_id if type_id is not None and cached.type_id is None else cached.type_id
+            new_length = cached.length
+            if length is not None and (cached.length is None or length > cached.length):
+                new_length = length
+            if new_type_id != cached.type_id or new_length != cached.length:
+                cached = MemoryLocation(
+                    module=cached.module,
+                    section=cached.section,
+                    offset=cached.offset,
+                    type_id=new_type_id,
+                    name=cached.name,
+                    role=cached.role,
+                    length=new_length,
+                    scope=cached.scope,
+                )
+                self._locations[key] = cached
+            return cached
+
+        scope = "const" if role == "const_span" else self.scope_map.get(offset, "global")
+        loc = MemoryLocation(
             module=self.module_name,
             section="data",
             offset=offset,
             type_id=type_id,
-            name=f"{prefix}_{offset:04X}",
+            name=self._name_for(offset=offset, category=category, scope=scope, type_id=type_id),
             role=role,
             length=length,
+            scope=scope,
         )
+        self._locations[key] = loc
+        return loc
+
+    def declarations(self, *, scope: str | None = None) -> list[MemoryLocation]:
+        locations = [loc for loc in self._locations.values() if loc.scope != "const" and loc.role != "arg"]
+        if scope is not None:
+            locations = [loc for loc in locations if loc.scope == scope]
+        return sorted(locations, key=lambda loc: (loc.offset, loc.role, loc.name or ""))
+
+    @staticmethod
+    def declaration_text(location: MemoryLocation) -> str:
+        typ = location.pseudo_type_name
+        name = location.render()
+        extent, note = SymbolicDataMemory._declaration_extent(location)
+        if extent is not None and extent > 1:
+            name = f"{name}[{extent}]"
+        suffix_parts = [f"data[0x{location.offset:04X}]"]
+        if note:
+            suffix_parts.append(note)
+        return f"{typ} {name}; // {', '.join(suffix_parts)}"
+
+    @staticmethod
+    def _declaration_extent(location: MemoryLocation) -> tuple[int | None, str]:
+        length = location.length
+        if not isinstance(length, int) or length <= 1:
+            return None, ""
+        if location.role == "array":
+            return length, ""
+        if location.type_id == TYPE_STRING:
+            return length, ""
+        if location.type_id == TYPE_SLICE and length % 12 == 0:
+            return length // 12, f"{length} bytes"
+        if location.type_id in {TYPE_INT, TYPE_FLOAT} and length % 4 == 0:
+            return length // 4, f"{length} bytes"
+        return length, f"{length} bytes"
+
+    @staticmethod
+    def _category_for(role: str, type_id: int | None) -> str:
+        if role == "array":
+            return "array"
+        if role in {"span", "const_span"}:
+            return "span"
+        if isinstance(type_id, int) and type_id not in {TYPE_CHAR, TYPE_INT, TYPE_FLOAT}:
+            return "span"
+        return "var"
+
+    @staticmethod
+    def _name_for(*, offset: int, category: str, scope: str, type_id: int | None = None) -> str:
+        if scope == "const":
+            return f"str_{offset:04X}"
+        local = scope == "local"
+        prefix = "" if local else "g_"
+        if category == "array":
+            return f"{prefix}arr_{offset:04X}"
+        if category == "span":
+            if type_id == TYPE_STRING:
+                stem = "buf"
+            elif type_id == TYPE_SLICE:
+                stem = "rec"
+            else:
+                stem = "span"
+            return f"{prefix}{stem}_{offset:04X}"
+        return f"v_{offset:04X}" if local else f"g_{offset:04X}"
 
     def define(self, location: MemoryLocation | None, fallback: str) -> str:
         key = location.render() if location is not None else fallback
@@ -536,10 +661,10 @@ def _make_label_statement(offset: int, *, unresolved: bool = False) -> AstStatem
     )
 
 class AstExpressionRenderer:
-    def __init__(self, script: MbcScript, program: MbcProgram, *, memory: SymbolicDataMemory | None = None):
+    def __init__(self, script: MbcScript, program: MbcProgram, *, memory: SymbolicDataMemory | None = None, scope_map: dict[int, str] | None = None):
         self.script = script
         self.program = program
-        self.memory = memory or SymbolicDataMemory(module_name=script.path.stem, data=script.data)
+        self.memory = memory or SymbolicDataMemory(module_name=script.path.stem, data=script.data, scope_map=scope_map)
 
     def push_value(self, ins: Any) -> str:
         operands = ins.operands or {}
@@ -564,24 +689,23 @@ class AstExpressionRenderer:
         if m == "push_inline_span":
             off = operands.get("data_offset", 0)
             length = operands.get("length", 0)
-            return self.span_expr(off, length)
+            return self.span_expr(off, length, type_id=TYPE_STRING, role="const_span")
 
         if m in {"push_typed_span_ref", "push_inline_typed_span"}:
             off = operands.get("data_offset", 0)
             length = operands.get("length", 0)
-            return self.span_expr(off, length, tname)
+            return self.span_expr(off, length, type_id=typ, role="span")
 
         return f"{m}(...)"
 
-    def span_expr(self, off: Any, length: Any, type_name: str | None = None) -> str:
-        if isinstance(off, int):
-            loc = self.memory.location(offset=off, type_id=None, role="span", length=length if isinstance(length, int) else None)
-            base = loc.render()
-        else:
-            base = f"span[{off!r}]"
-        suffix = "" if type_name is None else f":{type_name}"
+    def span_expr(self, off: Any, length: Any, type_id: int | None = None, *, role: str = "span") -> str:
         preview = self.data_preview(off, length if isinstance(length, int) else None)
-        return f"{base}[{length}{suffix}]" + (f" /* {preview!r} */" if preview else "")
+        if role == "const_span" and preview:
+            return _escape_string_literal(preview)
+        if isinstance(off, int):
+            loc = self.memory.location(offset=off, type_id=type_id, role=role, length=length if isinstance(length, int) else None)
+            return loc.render()
+        return f"span[{off!r}]"
 
     def program_arg(self, idx: Any) -> str:
         pname = self.program_name(idx)
@@ -604,12 +728,12 @@ REF_TYPES = {TYPE_STRING, TYPE_INT_REF, TYPE_FLOAT_REF, TYPE_SLICE}  # legacy; u
 class StackAstBuilder:
     """Interpret decoded instructions as a conservative symbolic stack AST seed."""
 
-    def __init__(self, script: MbcScript, program: MbcProgram, *, linker: MbcStaticLinker | None = None):
+    def __init__(self, script: MbcScript, program: MbcProgram, *, linker: MbcStaticLinker | None = None, scope_map: dict[int, str] | None = None):
         self.script = script
         self.program = program
         self.linker = linker or MbcStaticLinker(script)
-        self.memory = SymbolicDataMemory(module_name=script.path.stem, data=script.data)
-        self.renderer = AstExpressionRenderer(script, program, memory=self.memory)
+        self.memory = SymbolicDataMemory(module_name=script.path.stem, data=script.data, scope_map=scope_map)
+        self.renderer = AstExpressionRenderer(script, program, memory=self.memory, scope_map=scope_map)
         self.vm = VMStackMachine(memory=self.memory)
         self.statements: list[AstStatement] = []
         self.pending_arg_count: Optional[int] = None
@@ -618,13 +742,45 @@ class StackAstBuilder:
         for ins in instructions:
             self._visit(ins)
         self._flush_pending_side_effect_slots()
+        normalized = normalize_ast_statements(self.statements)
+        declarations = self._declaration_statements(scope="local")
         payload = ast_payload(
-            statements=normalize_ast_statements(self.statements),
+            statements=declarations + normalized,
             residual_stack=self.vm.residual(),
             underflows=self.vm.underflows,
         )
         payload["memory_bindings"] = self.memory.bindings()
+        payload["declarations"] = [loc.to_dict() for loc in self.memory.declarations()]
         return payload
+
+    def _declaration_statements(self, *, scope: str) -> list[AstStatement]:
+        locations = self.memory.declarations(scope=scope)
+        if not locations:
+            return []
+        statements = [
+            AstStatement(
+                offset=self.program.start,
+                file_offset=self.program.file_start,
+                kind="decl_header",
+                text=f"// {scope}s",
+                opcode=-1,
+                mnemonic="declaration",
+                operands={},
+            )
+        ]
+        for loc in locations:
+            statements.append(
+                AstStatement(
+                    offset=self.program.start,
+                    file_offset=self.program.file_start,
+                    kind="decl",
+                    text=SymbolicDataMemory.declaration_text(loc),
+                    opcode=-1,
+                    mnemonic="declaration",
+                    operands={"declaration": loc.to_dict()},
+                )
+            )
+        return statements
 
     def _visit(self, ins: Any) -> None:
         op = ins.opcode
@@ -954,8 +1110,24 @@ class StackAstBuilder:
             begin = operands.get("data_offset")
             length = operands.get("length")
             end = begin + length - 1 if isinstance(begin, int) and isinstance(length, int) and length > 0 else None
-            loc = self.memory.location(offset=begin, type_id=typ if typ is not None else TYPE_STRING, role="span", length=length) if isinstance(begin, int) else None
-            self.vm.push_slice(expr, type_id=typ if typ is not None else TYPE_STRING, begin=begin, end=end, note=m, location=loc)
+            role = "const_span" if m == "push_inline_span" else "span"
+            slot_type = typ if typ is not None else TYPE_STRING
+            loc = self.memory.location(offset=begin, type_id=slot_type, role=role, length=length) if isinstance(begin, int) else None
+            self.vm.push_slice(
+                expr,
+                type_id=slot_type,
+                begin=begin,
+                end=end,
+                note=m,
+                location=loc,
+                metadata={
+                    "span_base": loc.render() if loc is not None else expr,
+                    "span_data_offset": begin,
+                    "span_length": length,
+                    "span_type_id": slot_type,
+                    "span_role": role,
+                },
+            )
             return
 
         if typ == TYPE_FLOAT and "value_float" in operands:
@@ -975,43 +1147,103 @@ class StackAstBuilder:
         if m == "array_index_abs":
             index = self.vm.coerce_int(self._pop_value(ins, "index"))
             base = int(operands.get("base", 0))
-            expr = f"array_{base:04X}[{index.render()}]"
-            self._push_typed_index_result(expr, typ, operands)
+            count = operands.get("count")
+            loc = self.memory.location(
+                offset=base,
+                type_id=typ,
+                role="array",
+                length=abs(count) if isinstance(count, int) and count != 0 else None,
+            )
+            expr = f"{loc.render()}[{index.render()}]"
+            self._push_typed_index_result(
+                expr,
+                typ,
+                operands,
+                metadata={
+                    "array_base": loc.render(),
+                    "array_index": index.render(),
+                    "array_data_offset": base,
+                    "array_element_size": operands.get("element_size"),
+                    "array_type_id": typ,
+                },
+            )
             return
 
         if m in {"array2_index", "array2_index_checked"}:
-            index = self.vm.coerce_int(self._pop_value(ins, "index"))
             base = self.vm.get_pointer_or_slice(self._pop_value(ins, "base"))
+            index = self.vm.coerce_int(self._pop_value(ins, "index"))
             expr = f"{base.render()}[{index.render()}]"
-            self._push_typed_index_result(expr, typ, operands)
+            self._push_typed_index_result(
+                expr,
+                typ,
+                operands,
+                metadata={
+                    "array_base": base.render(),
+                    "array_index": index.render(),
+                    "array_element_size": operands.get("element_size"),
+                    "array_type_id": typ,
+                    "base_metadata": dict(base.metadata),
+                },
+            )
             return
 
         if m == "slice_offset_ref":
             base = self.vm.get_pointer_or_slice(self._pop_value(ins, "base"))
-            offset = operands.get("offset", "?")
-            expr = f"{base.render()}+{offset}"
-            self._push_typed_index_result(expr, typ, operands)
+            expr, metadata = self._slice_offset_expr(base, operands, typ)
+            self._push_typed_index_result(expr, typ, operands, metadata=metadata)
             return
 
         if m == "slice_offset_span":
             base = self.vm.get_pointer_or_slice(self._pop_value(ins, "base"))
-            expr = f"span({base.render()}+{operands.get('offset', '?')}, {operands.get('length', '?')})"
-            self.vm.push_slice(expr, type_id=typ, note="slice_offset_span")
+            offset = operands.get("offset", "?")
+            length = operands.get("length", "?")
+            expr = f"{base.render()}.span_{offset:02X}_{length}" if isinstance(offset, int) else f"span({base.render()}+{offset}, {length})"
+            self.vm.push_slice(expr, type_id=typ, note="slice_offset_span", metadata={"base_metadata": dict(base.metadata), "offset": offset, "length": length})
             return
 
         self.vm.push_unknown(f"{m}(...)", type_id=typ)
 
-    def _push_typed_index_result(self, expr: str, typ: Any, operands: dict[str, Any]) -> None:
+    def _slice_offset_expr(self, base: VMSlot, operands: dict[str, Any], typ: Any) -> tuple[str, dict[str, Any]]:
+        offset = operands.get("offset", "?")
+        metadata = {"base_metadata": dict(base.metadata), "offset": offset, "field_type_id": typ}
+
+        if typ == TYPE_SLICE and isinstance(offset, int):
+            stride = operands.get("length")
+            if isinstance(stride, int) and stride > 0 and offset % stride == 0:
+                index = offset // stride
+                expr = f"{base.render()}[{index}]"
+                metadata.update({"record_base": base.render(), "record_index": index, "record_stride": stride})
+                return expr, metadata
+
+        if isinstance(offset, int):
+            return self._field_expr(base.render(), offset, typ), metadata
+        return f"{base.render()}+{offset}", metadata
+
+    def _field_expr(self, base_expr: str, offset: int, typ: Any = None) -> str:
+        return f"{base_expr}.{self._field_name(offset, typ)}"
+
+    @staticmethod
+    def _field_name(offset: int, typ: Any = None) -> str:
+        if typ == TYPE_FLOAT and offset % 4 == 0:
+            return f"f{offset // 4}"
+        if typ == TYPE_INT and offset % 4 == 0:
+            return f"i{offset // 4}"
+        if typ == TYPE_CHAR:
+            return f"b{offset:02X}"
+        return f"field_{offset:02X}"
+
+    def _push_typed_index_result(self, expr: str, typ: Any, operands: dict[str, Any], *, metadata: dict[str, Any] | None = None) -> None:
+        metadata = metadata or {}
         if typ == TYPE_FLOAT:
-            self.vm.push_float(expr, note="indexed float load")
+            self.vm.push_float(expr, note="indexed float load", metadata=metadata)
         elif typ in {TYPE_CHAR, TYPE_INT}:
-            self.vm.push_int(expr, note="indexed scalar load")
+            self.vm.push_int(expr, note="indexed scalar load", metadata=metadata)
         elif typ == TYPE_SLICE:
-            self.vm.push_slice(expr, type_id=typ, note="indexed descriptor")
+            self.vm.push_slice(expr, type_id=typ, note="indexed descriptor", metadata=metadata)
         elif is_reference_type(typ) or (isinstance(typ, int) and typ not in {TYPE_CHAR, TYPE_INT, TYPE_FLOAT}):
-            self.vm.push_ref(expr, type_id=typ, storage_size=self._storage_size(typ), note="indexed ref")
+            self.vm.push_ref(expr, type_id=typ, storage_size=self._storage_size(typ), note="indexed ref", metadata=metadata)
         else:
-            self.vm.push_unknown(expr, type_id=typ, kind="indexed")
+            self.vm.push_unknown(expr, type_id=typ, kind="indexed", metadata=metadata)
 
     def _consume_arg_count(self) -> int | None:
         count = self.pending_arg_count
@@ -1064,5 +1296,6 @@ def build_program_ast(
     instructions: Iterable[Any],
     *,
     linker: MbcStaticLinker | None = None,
+    scope_map: dict[int, str] | None = None,
 ) -> dict[str, Any]:
-    return StackAstBuilder(script, program, linker=linker).build(instructions)
+    return StackAstBuilder(script, program, linker=linker, scope_map=scope_map).build(instructions)

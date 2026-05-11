@@ -13,7 +13,7 @@ from typing import Iterable
 from .bytecode import MbcControlFlow, MbcDecoder
 from .linker import MbcProjectLinker, MbcStaticLinker
 from .loader import MbcLoader, MbcProgram, MbcProject, MbcScript
-from .vm_ast import build_program_ast
+from .vm_ast import SymbolicDataMemory, build_program_ast, pseudo_type_name
 
 LOCAL_HELPER_PREFIX = "local"
 
@@ -61,6 +61,128 @@ class LocalHelperIndex:
             target = operands.get("target")
             if isinstance(target, int) and target in names:
                 operands["target_name"] = names[target]
+
+
+@dataclass
+class DataUse:
+    offset: int
+    owners: set[int] = field(default_factory=set)
+    roles: set[str] = field(default_factory=set)
+    type_ids: set[int] = field(default_factory=set)
+    length: int | None = None
+
+    def add(self, *, owner_index: int, role: str, type_id: int | None, length: int | None = None) -> None:
+        self.owners.add(owner_index)
+        self.roles.add(role)
+        if isinstance(type_id, int):
+            self.type_ids.add(type_id)
+        if isinstance(length, int) and length > 0:
+            self.length = length if self.length is None else max(self.length, length)
+
+    @property
+    def primary_role(self) -> str:
+        if "array" in self.roles:
+            return "array"
+        if "span" in self.roles:
+            return "span"
+        return "data"
+
+    @property
+    def primary_type_id(self) -> int | None:
+        if not self.type_ids:
+            return None
+        return sorted(self.type_ids)[0]
+
+
+def _instruction_data_uses(ins: object) -> Iterable[tuple[int, str, int | None, int | None]]:
+    mnemonic = getattr(ins, "mnemonic", "")
+    operands = getattr(ins, "operands", None)
+    if not isinstance(operands, dict):
+        return
+
+    if mnemonic == "push_data_ref":
+        off = operands.get("data_offset")
+        if isinstance(off, int):
+            yield off, "data", operands.get("type") if isinstance(operands.get("type"), int) else None, None
+        return
+
+    if mnemonic in {"push_typed_span_ref", "push_inline_typed_span"}:
+        off = operands.get("data_offset")
+        length = operands.get("length")
+        if isinstance(off, int):
+            yield off, "span", operands.get("type") if isinstance(operands.get("type"), int) else None, length if isinstance(length, int) else None
+        return
+
+    if mnemonic == "array_index_abs":
+        base = operands.get("base")
+        count = operands.get("count")
+        if isinstance(base, int):
+            array_count = abs(count) if isinstance(count, int) and count != 0 else None
+            yield base, "array", operands.get("type") if isinstance(operands.get("type"), int) else None, array_count
+        return
+
+
+def collect_data_scope_index(
+    script: MbcScript,
+    flow: MbcControlFlow,
+    local_index: LocalHelperIndex,
+    *,
+    stop_offsets: set[int],
+) -> tuple[dict[int, DataUse], dict[int, str]]:
+    """Infer which data-section slots are program-local and which are shared.
+
+    MBC bytecode stores both original locals and true module globals in the same
+    data section.  Without a debug local table, the most reliable recoverable
+    distinction is ownership: a slot referenced only by one program/helper owner
+    is rendered as local, while a slot referenced by several owners is rendered
+    as global.
+    """
+    usage: dict[int, DataUse] = {}
+    helpers_by_owner = local_index.by_owner()
+
+    def record(entry_program: MbcProgram, owner_index: int) -> None:
+        instructions = flow.decode_program(entry_program, follow_local_calls=False, stop_offsets=stop_offsets)
+        for ins in instructions:
+            for offset, role, type_id, length in _instruction_data_uses(ins):
+                usage.setdefault(offset, DataUse(offset)).add(
+                    owner_index=owner_index,
+                    role=role,
+                    type_id=type_id,
+                    length=length,
+                )
+
+    for program in script.programs:
+        record(program, program.index)
+        for helper in helpers_by_owner.get(program.index, []):
+            record(helper.program, helper.owner_index)
+
+    for helper in helpers_by_owner.get(-1, []):
+        record(synthetic_helper_program(script, helper.offset, None), helper.owner_index)
+
+    scope_map: dict[int, str] = {}
+    for offset, use in usage.items():
+        scope_map[offset] = "local" if len(use.owners) == 1 and next(iter(use.owners)) >= 0 else "global"
+    return usage, scope_map
+
+
+def render_global_data_declarations(script: MbcScript, usage: dict[int, DataUse], scope_map: dict[int, str]) -> list[str]:
+    memory = SymbolicDataMemory(module_name=script.path.stem, data=script.data, scope_map=scope_map)
+    for offset, use in sorted(usage.items()):
+        if scope_map.get(offset) != "global":
+            continue
+        memory.location(
+            offset=offset,
+            type_id=use.primary_type_id,
+            role=use.primary_role,
+            length=use.length,
+        )
+    declarations = memory.declarations(scope="global")
+    if not declarations:
+        return []
+    lines = ["globals", "{"]
+    lines.extend(f"    {SymbolicDataMemory.declaration_text(loc)}" for loc in declarations)
+    lines.extend(["}", ""])
+    return lines
 
 
 def synthetic_helper_program(script: MbcScript, entry: int, owner: MbcProgram | None = None) -> MbcProgram:
@@ -140,14 +262,24 @@ def load_project_for(mbc_path: Path) -> tuple[MbcProject, MbcScript, MbcProjectL
     return project, script, project_linker
 
 
+def _signature_text(symbol: object | None) -> str:
+    signature = getattr(symbol, "signature", None)
+    if signature is None or getattr(signature, "source", "unknown") == "unknown" and not getattr(signature, "args", ()):  # type: ignore[truthy-function]
+        return "()"
+    parts = [f"{pseudo_type_name(arg.type_id)} {arg.name}" for arg in signature.args]
+    if signature.variadic:
+        parts.append("...")
+    ret = "" if signature.return_type == "unknown" else f" -> {signature.return_type}"
+    return f"({', '.join(parts)}){ret}"
+
+
 def _program_header(program: MbcProgram, linker: MbcStaticLinker, *, local_helper: LocalHelper | None = None) -> str:
     if local_helper is not None:
-        return f"// === {local_helper.name}() @ 0x{local_helper.offset:08X} ==="
+        return f"function {local_helper.name}()"
 
     symbol = linker.internal_at(program.start) or linker.symbol_at(program.start)
     name = program.name or (symbol.name if symbol else f"program_{program.index}")
-    signature = symbol.signature.render(include_storage=True) if symbol is not None else "()"
-    return f"// === {name}{signature} @ 0x{program.start:08X} ==="
+    return f"function {name}{_signature_text(symbol)}"
 
 
 def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | None = None) -> str:
@@ -157,12 +289,13 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
     local_index = discover_local_helpers(script, flow, linker)
     helpers_by_owner = local_index.by_owner()
     stop_offsets = {program.start for program in script.programs} | local_index.stop_offsets
+    data_usage, data_scope_map = collect_data_scope_index(script, flow, local_index, stop_offsets=stop_offsets)
 
     chunks: list[str] = [
         "// Experimental MBC pseudo-source",
         f"// source: {script.path.name}",
         f"// programs: {len(script.programs)}",
-        "// data naming: argN = program_prologue binding; global_XXXX/global_span_XXXX = current process data-section slot",
+        "// data naming: argN = program_prologue binding; v_XXXX/buf_XXXX/rec_XXXX = local slots; g_XXXX/g_buf_XXXX/g_rec_XXXX = shared slots",
         "// synthetic call returns are now kept as expressions, not ret_* placeholder variables",
         "// local call targets are split into local_XXXXXXXX() helpers instead of being inlined into caller bodies",
     ]
@@ -171,24 +304,25 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
     if project_linker is not None:
         chunks.extend(project_linker.summary_lines())
     chunks.extend([*linker.summary_lines(), ""])
+    chunks.extend(render_global_data_declarations(script, data_usage, data_scope_map))
 
     def render_entry(entry_program: MbcProgram, *, local_helper: LocalHelper | None = None) -> None:
         chunks.append(_program_header(entry_program, linker, local_helper=local_helper))
+        chunks.append("{")
 
         if not (0 <= entry_program.start < len(script.code)):
-            chunks.append("// warning: program start is outside code section")
-            chunks.append("")
-            return
-        if entry_program.end < entry_program.start:
-            chunks.append("// warning: program end is before start")
-            chunks.append("")
-            return
+            body = "// warning: program start is outside code section"
+        elif entry_program.end < entry_program.start:
+            body = "// warning: program end is before start"
+        else:
+            instructions = flow.decode_program(entry_program, follow_local_calls=False, stop_offsets=stop_offsets)
+            local_index.annotate_call_names(instructions)
+            ast = build_program_ast(script, entry_program, instructions, linker=linker, scope_map=data_scope_map)
+            body = str(ast.get("source", "")) or "// no decoded statements"
 
-        instructions = flow.decode_program(entry_program, follow_local_calls=False, stop_offsets=stop_offsets)
-        local_index.annotate_call_names(instructions)
-        ast = build_program_ast(script, entry_program, instructions, linker=linker)
-        source = ast.get("source", "")
-        chunks.append(source if source else "// no decoded statements")
+        for line in body.splitlines():
+            chunks.append(f"    {line}" if line else "")
+        chunks.append("}")
         chunks.append("")
 
     for program in script.programs:
