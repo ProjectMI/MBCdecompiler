@@ -567,7 +567,7 @@ def ast_payload(
         "source": "\n".join(stmt.text for stmt in statements),
     }
 
-_BRANCH_KINDS = {"goto", "if_goto"}
+_BRANCH_KINDS = {"goto", "if_goto", "yield"}
 _ARGC_META_PREFIX = "// argc ="
 _TYPE_COMMENT_RE = re.compile(
     r"\s*/\*\s*(?:char|string|int32|int32_ref_or_span|float|float_ref|span/string|slice_descriptor|type_\d+)\s*\*/"
@@ -584,9 +584,10 @@ def label_for_offset(offset: Any) -> str:
 def normalize_ast_statements(statements: Iterable[AstStatement]) -> list[AstStatement]:
     """Return a source-oriented AST statement list.
 
-    Normalization currently does three small things:
+    Normalization currently does four small things:
     * drops transient `set_arg_count` comments (`// argc = N`);
     * removes inline comments that only repeat scalar MBC type names;
+    * collapses linear runs of coroutine yields into one visible wait marker;
     * inserts `loc_XXXXXXXX:` labels before visible branch targets.
 
     Labels are inserted before the first emitted statement at the target offset.
@@ -595,6 +596,7 @@ def normalize_ast_statements(statements: Iterable[AstStatement]) -> list[AstStat
     navigable without reintroducing low-level VM noise.
     """
     cleaned = [_normalize_statement(stmt) for stmt in statements if not _is_argc_meta(stmt)]
+    cleaned = _collapse_consecutive_yields(cleaned)
     return _insert_branch_labels(cleaned)
 
 
@@ -614,6 +616,88 @@ def _normalize_statement(stmt: AstStatement) -> AstStatement:
         opcode=stmt.opcode,
         mnemonic=stmt.mnemonic,
         operands=dict(stmt.operands or {}),
+    )
+
+
+def _collapse_consecutive_yields(statements: list[AstStatement]) -> list[AstStatement]:
+    """Coalesce linear `yield_program` chains without losing wait count.
+
+    The runtime saves PC after each `|`, so `|||| work();` means four scheduler
+    slices pass before `work()` runs.  Emitting all intermediate resume labels is
+    noisy, but treating the chain as a single ordinary yield is wrong.  This
+    pass replaces only unbranched, adjacent yield-resume chains with one
+    pseudo-source marker carrying the original count and final resume target.
+
+    If a non-yield branch targets an intermediate yield, the chain is split at
+    that target because callers entering the middle observe a different delay.
+    """
+    if not statements:
+        return statements
+
+    by_offset = {stmt.offset: stmt for stmt in statements}
+    protected_targets = {
+        target
+        for stmt in statements
+        if stmt.kind in _BRANCH_KINDS - {"yield"}
+        for target in [stmt.operands.get("target")]
+        if isinstance(target, int)
+    }
+
+    result: list[AstStatement] = []
+    i = 0
+    while i < len(statements):
+        first = statements[i]
+        if first.kind != "yield":
+            result.append(first)
+            i += 1
+            continue
+
+        chain = [first]
+        final_target = first.operands.get("target")
+        j = i + 1
+        while isinstance(final_target, int):
+            if final_target in protected_targets:
+                break
+            next_stmt = by_offset.get(final_target)
+            if next_stmt is None or next_stmt.kind != "yield":
+                break
+            if j >= len(statements) or statements[j] is not next_stmt:
+                # Do not fold across reordered output or hidden visible statements.
+                break
+            chain.append(next_stmt)
+            final_target = next_stmt.operands.get("target")
+            j += 1
+
+        if len(chain) == 1:
+            result.append(first)
+            i += 1
+            continue
+
+        result.append(_make_coalesced_yield_statement(chain, final_target))
+        i += len(chain)
+
+    return result
+
+
+def _make_coalesced_yield_statement(chain: list[AstStatement], final_target: object) -> AstStatement:
+    first = chain[0]
+    count = len(chain)
+    operands = dict(first.operands or {})
+    operands["target"] = final_target
+    operands["yield_count"] = count
+    operands["coalesced_offsets"] = [stmt.offset for stmt in chain]
+    if isinstance(final_target, int):
+        suffix = f" // suspend x{count}; resumes at {label_for_offset(final_target)}"
+    else:
+        suffix = f" // suspend x{count}; resumes from saved PC"
+    return AstStatement(
+        offset=first.offset,
+        file_offset=first.file_offset,
+        kind="yield",
+        text=f"yield_program();{suffix}",
+        opcode=first.opcode,
+        mnemonic=first.mnemonic,
+        operands=operands,
     )
 
 
@@ -944,6 +1028,15 @@ class StackAstBuilder:
         if m == "halt_interpreter":
             self._flush_pending_side_effect_slots(fallback_ins=ins)
             self._emit(ins, "halt", "halt_interpreter();")
+            return
+
+        if m == "yield_program":
+            self._flush_pending_side_effect_slots(fallback_ins=ins)
+            self.vm.reset_frame()
+            self.pending_arg_count = None
+            resume_target = operands.get("resume_target")
+            suffix = f" // suspend; resumes at {label_for_offset(resume_target)}" if isinstance(resume_target, int) else " // suspend; resumes from saved PC"
+            self._emit(ins, "yield", f"yield_program();{suffix}", extra={"target": resume_target} if isinstance(resume_target, int) else None)
             return
 
         if m == "end_program":

@@ -298,6 +298,7 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
         "// data naming: argN = program_prologue binding; v_XXXX/buf_XXXX/rec_XXXX = local slots; g_XXXX/g_buf_XXXX/g_rec_XXXX = shared slots",
         "// synthetic call returns are now kept as expressions, not ret_* placeholder variables",
         "// local call targets are split into local_XXXXXXXX() helpers instead of being inlined into caller bodies",
+        "// coroutine model: yield_program() suspends the current scheduler slice and the following loc_XXXXXXXX label is the saved-PC resume point",
     ]
     if local_index.helpers:
         chunks.append(f"// local helpers: {len(local_index.helpers)}")

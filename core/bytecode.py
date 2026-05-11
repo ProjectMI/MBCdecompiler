@@ -207,6 +207,9 @@ CONTROL_EDGE_KINDS = {
     "jtrue_fallthrough",
     "call_rel32",
     "call_return",
+    # Coroutine continuation: opcode '|' ends the current VM scheduler slice,
+    # but the interpreter saves PC=off+1 and resumes from there later.
+    "yield_resume",
 }
 
 

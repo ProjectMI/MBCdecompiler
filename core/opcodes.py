@@ -1892,13 +1892,20 @@ def decode_opcode(buf: bytes, off: int) -> DecodedOpcode:
             edges=[DecodedEdge("end_program", None)],
         )
     if opcode == 0x7C:  # '|': yield / suspend current program
+        resume_target = off + 1
         return DecodedOpcode(
             mnemonic="yield_program",
             length=1,
-            operands={"semantic": "main-loop special: save current PC and yield/suspend"},
+            operands={
+                "semantic": "main-loop special: save PC after this opcode, suspend current scheduler slice, and resume later",
+                "resume_target": resume_target,
+            },
+            # Keep this terminal for the *current scheduler slice*.  The explicit
+            # yield_resume edge below models the coroutine continuation that the
+            # engine reaches after it reloads the saved PC on a later pass.
             terminal=True,
             known=True,
-            edges=[DecodedEdge("yield", None)],
+            edges=[DecodedEdge("yield_resume", resume_target, "saved PC after yield; resumed by scheduler")],
         )
 
     spec = OPCODES.get(opcode)
