@@ -597,6 +597,9 @@ def normalize_ast_statements(statements: Iterable[AstStatement]) -> list[AstStat
     """
     cleaned = [_normalize_statement(stmt) for stmt in statements if not _is_argc_meta(stmt)]
     cleaned = _collapse_consecutive_yields(cleaned)
+    cleaned = _fold_short_circuit_conditions(cleaned)
+    cleaned = _structure_control_flow(cleaned)
+    cleaned = _retarget_branches_to_visible_offsets(cleaned)
     return _insert_branch_labels(cleaned)
 
 
@@ -701,6 +704,266 @@ def _make_coalesced_yield_statement(chain: list[AstStatement], final_target: obj
     )
 
 
+def _retarget_branches_to_visible_offsets(statements: list[AstStatement]) -> list[AstStatement]:
+    """Move branch labels from suppressed VM offsets to the next visible statement.
+
+    Several bytecode targets land on instructions that do not produce source
+    statements (`stack_frame_reset`, argc metadata, and other VM book-keeping).
+    `_insert_branch_labels` used to preserve those offsets verbatim, which could
+    produce adjacent naked labels such as `loc_A:` immediately followed by
+    `loc_B:` before real code.  At source level both labels enter the same
+    visible statement, so rewrite remaining branch targets to that visible
+    offset before labels are inserted.
+
+    Exact targets are left unchanged.  A coroutine resume that lands on a real
+    visible `goto` also remains unchanged; that jump is executable and must stay
+    visible.
+    """
+    if not statements:
+        return statements
+
+    visible_offsets = sorted({stmt.offset for stmt in statements})
+    if not visible_offsets:
+        return statements
+
+    def resolve(target: int) -> int:
+        for offset in visible_offsets:
+            if offset >= target:
+                return offset
+        return target
+
+    aliases: dict[int, int] = {}
+    for stmt in statements:
+        if stmt.kind not in _BRANCH_KINDS:
+            continue
+        target = stmt.operands.get("target") if isinstance(stmt.operands, dict) else None
+        if not isinstance(target, int):
+            continue
+        resolved = resolve(target)
+        if resolved != target:
+            aliases[target] = resolved
+
+    if not aliases:
+        return statements
+
+    label_aliases = {label_for_offset(old): label_for_offset(new) for old, new in aliases.items()}
+
+    def rewrite_text(text: str) -> str:
+        for old, new in label_aliases.items():
+            text = text.replace(old, new)
+        return text
+
+    rewritten: list[AstStatement] = []
+    for stmt in statements:
+        operands = dict(stmt.operands or {})
+        for key in ("target", "resume_target", "fallthrough"):
+            value = operands.get(key)
+            if isinstance(value, int) and value in aliases:
+                operands[key] = aliases[value]
+        rewritten.append(
+            AstStatement(
+                offset=stmt.offset,
+                file_offset=stmt.file_offset,
+                kind=stmt.kind,
+                text=rewrite_text(stmt.text),
+                opcode=stmt.opcode,
+                mnemonic=stmt.mnemonic,
+                operands=operands,
+            )
+        )
+    return rewritten
+
+
+def _fold_short_circuit_conditions(statements: list[AstStatement]) -> list[AstStatement]:
+    """Fold VM short-circuit helper branches into the final boolean test.
+
+    Opcodes ``logical_or_rel16`` and ``logical_and_rel16`` are not source-level
+    branches.  They are VM helpers used while constructing a boolean value on
+    the stack.  Emitting them as visible ``goto`` statements makes many ordinary
+    conditions look like tangled control flow and prevents later if/switch
+    recovery.  This pass recognizes a contiguous run of short-circuit helper
+    tests followed by the real ``jfalse`` consumer and replaces the whole run
+    with one source-level conditional branch.
+    """
+    if not statements:
+        return statements
+
+    result: list[AstStatement] = []
+    i = 0
+    while i < len(statements):
+        if not _is_short_circuit_branch(statements[i]):
+            result.append(statements[i])
+            i += 1
+            continue
+
+        start = i
+        while i < len(statements) and _is_short_circuit_branch(statements[i]):
+            i += 1
+
+        if i < len(statements) and _is_boolean_consumer_branch(statements[i]):
+            folded = _make_folded_short_circuit_statement(statements[start:i], statements[i])
+            if folded is not None:
+                result.append(folded)
+                i += 1
+                continue
+
+        # The run was not a complete condition, so keep it unchanged.
+        result.extend(statements[start:i])
+
+    return result
+
+
+def _is_short_circuit_branch(stmt: AstStatement) -> bool:
+    return (
+        stmt.kind == "if_goto"
+        and stmt.operands.get("short_circuit") in {"and", "or"}
+        and isinstance(stmt.operands.get("condition"), str)
+        and isinstance(stmt.operands.get("target"), int)
+    )
+
+
+def _is_boolean_consumer_branch(stmt: AstStatement) -> bool:
+    return (
+        stmt.kind == "if_goto"
+        and stmt.operands.get("branch_when") == "false"
+        and not stmt.operands.get("short_circuit")
+        and isinstance(stmt.operands.get("condition"), str)
+        and isinstance(stmt.operands.get("target"), int)
+    )
+
+
+def _make_folded_short_circuit_statement(chain: list[AstStatement], final_branch: AstStatement) -> AstStatement | None:
+    if not chain:
+        return None
+
+    condition_stmts = list(chain) + [final_branch]
+    offset_to_pos = {stmt.offset: idx for idx, stmt in enumerate(condition_stmts)}
+
+    ops: list[str] = []
+    target_positions: list[int | None] = []
+    for stmt in chain:
+        op_name = stmt.operands.get("short_circuit")
+        ops.append("&&" if op_name == "and" else "||")
+        target_positions.append(_target_position_for_short_circuit(stmt, condition_stmts, offset_to_pos))
+
+    # Do not fold malformed or backward helper branches.  Those are probably
+    # real control flow, or at least not a safe source-level boolean expression.
+    for idx, target_pos in enumerate(target_positions):
+        if target_pos is None or target_pos <= idx:
+            return None
+
+    conditions: list[str] = []
+    for stmt in condition_stmts:
+        cond = stmt.operands.get("condition")
+        if not isinstance(cond, str) or not cond.strip():
+            return None
+        conditions.append(_ControlStructurer._clean_condition(cond))
+
+    combined = _render_short_circuit_expression(conditions, ops, target_positions, 0, len(conditions) - 1)
+    if combined is None:
+        return None
+
+    first = chain[0]
+    operands = dict(final_branch.operands or {})
+    operands["condition"] = combined
+    operands["branch_when"] = "false"
+    operands["short_circuit_folded"] = True
+    operands["folded_offsets"] = [stmt.offset for stmt in condition_stmts]
+    operands["folded_ops"] = list(ops)
+
+    return AstStatement(
+        offset=first.offset,
+        file_offset=first.file_offset,
+        kind="if_goto",
+        text=f"if (!({combined})) goto {label_for_offset(operands.get('target'))};",
+        opcode=final_branch.opcode,
+        mnemonic="folded_short_circuit",
+        operands=operands,
+    )
+
+
+def _target_position_for_short_circuit(stmt: AstStatement, condition_stmts: list[AstStatement], offset_to_pos: dict[int, int]) -> int | None:
+    target = stmt.operands.get("target")
+    if not isinstance(target, int):
+        return None
+    exact = offset_to_pos.get(target)
+    if exact is not None:
+        return exact
+    for idx, candidate in enumerate(condition_stmts):
+        if candidate.offset >= target:
+            return idx
+    return None
+
+
+def _render_short_circuit_expression(
+    conditions: list[str],
+    ops: list[str],
+    target_positions: list[int | None],
+    start: int,
+    end: int,
+) -> str | None:
+    """Render a folded boolean expression for condition indexes [start, end].
+
+    A short-circuit helper whose jump skips over later helper tests marks a
+    source-level grouping boundary.  This recovers common shapes like
+    ``(a || b || c) && (d || e)`` and ``a || (b && c)`` instead of flattening
+    them into precedence-changing C syntax.
+    """
+    if start > end:
+        return None
+    if start == end:
+        return _maybe_parenthesize_condition(conditions[start])
+
+    split: int | None = None
+    for idx in range(start, end):
+        target_pos = target_positions[idx] if idx < len(target_positions) else None
+        if target_pos == end and target_pos > idx + 1:
+            split = idx
+            break
+
+    if split is not None:
+        left = _render_short_circuit_expression(conditions, ops, target_positions, start, split)
+        right = _render_short_circuit_expression(conditions, ops, target_positions, split + 1, end)
+        if left is None or right is None:
+            return None
+        return f"({_parenthesize_boolean_side(left)} {ops[split]} {_parenthesize_boolean_side(right)})"
+
+    # No target-delimited subexpression.  Render flat runs of the same operator
+    # and parenthesize at operator changes so C precedence cannot rewrite the VM
+    # short-circuit order.
+    expr = _maybe_parenthesize_condition(conditions[start])
+    current_op = ops[start]
+    parts = [expr]
+    for idx in range(start, end):
+        op = ops[idx]
+        rhs = _maybe_parenthesize_condition(conditions[idx + 1])
+        if op == current_op:
+            parts.append(rhs)
+        else:
+            expr = f"({f' {current_op} '.join(parts)})"
+            parts = [expr, rhs]
+            current_op = op
+    if len(parts) == 1:
+        return parts[0]
+    return f" {current_op} ".join(parts)
+
+
+def _maybe_parenthesize_condition(cond: str) -> str:
+    cond = _ControlStructurer._clean_condition(cond)
+    if re.search(r"\s(&&|\|\|)\s", cond):
+        return _parenthesize_boolean_side(cond)
+    return cond
+
+
+def _parenthesize_boolean_side(expr: str) -> str:
+    expr = expr.strip()
+    if not re.search(r"\s(&&|\|\|)\s", expr):
+        return expr
+    if expr.startswith("(") and expr.endswith(")") and _outer_parens_wrap(expr):
+        return expr
+    return f"({expr})"
+
+
 def _insert_branch_labels(statements: list[AstStatement]) -> list[AstStatement]:
     targets = sorted(
         {
@@ -743,6 +1006,557 @@ def _make_label_statement(offset: int, *, unresolved: bool = False) -> AstStatem
         mnemonic="label",
         operands={"target": offset},
     )
+
+# ---------------------------------------------------------------------------
+# Conservative source-level control-flow structuring.
+#
+# This pass intentionally sits on top of the low-level stack AST.  It only
+# rewrites branch shapes that are fully contained in a linear statement range and
+# have no external jumps into the would-be structured region.  Coroutine yields
+# are treated as scheduler boundaries: regions that contain a yield are left in
+# label/goto form so the saved-PC resume labels stay visible and truthful.
+
+_TERMINAL_STATEMENT_KINDS = {"return", "halt", "yield"}
+_SWITCH_MIN_CASES = 2
+
+
+def _structure_control_flow(statements: list[AstStatement]) -> list[AstStatement]:
+    if not statements:
+        return statements
+    return _ControlStructurer(statements).structure()
+
+
+@dataclass
+class _StructuredMatch:
+    end: int
+    lines: list[str]
+    kind: str
+
+
+@dataclass
+class _SwitchCase:
+    value: str
+    body: list[AstStatement]
+    exit_kind: str  # "break", "terminal", or "fallthrough"
+
+
+class _ControlStructurer:
+    def __init__(self, statements: list[AstStatement]):
+        self.statements = statements
+        self._offset_to_index: dict[int, int] = {}
+        for idx, stmt in enumerate(statements):
+            self._offset_to_index.setdefault(stmt.offset, idx)
+
+    def structure(self) -> list[AstStatement]:
+        return self._structure_range(0, len(self.statements))
+
+    def _structure_range(self, start: int, end: int) -> list[AstStatement]:
+        result: list[AstStatement] = []
+        i = start
+        while i < end:
+            if self._is_noop_goto(i, end) or self._is_noop_branch(i, end):
+                i += 1
+                continue
+            match = self._match_switch(i, end) or self._match_while(i, end) or self._match_if(i, end)
+            if match is not None:
+                first = self.statements[i]
+                if match.lines:
+                    result.append(
+                        AstStatement(
+                            offset=first.offset,
+                            file_offset=first.file_offset,
+                            kind=match.kind,
+                            text="\n".join(match.lines),
+                            opcode=first.opcode,
+                            mnemonic=first.mnemonic,
+                            operands={"structured_range": [first.offset, self.statements[match.end - 1].offset if match.end > i else first.offset]},
+                        )
+                    )
+                i = match.end
+                continue
+            result.append(self.statements[i])
+            i += 1
+        return result
+
+    def _match_if(self, i: int, end: int) -> _StructuredMatch | None:
+        stmt = self.statements[i]
+        if not self._is_plain_false_branch(stmt):
+            return None
+        target = self._target(stmt)
+        target_idx = self._index_at_or_after(target, lower=i + 1, upper=end)
+        if target_idx is None or target_idx <= i + 1:
+            return None
+
+        cond = self._positive_condition(stmt)
+        if cond is None:
+            return None
+
+        # Inverted guard shape:
+        #   if (!cond) goto body_start;
+        #   goto after;
+        # body_start:
+        #   body...
+        # after:
+        # This comes from source like `if (!cond) { ... }` when the true side
+        # is only a skip over the real body.
+        if i + 1 < target_idx and self.statements[i + 1].kind == "goto":
+            after_target = self._target(self.statements[i + 1])
+            after_idx = self._index_at_or_after(after_target, lower=target_idx + 1, upper=end)
+            if after_idx is not None and after_idx > target_idx:
+                if self._safe_region(i, after_idx) and not self._range_has_yield(target_idx, after_idx):
+                    body_chunks = self._structure_range_by_statements(self.statements[target_idx:after_idx])
+                    if not self._has_unstructured_branch(body_chunks):
+                        return _StructuredMatch(end=after_idx, lines=self._render_if(self._negated_condition(cond), body_chunks), kind="if")
+
+        # if/else shape:
+        #   if (!cond) goto else_start;
+        #   then...
+        #   goto after;
+        # else_start:
+        #   else...
+        # after:
+        maybe_goto_idx = target_idx - 1
+        if maybe_goto_idx > i and self.statements[maybe_goto_idx].kind == "goto":
+            after_target = self._target(self.statements[maybe_goto_idx])
+            after_idx = self._index_at_or_after(after_target, lower=target_idx + 1, upper=end)
+            if after_idx is not None and after_idx > target_idx:
+                region_end = after_idx
+                if self._safe_region(i, region_end) and not self._range_has_yield(i + 1, region_end):
+                    then_chunks = self._structure_range_by_statements(self.statements[i + 1:maybe_goto_idx])
+                    else_chunks = self._structure_range_by_statements(self.statements[target_idx:after_idx])
+                    if not self._has_unstructured_branch(then_chunks) and not self._has_unstructured_branch(else_chunks):
+                        lines = self._render_if_else(cond, then_chunks, else_chunks)
+                        return _StructuredMatch(end=after_idx, lines=lines, kind="if_else")
+
+        # Simple if / guard shape.  This handles early exits naturally:
+        #   if (!cond) goto after;
+        #   return ...;
+        # after:
+        if self._safe_region(i, target_idx) and not self._range_has_yield(i + 1, target_idx):
+            body_chunks = self._structure_range_by_statements(self.statements[i + 1:target_idx])
+            if not self._has_unstructured_branch(body_chunks):
+                return _StructuredMatch(end=target_idx, lines=self._render_if(cond, body_chunks), kind="if")
+        return None
+
+    def _match_while(self, i: int, end: int) -> _StructuredMatch | None:
+        stmt = self.statements[i]
+        if not self._is_plain_false_branch(stmt):
+            return None
+        target = self._target(stmt)
+        after_idx = self._index_at_or_after(target, lower=i + 1, upper=end)
+        if after_idx is None or after_idx <= i + 1:
+            return None
+        back_idx = after_idx - 1
+        if back_idx <= i or self.statements[back_idx].kind != "goto":
+            return None
+        back_target = self._target(self.statements[back_idx])
+        back_target_idx = self._index_at_or_after(back_target, lower=0, upper=end)
+        if back_target_idx != i:
+            return None
+        if not self._safe_region(i, after_idx) or self._range_has_yield(i + 1, back_idx):
+            return None
+        cond = self._positive_condition(stmt)
+        if cond is None:
+            return None
+        body_chunks = self._structure_range_by_statements(self.statements[i + 1:back_idx])
+        if self._has_unstructured_branch(body_chunks):
+            return None
+        lines = [f"while ({cond}) {{"]
+        lines.extend(self._indent(self._chunks_to_lines(body_chunks)))
+        lines.append("}")
+        return _StructuredMatch(end=after_idx, lines=lines, kind="while")
+
+    def _match_switch(self, i: int, end: int) -> _StructuredMatch | None:
+        """Recover equality-dispatch ladders as switch statements.
+
+        The bytecode compiler often emits switches as a chain of
+        ``if (!(selector == value)) goto next_case`` tests.  Cases may either
+        jump to a shared epilogue, return/halt/end immediately, or intentionally
+        fall through with an empty body.  The previous pass required a shared
+        ``goto after`` and therefore missed very common terminal switch shapes
+        such as ``case: return`` / ``default: return``.
+        """
+        cases: list[_SwitchCase] = []
+        selector: str | None = None
+        common_end_idx: int | None = None
+        saw_terminal_case = False
+        saw_break_case = False
+        cur = i
+
+        while cur < end:
+            stmt = self.statements[cur]
+            if not self._is_plain_false_branch(stmt):
+                break
+            parsed = self._parse_equality_case(self._positive_condition(stmt))
+            if parsed is None:
+                break
+            case_selector, case_value = parsed
+            if selector is None:
+                selector = case_selector
+            elif selector != case_selector:
+                break
+
+            next_idx = self._index_at_or_after(self._target(stmt), lower=cur + 1, upper=end)
+            if next_idx is None or next_idx < cur + 1:
+                break
+
+            # If true and false both resume at the same visible statement, the
+            # test is an empty case label falling through into the next/default
+            # body.  This is common for the last explicit case before default.
+            if self._branch_targets_visible_fallthrough(stmt, cur, next_idx):
+                cases.append(_SwitchCase(case_value, [], "fallthrough"))
+                cur = next_idx
+                continue
+
+            case_body_end = next_idx
+            exit_kind = "fallthrough"
+            trailing_goto = next_idx - 1
+            if trailing_goto > cur and self.statements[trailing_goto].kind == "goto":
+                goto_target = self._target(self.statements[trailing_goto])
+                goto_idx = self._index_at_or_after(goto_target, lower=next_idx, upper=end)
+                if goto_idx is None:
+                    break
+                if common_end_idx is None:
+                    common_end_idx = goto_idx
+                elif common_end_idx != goto_idx:
+                    break
+                case_body_end = trailing_goto
+                exit_kind = "break"
+                saw_break_case = True
+            elif self._range_ends_with_terminal(cur + 1, next_idx):
+                exit_kind = "terminal"
+                saw_terminal_case = True
+            elif cur + 1 == next_idx:
+                exit_kind = "fallthrough"
+            else:
+                # Non-empty, non-terminal fallthrough is legal C, but the MBC
+                # AST is not path-sensitive enough yet to prove it is intended.
+                break
+
+            if self._range_has_yield(cur + 1, case_body_end):
+                return None
+            cases.append(_SwitchCase(case_value, self.statements[cur + 1:case_body_end], exit_kind))
+            cur = next_idx
+
+        if selector is None or len(cases) < _SWITCH_MIN_CASES:
+            return None
+
+        if common_end_idx is not None:
+            if common_end_idx < cur or common_end_idx > end:
+                return None
+            region_end = common_end_idx
+            default_body = self.statements[cur:common_end_idx]
+            if self._range_has_yield(cur, common_end_idx):
+                return None
+        else:
+            # Terminal switches have no shared epilogue.  The false path after
+            # the last comparison is the default body; accept it only when it
+            # reaches an obvious terminal so we do not swallow unrelated code.
+            default_end = self._default_terminal_end(cur, end)
+            if default_end is None:
+                # Empty default is still safe when every explicit non-empty case
+                # exits terminally and there are no fallthrough-only labels.
+                if cur != end or not saw_terminal_case or any(case.exit_kind == "fallthrough" for case in cases):
+                    return None
+                default_end = cur
+            region_end = default_end
+            default_body = self.statements[cur:default_end]
+            if self._range_has_yield(cur, default_end):
+                return None
+
+        if not self._safe_region(i, region_end):
+            return None
+
+        rendered_cases: list[_SwitchCase] = []
+        for case in cases:
+            body_chunks = self._structure_range_by_statements(case.body)
+            if self._has_unstructured_branch(body_chunks):
+                return None
+            rendered_cases.append(_SwitchCase(case.value, body_chunks, case.exit_kind))
+
+        default_chunks = self._structure_range_by_statements(default_body)
+        if self._has_unstructured_branch(default_chunks):
+            return None
+
+        lines = [f"switch ({selector}) {{"]
+        grouped_cases = self._group_equivalent_switch_cases(rendered_cases)
+        for group_idx, (values, body, exit_kind) in enumerate(grouped_cases):
+            for value in values:
+                lines.append(f"case {value}:")
+            body_lines = self._chunks_to_lines(body)
+            if body_lines:
+                lines.extend(self._indent(body_lines, 1))
+                if exit_kind == "break" and not self._chunks_end_with_terminal(body):
+                    lines.append("    break;")
+            elif group_idx == len(grouped_cases) - 1 and not default_chunks:
+                lines.append("    break;")
+            # Empty fallthrough cases intentionally render as label-only.
+
+        if default_chunks:
+            lines.append("default:")
+            lines.extend(self._indent(self._chunks_to_lines(default_chunks), 1))
+            if common_end_idx is not None and not self._chunks_end_with_terminal(default_chunks):
+                lines.append("    break;")
+        lines.append("}")
+        return _StructuredMatch(end=region_end, lines=lines, kind="switch")
+
+    def _group_equivalent_switch_cases(self, cases: list[_SwitchCase]) -> list[tuple[list[str], list[AstStatement], str]]:
+        """Group adjacent cases with identical exiting bodies.
+
+        A ladder like ``if (x == 0) return 0; if (x == 1) return 0;`` is
+        usually original switch syntax with stacked case labels.  Grouping only
+        adjacent, non-empty, non-fallthrough bodies is semantics-preserving and
+        avoids inventing cross-case fallthrough where the bytecode had work.
+        """
+        groups: list[tuple[list[str], list[AstStatement], str]] = []
+        i = 0
+        while i < len(cases):
+            case = cases[i]
+            values = [case.value]
+            body_key = tuple(self._chunks_to_lines(case.body))
+            if body_key and case.exit_kind != "fallthrough":
+                j = i + 1
+                while j < len(cases):
+                    other = cases[j]
+                    if other.exit_kind != case.exit_kind:
+                        break
+                    if tuple(self._chunks_to_lines(other.body)) != body_key:
+                        break
+                    values.append(other.value)
+                    j += 1
+                groups.append((values, case.body, case.exit_kind))
+                i = j
+            else:
+                groups.append((values, case.body, case.exit_kind))
+                i += 1
+        return groups
+
+    def _default_terminal_end(self, start: int, end: int) -> int | None:
+        if start >= end:
+            return start
+        if self._range_has_yield(start, end):
+            return None
+        for idx in range(start, end):
+            if self._is_terminal_statement(self.statements[idx]):
+                return idx + 1
+            # A new unrelated branch before a terminal makes the default body
+            # ambiguous; leave it in low-level form.
+            if idx > start and self.statements[idx].kind in {"if_goto", "goto"}:
+                return None
+        return None
+
+    def _branch_targets_visible_fallthrough(self, stmt: AstStatement, cur: int, target_idx: int) -> bool:
+        fallthrough = stmt.operands.get("fallthrough") if isinstance(stmt.operands, dict) else None
+        target = self._target(stmt)
+        if isinstance(fallthrough, int) and isinstance(target, int) and fallthrough == target:
+            return True
+        return target_idx == cur + 1 and isinstance(fallthrough, int) and self._index_at_or_after(fallthrough, lower=cur + 1, upper=len(self.statements)) == target_idx
+
+    def _is_noop_goto(self, i: int, end: int) -> bool:
+        if i >= end:
+            return False
+        stmt = self.statements[i]
+        if stmt.kind != "goto":
+            return False
+        target = self._target(stmt)
+        if target is None or i + 1 >= end:
+            return False
+        # Only remove a goto when its target resolves to the very next visible
+        # statement in this same statement stream.  The old check used
+        # ``target <= next_stmt.offset`` so any backward jump also looked like a
+        # no-op after metadata suppression.  That erased coroutine-loop resumes
+        # such as ``yield; goto loop_head`` and left naked resume labels behind.
+        target_idx = self._index_at_or_after(target, lower=0, upper=end)
+        return target_idx == i + 1
+
+    def _is_noop_branch(self, i: int, end: int) -> bool:
+        if i >= end:
+            return False
+        stmt = self.statements[i]
+        if stmt.kind != "if_goto":
+            return False
+        target = self._target(stmt)
+        fallthrough = stmt.operands.get("fallthrough") if isinstance(stmt.operands, dict) else None
+        if isinstance(target, int) and isinstance(fallthrough, int) and target == fallthrough:
+            return True
+        target_idx = self._index_at_or_after(target, lower=i + 1, upper=end)
+        fallthrough_idx = self._index_at_or_after(fallthrough if isinstance(fallthrough, int) else None, lower=i + 1, upper=end)
+        return target_idx is not None and target_idx == fallthrough_idx == i + 1
+
+    def _structure_range_by_statements(self, stmts: list[AstStatement]) -> list[AstStatement]:
+        if not stmts:
+            return []
+        sub = _ControlStructurer(stmts)
+        return sub.structure()
+
+    def _safe_region(self, start: int, end: int) -> bool:
+        if end <= start:
+            return False
+        for idx, stmt in enumerate(self.statements):
+            if start <= idx < end:
+                continue
+            target = self._target(stmt)
+            if target is None:
+                continue
+            target_idx = self._index_at_or_after(target, lower=0, upper=len(self.statements))
+            # Incoming edges to the first statement of the candidate region are
+            # safe: they are the normal continuation of a previously structured
+            # guard/ladder arm.  Reject only jumps into the interior.  The older
+            # `start <= target_idx < end` test made guard chains look unsafe and
+            # prevented deep nested if/terminal-ladder recovery.
+            if target_idx is not None and start < target_idx < end:
+                return False
+        return True
+
+    def _range_has_yield(self, start: int, end: int) -> bool:
+        return any(stmt.kind == "yield" for stmt in self.statements[start:end])
+
+    def _range_ends_with_terminal(self, start: int, end: int) -> bool:
+        if start >= end:
+            return False
+        return self._is_terminal_statement(self.statements[end - 1])
+
+    def _chunks_end_with_terminal(self, chunks: list[AstStatement]) -> bool:
+        if not chunks:
+            return False
+        last = chunks[-1]
+        if last.kind in {"if", "if_else", "while", "switch"}:
+            return False
+        return self._is_terminal_statement(last)
+
+    @staticmethod
+    def _is_terminal_statement(stmt: AstStatement) -> bool:
+        if stmt.kind in _TERMINAL_STATEMENT_KINDS:
+            return True
+        if stmt.mnemonic == "end_program" or stmt.text.strip() == "// end_program":
+            return True
+        return False
+
+    @staticmethod
+    def _has_unstructured_branch(chunks: list[AstStatement]) -> bool:
+        return any(chunk.kind in {"goto", "if_goto"} for chunk in chunks)
+
+    @staticmethod
+    def _target(stmt: AstStatement) -> int | None:
+        target = stmt.operands.get("target") if isinstance(stmt.operands, dict) else None
+        return target if isinstance(target, int) else None
+
+    def _index_at_or_after(self, target: int | None, *, lower: int, upper: int) -> int | None:
+        if target is None:
+            return None
+        for idx in range(max(0, lower), min(upper, len(self.statements))):
+            if self.statements[idx].offset >= target:
+                return idx
+        if target >= (self.statements[upper - 1].offset if upper > 0 else 0):
+            return upper
+        return None
+
+    @staticmethod
+    def _is_plain_false_branch(stmt: AstStatement) -> bool:
+        return (
+            stmt.kind == "if_goto"
+            and stmt.operands.get("branch_when") == "false"
+            and not stmt.operands.get("short_circuit")
+            and isinstance(stmt.operands.get("target"), int)
+        )
+
+    def _positive_condition(self, stmt: AstStatement) -> str | None:
+        cond = stmt.operands.get("condition") if isinstance(stmt.operands, dict) else None
+        if not isinstance(cond, str) or not cond.strip():
+            return None
+        return self._clean_condition(cond)
+
+    @classmethod
+    def _parse_equality_case(cls, cond: str | None) -> tuple[str, str] | None:
+        if not cond:
+            return None
+        cond = cls._clean_condition(cond)
+        match = re.match(r"^(?P<a>.+?)\s*==\s*(?P<b>.+)$", cond)
+        if not match:
+            return None
+        a = cls._clean_condition(match.group("a"))
+        b = cls._clean_condition(match.group("b"))
+        if cls._looks_like_case_value(a) and not cls._looks_like_case_value(b):
+            return b, a
+        if cls._looks_like_case_value(b) and not cls._looks_like_case_value(a):
+            return a, b
+        return None
+
+    @staticmethod
+    def _looks_like_case_value(value: str) -> bool:
+        value = value.strip()
+        return bool(
+            re.fullmatch(r"-?\d+", value)
+            or re.fullmatch(r"\(-?\d+\)", value)
+            or re.fullmatch(r"0x[0-9A-Fa-f]+", value)
+            or (len(value) >= 2 and value[0] == value[-1] == '"')
+        )
+
+    @staticmethod
+    def _clean_condition(cond: str) -> str:
+        cond = cond.strip()
+        changed = True
+        while changed:
+            changed = False
+            if cond.startswith("(") and cond.endswith(")") and _outer_parens_wrap(cond):
+                cond = cond[1:-1].strip()
+                changed = True
+        return cond
+
+    @classmethod
+    def _negated_condition(cls, cond: str) -> str:
+        cond = cls._clean_condition(cond)
+        if cond.startswith("!"):
+            return cls._clean_condition(cond[1:])
+        return f"!({cond})"
+
+    def _render_if(self, cond: str, body_chunks: list[AstStatement]) -> list[str]:
+        lines = [f"if ({cond}) {{"]
+        lines.extend(self._indent(self._chunks_to_lines(body_chunks) or ["// empty"]))
+        lines.append("}")
+        return lines
+
+    def _render_if_else(self, cond: str, then_chunks: list[AstStatement], else_chunks: list[AstStatement]) -> list[str]:
+        lines = [f"if ({cond}) {{"]
+        lines.extend(self._indent(self._chunks_to_lines(then_chunks) or ["// empty"]))
+        else_lines = self._chunks_to_lines(else_chunks) or ["// empty"]
+        if else_lines and else_lines[0].startswith("if "):
+            lines.append(f"}} else {else_lines[0]}")
+            lines.extend(else_lines[1:])
+        else:
+            lines.append("} else {")
+            lines.extend(self._indent(else_lines))
+            lines.append("}")
+        return lines
+
+    @staticmethod
+    def _chunks_to_lines(chunks: list[AstStatement]) -> list[str]:
+        lines: list[str] = []
+        for chunk in chunks:
+            text = chunk.text.rstrip()
+            if not text:
+                continue
+            lines.extend(text.splitlines())
+        return lines
+
+    @staticmethod
+    def _indent(lines: list[str], levels: int = 1) -> list[str]:
+        prefix = "    " * levels
+        return [prefix + line if line else line for line in lines]
+
+
+def _outer_parens_wrap(text: str) -> bool:
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and idx != len(text) - 1:
+                return False
+            if depth < 0:
+                return False
+    return depth == 0
 
 class AstExpressionRenderer:
     def __init__(self, script: MbcScript, program: MbcProgram, *, memory: SymbolicDataMemory | None = None, scope_map: dict[int, str] | None = None):
@@ -978,17 +1792,32 @@ class StackAstBuilder:
 
         if m in {"jfalse_rel16", "jfalse_rel32"}:
             cond = self._pop_value(ins, "cond")
-            self._emit(ins, "if_goto", f"if (!({cond.render()})) goto {label_for_offset(operands.get('target'))};", extra={"uses": self._uses(cond)})
+            self._emit(
+                ins,
+                "if_goto",
+                f"if (!({cond.render()})) goto {label_for_offset(operands.get('target'))};",
+                extra={"condition": cond.render(), "branch_when": "false", "uses": self._uses(cond)},
+            )
             return
 
         if m == "logical_or_rel16":
             cond = self._pop_value(ins, "lhs")
-            self._emit(ins, "if_goto", f"if ({cond.render()}) goto {label_for_offset(operands.get('target'))}; // || short-circuit", extra={"uses": self._uses(cond)})
+            self._emit(
+                ins,
+                "if_goto",
+                f"if ({cond.render()}) goto {label_for_offset(operands.get('target'))}; // || short-circuit",
+                extra={"condition": cond.render(), "branch_when": "true", "short_circuit": "or", "uses": self._uses(cond)},
+            )
             return
 
         if m == "logical_and_rel16":
             cond = self._pop_value(ins, "lhs")
-            self._emit(ins, "if_goto", f"if (!({cond.render()})) goto {label_for_offset(operands.get('target'))}; // && short-circuit", extra={"uses": self._uses(cond)})
+            self._emit(
+                ins,
+                "if_goto",
+                f"if (!({cond.render()})) goto {label_for_offset(operands.get('target'))}; // && short-circuit",
+                extra={"condition": cond.render(), "branch_when": "false", "short_circuit": "and", "uses": self._uses(cond)},
+            )
             return
 
         if m == "call_rel32":

@@ -299,6 +299,7 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
         "// synthetic call returns are now kept as expressions, not ret_* placeholder variables",
         "// local call targets are split into local_XXXXXXXX() helpers instead of being inlined into caller bodies",
         "// coroutine model: yield_program() suspends the current scheduler slice and the following loc_XXXXXXXX label is the saved-PC resume point",
+        "// control-flow structuring: if/else/else-if/switch/while recovery with folded short-circuit boolean chains; unresolved or coroutine-sensitive branches remain as labels/gotos",
     ]
     if local_index.helpers:
         chunks.append(f"// local helpers: {len(local_index.helpers)}")
