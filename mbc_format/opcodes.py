@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import struct
 
-from .common import (
+from mbc_format.common import (
     CODE_FILE_OFFSET,
     TYPE_BASE_NAMES,
     TYPE_NAMES,

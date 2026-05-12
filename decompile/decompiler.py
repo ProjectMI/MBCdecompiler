@@ -10,9 +10,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from .bytecode import MbcControlFlow, MbcDecoder
+from mbc_format.bytecode import MbcControlFlow, MbcDecoder
 from .linker import MbcProjectLinker, MbcStaticLinker
-from .loader import MbcLoader, MbcProgram, MbcProject, MbcScript
+from mbc_format.loader import MbcLoader, MbcProgram, MbcProject, MbcScript
 from .vm_ast import SymbolicDataMemory, build_program_ast, pseudo_type_name
 
 LOCAL_HELPER_PREFIX = "local"
@@ -282,7 +282,28 @@ def _program_header(program: MbcProgram, linker: MbcStaticLinker, *, local_helpe
     return f"function {name}{_signature_text(symbol)}"
 
 
+@dataclass(frozen=True)
+class DecompileDocument:
+    """Rendered pseudo-source plus source-line → bytecode-offset anchors.
+
+    The plain text output remains compatible with the old decompiler API, but
+    the editor can now use ``line_offsets`` instead of guessing that every line
+    inside a function belongs to the function prologue.  Multi-line structured
+    statements keep the offset of the branch/statement that produced them; this
+    is still conservative, but it is good enough for navigation and safe value
+    patch candidates.
+    """
+
+    text: str
+    line_offsets: dict[int, int]
+    function_ranges: list[tuple[int, int, int, int, str]]
+
+
 def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | None = None) -> str:
+    return decompile_to_document(script, project_linker=project_linker).text
+
+
+def decompile_to_document(script: MbcScript, *, project_linker: MbcProjectLinker | None = None) -> DecompileDocument:
     linker = (project_linker.module(script.path.stem) if project_linker is not None else None) or MbcStaticLinker(script)
     decoder = MbcDecoder(script, linker=linker, cache_decodes=True)
     flow = MbcControlFlow(script, decoder=decoder)
@@ -291,7 +312,18 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
     stop_offsets = {program.start for program in script.programs} | local_index.stop_offsets
     data_usage, data_scope_map = collect_data_scope_index(script, flow, local_index, stop_offsets=stop_offsets)
 
-    chunks: list[str] = [
+    chunks: list[str] = []
+    line_offsets: dict[int, int] = {}
+    function_ranges: list[tuple[int, int, int, int, str]] = []
+
+    def append(line: str = "", *, offset: int | None = None) -> int:
+        chunks.append(line)
+        line_no = len(chunks)
+        if offset is not None:
+            line_offsets[line_no] = int(offset)
+        return line_no
+
+    for line in [
         "// Experimental MBC pseudo-source",
         f"// source: {script.path.name}",
         f"// programs: {len(script.programs)}",
@@ -300,32 +332,52 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
         "// local call targets are split into local_XXXXXXXX() helpers instead of being inlined into caller bodies",
         "// coroutine model: yield_program() suspends the current scheduler slice and the following loc_XXXXXXXX label is the saved-PC resume point",
         "// control-flow structuring: if/else/else-if/switch/while recovery with folded short-circuit boolean chains; unresolved or coroutine-sensitive branches remain as labels/gotos",
-    ]
+    ]:
+        append(line)
     if local_index.helpers:
-        chunks.append(f"// local helpers: {len(local_index.helpers)}")
+        append(f"// local helpers: {len(local_index.helpers)}")
     if project_linker is not None:
-        chunks.extend(project_linker.summary_lines())
-    chunks.extend([*linker.summary_lines(), ""])
-    chunks.extend(render_global_data_declarations(script, data_usage, data_scope_map))
+        for line in project_linker.summary_lines():
+            append(line)
+    for line in linker.summary_lines():
+        append(line)
+    append("")
+    for line in render_global_data_declarations(script, data_usage, data_scope_map):
+        append(line)
 
     def render_entry(entry_program: MbcProgram, *, local_helper: LocalHelper | None = None) -> None:
-        chunks.append(_program_header(entry_program, linker, local_helper=local_helper))
-        chunks.append("{")
+        header_line = append(_program_header(entry_program, linker, local_helper=local_helper), offset=entry_program.start)
+        append("{", offset=entry_program.start)
 
         if not (0 <= entry_program.start < len(script.code)):
-            body = "// warning: program start is outside code section"
+            append("    // warning: program start is outside code section", offset=entry_program.start)
         elif entry_program.end < entry_program.start:
-            body = "// warning: program end is before start"
+            append("    // warning: program end is before start", offset=entry_program.start)
         else:
             instructions = flow.decode_program(entry_program, follow_local_calls=False, stop_offsets=stop_offsets)
             local_index.annotate_call_names(instructions)
             ast = build_program_ast(script, entry_program, instructions, linker=linker, scope_map=data_scope_map)
-            body = str(ast.get("source", "")) or "// no decoded statements"
+            statements = ast.get("statements")
+            if isinstance(statements, list) and statements:
+                for stmt in statements:
+                    if not isinstance(stmt, dict):
+                        continue
+                    stmt_offset = stmt.get("offset")
+                    if not isinstance(stmt_offset, int):
+                        stmt_offset = entry_program.start
+                    text = str(stmt.get("text", ""))
+                    if not text:
+                        continue
+                    for line in text.splitlines():
+                        append(f"    {line}" if line else "", offset=stmt_offset)
+            else:
+                body = str(ast.get("source", "")) or "// no decoded statements"
+                for line in body.splitlines():
+                    append(f"    {line}" if line else "", offset=entry_program.start)
 
-        for line in body.splitlines():
-            chunks.append(f"    {line}" if line else "")
-        chunks.append("}")
-        chunks.append("")
+        end_line = append("}", offset=entry_program.start)
+        append("")
+        function_ranges.append((header_line, end_line, entry_program.start, entry_program.end, entry_program.name))
 
     for program in script.programs:
         render_entry(program)
@@ -333,7 +385,10 @@ def decompile_to_text(script: MbcScript, *, project_linker: MbcProjectLinker | N
             render_entry(helper.program, local_helper=helper)
 
     for helper in helpers_by_owner.get(-1, []):
-        # Recreate from the offset for safety if callers mutate/helper.program is stale.
         render_entry(synthetic_helper_program(script, helper.offset, None), local_helper=helper)
 
-    return "\n".join(chunks).rstrip() + "\n"
+    return DecompileDocument(
+        text="\n".join(chunks).rstrip() + "\n",
+        line_offsets=line_offsets,
+        function_ranges=function_ranges,
+    )

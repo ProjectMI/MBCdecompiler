@@ -14,11 +14,11 @@ from dataclasses import dataclass, field
 import re
 from typing import Iterable, Optional, Sequence
 
-from .bytecode import MbcControlFlow, MbcDecoder
-from .loader import MbcFunction, MbcProgram, MbcScript
+from mbc_format.bytecode import MbcControlFlow, MbcDecoder
+from mbc_format.loader import MbcFunction, MbcProgram, MbcScript
 from .calls import NativeCallSpec, engine_native_import
-from .opcodes import decode_opcode
-from .common import CODE_FILE_OFFSET, type_name as _type_name
+from mbc_format.opcodes import decode_opcode
+from mbc_format.common import CODE_FILE_OFFSET, type_name as _type_name
 
 
 LINK_PATCH_OPCODE = 0x47  # 'G' / jmp_rel32

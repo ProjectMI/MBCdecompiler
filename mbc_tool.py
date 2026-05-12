@@ -4,15 +4,9 @@ import argparse
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-
-try:
-    from core.decompiler import decompile_to_text, load_project_for
-    from core.linker import MbcProjectLinker
-    from core.loader import MbcProject
-except ModuleNotFoundError:  # packaged layout used by mbc_decompiler_*.zip
-    from mbcproj.decompiler import decompile_to_text, load_project_for
-    from mbcproj.linker import MbcProjectLinker
-    from mbcproj.loader import MbcProject
+from decompile.decompiler import decompile_to_text, load_project_for
+from decompile.linker import MbcProjectLinker
+from mbc_format.loader import MbcProject
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent

@@ -9,12 +9,12 @@ into instruction objects and follows direct control-flow edges for one program.
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
-from .common import CODE_FILE_OFFSET
-from .loader import MbcProgram, MbcScript
-from .opcodes import decode_opcode
+from mbc_format.common import CODE_FILE_OFFSET
+from mbc_format.loader import MbcProgram, MbcScript
+from mbc_format.opcodes import decode_opcode
 
 if TYPE_CHECKING:
-    from .linker import MbcStaticLinker
+    from decompile.linker import MbcStaticLinker
 
 @dataclass
 class Edge:
@@ -65,7 +65,7 @@ class MbcDecoder:
         if linker is None and annotate_linkage:
             # Import lazily so linker.py can reuse the CFG decoder without a
             # module-level circular import.
-            from .linker import MbcStaticLinker
+            from decompile.linker import MbcStaticLinker
 
             linker = MbcStaticLinker(script)
         self.linker = linker

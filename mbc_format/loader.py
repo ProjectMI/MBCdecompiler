@@ -5,7 +5,7 @@ from pathlib import Path
 import struct
 from typing import List, Optional
 
-from .common import (
+from mbc_format.common import (
     CODE_FILE_OFFSET,
     MAGIC,
     i32 as _i32,

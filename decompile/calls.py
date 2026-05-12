@@ -12,8 +12,8 @@ from dataclasses import dataclass, replace
 import re
 from typing import Any
 
-from .common import TYPE_FLOAT, TYPE_INT, TYPE_SLICE, TYPE_STRING
-from .opcodes import BUILTINS
+from mbc_format.common import TYPE_FLOAT, TYPE_INT, TYPE_SLICE, TYPE_STRING
+from mbc_format.opcodes import BUILTINS
 
 @dataclass(frozen=True)
 class NativeCallSpec:

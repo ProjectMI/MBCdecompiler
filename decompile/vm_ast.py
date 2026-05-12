@@ -21,7 +21,7 @@ from .calls import (
     specialize_builtin_call,
     unresolved_import_effect,
 )
-from .common import (
+from mbc_format.common import (
     CODE_FILE_OFFSET,
     TYPE_BASE_NAMES,
     TYPE_CHAR,
@@ -44,8 +44,8 @@ from .common import (
     type_name,
 )
 from .linker import FunctionSignature, MbcStaticLinker
-from .loader import MbcProgram, MbcScript
-from .opcodes import BINARY_AST_OPS, UNARY_AST_OPS
+from mbc_format.loader import MbcProgram, MbcScript
+from mbc_format.opcodes import BINARY_AST_OPS, UNARY_AST_OPS
 
 STACK_LIMIT = 0x100
 SLOT_STRIDE = 0x20
