@@ -396,6 +396,7 @@ class VMStackMachine:
         self.stack: list[VMSlot] = []
         self.underflows = 0
         self.overflow_warnings = 0
+        self.frame_bases: list[int] = [0]
 
     def __len__(self) -> int:
         return len(self.stack)
@@ -404,7 +405,20 @@ class VMStackMachine:
         return [value.render() for value in self.stack[-16:]]
 
     def reset_frame(self) -> None:
+        del self.stack[self.frame_bases[-1]:]
+
+    def enter_frame(self) -> None:
+        self.frame_bases.append(len(self.stack))
+
+    def leave_frame(self) -> None:
+        if len(self.frame_bases) > 1:
+            self.frame_bases.pop()
+        else:
+            self.underflows += 1
+
+    def suspend(self) -> None:
         self.stack.clear()
+        self.frame_bases = [0]
 
     def push(self, value: VMSlot) -> VMSlot:
         if len(self.stack) >= STACK_LIMIT:
@@ -698,7 +712,7 @@ def _make_coalesced_yield_statement(chain: list[AstStatement], final_target: obj
         offset=first.offset,
         file_offset=first.file_offset,
         kind="yield",
-        text=f"yield_program();{suffix}",
+        text=f"yield_program({count});{suffix}",
         opcode=first.opcode,
         mnemonic=first.mnemonic,
         operands=operands,
@@ -1856,16 +1870,24 @@ class StackAstBuilder:
         self.pending_arg_count: Optional[int] = None
 
     def build(self, instructions: Iterable[Any]) -> dict[str, Any]:
-        for ins in instructions:
-            self._visit(ins)
-        self._flush_pending_side_effect_slots()
-        normalized = normalize_ast_statements(self.statements)
+        instructions = list(instructions)
+        has_cfg = any(ins.opcode in {71, 74, 73, 75, 76, 77} for ins in instructions)
+        if has_cfg:
+            from .stack_flow import build_stack_flow
+            self.statements = build_stack_flow(self, instructions)
+            normalized = self.statements
+        else:
+            for ins in instructions:
+                self._visit(ins)
+            self._flush_pending_side_effect_slots()
+            normalized = normalize_ast_statements(self.statements)
         declarations = self._declaration_statements(scope="local")
         payload = ast_payload(
             statements=declarations + normalized,
             residual_stack=self.vm.residual(),
             underflows=self.vm.underflows,
         )
+        payload["flow_diagnostics"] = getattr(self, "flow_diagnostics", [])
         payload["memory_bindings"] = self.memory.bindings()
         payload["declarations"] = [loc.to_dict() for loc in self.memory.declarations()]
         return payload
@@ -1908,6 +1930,14 @@ class StackAstBuilder:
             self.pending_arg_count = int(operands.get("value", 0))
             return
 
+        if m == "push_stack_frame":
+            self.vm.enter_frame()
+            return
+
+        if m == "pop_stack_frame":
+            self.vm.leave_frame()
+            return
+
         if m == "stack_frame_reset":
             self._flush_pending_side_effect_slots(fallback_ins=ins)
             self.vm.reset_frame()
@@ -1940,12 +1970,14 @@ class StackAstBuilder:
             self.vm.push(VMSlot(expr=f"({symbol}{value.render()})", type_id=result_type, kind="value"))
             return
 
-        if m in {"to_float", "to_float_prev"}:
-            self.vm.push(self.vm.coerce_float(self._pop_value(ins, "value")))
-            return
-
-        if m in {"to_int", "to_int_prev"}:
-            self.vm.push(self.vm.coerce_int(self._pop_value(ins, "value")))
+        if m in {"to_float", "to_float_prev", "to_int", "to_int_prev"}:
+            depth = 2 if m.endswith("_prev") else 1
+            if len(self.vm.stack) < depth:
+                self.vm.underflows += 1
+                self._emit(ins, "warning", "// conversion: symbolic stack underflow")
+                return
+            convert = self.vm.coerce_float if m.startswith("to_float") else self.vm.coerce_int
+            self.vm.stack[-depth] = convert(self.vm.stack[-depth])
             return
 
         if m == "swap":
@@ -1982,8 +2014,9 @@ class StackAstBuilder:
             symbol = "++" if "inc" in m else "--"
             text = f"{symbol}{target.render()}" if m.startswith("pre") else f"{target.render()}{symbol}"
             version = self.vm.store(target, VMSlot(expr=text, type_id=target.type_id, kind="value"))
-            self._emit(ins, "expr", f"{text};", extra={"defs": [version], "uses": self._uses(target)})
-            self.vm.push(target.clone(expr=text, kind="value", is_lvalue=False))
+            result = f"value_{ins.offset:08X}"
+            self._emit(ins, "expr", f"auto {result} = {text};", extra={"defs": [version, result], "uses": self._uses(target)})
+            self.vm.push(target.clone(expr=result, kind="value", is_lvalue=False, metadata={}))
             return
 
         if m.endswith("assign_u16") or m in {"ptr_add_assign_u16", "ptr_sub_assign_u16"}:
@@ -2080,7 +2113,7 @@ class StackAstBuilder:
 
         if m == "yield_program":
             self._flush_pending_side_effect_slots(fallback_ins=ins)
-            self.vm.reset_frame()
+            self.vm.suspend()
             self.pending_arg_count = None
             resume_target = operands.get("resume_target")
             suffix = f" // suspend; resumes at {label_for_offset(resume_target)}" if isinstance(resume_target, int) else " // suspend; resumes from saved PC"
@@ -2164,22 +2197,10 @@ class StackAstBuilder:
                 self.vm.push_int("(-1)", value=-1, metadata={"call_effect": effect.to_dict()})
                 return
 
-            embedded_side_effect = any(arg.metadata.get("emit_on_discard") for arg in args)
-            metadata = {
-                "call_effect": effect.to_dict(),
-                "call": call_expr,
-                "call_kind": kind,
-                "call_offset": ins.offset,
-                "call_file_offset": ins.file_offset,
-                "call_opcode": ins.opcode,
-                "call_mnemonic": ins.mnemonic,
-                "uses": uses,
-                # Inline when consumed, but emit as a standalone statement if the
-                # returned VM slot is later discarded by stack_frame_reset / discard_value.
-                "emit_on_discard": bool(effect.statement or embedded_side_effect),
-            }
+            result = f"value_{ins.offset:08X}"
+            self._emit(ins, kind, f"auto {result} = {call_expr};", extra=extra)
             slot_kind = "slice" if effect.return_type_id == TYPE_SLICE else "value"
-            self.vm.push(VMSlot(expr=call_expr, type_id=effect.return_type_id, kind=slot_kind, metadata=metadata))
+            self.vm.push(VMSlot(expr=result, type_id=effect.return_type_id, kind=slot_kind))
             return
 
         self._emit(ins, kind, f"{call_expr};", extra=extra)

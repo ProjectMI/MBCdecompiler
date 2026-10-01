@@ -129,13 +129,10 @@ def collect_data_scope_index(
     *,
     stop_offsets: set[int],
 ) -> tuple[dict[int, DataUse], dict[int, str]]:
-    """Infer which data-section slots are program-local and which are shared.
+    """Collect persistent module storage and its program/helper users.
 
-    MBC bytecode stores both original locals and true module globals in the same
-    data section.  Without a debug local table, the most reliable recoverable
-    distinction is ownership: a slot referenced only by one program/helper owner
-    is rendered as local, while a slot referenced by several owners is rendered
-    as global.
+    A single user does not establish automatic lifetime. Every data-section
+    slot remains module-owned until an escape/lifetime proof permits promotion.
     """
     usage: dict[int, DataUse] = {}
     helpers_by_owner = local_index.by_owner()
@@ -161,7 +158,8 @@ def collect_data_scope_index(
 
     scope_map: dict[int, str] = {}
     for offset, use in usage.items():
-        scope_map[offset] = "local" if len(use.owners) == 1 and next(iter(use.owners)) >= 0 else "global"
+        # Single-user data is still persistent process state. Ownership does not prove stack lifetime.
+        scope_map[offset] = "global"
     return usage, scope_map
 
 

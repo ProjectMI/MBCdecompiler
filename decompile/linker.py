@@ -1024,9 +1024,8 @@ class MbcProjectLinker:
       decoding), not casefold/stricmp;
     * imports in the newly linked module are resolved only against providers
       already present in the process;
-    * still-unresolved old imports are then resolved against providers from the
-      newly linked module;
-    * providers that appear later do not override an already patched import;
+    * all old imports are rebound against the first matching provider in the
+      newly linked module, including imports patched by an earlier link;
     * patch rel32 is computed from process-code offsets:
       ``target_runtime_offset - source_runtime_offset - 1``.
     """
@@ -1112,18 +1111,14 @@ class MbcProjectLinker:
             for provider in new_providers:
                 new_first_provider_by_name.setdefault(provider.name, provider)
 
-            # Second half: old unresolved imports resolve against providers from
-            # the module that has just been linked.  Already patched imports are
-            # not reconsidered when later duplicate providers appear.
-            if new_first_provider_by_name and self._unresolved_imports:
-                for key, source in list(self._unresolved_imports.items()):
-                    if source.module_name == state.module_name:
-                        continue
+            # MbcLoader::linkProcessResolve revisits every old import. Its
+            # program_index remains -1 after patching; later providers rebind it.
+            for previous in self._runtime_order[:-1]:
+                for source in previous.linker.imports:
                     target = new_first_provider_by_name.get(source.name)
-                    if target is None:
-                        continue
-                    self._record_link(source, target)
-                    self._unresolved_imports.pop(key, None)
+                    if target is not None:
+                        self._record_link(source, target)
+                        self._unresolved_imports.pop((source.module_name, source.index), None)
 
             for provider in new_providers:
                 loaded_first_provider_by_name.setdefault(provider.name, provider)

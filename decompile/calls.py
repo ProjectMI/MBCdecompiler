@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 import re
 from typing import Any
 
-from mbc_format.common import TYPE_FLOAT, TYPE_INT, TYPE_SLICE, TYPE_STRING
+from mbc_format.common import TYPE_FLOAT, TYPE_INT, TYPE_SLICE, TYPE_STRING, i32, s8
 from mbc_format.opcodes import BUILTINS
 
 @dataclass(frozen=True)
@@ -290,21 +290,22 @@ _FFSYS_CASES = {
     83: ("g_plant", True), 84: ("plant_or_map_query", True), 85: ("map_object_write", True),
     86: ("map_object_query_pair", True), 87: ("map_object_query", True), 88: ("map_global_query", True),
     89: ("map_or_object_update", False), 92: ("load_mbc_or_script_path", False), 93: ("sel_093", False),
-    94: ("sel_094", False), 95: ("object_collision_or_region_test", True), 96: ("object_query_bool", True),
+    94: ("sel_094", True), 95: ("object_collision_or_region_test", True), 96: ("object_query_bool", False),
     98: ("runtime_pattern_set_short", False), 99: ("runtime_pattern_patch", False), 100: ("runtime_vector_query", True),
     103: ("write_version", False), 106: ("runtime_string_command", False), 107: ("set_runtime_flag_4a9a824", False),
     109: ("process_bind_strings", False), 110: ("process_step_move_or_query", False), 111: ("process_state_reset", False), 112: ("process_state_query", True),
     113: ("sel_113", False), 114: ("get_root_drive", True), 115: ("path_exists", True), 116: ("resource_load_by_name", True),
-    119: ("sel_119", False), 120: ("set_runtime_handle_state", False), 121: ("runtime_pointer_query", True),
+    119: ("sel_119", True), 120: ("set_runtime_handle_state", False), 121: ("runtime_pointer_query", True),
     122: ("u64_to_string", True), 123: ("u64_add_i32_checked", True), 124: ("u64_sub_i32_checked", True), 125: ("u64_compare_i32", True),
     126: ("u64_mul_float_to_i32", True), 127: ("u64_mul_i32_checked", True), 128: ("u64_compare", True), 131: ("format_date_time", True),
     132: ("shell_execute", True), 133: ("push_zero_reserved_133", True), 134: ("push_zero_reserved_134", True), 136: ("path_is_directory", True),
-    138: ("push_zero_reserved_138", True), 140: ("chat_set_user_name", False), 150: ("connection_lost_notification", False),
+    138: ("push_zero_reserved_138", True), 140: ("chat_set_user_name", True), 150: ("connection_lost_notification", True),
     152: ("runtime_ui_flush", False), 206: ("world_map_bitmap", True), 207: ("world_map_state", True), 212: ("get_global_5610B8", True),
     213: ("runtime_set_4FA240", False), 214: ("runtime_set_4FA2D0", False), 215: ("process_find_state_by_name", True), 216: ("process_compare_state_strings", True),
     218: ("runtime_flag_save_and_clear", False), 219: ("lookup_runtime_table_entry", True), 220: ("lookup_runtime_table_global", True), 221: ("runtime_flag_restore", False),
     224: ("object_set_extra_vec3", False), 225: ("write_localtime_struct", False), 226: ("get_tick_count", True), 227: ("normalize_vec3_in_place", True),
-    228: ("query_login_cache", True), 229: ("slice_copy_runtime", True), 508: ("script_function_find_next", True), 509: ("set_global_55F760", False),
+    228: ("query_login_cache", True), 229: ("slice_copy_runtime", True),
+    230: ("movement_noop", False), 231: ("moved_since_query", True), 508: ("script_function_find_next", True), 509: ("set_global_55F760", False),
     510: ("get_global_55F760", True),
 }
 
@@ -313,6 +314,13 @@ _FFSYS_CASES = {
 # final game-facing name.  The important part for the VM model is whether the
 # selector pushes a value and what broad memory/process/UI effect it has.
 _FFSYS_NOTES: dict[int, str] = {
+    94: "client MbcSystemCommands.cpp/executeSystemWorld: grid query pushes int32",
+    96: "client MbcSystemCommands.cpp/executeSystemWorld: approachHeading writes state without a result",
+    119: "client MbcSystemCommands.cpp/executeSystemWorld: object selection pushes 0/-1 status",
+    140: "client MbcSystemCommands.cpp/executeSystemRuntime: setting user name pushes 1",
+    150: "client MbcSystemCommands.cpp/executeSystemRuntime: connection notification pushes 0",
+    230: "client MbcSystemCommands.cpp/executeSystemWorld: reserved movement command returns without a result",
+    231: "client MbcSystemCommands.cpp/executeSystemWorld: pushes and clears moved_since_query",
     75: "pops enable flag, calls sub_46AE00 and manages dword_55F764 timer/update handle",
     98: "pops six scalar fields and updates runtime pattern/state table through sub_45C230",
     99: "pops extended scalar pattern fields and updates runtime pattern/state table",
@@ -375,6 +383,77 @@ FFSYS_SELECTORS: dict[int, NativeCallSpec] = {
     selector: _ffsys_spec(selector, short_name, returns)
     for selector, (short_name, returns) in _FFSYS_CASES.items()
 }
+
+# Window commands have selector-specific results just like System and Configuration.
+# The command form of Shutdown(46) only signals startup completion; the query
+# form with an extra argument returns main_loop_started (specialized below).
+_WINDOW_CASES: dict[int, tuple[str, bool]] = {
+    0: ("create", True),
+    1: ("destroy", False),
+    2: ("display_width", True),
+    3: ("display_height", True),
+    4: ("text_height", True),
+    5: ("font_height", True),
+    6: ("line_offset", True),
+    7: ("take_input", False),
+    8: ("hit_test", False),
+    9: ("visible", False),
+    10: ("bounds", False),
+    11: ("text_size", False),
+    12: ("glyph_width", True),
+    13: ("scrollable", False),
+    14: ("cursor_position", False),
+    15: ("system_cursor_visible", True),
+    16: ("system_cursor_kind", False),
+    17: ("cursor_kind", False),
+    18: ("cursor_image", False),
+    19: ("cursor_text", False),
+    20: ("open", True),
+    21: ("close", False),
+    22: ("poll_event", True),
+    23: ("set_text", True),
+    24: ("control_at", True),
+    25: ("send_message", True),
+    26: ("get_text", True),
+    27: ("system_event", True),
+    28: ("window_under_cursor", True),
+    29: ("item_at", True),
+    30: ("saved_positions_size", True),
+    31: ("read_saved_positions", False),
+    32: ("write_saved_positions", False),
+    33: ("position", False),
+    34: ("size", False),
+    35: ("description", False),
+    36: ("tooltip", False),
+    37: ("options", True),
+    38: ("escape_window", True),
+    39: ("legacy_create_dialog", True),
+    40: ("legacy_destroy_dialog", False),
+    41: ("legacy_poll_dialog_event", True),
+    42: ("legacy_send_dialog_message", True),
+    43: ("legacy_dialog_item", True),
+    44: ("legacy_set_dialog_text", True),
+    45: ("legacy_get_dialog_text", True),
+    46: ("shutdown", True),
+    47: ("legacy_pump_messages", False),
+    55: ("active_window", True),
+    78: ("loading_progress", False),
+    79: ("finish_loading", False),
+}
+
+WINDOW_API_SELECTORS: dict[int, NativeCallSpec] = {
+    selector: (_int if returns else _void)(
+        f"window.{name}",
+        side_effects=("ui", "memory", "runtime_call"),
+        confidence="client-handler-verified",
+        layer="window",
+        selector=selector,
+        source=f"MbcInterface.cpp/windowCommand/{selector}",
+    )
+    for selector, (name, returns) in _WINDOW_CASES.items()
+}
+
+SELECTOR_BUILTINS = frozenset({0x0A, 0x67, 0x75, 0x83, 0x84})
 
 CONFIG_API_SELECTORS: dict[int, NativeCallSpec] = {
     # sub_486A60 is reached from sub_477500 case 117 (builtin 0x75).  It first
@@ -529,6 +608,11 @@ def selector_from_value(value: Any) -> int | None:
 
 
 def selector_from_slot(slot: Any) -> int | None:
+    if getattr(slot, "kind", None) == "prefix" and slot.value in {"+", "-"}:
+        child, = slot.children
+        selector = selector_from_slot(child)
+        if selector is not None:
+            return -selector if slot.value == "-" else selector
     value = getattr(slot, "value", None)
     selector = selector_from_value(value)
     if selector is not None:
@@ -552,6 +636,25 @@ def selector_from_args(args: list[Any] | tuple[Any, ...]) -> int | None:
 
 
 def builtin_api_spec(subopcode: int, selector: int) -> NativeCallSpec | None:
+    if subopcode in {0x83, 0x84}:
+        returns = selector == 0 if subopcode == 0x83 else 1 <= selector <= 11
+        group = "editor_pick" if subopcode == 0x83 else "player_lists"
+        constructor = _int if returns else _void
+        return constructor(f"{group}.selector_{selector}", selector=selector, layer=group,
+                           side_effects=("memory", "ui", "runtime_call"),
+                           confidence="client-handler-verified", source="MbcBuiltins.cpp")
+    if subopcode == 0x0A:
+        spec = WINDOW_API_SELECTORS.get(selector)
+        if spec is not None:
+            return spec
+        return _void(
+            f"window.noop_selector_{selector}",
+            side_effects=(),
+            confidence="client-handler-default-no-push",
+            layer="window",
+            selector=selector,
+            source="MbcInterface.cpp/windowCommand/default",
+        )
     if subopcode == 0x67:
         spec = FFSYS_SELECTORS.get(selector)
         if spec is not None:
@@ -582,7 +685,49 @@ def builtin_api_spec(subopcode: int, selector: int) -> NativeCallSpec | None:
 
 
 def specialize_builtin_api(subopcode: int, args: list[Any]) -> tuple[NativeCallSpec, list[Any]] | None:
-    if subopcode not in (0x67, 0x75):
+    if subopcode in {34, 35, 67, 91, 123, 126, 136}:
+        # CopyString and formatArguments return the *original* first VM value.
+        # The latter is used by both formatting and logging entry points.
+        typ = getattr(args[0], "type_id", None) if args else None
+        result = "unknown" if typ is None or typ < 0 else (
+            "float32" if typ == TYPE_FLOAT else "int32" if typ in {0, TYPE_INT} else "span/string")
+        spec = _spec(BUILTINS[subopcode].mnemonic, arity=len(args), return_type=result,
+                     return_type_id=typ, pushes=1, side_effects=("memory", "runtime_call"),
+                     confidence="client-handler-verified", source="MbcRuntime::returnFirstArgument")
+        return spec, list(args)
+    if subopcode == 0x3D:
+        # executeVisualBuiltin::Text dispatches on the exact VM type, not on
+        # arity or on whether the numeric value resembles an address.
+        first_type = getattr(args[0], "type_id", None) if args else None
+        if first_type is None or first_type < 0:
+            # Return-type propagation starts with unknown callees. Keep that
+            # uncertainty explicit until the project reaches its fixed point.
+            return _unknown_value("text.dynamic", arity=len(args),
+                                  side_effects=("ui", "runtime_call"),
+                                  confidence="pending-type-resolution"), list(args)
+        create = first_type == TYPE_STRING
+        constructor = _int if create else _void
+        name = "text.create" if create else "text.configure"
+        spec = constructor(name, arity=len(args), side_effects=("ui", "runtime_call"),
+                           confidence="client-handler-verified", source="MbcBuiltins.cpp/executeVisualBuiltin/Text")
+        return spec, list(args)
+    if subopcode == 0x79:
+        # RebaseSlice(reference) writes the caller-relative descriptor and
+        # returns a status; RebaseSlice(process, reference) returns a cursor.
+        constructor = _int if len(args) == 1 else _string
+        spec = constructor("process_translate_ptr", arity=len(args),
+                           side_effects=("memory", "process", "runtime_call"),
+                           confidence="client-handler-verified", source="MbcBuiltins.cpp/executeMemoryBuiltin/RebaseSlice")
+        return spec, list(args)
+    if subopcode == 0x0F and args:
+        size = selector_from_slot(args[0])
+        if size is not None and getattr(args[0], "type_id", None) in {0, TYPE_INT}:
+            size = s8(size & 0xFF) if args[0].type_id == 0 else i32(size)
+        constructor = _unknown_value if size is None else _int if size <= 0 else _string
+        spec = constructor("alloc_span", arity=len(args), side_effects=("memory", "runtime_call"),
+                           confidence="client-handler-verified", source="MbcBuiltins.cpp/executeMemoryBuiltin/AllocateMemory")
+        return spec, list(args)
+    if subopcode not in SELECTOR_BUILTINS:
         return None
     selector = selector_from_args(args)
     if selector is None:
@@ -590,6 +735,14 @@ def specialize_builtin_api(subopcode: int, args: list[Any]) -> tuple[NativeCallS
     spec = builtin_api_spec(subopcode, selector)
     if spec is None:
         return None
+    if subopcode == 0x67 and selector == 73 and len(args) == 1:
+        # executeSystemResources: loadResources() is a command; adding an
+        # argument changes it into a resources_loaded status query.
+        spec = replace(spec, return_type="void", return_type_id=None, pushes=0,
+                       note=spec.note + "; no extra argument: load resources without a result")
+    if subopcode == 0x0A and selector == 46 and len(args) == 1:
+        spec = replace(spec, return_type="void", return_type_id=None, pushes=0,
+                       note="Window(46) signals startup completion without a result")
     return spec, list(args[1:])
 
 @dataclass(frozen=True)
@@ -637,40 +790,35 @@ class CallEffect:
 
 _FLOAT_UNARY = {"sin", "cos", "sqrt_abs_float", "exp", "abs_float", "logf_math"}
 _INT_UNARY = {"abs_int", "identity_int", "bit_not"}
-_FLOAT_RETURNS = {
-    "sin", "cos", "sqrt_abs_float", "exp", "rand_float", "object_get_x", "object_get_y", "object_get_z",
-    "object_get_vec14_x", "object_get_vec14_y", "object_get_vec14_z", "get_float_field_0x294",
+# Result types are taken from the client handlers, not inferred from opcode
+# names or prose. In particular the old typed_load/store mnemonics are not a
+# reliable description of the returned cursor. All cursor helpers push type 1.
+# Selector/type/arity-dependent contracts are refined in specialize_builtin_api.
+_BUILTIN_RESULT_GROUPS = {
+    "void": (
+        0, 1, 2, 26, 31, 38, 42, 48, 49, 50, 51, 52, 53, 60, 62, 63, 71, 72, 77, 78, 79, 82, 86, 87,
+        88, 90, 92, 93, 94, 96, 99, 100, 101, 102, 104, 105, 108, 112, 113, 114, 120, 122, 130, 133,
+    ),
+    "int32": (
+        6, 8, 9, 10, 11, 13, 14, 16, 17, 18, 19, 22, 23, 24, 25, 27, 28, 29, 30, 32, 33, 36, 37, 39,
+        40, 41, 43, 44, 45, 47, 61, 64, 65, 66, 68, 69, 70, 73, 74, 75, 76, 80, 83, 84, 85, 89, 97, 98,
+        103, 107, 109, 110, 111, 115, 116, 117, 119, 124, 127, 129, 131, 132, 134, 137, 138, 139, 140,
+        141, 142, 143, 144, 145, 146, 147, 160, 161, 162, 163,
+    ),
+    "float32": (
+        3, 4, 5, 7, 12, 46, 54, 55, 56, 57, 58, 59, 81, 106, 125,
+    ),
+    "span/string": (
+        95, 118, 128, 135, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159,
+    ),
+    "unknown": (
+        15, 20, 21, 34, 35, 67, 91, 121, 123, 126, 136,
+    ),
 }
-_INT_RETURNS_BY_NAME = {
-    "push_vm_tick", "push_runtime_handle", "push_runtime_flag_byte", "ffprc_load", "ffprc_link", "ffprc_state",
-    "last_process_result", "arg_count", "current_process_state", "push_zero", "push_zero_alias", "ffprc_id",
-    "send_to_process_id", "send_to_process_zero", "send_message_marshaled", "receive_message_marshaled", "window_api",
-    "ffsys_api", "text_api", "native_config_api", "effect_attach", "item_inventory_api", "entity_ref_api", "resource_handle_api", "sscanf", "prc_name", "file_remove", "reserved_noop_7a",
-    "push_context_id_or_zero", "lookup_process_by_name", "push_current_flags_mask_4", "strlen_checked", "strcmp",
-    "current_process_id", "file_create", "file_open", "file_close", "file_read", "file_read_line", "file_write", "identity_int", "object_create",
-    "object_get_or_set_flag_0x278", "push_runtime_constant_pair", "find_effect_id", "assoc_array_get", "file_seek",
-    "file_length", "file_stat_time_field", "file_lookup_476310", "stricmp", "strncmp", "strnicmp", "current_sender_id",
-    "bit_and", "bit_or", "bit_xor", "bit_not", "shift_left", "shift_right", "bit_clear", "bit_set", "bit_test",
-    "memcmp", "binary_search_i32", "buffer_hash_or_checksum", "push_runtime_slot", "distance_or_distance_sq",
-    "angle_delta", "push_minus_one", "pack_rgb24", "object_create", "sprite_create_or_update",
-    "typed_load_width_1", "typed_load_width_2", "typed_load_width_3", "typed_load_width_4",
-}
-_SLICE_RETURNS_BY_NAME = {
-    "alloc_span", "strstr", "strchr", "stristr", "push_static_word_span", "parse_api",
-    "typed_store_width_1", "typed_store_width_2", "typed_store_width_3", "typed_store_width_4", "process_translate_ptr", "span_write_float", "span_write_cstring", "ptr_store_i32_from_ptr", "ptr_copy_cstring",
-}
-_VOID_BY_NAME = {
-    "debug_print_float", "debug_print_float_alias", "print_string_or_exit",
-    "ffprc_unload",
-    "strcpy_checked", "strcat_checked", "log_event_dispatch",
-    "object_set_pos_xyz", "object_add_pos_xyz", "view_set_pos_xyz", "view_set_z", "object_set_vec14_xyz",
-    "global_vector_set", "object_delete_type0", "object_release_type4", "text_color",
-    "process_memcpy", "memcpy", "memset", "thisname", "ffmempcpy_alt", "copy_effect_name_by_id",
-    "dmalloc_free", "dmalloc", "assoc_array_set", "file_lock",
-    "snprintf", "sprintf", "file_rename", "file_truncate", "file_set_time",
-    "object_set_flag_0x141", "object_get_norm_vec3", "object_get_position_vec3", "object_get_abg_vec3",
-    "chat_utility_api", "editor_get_click_point", "raw_arg_read", "external_runtime_update_473730", "reserved_noop_82", "reserved_noop_85",
-}
+_BUILTIN_RESULTS = {opcode: result for result, opcodes in _BUILTIN_RESULT_GROUPS.items() for opcode in opcodes}
+if set(_BUILTIN_RESULTS) != set(BUILTINS) or len(_BUILTIN_RESULTS) != sum(map(len, _BUILTIN_RESULT_GROUPS.values())):
+    raise ValueError("Every builtin must have exactly one explicit client result contract")
+_RESULT_TYPES = {"void": None, "int32": TYPE_INT, "float32": TYPE_FLOAT, "span/string": TYPE_STRING, "unknown": None}
 
 _EXPLICIT_ARITY: dict[str, int] = {
     "sin": 1,
@@ -715,21 +863,9 @@ def _side_effects_for(name: str, semantic: str, returns: bool) -> tuple[str, ...
     return tuple(dict.fromkeys(effects))
 
 
-def _return_for(name: str, semantic: str) -> tuple[str, int | None, int]:
-    s = semantic.lower()
-    if name in _VOID_BY_NAME:
-        return "void", None, 0
-    if name in _FLOAT_RETURNS or ("pushes" in s and "float" in s and "string" not in s):
-        return "float32", TYPE_FLOAT, 1
-    if name in _SLICE_RETURNS_BY_NAME or ("pushes" in s and ("slice descriptor" in s or "span" in s) and "writes" not in s):
-        return "slice", TYPE_SLICE, 1
-    if name in _INT_RETURNS_BY_NAME:
-        return "int32", TYPE_INT, 1
-    if "pushes" in s or name.startswith("push_"):
-        if "string" in s and "length" not in s:
-            return "span/string", TYPE_STRING, 1
-        return "int32", TYPE_INT, 1
-    return "void", None, 0
+def _return_for(subopcode: int) -> tuple[str, int | None, int]:
+    result = _BUILTIN_RESULTS[subopcode]
+    return result, _RESULT_TYPES[result], 0 if result == "void" else 1
 
 
 def _arg_types_for(name: str, arity: int | None) -> tuple[str, ...]:
@@ -803,7 +939,7 @@ def builtin_effect(subopcode: int, *, argc: int | None = None) -> CallEffect:
     builtin = BUILTINS[subopcode]
     name = builtin.mnemonic
     semantic = builtin.semantic
-    return_type, return_type_id, pushes = _return_for(name, semantic)
+    return_type, return_type_id, pushes = _return_for(subopcode)
     arity = argc if argc is not None else _EXPLICIT_ARITY.get(name)
     returns = pushes > 0 and return_type != "void"
     side_effects = _side_effects_for(name, semantic, returns)
